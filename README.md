@@ -2,6 +2,9 @@
 
 Evidence-Grounded Dynamic Lane Sequence Model for 2D lane detection.
 
+For copy-paste setup, checkpoint download, training, and evaluation commands,
+see [`docs/INSTALL_AND_TRAIN.md`](docs/INSTALL_AND_TRAIN.md).
+
 This repository follows `docs/prd.md` as the canonical implementation
 specification. Development is gated in the PRD order:
 
