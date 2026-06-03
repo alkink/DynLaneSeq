@@ -64,6 +64,14 @@ gh release create s0-strong-b16-75k \
   --notes "Strong S0 checkpoint used to initialize full CULane S1 residual training."
 ```
 
+If GitHub CLI (`gh`) is not installed, create the release in the GitHub web UI:
+
+1. Open `https://github.com/alkink/DynLaneSeq/releases/new`.
+2. Use tag `s0-strong-b16-75k`.
+3. Use title `S0 Strong B16 75k Checkpoint`.
+4. Attach `outputs/culane_s0_res34_strong_b16_giou/iter_0075000.pt`.
+5. Publish the release.
+
 Suggested download command on another machine:
 
 ```bash
