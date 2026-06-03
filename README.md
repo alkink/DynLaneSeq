@@ -41,3 +41,34 @@ Both scripts accept overrides:
 ```bash
 DEVICE=cuda INIT_FROM=path/to/checkpoint.pt bash scripts/run_culane_s1_strong_from_s0_75k.sh
 ```
+
+## Checkpoint Artifacts
+
+Model checkpoints are not tracked in regular Git because GitHub blocks regular
+repository files larger than 100 MiB. Keep checkpoints under `outputs/` locally
+and distribute the required files as GitHub Release assets, Git LFS objects, or
+external storage.
+
+Required S1 initialization artifact:
+
+```text
+outputs/culane_s0_res34_strong_b16_giou/iter_0075000.pt
+```
+
+Suggested GitHub Release upload command:
+
+```bash
+gh release create s0-strong-b16-75k \
+  outputs/culane_s0_res34_strong_b16_giou/iter_0075000.pt \
+  --title "S0 Strong B16 75k Checkpoint" \
+  --notes "Strong S0 checkpoint used to initialize full CULane S1 residual training."
+```
+
+Suggested download command on another machine:
+
+```bash
+mkdir -p outputs/culane_s0_res34_strong_b16_giou
+gh release download s0-strong-b16-75k \
+  --pattern iter_0075000.pt \
+  --dir outputs/culane_s0_res34_strong_b16_giou
+```
