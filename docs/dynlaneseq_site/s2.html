@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S2 Curve-Aligned Evidence</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+<div class="shell">
+  <aside class="side"><a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a><nav class="nav"><a href="index.html">Ana fikir</a><a href="s0.html">S0: Geometry-only</a><a href="s1.html">S1: Row token sequence</a><a class="active" href="s2.html">S2: Curve evidence</a><a href="s3.html">S3: Low-rank bridge</a><a href="s4.html">S4: Zoom refinement</a></nav></aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">S2</span><span class="tag">Curve-aligned sampler</span><span class="tag">Evidence-grounded</span>
+        <h1>S2: Küçük kamerayı lane üstünde gezdir.</h1>
+        <p class="lead">S2, modelin asıl “evidence-grounded” hale geldiği yer. Önce coarse lane çiziliyor. Sonra bu lane’in üzerindeki row noktalarından feature okunuyor. Final decoder artık sadece query’ye değil, lane üstünden gelen görsel kanıta da bakıyor.</p>
+        <div class="note good">Bunu şöyle düşün: Önce haritada yolu tahmin et. Sonra yolun üstüne küçük kameralar koy. Kameralar “burada gerçekten şerit çizgisi var mı?” diye kontrol etsin.</div>
+      </div>
+      <div class="photo-card"><img src="assets/images/s2-a.jpg" alt="S2 lane prediction"><p class="caption">S2 2k subset çıktısı. Bu phase’te final çizgi, lane üstünden okunan evidence ile beslenir.</p></div>
+    </header>
+
+    <section>
+      <h2>S2 Hangi Sorunu By-Pass Ediyor?</h2>
+      <p>S1 row token üretir ama row token’ın elinde o satırdaki lane çevresinden doğrudan okunmuş feature yoktur. S2 bu boşluğu kapatır: “global feature bana yetmez, tahmin ettiğim eğrinin üstünden özel kanıt okuyayım” der.</p>
+      <div class="grid three">
+        <div class="card"><h3>Ne görüyor?</h3><p>Feature map, lane query ve coarse lane tahmini.</p></div>
+        <div class="card"><h3>Neye çeviriyor?</h3><p><code>E_seq</code>: her lane için 72 satırlık evidence dizisi.</p></div>
+        <div class="card"><h3>Sonraki adıma ne gönderiyor?</h3><p>Final row decoder’a <code>query + row_embedding + evidence</code>.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Bunu Nasıl Yapıyor?</h2>
+      <div class="figure">
+        <svg viewBox="0 0 1100 390" role="img" aria-label="S2 curve aligned sampling diagram">
+          <rect width="1100" height="390" fill="#081019"/>
+          <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/></marker></defs>
+          <rect x="45" y="52" width="330" height="270" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+          <path d="M95 282 C150 220, 204 155, 292 82" stroke="#31465e" stroke-width="16" fill="none" stroke-linecap="round"/>
+          <path d="M98 280 C154 216, 207 154, 294 84" stroke="#5bd7ff" stroke-width="4" fill="none" stroke-linecap="round" stroke-dasharray="9 10"/>
+          <g fill="#ffd36d" stroke="#081019" stroke-width="2"><circle cx="112" cy="263" r="8"/><circle cx="151" cy="219" r="8"/><circle cx="197" cy="167" r="8"/><circle cx="245" cy="122" r="8"/><circle cx="286" cy="89" r="8"/></g>
+          <text x="82" y="348" fill="#aab8c8" font-family="Arial" font-size="15">sample_x + fixed_y_rows</text>
+          <rect x="490" y="70" width="210" height="90" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="535" y="105" fill="#eef6ff" font-family="Arial" font-size="19">grid_sample</text><text x="526" y="135" fill="#aab8c8" font-family="Arial" font-size="15">feature map’ten oku</text>
+          <rect x="818" y="52" width="230" height="270" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="875" y="92" fill="#eef6ff" font-family="Arial" font-size="20">E_seq</text><text x="850" y="126" fill="#aab8c8" font-family="Arial" font-size="15">lane başına 72 kanıt</text><text x="850" y="156" fill="#aab8c8" font-family="Arial" font-size="15">row decoder’a eklenir</text>
+          <line x1="376" y1="180" x2="488" y2="118" stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)"/>
+          <line x1="701" y1="118" x2="816" y2="180" stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)"/>
+          <path d="M855 275 C895 230, 938 176, 1000 116" stroke="#7ce59a" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <g fill="#ff82b7"><circle cx="865" cy="263" r="6"/><circle cx="900" cy="222" r="6"/><circle cx="945" cy="169" r="6"/><circle cx="990" cy="126" r="6"/></g>
+        </svg>
+      </div>
+      <pre><code># dynlaneseq_s2.py özü
+coarse_row = row_decoder(query + row_embedding)
+coarse_x = coarse_row["pred_x_rows"]
+
+sample_x = curriculum.build_sample_x(
+    coarse_x, targets, matches, alpha=sampler_alpha
+)
+
+evidence = CurveAlignedSampler(features, sample_x)
+tokens = query + row_embedding + EvidenceAdapter(evidence)
+final_row = row_decoder(tokens)</code></pre>
+    </section>
+
+    <section>
+      <h2>Curve-Aligned Sampler Ne Yapıyor?</h2>
+      <p><code>CurveAlignedSampler</code>, predicted lane’in x koordinatları ile sabit y row’larını birleştirir. Sonra bu koordinatları <code>grid_sample</code> formatına çevirir. Yani “feature map’in şu noktalarından oku” der.</p>
+      <pre><code># curve_aligned_sampler.py fikri
+x = sample_x_rows.clamp(0, input_w - 1)
+y = fixed_y_rows(num_rows)
+grid = input_to_grid(x, y)
+sampled = grid_sample(features, grid)
+E_seq = sampled.view(batch, slots, rows, channels)</code></pre>
+      <div class="note">Eğer local window açıksa tek çizgi üstünden değil, çizginin sağından solundan da birkaç offset okunabilir. Config’te offset örneği: <code>[-8, -4, 0, 4, 8]</code>.</div>
+    </section>
+
+    <section>
+      <h2>Curriculum Neden Lazım?</h2>
+      <p>Burası zor. Eğitim başında coarse lane rastgeleye yakındır. Sampler doğrudan o çizgiye güvenirse yanlış yerden evidence okur. Model yanlış kanıtla kendini daha da bozabilir.</p>
+      <div class="grid two">
+        <div class="card"><h3>Erken eğitim</h3><p><code>sample_x</code> GT lane’e yakın tutulur. Biraz noise eklenir. Model doğru lane çevresinden kanıt okumayı öğrenir.</p></div>
+        <div class="card"><h3>Geç eğitim</h3><p><code>alpha</code> azalır. Model yavaş yavaş kendi coarse tahmininden evidence okumaya geçer.</p></div>
+      </div>
+      <pre><code># sampler_curriculum.py fikri
+mixed = alpha * gt_x + (1 - alpha) * coarse_pred_x
+sample_x = where(valid_gt_row, mixed, coarse_pred_x)
+sample_x = clamp(sample_x)
+sample_x = detach(sample_x)  # stabilite için</code></pre>
+      <p>Bu problemi tamamen çözmez. Ama “yanlış tahmin -> yanlış kanıt -> daha yanlış tahmin” döngüsünü eğitim başında yumuşatır.</p>
+    </section>
+
+    <section>
+      <h2>Evidence Adapter Ne İşe Yarıyor?</h2>
+      <p>Evidence doğrudan decoder’a bastırılmaz. <code>EvidenceAdapter</code> küçük bir MLP ve öğrenilebilir <code>gamma</code> ile evidence etkisini kontrollü ekler.</p>
+      <pre><code># evidence_adapter.py
+adapted = gamma * MLP(E_seq)
+tokens = query + row_embedding + adapted</code></pre>
+      <div class="note warn">Eğer <code>gamma</code> hep sıfıra yakın kalırsa model evidence kullanmıyor olabilir. Eğer çok hızlı büyürse evidence branch modeli bozabilir.</div>
+    </section>
+
+    <section>
+      <h2>Görsel Üzerinden Oku</h2>
+      <div class="gallery">
+        <div class="photo-card"><img src="assets/images/s2-a.jpg" alt="S2 sample A"><p class="caption">S2’de final lane, coarse tahmin üzerinden okunan evidence ile güncellenir.</p></div>
+        <div class="photo-card"><img src="assets/images/s2-b.jpg" alt="S2 sample B"><p class="caption">Bu görüntüleri “çizgi üstündeki küçük kamera noktaları final çizgiyi besliyor” diye oku.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>S2’nin Sınırı</h2>
+      <ul>
+        <li>Evidence var ama henüz lane query’ye göre dinamik biçimde rafine edilmiyor.</li>
+        <li>Coarse prediction yanlışsa sampler hâlâ yanlış bölgeye kayabilir.</li>
+        <li>Topology yok; bağlantılar hâlâ doğrudan modellenmiyor.</li>
+      </ul>
+      <div class="nextprev"><a class="button" href="s1.html">S1’e dön</a><a class="button" href="s3.html">S3’e geç</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Query ve Tensor Mikroskobu</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="menu">
+    <a class="brand" href="index.html"><strong>Lane School</strong><span>Önce görsel, sonra kod</span></a>
+    <a class="nav" href="index.html">0. Yol haritası</a>
+    <a class="nav active" href="query.html">Query mikroskobu</a>
+    <a class="nav" href="s0.html">1. S0: Şerit adayı</a>
+    <a class="nav" href="s1.html">2. S1: Boncuk dizisi</a>
+    <a class="nav" href="s2.html">3. S2: Şeritten kanıt oku</a>
+    <a class="nav" href="s3.html">4. S3: Kanıtı düzelt</a>
+    <a class="nav" href="s4.html">5. S4: Bir daha bak</a>
+  </aside>
+  <main>
+    <header>
+      <span class="pill">En detaylı sayfa</span><span class="pill">Kod objesi → tensor → lane karşılığı</span>
+      <h1>Query tam olarak nedir? İçinde ne var? Lane’e nasıl dönüşüyor?</h1>
+      <p class="lead">Bu sayfa “query karttır” gibi kısa benzetmeleri bırakıp, kodun bellekte ne tuttuğunu ve bunun görüntüde hangi çizgiye dönüştüğünü tek tek anlatır.</p>
+      <div class="note bad">
+        En önemli düzeltme: <strong>query içinde x1, x2, x3 koordinatları yok.</strong> Query başlangıçta 256 sayılık öğrenilen bir vektördür. Koordinatlar daha sonra head/decoder tarafından üretilir.
+      </div>
+    </header>
+
+    <section>
+      <h2>1. En Başta Elimizde Ne Var?</h2>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s2-a.jpg" alt="Lane prediction visual">
+        <svg viewBox="0 0 800 288">
+          <path d="M188 270 C225 220 267 165 330 82" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+          <path d="M480 270 C520 220 560 160 620 75" fill="none" stroke="#8af09f" stroke-width="6" stroke-linecap="round"/>
+          <text x="30" y="36" fill="#f2f7fb" font-size="20" font-family="Arial">Girdi: 800x288 yol görüntüsü</text>
+          <text x="30" y="64" fill="#63d8ff" font-size="17" font-family="Arial">Çıkmak istediğimiz şey: bu çizgilerin x,y noktaları</text>
+        </svg>
+      </div>
+      <p>Modelin nihai amacı bu görseldeki şeritleri nokta nokta üretmek. Ama bunu doğrudan “resimden x1,x2,x3 çıkar” diye yapmıyor. Arada birkaç temsil var.</p>
+      <div class="grid three">
+        <div class="card"><h3>Image tensor</h3><p><code>images</code> yaklaşık <code>[B, 3, 288, 800]</code>. Bu gerçek RGB görüntü.</p></div>
+        <div class="card"><h3>Feature map</h3><p><code>features</code> yaklaşık <code>[B, 256, 72, 200]</code>. Bu artık piksel değil; görüntünün sıkıştırılmış anlam haritası.</p></div>
+        <div class="card"><h3>Lane output</h3><p><code>pred_x_rows</code> <code>[B, 20, 72]</code>. İşte gerçek çizgi noktaları burada doğuyor.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Query Bir Array mi?</h2>
+      <p>Evet, query PyTorch tarafında bir tensör/array. Ama koordinat array’i değil. Kod şunu kuruyor:</p>
+      <pre><code># dynlaneseq_eg/modeling/lane_queries.py
+self.query = nn.Embedding(num_slots=20, dim=256)
+
+# self.query.weight shape:
+[20, 256]</code></pre>
+      <p>Yani modelin içinde 20 tane satır var. Her satır 256 float sayıdan oluşuyor.</p>
+      <pre><code>query.weight =
+slot 0: [0.013, -0.004, 0.021, ..., 0.006]  # 256 sayı
+slot 1: [-0.009, 0.017, 0.003, ..., -0.014] # 256 sayı
+...
+slot 19: [0.002, 0.011, -0.018, ..., 0.020]</code></pre>
+      <div class="note">
+        Bu 256 sayının tek tek “x”, “y”, “renk”, “sol lane” diye insan tarafından okunabilir anlamı yok. Model eğitim sırasında bu sayıları ayarlıyor. Bu vektör, “ben bir lane adayı olarak görüntüye nasıl bakmalıyım?” bilgisini taşımaya başlıyor.
+      </div>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s0-a.jpg" alt="Query slots visual">
+        <svg viewBox="0 0 800 288">
+          <rect x="34" y="30" width="110" height="40" rx="8" fill="#111820" stroke="#ffd56f" stroke-width="3"/>
+          <rect x="34" y="82" width="110" height="40" rx="8" fill="#111820" stroke="#ffd56f" stroke-width="3"/>
+          <rect x="34" y="134" width="110" height="40" rx="8" fill="#111820" stroke="#ffd56f" stroke-width="3"/>
+          <text x="54" y="56" fill="#f2f7fb" font-size="16" font-family="Arial">slot 0</text>
+          <text x="54" y="108" fill="#f2f7fb" font-size="16" font-family="Arial">slot 1</text>
+          <text x="54" y="160" fill="#f2f7fb" font-size="16" font-family="Arial">slot 2</text>
+          <line x1="144" y1="50" x2="220" y2="210" stroke="#ffd56f" stroke-width="3"/>
+          <path d="M190 270 C230 220 270 160 330 80" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+          <text x="190" y="42" fill="#63d8ff" font-size="18" font-family="Arial">Bu çizgi slot vektöründen sonra üretilir.</text>
+        </svg>
+      </div>
+      <p class="caption">Slot kutusu çizginin kendisi değildir. Slot kutusu çizgiyi arayacak başlangıç vektörüdür.</p>
+    </section>
+
+    <section>
+      <h2>3. Query Batch İçinde Nasıl Çoğalıyor?</h2>
+      <p>Bir batch içinde B tane görüntü varsa aynı 20 query her görüntü için kopyalanır:</p>
+      <pre><code># lane_queries.py
+q = self.query.weight.unsqueeze(0)      # [1, 20, 256]
+q = q.expand(batch_size, -1, -1)        # [B, 20, 256]</code></pre>
+      <div class="grid two">
+        <div class="card">
+          <h3>Bu ne demek?</h3>
+          <p>Batch’teki her görüntüye 20 aday lane arayıcısı verilir.</p>
+          <p><code>q[b, n, :]</code> = b’inci görüntüde n’inci lane adayının 256 sayılık vektörü.</p>
+        </div>
+        <div class="card">
+          <h3>Bu ne demek değil?</h3>
+          <p><code>q[b, n, 0]</code> x koordinatı değildir.</p>
+          <p><code>q[b, n, 1]</code> y koordinatı değildir.</p>
+          <p>Bu sayılar direkt çizilemez. Çizgiye dönüşmeleri için head gerekir.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Query Görüntüye Nasıl Bakıyor?</h2>
+      <p>Backbone ve FPN görüntüyü feature map’e çevirir. Sonra bu feature map düzleştirilir:</p>
+      <pre><code># dynlaneseq_s0.py
+f_proj = self.proj(fpn)                         # [B, 256, 72, 200]
+mem_value = f_proj.flatten(2).transpose(1, 2)   # [B, 14400, 256]
+mem_key = (f_proj + pos).flatten(2).transpose(1, 2)</code></pre>
+      <p><code>14400 = 72 * 200</code>. Yani feature map’te 14.400 küçük konum var. Her konumun 256 sayılık anlam vektörü var.</p>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s0-b.jpg" alt="Feature map visual">
+        <svg viewBox="0 0 800 288">
+          <g stroke="#ffd56f" stroke-width="1" opacity=".45">
+            <path d="M0 72 H800"/><path d="M0 144 H800"/><path d="M0 216 H800"/>
+            <path d="M200 0 V288"/><path d="M400 0 V288"/><path d="M600 0 V288"/>
+          </g>
+          <circle cx="228" cy="210" r="9" fill="#ffd56f"/>
+          <circle cx="285" cy="140" r="9" fill="#ffd56f"/>
+          <circle cx="340" cy="78" r="9" fill="#ffd56f"/>
+          <text x="28" y="34" fill="#f2f7fb" font-size="19" font-family="Arial">Feature map: görüntünün küçük konumlara bölünmüş anlam haritası</text>
+        </svg>
+      </div>
+      <p>Cross-attention şu işi yapar: query vektörü, 14.400 feature konumu içinden kendisi için önemli bilgiyi toplar.</p>
+      <pre><code># cross_attention_decoder.py
+q_content = cross_attn(
+    query=q_with_pos,     # lane adayı
+    key=memory_key,       # görüntü konumları + pozisyon
+    value=memory_value    # görüntü konumlarının içerikleri
+)</code></pre>
+      <div class="note">
+        Cross-attention sonrası <code>q1</code> hâlâ <code>[B,20,256]</code>. Shape değişmez. Ama artık query vektörü görüntüden bilgi almıştır. Başta boş arayıcıydı; şimdi “bu görüntüde muhtemelen şöyle bir lane var” bilgisini içinde taşır.
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Peki Query Ne Zaman Çizgi Oluyor?</h2>
+      <p>S0’da çizgi, query’den geçen üç head ile doğar:</p>
+      <pre><code># heads_s0.py
+exist_logits = self.exist(q)       # [B, 20, 2]
+row_x_logits = self.row_x(q)       # [B, 20, 72, 200]
+pred_x_rows = soft_expected_x(row_x_logits) # [B, 20, 72]
+range_norm = self.range(q)         # [B, 20, 2]</code></pre>
+      <div class="grid two">
+        <div class="card">
+          <h3><code>exist_logits</code></h3>
+          <p>Bu slot gerçekten lane mi, boş mu?</p>
+          <p>Kodda class 0 = lane, class 1 = no-lane gibi kullanılıyor. Çünkü matcher <code>p_lane = softmax(...)[...,0]</code> alıyor.</p>
+        </div>
+        <div class="card">
+          <h3><code>range_norm</code></h3>
+          <p>Lane dikeyde nereden başlıyor, nerede bitiyor?</p>
+          <p>Bu x değil. İki sayı: y_min ve y_max. Sonradan 288 piksele ölçeklenir.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>6. <code>row_x_logits</code> İçinde Ne Var?</h2>
+      <p>Bu, çizgiye en yakın tensor. Shape:</p>
+      <pre><code>row_x_logits[b, n, p, k]
+
+b = batch içindeki görüntü
+n = lane slotu, 0..19
+p = y satırı, 0..71
+k = x kutusu, 0..199</code></pre>
+      <p>Görüntü genişliği 800 px. <code>x_bins = 200</code>. Bir kutu yaklaşık 4 piksel eder.</p>
+      <pre><code>k = 0   -> x ≈ 0 px
+k = 50  -> x ≈ 200 px
+k = 100 -> x ≈ 400 px
+k = 150 -> x ≈ 600 px
+k = 199 -> x ≈ 796 px</code></pre>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s1-b.jpg" alt="Row bin visual">
+        <svg viewBox="0 0 800 288">
+          <line x1="0" y1="190" x2="800" y2="190" stroke="#ffd56f" stroke-width="3" stroke-dasharray="8 8"/>
+          <rect x="238" y="162" width="16" height="28" fill="#ff83b7"/>
+          <rect x="254" y="150" width="16" height="40" fill="#ff83b7"/>
+          <rect x="270" y="166" width="16" height="24" fill="#ff83b7"/>
+          <circle cx="260" cy="190" r="10" fill="#63d8ff" stroke="#070a0d" stroke-width="3"/>
+          <text x="28" y="38" fill="#f2f7fb" font-size="19" font-family="Arial">Bir y satırı: 200 x kutusuna puan verilir</text>
+          <text x="28" y="64" fill="#63d8ff" font-size="17" font-family="Arial">Mavi nokta = soft expected sonucu</text>
+        </svg>
+      </div>
+      <p><code>soft_expected_x</code> bu 200 kutuyu sert seçmez. Olasılık dağılımının ağırlıklı ortalamasını alır:</p>
+      <pre><code>probs = softmax(row_x_logits)
+expected_bin = sum(probs * bin_index)
+x_pixel = expected_bin * (800 / 200)</code></pre>
+      <p>Sonuç: <code>pred_x_rows[b,n,p]</code>. Bu artık çizilebilir x koordinatıdır.</p>
+    </section>
+
+    <section>
+      <h2>7. Lane Çizgisi Tam Olarak Hangi Tensörden Çiziliyor?</h2>
+      <p>Final çizgi çoğu yerde <code>pred_x_rows</code> ile çizilir. y koordinatları ayrıca sabittir:</p>
+      <pre><code># common.py
+y_rows = [0, 4, 8, 12, ..., 284]  # 72 değer
+
+# bir lane çizgisi:
+points = [
+  (pred_x_rows[b,n,0],   0),
+  (pred_x_rows[b,n,1],   4),
+  (pred_x_rows[b,n,2],   8),
+  ...
+  (pred_x_rows[b,n,71], 284),
+]</code></pre>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s1-a.jpg" alt="Pred x rows visual">
+        <svg viewBox="0 0 800 288">
+          <path d="M190 272 C230 220 270 160 332 78" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+          <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+            <circle cx="202" cy="256" r="7"/><circle cx="220" cy="232" r="7"/><circle cx="238" cy="208" r="7"/><circle cx="258" cy="184" r="7"/><circle cx="279" cy="156" r="7"/><circle cx="300" cy="126" r="7"/><circle cx="322" cy="96" r="7"/>
+          </g>
+          <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">Sarı noktalar: pred_x_rows + fixed_y_rows</text>
+          <text x="28" y="62" fill="#63d8ff" font-size="18" font-family="Arial">Mavi çizgi: bu noktaların birleşimi</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>8. S1’de Query’ye Ne Ekleniyor?</h2>
+      <p>S1’de query tek başına 72 row’u bir MLP ile üretmek yerine, her row için ayrı token yapılır.</p>
+      <pre><code># dynlaneseq_s1.py
+row_emb = self.row_embedding.weight.view(1, 1, 72, 256)
+tokens = queries.unsqueeze(2) + row_emb
+
+# shape:
+queries.unsqueeze(2) = [B, 20, 1, 256]
+row_emb              = [1, 1, 72, 256]
+tokens               = [B, 20, 72, 256]</code></pre>
+      <p>Bu şu demek: aynı lane adayı 72 farklı y satırına kopyalanıyor. Her kopyaya “ben şu y satırıyım” bilgisi ekleniyor.</p>
+      <div class="grid two">
+        <div class="card">
+          <h3><code>tokens[b,n,p,:]</code></h3>
+          <p>b’inci görüntü, n’inci lane, p’inci y satırı için 256 sayılık temsil.</p>
+        </div>
+        <div class="card">
+          <h3>Lane karşılığı</h3>
+          <p>Bu, çizgi üstündeki tek boncuğun bellekteki halidir. Henüz x değil. X, row decoder’dan sonra çıkar.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>9. S2’de Evidence Tam Olarak Nedir?</h2>
+      <p>S2’de önce <code>coarse_x</code> üretilir. Bu kaba çizginin x koordinatlarıdır:</p>
+      <pre><code>coarse_x = coarse_row["pred_x_rows"]  # [B, 20, 72]</code></pre>
+      <p>Sonra sampler bu x noktalarının altındaki feature’ları okur:</p>
+      <pre><code>sample_x = curriculum.build_sample_x(coarse_x, ...)
+evidence = sampler(features, sample_x)
+
+# evidence shape:
+[B, 20, 72, 256]</code></pre>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s2-a.jpg" alt="Evidence visual">
+        <svg viewBox="0 0 800 288">
+          <path d="M188 272 C225 220 267 165 330 82" fill="none" stroke="#63d8ff" stroke-width="5" stroke-linecap="round" stroke-dasharray="10 8"/>
+          <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+            <circle cx="205" cy="246" r="9"/><circle cx="236" cy="205" r="9"/><circle cx="276" cy="151" r="9"/><circle cx="318" cy="95" r="9"/>
+          </g>
+          <text x="30" y="36" fill="#63d8ff" font-size="18" font-family="Arial">coarse_x: mavi kesik çizgi</text>
+          <text x="30" y="62" fill="#ffd56f" font-size="18" font-family="Arial">evidence: sarı noktalardan okunan 256 sayılık feature</text>
+        </svg>
+      </div>
+      <p><code>evidence[b,n,p,:]</code> artık şu anlama gelir: “b’inci görüntüde, n’inci lane adayının p’inci row noktasında görüntüden okunan 256 sayılık kanıt”.</p>
+      <div class="note">
+        S1’de <code>tokens[b,n,p,:]</code> sadece query + row bilgisiydi. S2’de buna gerçek görüntüden o noktada okunan <code>evidence[b,n,p,:]</code> eklenir. İşte fark bu.
+      </div>
+    </section>
+
+    <section>
+      <h2>10. S2’de Kod Lane’i Nasıl Değiştiriyor?</h2>
+      <pre><code># dynlaneseq_s2.py
+tokens = queries.unsqueeze(2) + row_emb + self.adapter(evidence)
+row = self.row_decoder(tokens)
+final_x = row["pred_x_rows"]</code></pre>
+      <p>Bu satırın görsel anlamı:</p>
+      <div class="grid three">
+        <div class="card"><h3><code>queries</code></h3><p>“Ben hangi lane adayının boncuğuyum?”</p></div>
+        <div class="card"><h3><code>row_emb</code></h3><p>“Ben bu lane’in hangi y satırındayım?”</p></div>
+        <div class="card"><h3><code>adapter(evidence)</code></h3><p>“Bu noktada görüntü bana ne söylüyor?”</p></div>
+      </div>
+      <p>Final decoder bu üç bilgiyi birleştirip yeşil çizgiyi üretir.</p>
+    </section>
+
+    <section>
+      <h2>11. S3’te Bridge Hangi Array’i Değiştiriyor?</h2>
+      <p>S3 query’yi doğrudan çizgiye çevirmiyor. S2’den gelen <code>evidence</code> array’ini değiştiriyor.</p>
+      <pre><code># before bridge
+evidence: [B, 20, 72, 256]
+
+# low_rank_bridge.py
+out[bi, ni] = e + bridge_scale * delta
+
+# after bridge
+refined_evidence: [B, 20, 72, 256]</code></pre>
+      <p>Yani shape aynı kalıyor. İçerik değişiyor. Lane görselinde bu, sarı noktalardan gelen ham kanıtın final çizgiye daha uygun hale getirilmesi gibi düşünülebilir.</p>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s3-a.jpg" alt="Bridge visual">
+        <svg viewBox="0 0 800 288">
+          <path d="M180 272 C225 216 270 154 335 78" fill="none" stroke="#ffd56f" stroke-width="9" stroke-linecap="round" opacity=".45"/>
+          <path d="M184 272 C230 216 275 153 340 76" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+          <text x="30" y="36" fill="#ffd56f" font-size="18" font-family="Arial">evidence: ham kanıt</text>
+          <text x="30" y="62" fill="#8af09f" font-size="18" font-family="Arial">refined_evidence: bridge sonrası kanıt</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>12. S4’te İkinci Bakış Hangi Tensor ile Oluyor?</h2>
+      <p>S4’te stage1 final çizgisi, stage2 için yeni sample çizgisi olur.</p>
+      <pre><code># dynlaneseq_s4.py
+stage1_x = stage1_out["final"]["pred_x_rows"]  # [B,20,72]
+sample_x2 = curriculum.build_sample_x(stage1_x, ...)
+evidence2 = sampler(features, sample_x2)       # [B,20,72,256]
+stage2 = row_decoder(query + row + evidence2 + hidden_scale*h1)</code></pre>
+      <div class="lane-board">
+        <img src="../dynlaneseq_site/assets/images/s4-a.jpg" alt="S4 visual">
+        <svg viewBox="0 0 800 288">
+          <path d="M180 272 C225 218 270 158 335 82" fill="none" stroke="#ff83b7" stroke-width="6" stroke-linecap="round" stroke-dasharray="10 8"/>
+          <g fill="#63d8ff" stroke="#070a0d" stroke-width="2"><circle cx="205" cy="248" r="8"/><circle cx="242" cy="202" r="8"/><circle cx="285" cy="146" r="8"/><circle cx="330" cy="88" r="8"/></g>
+          <path d="M186 272 C230 216 276 154 343 76" fill="none" stroke="#8af09f" stroke-width="6" stroke-linecap="round"/>
+          <text x="30" y="36" fill="#ff83b7" font-size="18" font-family="Arial">stage1_x: ilk çizgi</text>
+          <text x="30" y="62" fill="#63d8ff" font-size="18" font-family="Arial">sample_x2/evidence2: ikinci bakış</text>
+          <text x="30" y="88" fill="#8af09f" font-size="18" font-family="Arial">stage2 pred_x_rows: son çizgi</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>13. Tüm Pipeline’ı Yazılımcı Gibi Oku</h2>
+      <pre><code>images
+  [B,3,288,800]
+  gerçek kamera görüntüsü
+
+features = backbone + fpn + proj
+  [B,256,72,200]
+  görüntünün anlam haritası
+
+memory = flatten(features)
+  [B,14400,256]
+  72*200 görüntü konumu
+
+q0 = learned query table
+  [B,20,256]
+  20 lane adayı, koordinat değil
+
+q1 = cross_attention(q0, memory)
+  [B,20,256]
+  görüntüden bilgi almış lane adayları
+
+row_x_logits
+  [B,20,72,200]
+  her lane, her row için 200 x kutusu skoru
+
+pred_x_rows
+  [B,20,72]
+  artık çizilebilir x koordinatları
+
+range_norm
+  [B,20,2]
+  çizginin dikey görünür aralığı
+
+evidence  # S2+
+  [B,20,72,256]
+  çizgi üstünden okunan görüntü kanıtı
+
+stage2.pred_x_rows  # S4
+  [B,20,72]
+  ikinci bakıştan sonra final çizgi</code></pre>
+    </section>
+
+    <section>
+      <h2>14. En Önemli Yanlış Anlamaları Temizleyelim</h2>
+      <div class="grid two">
+        <div class="card">
+          <h3>Query koordinat değildir</h3>
+          <p>Query başlangıçta <code>[20,256]</code> learned embedding tablosudur. İçinde açık <code>x1,x2,x3</code> yoktur.</p>
+        </div>
+        <div class="card">
+          <h3>Koordinat <code>pred_x_rows</code> ile doğar</h3>
+          <p>Çizilebilir lane noktaları <code>row_x_logits -> soft_expected_x</code> sonrası oluşur.</p>
+        </div>
+        <div class="card">
+          <h3>Evidence görüntüden okunmuş feature’dır</h3>
+          <p>Bu, lane üstündeki noktalarda feature map’ten alınan 256 sayılık vektördür.</p>
+        </div>
+        <div class="card">
+          <h3>Bridge çizgiyi doğrudan çizmez</h3>
+          <p>S3 bridge <code>evidence</code> içeriğini değiştirir; çizgi yine decoder sonrası çıkar.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Bu Sayfayı Tek Cümlede Hatırla</h2>
+      <p class="lead">Query, koordinat listesi değil; görüntüye bakıp lane çizgisine dönüşmek için kullanılan 256 sayılık aday temsilidir. Çizgi ise <code>pred_x_rows</code> tensoründe doğar.</p>
+      <div class="next"><a class="btn" href="index.html">Yol haritası</a><a class="btn" href="s0.html">S0’a geç</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

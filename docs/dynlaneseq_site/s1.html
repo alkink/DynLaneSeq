@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S1 Row Token Sequence</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+<div class="shell">
+  <aside class="side"><a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a><nav class="nav"><a href="index.html">Ana fikir</a><a href="s0.html">S0: Geometry-only</a><a class="active" href="s1.html">S1: Row token sequence</a><a href="s2.html">S2: Curve evidence</a><a href="s3.html">S3: Low-rank bridge</a><a href="s4.html">S4: Zoom refinement</a></nav></aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">S1</span><span class="tag">Sequence generation</span><span class="tag">Soft expected x</span>
+        <h1>S1: Lane’i tek çizgi değil, boncuk dizisi gibi üret.</h1>
+        <p class="lead">S1, S0’daki doğrudan row head yerine <code>RowTokenDecoder</code> kullanır. Her lane slotu için 72 row token oluşur. Her token “bu satırda x nerede?” sorusunu cevaplar.</p>
+        <div class="note">Token = küçük karar parçası. Burada her token bir y satırındaki x konumunu arayan parçadır.</div>
+      </div>
+      <div class="photo-card"><img src="assets/images/s1-a.jpg" alt="S1 lane prediction"><p class="caption">S1 2k subset görseli. Şerit artık row token dizisi üzerinden üretilir.</p></div>
+    </header>
+
+    <section>
+      <h2>S1 Neyi Farklı Yapıyor?</h2>
+      <div class="grid two">
+        <div class="card"><h3>S0’da</h3><p>Bir query vektörü, tek MLP head ile 72 row’un x-bin skorlarını üretir.</p></div>
+        <div class="card"><h3>S1’de</h3><p>Query her row için ayrı token’a yayılır. Transformer encoder bu 72 token’ın birbirini görmesini sağlar.</p></div>
+      </div>
+      <p>Görsel olarak: S0 “tek kalem darbesiyle çiz” gibidir. S1 “ipi 72 boncuğa böl, boncukları sırayla ayarla” gibidir.</p>
+    </section>
+
+    <section>
+      <h2>Mekanizma</h2>
+      <div class="figure">
+        <svg viewBox="0 0 1040 310" role="img" aria-label="S1 row token decoder">
+          <rect width="1040" height="310" fill="#081019"/>
+          <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/></marker></defs>
+          <g font-family="Arial">
+            <rect x="42" y="92" width="160" height="95" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="75" y="128" fill="#eef6ff" font-size="18">Query</text><text x="63" y="158" fill="#aab8c8" font-size="15">lane arayıcı</text>
+            <rect x="260" y="92" width="180" height="95" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="287" y="128" fill="#eef6ff" font-size="18">Row embedding</text><text x="298" y="158" fill="#aab8c8" font-size="15">72 satır kimliği</text>
+            <rect x="498" y="70" width="190" height="140" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="536" y="112" fill="#eef6ff" font-size="18">72 token</text><text x="525" y="145" fill="#aab8c8" font-size="15">boncuk dizisi</text><text x="530" y="174" fill="#aab8c8" font-size="15">row decoder</text>
+            <rect x="746" y="92" width="220" height="95" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="783" y="128" fill="#eef6ff" font-size="18">x-bin logits</text><text x="787" y="158" fill="#aab8c8" font-size="15">soft expected x</text>
+          </g>
+          <g stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)"><line x1="202" y1="140" x2="258" y2="140"/><line x1="440" y1="140" x2="496" y2="140"/><line x1="688" y1="140" x2="744" y2="140"/></g>
+          <path d="M120 268 C174 215, 238 162, 325 80" stroke="#5bd7ff" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <g fill="#ffd36d"><circle cx="132" cy="255" r="6"/><circle cx="172" cy="215" r="6"/><circle cx="220" cy="175" r="6"/><circle cx="272" cy="125" r="6"/><circle cx="315" cy="88" r="6"/></g>
+          <text x="114" y="296" fill="#aab8c8" font-size="15">Boncuklar = row token kararları</text>
+        </svg>
+      </div>
+      <pre><code># dynlaneseq_s1.py
+q = encoder.forward_features(images)["queries"]
+row_tokens = q.unsqueeze(2) + row_embedding
+row = row_decoder(row_tokens)
+
+out = {
+  "exist_logits": exist_head(q),
+  "row_x_logits": row["row_x_logits"],
+  "pred_x_rows": row["pred_x_rows"],
+  "range_norm": range_head(q)
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>Soft Expected X Neden Bu Kadar Önemli?</h2>
+      <p><code>argmax</code> “en yüksek skoru seç” demek. Eğitimde argmax kullanırsan modelin hatası seçimin arkasındaki skorlara düzgün geri akmaz. Bu yüzden kod <code>soft_expected_x</code> kullanır.</p>
+      <div class="grid two">
+        <div class="card"><h3>Argmax gibi düşünme</h3><pre><code>bin = argmax(logits)
+x = bin * bin_width
+loss(x, gt_x)  # gradient zayıf/kopuk</code></pre></div>
+        <div class="card"><h3>Soft expected gibi düşün</h3><pre><code>prob = softmax(logits)
+x = sum(prob * bin_centers)
+loss(x, gt_x)  # gradient akar</code></pre></div>
+      </div>
+      <p>Bu aslında “gürültülü çizgiyi temizleme” için yumuşak bir kontrol sağlar. Model sadece doğru kutuyu seçmeyi değil, yakın kutular arasında düzgün dağılım kurmayı da öğrenir.</p>
+    </section>
+
+    <section>
+      <h2>Loss Tarafı</h2>
+      <p>S1, S0 loss’una token loss ekler. Yani hem koordinat düzgün olsun ister, hem de doğru x-bin sınıfı yüksek skor alsın ister.</p>
+      <pre><code># loss_s1.py fikri
+base = S0Loss(exist + point + range + smooth)
+loss_token = cross_entropy(row_x_logits, target_x_bins)
+loss_total = base + w_token * loss_token</code></pre>
+      <div class="note">Bu iki hedef birbirini tamamlar: point loss çizgiyi piksel olarak yaklaştırır, token CE doğru bin’i netleştirir.</div>
+    </section>
+
+    <section>
+      <h2>Görsel Üzerinden Oku</h2>
+      <div class="gallery">
+        <div class="photo-card"><img src="assets/images/s1-a.jpg" alt="S1 sample A"><p class="caption">S1’de çizgi 72 row token’ın birlikte verdiği karardır.</p></div>
+        <div class="photo-card"><img src="assets/images/s1-b.jpg" alt="S1 sample B"><p class="caption">Token dizisi kıvrımı tek vektöre göre daha düzenli temsil edebilir.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>S1’in Sınırı</h2>
+      <p>S1 hâlâ lane üstünden görsel evidence okumaz. Query görüntüye attention ile bakmıştır, ama final row decoder’ın elinde doğrudan “bu row’da lane üstünden aldığım local feature” yoktur. Bu yüzden S2’ye ihtiyaç var.</p>
+      <div class="nextprev"><a class="button" href="s0.html">S0’a dön</a><a class="button" href="s2.html">S2’ye geç</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

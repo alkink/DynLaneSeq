@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DynLaneSeq-EG Okuma Sitesi</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a>
+    <nav class="nav">
+      <a class="active" href="index.html">Ana fikir</a>
+      <a href="s0.html">S0: Geometry-only</a>
+      <a href="s1.html">S1: Row token sequence</a>
+      <a href="s2.html">S2: Curve evidence</a>
+      <a href="s3.html">S3: Low-rank bridge</a>
+      <a href="s4.html">S4: Zoom refinement</a>
+    </nav>
+  </aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">Koyu tema</span><span class="tag">JS yok</span><span class="tag">Canvas yok</span><span class="tag">Gerçek train çıktıları</span>
+        <h1>Şeridi çizmeden önce şeridin üstünden kanıt oku.</h1>
+        <p class="lead">Bu site DynLaneSeq-EG kodunu uzman olmayan biri için anlatır. Her phase ayrı sayfada: model ne görüyor, hangi bilgiyle çalışıyor, bunu neye dönüştürüyor, sonraki adıma ne gönderiyor?</p>
+        <div class="note honest">Repo içinde PDF dosyası bulamadım. Bu site <code>docs/prd.md</code>, <code>dynlaneseq_eg/modeling</code>, <code>losses</code>, <code>engine</code>, config dosyaları ve kendi 2k subset eğitim görselleriniz üzerinden hazırlandı.</div>
+      </div>
+      <div class="photo-card">
+        <img src="assets/images/s3-a.jpg" alt="S3 2k subset lane prediction">
+        <p class="caption">Kendi eğitim çıktılarınızdan bir S3-B1 örneği. Sayfalarda bu tip görseller üzerinden hangi phase neyi ekliyor diye okuyacağız.</p>
+      </div>
+    </header>
+
+    <section>
+      <h2>Bu Makale/Proje Neyi Çözmeye Çalışıyor?</h2>
+      <div class="grid three">
+        <div class="card">
+          <h3>Problem</h3>
+          <p>Lane detection, kamera görüntüsündeki yol şeritlerini bulmak. Zor sahnelerde çizgi silik, kopuk, gölgeli, kalabalık veya kıvrımlı olabilir.</p>
+        </div>
+        <div class="card">
+          <h3>Eski tıkanma</h3>
+          <p>Model bazen görüntüyü tek büyük özet gibi kullanır. Şerit ince bir ip gibidir; büyük özet içinde ip kaybolabilir.</p>
+        </div>
+        <div class="card">
+          <h3>Yeni numara</h3>
+          <p>Her lane adayı kendi üstünden görsel kanıt okur. Bunu “küçük kamerayı tahmin edilen şerit üzerinde gezdirmek” gibi düşün.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Terimleri İlk Elden Oturtalım</h2>
+      <div class="grid two">
+        <div class="card"><strong>Query</strong><p>Modelin “bir şey arayan temsilcisi”. Burada her query bir aday lane arar.</p></div>
+        <div class="card"><strong>Slot</strong><p>Query için ayrılmış koltuk. 20 slot varsa model 20 aday lane çıkarabilir. Bazıları boş kalır.</p></div>
+        <div class="card"><strong>Attention</strong><p>Modelin “nereye bakayım?” mekanizması. Query, feature map üzerinde önemli yerlere bakar.</p></div>
+        <div class="card"><strong>Hungarian Matching</strong><p>Tahminlerle gerçek lane’leri eşleştiren hakem. Sabit “sol query” yok; eşleşme maliyete göre yapılır.</p></div>
+        <div class="card"><strong>Evidence</strong><p>Şerit boyunca toplanan görsel kanıt. Boncuk dizisi gibi: her row’da bir kanıt noktası.</p></div>
+        <div class="card"><strong>Prior / Anchor</strong><p>Başlangıç tutunma noktası. Bu projede klasik anchor yok; coarse lane tahmini sampler için tutunma noktası olur.</p></div>
+        <div class="card"><strong>Topology</strong><p>Lane’lerin bağlantı bilgisi. Bu repo ana modelde topology head kullanmıyor.</p></div>
+        <div class="card"><strong>Diffusion</strong><p>Çok adımlı gürültüden temizleme yaklaşımı. Bu proje diffusion kullanmıyor; S4 sadece tek ekstra refinement yapıyor.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Phase Haritası</h2>
+      <div class="figure">
+        <svg viewBox="0 0 1120 360" role="img" aria-label="DynLaneSeq phase haritası">
+          <rect width="1120" height="360" fill="#081019"/>
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/>
+            </marker>
+          </defs>
+          <g font-family="Arial" fill="#eef6ff">
+            <rect x="32" y="92" width="165" height="118" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+            <text x="68" y="128" font-size="20">S0</text><text x="58" y="158" font-size="15" fill="#aab8c8">query + heads</text><text x="53" y="184" font-size="15" fill="#aab8c8">kaba lane çiz</text>
+            <rect x="246" y="92" width="165" height="118" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+            <text x="282" y="128" font-size="20">S1</text><text x="270" y="158" font-size="15" fill="#aab8c8">row token</text><text x="263" y="184" font-size="15" fill="#aab8c8">boncuk dizisi</text>
+            <rect x="460" y="92" width="165" height="118" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+            <text x="496" y="128" font-size="20">S2</text><text x="486" y="158" font-size="15" fill="#aab8c8">curve sampler</text><text x="482" y="184" font-size="15" fill="#aab8c8">lane üstü kanıt</text>
+            <rect x="674" y="92" width="165" height="118" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+            <text x="710" y="128" font-size="20">S3</text><text x="700" y="158" font-size="15" fill="#aab8c8">low-rank bridge</text><text x="703" y="184" font-size="15" fill="#aab8c8">kanıtı düzelt</text>
+            <rect x="888" y="92" width="165" height="118" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+            <text x="924" y="128" font-size="20">S4</text><text x="918" y="158" font-size="15" fill="#aab8c8">zoom-in</text><text x="908" y="184" font-size="15" fill="#aab8c8">ikinci kez bak</text>
+          </g>
+          <g stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)">
+            <line x1="198" y1="151" x2="244" y2="151"/><line x1="412" y1="151" x2="458" y2="151"/><line x1="626" y1="151" x2="672" y2="151"/><line x1="840" y1="151" x2="886" y2="151"/>
+          </g>
+          <path d="M96 305 C165 246, 226 216, 315 152" stroke="#5bd7ff" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <path d="M500 308 C550 250, 610 195, 700 132" stroke="#7ce59a" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <g fill="#ffd36d"><circle cx="518" cy="287" r="7"/><circle cx="566" cy="237" r="7"/><circle cx="630" cy="180" r="7"/><circle cx="685" cy="143" r="7"/></g>
+          <text x="48" y="44" fill="#aab8c8" font-size="16">Her phase yeni bir şey ekler; amaç bir anda karmaşık model değil, kontrollü büyüyen lane sistemi.</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>Eski Yöntem vs Bu Proje</h2>
+      <table>
+        <thead><tr><th>Konu</th><th>Daha klasik bakış</th><th>DynLaneSeq-EG bakışı</th></tr></thead>
+        <tbody>
+          <tr><td>Lane temsili</td><td>Tek çıktı veya doğrudan koordinat başlığı.</td><td>Slot + row token + lane boyunca evidence.</td></tr>
+          <tr><td>Query sorunu</td><td>Query hangi lane’i temsil ediyor belirsiz.</td><td>Hungarian matching ile “bu aday şu GT’ye yakın” denir.</td></tr>
+          <tr><td>Görsel kanıt</td><td>Global feature’dan çıkarım.</td><td>Tahmin edilen lane eğrisi üstünden local evidence okuma.</td></tr>
+          <tr><td>Zor sahne</td><td>İnce/kopuk çizgi genel temsilde kaybolabilir.</td><td>Sampler lane üstüne gidip kanıtı tekrar toplar.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Bu Siteyi Nasıl Oku?</h2>
+      <p>Önce S0 sayfasını oku. Çünkü S0 çalışmadan S1/S2/S3 anlamlı değil. Sonra S1’de “lane’i boncuk dizisi gibi üretme” fikrine geç. S2 asıl araştırma fikri: lane üstünden kanıt toplama. S3 bunu lane’e göre modüle ediyor. S4 ise bir kez daha bakıp düzeltme denemesi.</p>
+      <div class="nextprev">
+        <span></span>
+        <a class="button" href="s0.html">S0 ile başla</a>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

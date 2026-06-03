@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S4 Zoom Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="layout">
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav active" href="s4.html">5. S4: Zoom</a></aside>
+<main>
+<header>
+  <span class="pill">S4 derin anlatım</span><span class="pill">stage1_x → sample_x2 → stage2_x</span>
+  <h1>S4: İlk final çizgi, ikinci evidence okumasının koordinatı olur.</h1>
+  <p class="lead">S4, S3’ü bir kez çalıştırır ve stage1 çizgisini alır. Sonra bu çizgiyi yeni sampling yolu olarak kullanır. İkinci evidence okumasından stage2 final lane çıkar.</p>
+  <div class="note"><strong>S4 diffusion değildir.</strong> Çok adımlı gürültü temizleme yok. Sadece bir ek “ikinci bakış” var.</div>
+</header>
+
+<section>
+  <h2>1. S4 Görselini Tensorlara Ayıralım</h2>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s4-a.jpg" alt="S4 zoom visual">
+    <svg viewBox="0 0 800 288">
+      <path d="M180 272 C225 218 270 158 335 82" fill="none" stroke="#ff83b7" stroke-width="6" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <g fill="#63d8ff" stroke="#070a0d" stroke-width="2"><circle cx="205" cy="248" r="8"/><circle cx="242" cy="202" r="8"/><circle cx="285" cy="146" r="8"/><circle cx="330" cy="88" r="8"/></g>
+      <path d="M186 272 C230 216 276 154 343 76" fill="none" stroke="#8af09f" stroke-width="6" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#ff83b7" font-size="18" font-family="Arial">stage1_x: ilk çizgi [B,20,72]</text>
+      <text x="28" y="62" fill="#63d8ff" font-size="18" font-family="Arial">sample_x2/evidence2: ikinci okuma</text>
+      <text x="28" y="88" fill="#8af09f" font-size="18" font-family="Arial">stage2 pred_x_rows: son çizgi</text>
+    </svg>
+  </div>
+</section>
+
+<section>
+  <h2>2. S4 Forward Akışı</h2>
+  <pre><code># dynlaneseq_s4.py
+stage1_out = super().forward(
+    images,
+    targets=targets,
+    matches=matches,
+    sampler_alpha=sampler_alpha,
+    return_features=True,
+)
+
+enc_features = stage1_out["features"]       # [B,256,72,200]
+q = stage1_out["queries"]                   # [B,20,256]
+stage1_x = stage1_out["final"]["pred_x_rows"] # [B,20,72]
+
+sample_x2 = curriculum.build_sample_x(stage1_x, targets, matches, alpha=sampler_beta)
+evidence2 = sampler(enc_features, sample_x2) # [B,20,72,256]
+evidence2 = bridge(evidence2, q)
+
+h1 = stage1_out["final"]["row_hidden"]       # [B,20,72,256]
+row2 = row_decoder(q + row_emb + adapter(evidence2) + hidden_scale*h1)
+stage2_x = row2["pred_x_rows"]              # [B,20,72]</code></pre>
+  <p>Bu kodda en önemli satır: <code>stage1_x</code> artık stage2 sampler için koordinat olur.</p>
+</section>
+
+<section>
+  <h2>3. Stage1 Çıktısı İçinde Ne Var?</h2>
+  <p><code>stage1_out</code> aslında S3/S2 forward çıktısıdır. İçinde şunlar var:</p>
+  <pre><code>stage1_out = {
+  "coarse": {...},
+  "final": {
+    "row_x_logits": [B,20,72,200],
+    "pred_x_rows":  [B,20,72],
+    "row_hidden":   [B,20,72,256],
+    ...
+  },
+  "evidence": {
+    "sample_x_rows": [B,20,72],
+    "E_seq":         [B,20,72,256],
+    ...
+  },
+  "queries": [B,20,256],
+  "features": [B,256,72,200]
+}</code></pre>
+  <div class="grid two">
+    <div class="card"><h3><code>stage1_x</code></h3><p>İlk final çizginin x koordinatları. Görselde pembe çizgi.</p></div>
+    <div class="card"><h3><code>row_hidden</code></h3><p>Stage1 decoder’ın her lane-row için 256 sayılık iç hafızası. Koordinat değil, bağlam vektörü.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>4. <code>sample_x2</code> Nasıl Üretiliyor?</h2>
+  <pre><code>sample_x2 = self.curriculum.build_sample_x(
+    stage1_x,
+    targets,
+    matches,
+    alpha=float(sampler_beta)
+)</code></pre>
+  <p>Bu, S2’deki curriculum ile aynı fikir ama bu kez başlangıç çizgisi <code>coarse_x</code> değil <code>stage1_x</code>.</p>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s4-b.jpg" alt="S4 beta visual">
+    <svg viewBox="0 0 800 288">
+      <path d="M170 272 C220 215 270 150 340 78" fill="none" stroke="#ffd56f" stroke-width="6" stroke-linecap="round"/>
+      <path d="M205 272 C248 224 290 170 360 105" fill="none" stroke="#ff8a80" stroke-width="5" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">beta yüksekken teacher/GT yardım eder</text>
+      <text x="28" y="62" fill="#ff8a80" font-size="18" font-family="Arial">stage1 yanlışsa stage2 yanlış yere bakabilir</text>
+    </svg>
+  </div>
+  <div class="grid three">
+    <div class="card"><h3><code>beta=1</code></h3><p>Stage2 sampling GT’ye yakın tutulur.</p></div>
+    <div class="card"><h3><code>beta=0.5</code></h3><p>GT ve stage1 çizgisi karışır.</p></div>
+    <div class="card"><h3><code>beta=0</code></h3><p>Stage2 tamamen stage1 çizgisine güvenir.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>5. <code>evidence2</code> Nedir?</h2>
+  <p><code>evidence2</code>, ikinci kez okunan lane üstü kanıttır:</p>
+  <pre><code>evidence2 = self.sampler(enc_features, sample_x2)
+
+enc_features: [B,256,72,200]
+sample_x2:    [B,20,72]
+evidence2:    [B,20,72,256]</code></pre>
+  <p>Tek bir vektör:</p>
+  <pre><code>evidence2[b,n,p,:]
+= stage1 çizgisi rehber alınarak,
+  n'inci lane'in p'inci row noktasından ikinci kez okunan 256 feature</code></pre>
+  <p>Yani S4’te evidence iki kez vardır:</p>
+  <div class="grid two">
+    <div class="card"><h3><code>E_seq_stage1</code></h3><p>İlk sampling’den gelen kanıt.</p></div>
+    <div class="card"><h3><code>E_seq_stage2</code></h3><p>Stage1 çizgisinden sonra yapılan ikinci sampling kanıtı.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>6. Stage1 Hidden Neden Stage2’ye Ekleniyor?</h2>
+  <pre><code>h1 = stage1_out["final"]["row_hidden"]  # [B,20,72,256]
+if detach_stage1_hidden:
+    h1 = h1.detach()
+
+tokens2 = build_final_tokens(q, evidence2, stage_extra=hidden_scale * h1)</code></pre>
+  <div class="code-map">
+    <div class="card">
+      <h3><code>h1</code> array olarak</h3>
+      <p>Stage1 decoder’ın her lane-row için öğrendiği iç temsil.</p>
+      <p>Bu <code>pred_x_rows</code> değildir; koordinat değil, 256 sayılık bağlamdır.</p>
+    </div>
+    <div class="card">
+      <h3>Lane üzerinde</h3>
+      <p>Stage2 sadece yeni evidence’a bakmaz; stage1’in “ben bu row hakkında ne anlamıştım?” hafızasını da alır.</p>
+      <p><code>hidden_scale</code> bu hafızanın ne kadar güçlü ekleneceğini belirler.</p>
+    </div>
+  </div>
+  <div class="note">Detach edilmesi, stage2 loss’unun stage1 hidden yolundan karmaşık gradient göndermesini engeller. Bu stabilite tercihidir.</div>
+</section>
+
+<section>
+  <h2>7. S4 Çıktı Sözlüğü Nasıl Okunur?</h2>
+  <pre><code>out = {
+  "coarse": stage1_out["coarse"],
+  "stage1": {
+    "row_x_logits": [B,20,72,200],
+    "pred_x_rows":  [B,20,72],
+    "row_hidden":   [B,20,72,256],
+  },
+  "stage2": {
+    "exist_logits": [B,20,2],
+    "row_x_logits": [B,20,72,200],
+    "pred_x_rows":  [B,20,72],
+    "range_norm":   [B,20,2],
+    "row_hidden":   [B,20,72,256],
+  },
+  "evidence": {
+    "sample_x_stage1": [B,20,72],
+    "sample_x_stage2": [B,20,72],
+    "E_seq_stage1":    [B,20,72,256],
+    "E_seq_stage2":    [B,20,72,256],
+  }
+}</code></pre>
+  <p>Inference/postprocess tarafında final olarak <code>stage2["pred_x_rows"]</code> çizilir.</p>
+</section>
+
+<section>
+  <h2>8. Training ve Inference Farkı Tensor Seviyesinde</h2>
+  <table>
+    <thead><tr><th>Parça</th><th>Training</th><th>Inference</th></tr></thead>
+    <tbody>
+      <tr><td><code>sample_x_stage1</code></td><td><code>alpha</code> ile GT ve model tahmini karışabilir.</td><td>GT yok; model tahmini kullanılır.</td></tr>
+      <tr><td><code>sample_x_stage2</code></td><td><code>beta</code> ile GT ve stage1_x karışabilir.</td><td>Doğrudan stage1_x kullanılır.</td></tr>
+      <tr><td>Final çizgi</td><td>Loss stage2’ye ana ağırlık verir, stage1 yardımcıdır.</td><td><code>stage2.pred_x_rows</code> postprocess’e gider.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>9. S4’ü Tek Kod Akışıyla Hatırla</h2>
+  <pre><code>stage1_out = S3_forward(images)
+  stage1_x: [B,20,72]
+  stage1_hidden: [B,20,72,256]
+  features: [B,256,72,200]
+
+sample_x2 = curriculum(stage1_x, gt_x, beta)
+  [B,20,72]
+  ikinci bakışın x koordinatları
+
+evidence2 = sampler(features, sample_x2)
+  [B,20,72,256]
+  ikinci kez okunan lane üstü kanıt
+
+evidence2 = bridge(evidence2, q)
+  [B,20,72,256]
+  ikinci kanıt süzülür
+
+tokens2 = q + row_emb + adapter(evidence2) + hidden_scale*stage1_hidden
+  [B,20,72,256]
+
+stage2_x = row_decoder(tokens2)
+  [B,20,72]
+  final çizgi</code></pre>
+  <p class="lead">S4’ün özü: Stage1’in çizilebilir x koordinatları, stage2’nin ikinci evidence okuması için sampling yolu olur.</p>
+  <div class="next"><a class="btn" href="s3.html">S3’e dön</a><a class="btn" href="index.html">Başa dön</a></div>
+</section>
+</main></div></body></html>

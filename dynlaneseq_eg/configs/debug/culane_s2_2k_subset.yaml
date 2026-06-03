@@ -1,0 +1,83 @@
+output_dir: outputs/debug_s2_2k_subset
+
+dataset:
+  name: CULane
+  root: dataset
+  lists:
+    train: list/train_2k.txt
+    val: list/test_2k.txt
+    test: list/test_2k.txt
+  min_valid_rows: 5
+
+augmentation:
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  affine: false
+
+dataloader:
+  num_workers: 2
+  pin_memory: true
+  shuffle: true
+  eval_batch_size: 1
+
+model:
+  name: DynLaneSeqS2
+  input_h: 288
+  input_w: 800
+  fpn_channels: 128
+  dim: 256
+  pretrained_backbone: true
+  num_slots: 20
+  num_rows: 72
+  x_bins: 200
+  token_ignore_index: -100
+  decoder_layers: 2
+  row_decoder_layers: 2
+  num_heads: 8
+  decoder_ff_dim: 1024
+  row_decoder_ff_dim: 512
+  dropout: 0.1
+  evidence_gamma_init: 0.05
+  evidence_sampler:
+    noise_std: 2.0
+    detach_sample_coords: true
+    local_window:
+      enabled: false
+      offsets_px: [-8, -4, 0, 4, 8]
+
+sampler_curriculum:
+  warmup_iters: 2000
+  decay_iters: 6000
+  alpha_start: 1.0
+  alpha_end: 0.0
+
+matcher:
+  lambda_obj: 2.0
+  lambda_point: 5.0
+  lambda_range: 1.0
+
+loss:
+  w_exist: 2.0
+  w_point: 5.0
+  w_range: 1.0
+  w_token: 0.5
+  w_smooth: 0.05
+  lambda_coarse: 0.25
+  smooth_l1_beta: 0.01
+  no_lane_weight: 1.0
+
+optimizer:
+  base_lr: 0.00003
+  row_decoder_lr: 0.00005
+  evidence_lr: 0.0002
+  backbone_lr: 0.000003
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+training:
+  batch_size: 4
+  max_iters: 18000
+  amp: true
+  clip_grad_norm: 1.0
+  log_interval: 50
+  vis_interval: 500

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S0 Tensor Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="layout">
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav active" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<main>
+<header>
+  <span class="pill">S0 derin anlatım</span><span class="pill">Tensor → çizgi</span>
+  <h1>S0: Query vektörü ilk kez çizilebilir lane koordinatına dönüşür.</h1>
+  <p class="lead">S0'ın amacı basit ama kritik: görüntüden 20 aday lane üretmek. Bu sayfada “hangi array nerede çizgi oluyor?” sorusunu takip edeceğiz.</p>
+  <div class="note bad"><strong>Önemli:</strong> S0’da query hâlâ koordinat değildir. Koordinat <code>row_x_logits → soft_expected_x → pred_x_rows</code> yolunda ortaya çıkar.</div>
+</header>
+
+<section>
+  <h2>1. S0’ın Girdi ve Çıktısı</h2>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s0-a.jpg" alt="S0 output">
+    <svg viewBox="0 0 800 288">
+      <path d="M180 272 C222 220 264 160 322 80" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+      <path d="M500 272 C535 220 570 158 630 70" fill="none" stroke="#8af09f" stroke-width="6" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#f2f7fb" font-size="19" font-family="Arial">S0 çıktısı: 20 adaydan skoru geçen lane çizgileri</text>
+      <text x="28" y="62" fill="#63d8ff" font-size="17" font-family="Arial">Bu çizgiler pred_x_rows tensoründen çizilir</text>
+    </svg>
+  </div>
+  <div class="grid three">
+    <div class="card"><h3>Girdi</h3><p><code>images</code> shape: <code>[B,3,288,800]</code>. Bu gerçek yol görüntüsüdür.</p></div>
+    <div class="card"><h3>Ara temsil</h3><p><code>queries</code> shape: <code>[B,20,256]</code>. Bu 20 aday lane temsilidir; koordinat değildir.</p></div>
+    <div class="card"><h3>Çıktı</h3><p><code>pred_x_rows</code> shape: <code>[B,20,72]</code>. Bu artık lane çizmek için kullanılabilir x koordinatlarıdır.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>2. Encoder Görüntüyü Nasıl Query’ye Bağlıyor?</h2>
+  <pre><code># dynlaneseq_s0.py / DynLaneSeqEncoder.forward_features
+feats = self.backbone(images)
+fpn = self.fpn(feats)
+f_proj = self.proj(fpn)
+mem_value = f_proj.flatten(2).transpose(1, 2)
+mem_key = (f_proj + self.pos(f_proj)).flatten(2).transpose(1, 2)
+q_seed = self.queries(images.shape[0])
+q1 = self.decoder(q_content, q_pos, mem_key, mem_value)</code></pre>
+  <div class="code-map">
+    <div class="card">
+      <h3>Tensor tarafı</h3>
+      <p><code>f_proj</code>: <code>[B,256,72,200]</code>. Görüntünün 72x200'lük anlam haritası.</p>
+      <p><code>mem_value</code>: <code>[B,14400,256]</code>. Her feature konumu bir satıra açıldı.</p>
+      <p><code>q_seed</code>: <code>[B,20,256]</code>. 20 lane adayı.</p>
+      <p><code>q1</code>: <code>[B,20,256]</code>. Görüntüye bakmış lane adayları.</p>
+    </div>
+    <div class="card">
+      <h3>Lane tarafı</h3>
+      <p>Feature map, yol görüntüsünü küçük hücrelere böler.</p>
+      <p>Query bu hücrelere bakar ve “benim aradığım lane nerede olabilir?” bilgisini içine toplar.</p>
+      <p>Henüz çizgi yok. Sadece çizgi çıkarabilecek hale gelmiş 20 aday var.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>3. S0 Heads: Query Nasıl Üç Farklı Cevaba Ayrılıyor?</h2>
+  <pre><code># heads_s0.py
+exist_logits = self.exist(q)       # [B,20,2]
+row_x_logits = self.row_x(q)       # [B,20,72,200]
+pred_x_rows = soft_expected_x(row_x_logits) # [B,20,72]
+range_raw, range_norm = self.range(q)       # [B,20,2]</code></pre>
+  <div class="grid three">
+    <div class="card">
+      <h3><code>exist_logits</code></h3>
+      <p>Her slot için iki skor: lane mi, boş mu?</p>
+      <p>Görselde bu, “bu aday çizilsin mi çizilmesin mi?” kararıdır.</p>
+    </div>
+    <div class="card">
+      <h3><code>row_x_logits</code></h3>
+      <p>Her lane adayı, 72 yatay satır ve 200 x kutusu için skor verir.</p>
+      <p>Görselde bu, çizginin hangi yatay pikselde geçeceğini aramaktır.</p>
+    </div>
+    <div class="card">
+      <h3><code>range_norm</code></h3>
+      <p>Lane’in dikey görünür aralığıdır: başlangıç y ve bitiş y.</p>
+      <p>Görselde çizginin sadece yol üstündeki parçasını tutar.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>4. <code>row_x_logits</code> İçinde Gerçekten Ne Var?</h2>
+  <p>Bu tensoru yazılımcı gibi okuyalım:</p>
+  <pre><code>row_x_logits[b, n, p, k]
+
+b = batch içindeki görüntü
+n = 20 lane adayından hangisi
+p = 72 yatay row'dan hangisi
+k = 200 x kutusundan hangisi</code></pre>
+  <p>Örnek: <code>row_x_logits[0, 3, 40, 120]</code> şu demektir: “0. görüntüde, 3. lane adayı, 40. yatay satırda, x kutusu 120 ne kadar olası?”</p>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s0-b.jpg" alt="S0 row bin">
+    <svg viewBox="0 0 800 288">
+      <line x1="0" y1="188" x2="800" y2="188" stroke="#ffd56f" stroke-width="3" stroke-dasharray="8 8"/>
+      <rect x="230" y="160" width="16" height="28" fill="#ff83b7"/><rect x="246" y="148" width="16" height="40" fill="#ff83b7"/><rect x="262" y="164" width="16" height="24" fill="#ff83b7"/>
+      <circle cx="254" cy="188" r="10" fill="#63d8ff" stroke="#070a0d" stroke-width="3"/>
+      <text x="28" y="36" fill="#f2f7fb" font-size="19" font-family="Arial">Tek bir row: 200 x kutusuna skor verilir</text>
+      <text x="28" y="62" fill="#63d8ff" font-size="17" font-family="Arial">Mavi nokta: soft_expected_x sonrası çizilebilir x</text>
+    </svg>
+  </div>
+  <pre><code># common.py
+probs = softmax(row_x_logits)
+expected_bin = sum(probs * bin_index)
+x_pixel = expected_bin * (800 / 200)</code></pre>
+  <p><code>800/200 = 4</code>. Yani bin 120 civarı yaklaşık x=480 piksele denk gelir.</p>
+</section>
+
+<section>
+  <h2>5. Lane Çizgisi Hangi Noktalardan Oluşuyor?</h2>
+  <p><code>pred_x_rows[b,n]</code> 72 tane x değeri verir. y değerleri modelden çıkmaz; sabittir:</p>
+  <pre><code>y_rows = [0, 4, 8, 12, ..., 284]
+lane_noktaları =
+  (pred_x_rows[b,n,0], 0)
+  (pred_x_rows[b,n,1], 4)
+  ...
+  (pred_x_rows[b,n,71], 284)</code></pre>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s0-a.jpg" alt="S0 points">
+    <svg viewBox="0 0 800 288">
+      <path d="M180 272 C222 220 264 160 322 80" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+        <circle cx="190" cy="256" r="7"/><circle cx="210" cy="232" r="7"/><circle cx="232" cy="204" r="7"/><circle cx="254" cy="176" r="7"/><circle cx="278" cy="144" r="7"/><circle cx="302" cy="112" r="7"/><circle cx="320" cy="84" r="7"/>
+      </g>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">Sarı: pred_x_rows + sabit y_rows noktaları</text>
+      <text x="28" y="62" fill="#63d8ff" font-size="18" font-family="Arial">Mavi: bu noktaların çizgi gibi birleşmesi</text>
+    </svg>
+  </div>
+</section>
+
+<section>
+  <h2>6. Hungarian Matching S0’da Hangi Tensorları Kullanıyor?</h2>
+  <p>Training sırasında 20 tahmin var, ama gerçek lane sayısı daha az olabilir. Matcher şunu yapar:</p>
+  <pre><code># matcher_s0.py
+p_lane = softmax(exist_logits)[..., 0]
+cost_obj = -log(p_lane)
+cost_point = avg_abs(pred_x_rows - gt_x_rows)
+cost_range = abs(range_norm - gt_range)
+cost = 2*cost_obj + 5*cost_point + 1*cost_range</code></pre>
+  <div class="grid two">
+    <div class="card">
+      <h3>Tensor tarafı</h3>
+      <p><code>pred_x_rows</code> tahmin edilen çizgidir.</p>
+      <p><code>target["x_rows"]</code> gerçek çizgidir.</p>
+      <p>Matcher bu ikisini satır satır karşılaştırır.</p>
+    </div>
+    <div class="card">
+      <h3>Lane tarafı</h3>
+      <p>Modelin mavi çizgisi gerçek sarı çizgiye yakınsa maliyet düşer.</p>
+      <p>En düşük maliyetli eşleşmeler seçilir.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>7. S0’ı Tek Kod Akışıyla Hatırla</h2>
+  <pre><code>images [B,3,288,800]
+  ↓ backbone + fpn
+features [B,256,72,200]
+  ↓ flatten
+memory [B,14400,256]
+  ↓ cross attention with query
+queries [B,20,256]
+  ↓ heads
+exist_logits [B,20,2]
+row_x_logits [B,20,72,200]
+range_norm [B,20,2]
+  ↓ soft_expected_x
+pred_x_rows [B,20,72]
+  ↓ fixed_y_rows ile birleşir
+lane çizgisi</code></pre>
+  <p class="lead">S0’ın özü: Query koordinat değildir; query’den head’ler aracılığıyla <code>pred_x_rows</code> koordinatı üretilir.</p>
+  <div class="next"><a class="btn" href="query.html">Query mikroskobu</a><a class="btn" href="s1.html">S1’e geç</a></div>
+</section>
+</main></div></body></html>

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S3 Low-Rank Bridge</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+<div class="shell">
+  <aside class="side"><a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a><nav class="nav"><a href="index.html">Ana fikir</a><a href="s0.html">S0: Geometry-only</a><a href="s1.html">S1: Row token sequence</a><a href="s2.html">S2: Curve evidence</a><a class="active" href="s3.html">S3: Low-rank bridge</a><a href="s4.html">S4: Zoom refinement</a></nav></aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">S3</span><span class="tag">Low-rank bridge</span><span class="tag">Lane-conditioned evidence</span>
+        <h1>S3: Toplanan kanıtı lane’e göre düzelt.</h1>
+        <p class="lead">S2 evidence toplar. S3 bu evidence’ı her lane query’ye göre modüle eder. Ama bunu pahalı full dynamic kernel üreterek değil, sequence-level low-rank bridge ile yapar.</p>
+        <div class="note">Bunu şöyle düşün: S2 küçük kameralarla görüntü topladı. S3, her lane’in kendi filtresini takıp “bu kanıtta benim şeridim için önemli olan ne?” diye tekrar düzenliyor.</div>
+      </div>
+      <div class="photo-card"><img src="assets/images/s3-a.jpg" alt="S3 B1 lane prediction"><p class="caption">S3-B1 2k subset çıktısı. Bu modelde evidence, final decoder’a gitmeden önce bridge’den geçer.</p></div>
+    </header>
+
+    <section>
+      <h2>S3 Hangi Sorunu By-Pass Ediyor?</h2>
+      <p>Dynamic kernel fikri güçlüdür: lane’e özel filtre üret. Ama her lane ve her batch için büyük convolution kernel üretmek pahalı olabilir. S3, bu sorunu daha küçük bir forma çevirir: evidence sequence üzerinde low-rank bir dönüşüm yapar.</p>
+      <div class="grid two">
+        <div class="card"><h3>Full dynamic kernel</h3><p>Güçlü ama pahalı. Büyük tensor üretimi VRAM ve hız açısından riskli.</p></div>
+        <div class="card"><h3>Sequence low-rank bridge</h3><p>Kanıt zaten 72 row’luk dizi. Bu dizi üzerinde küçük rank ile modülasyon daha kontrollü.</p></div>
+      </div>
+      <div class="note honest">Bu tamamen çözüm değil. Yanlış evidence gelirse bridge kötü kanıtı sihirli şekilde iyi kanıta çeviremez. Sadece doğru kanıtı daha iyi kullanmayı öğrenebilir.</div>
+    </section>
+
+    <section>
+      <h2>Bunu Nasıl Yapıyor?</h2>
+      <div class="figure">
+        <svg viewBox="0 0 1080 360" role="img" aria-label="S3 low rank bridge diagram">
+          <rect width="1080" height="360" fill="#081019"/>
+          <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/></marker></defs>
+          <g font-family="Arial">
+            <rect x="44" y="90" width="190" height="110" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="92" y="128" fill="#eef6ff" font-size="20">E_seq</text><text x="72" y="160" fill="#aab8c8" font-size="15">S2’den gelen kanıt</text>
+            <rect x="305" y="54" width="200" height="95" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="350" y="92" fill="#eef6ff" font-size="19">Query</text><text x="334" y="121" fill="#aab8c8" font-size="15">parametre üretir</text>
+            <rect x="305" y="190" width="200" height="95" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="337" y="228" fill="#eef6ff" font-size="19">U, V, filter</text><text x="334" y="257" fill="#aab8c8" font-size="15">düşük-rütbeli yol</text>
+            <rect x="585" y="90" width="210" height="110" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="622" y="128" fill="#eef6ff" font-size="19">Bridge delta</text><text x="625" y="160" fill="#aab8c8" font-size="15">kanıta düzeltme</text>
+            <rect x="865" y="90" width="175" height="110" rx="8" fill="#111b28" stroke="#2a3a4d"/><text x="900" y="128" fill="#eef6ff" font-size="19">E_refined</text><text x="897" y="160" fill="#aab8c8" font-size="15">decoder’a gider</text>
+          </g>
+          <g stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)"><line x1="235" y1="145" x2="583" y2="145"/><line x1="505" y1="238" x2="620" y2="190"/><line x1="795" y1="145" x2="863" y2="145"/></g>
+          <path d="M90 310 C155 250, 220 188, 300 120" stroke="#7ce59a" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <path d="M700 310 C755 246, 825 178, 910 96" stroke="#ff82b7" stroke-width="5" fill="none" stroke-linecap="round"/>
+          <text x="62" y="335" fill="#aab8c8" font-size="15">kanıt dizisi</text><text x="690" y="335" fill="#aab8c8" font-size="15">rafine kanıt dizisi</text>
+        </svg>
+      </div>
+      <pre><code># low_rank_bridge.py sade mantık
+params = generator(query)
+U, V, s = split(params)
+
+e = norm(E_seq)
+z = e @ U                      # channel reduction
+z = depthwise_conv1d(z, s)      # row boyunca küçük filtre
+delta = z @ V                  # channel expansion
+
+E_refined = E_seq + bridge_scale * delta</code></pre>
+    </section>
+
+    <section>
+      <h2>FiLM vs Low-Rank</h2>
+      <p>Kod iki bridge tipi destekliyor: <code>film</code> ve <code>low_rank_sequence</code>. FiLM daha basit: evidence’ı query’den gelen gamma/beta ile ölçekler ve kaydırır. Low-rank daha esnek: row boyunca küçük filtreleme de yapar.</p>
+      <table>
+        <thead><tr><th>Bridge</th><th>Nasıl düşünmeli?</th><th>Artı/Eksi</th></tr></thead>
+        <tbody>
+          <tr><td>FiLM</td><td>Parlaklık/kontrast ayarı gibi: evidence’ı büyüt/küçült/kaydır.</td><td>Basit ve güvenli. Ama ifade gücü sınırlı.</td></tr>
+          <tr><td>Low-rank</td><td>Lane’e özel küçük bir düzenleme filtresi gibi.</td><td>Daha güçlü. Ama daha karmaşık ve yavaş olabilir.</td></tr>
+        </tbody>
+      </table>
+      <div class="note honest">Eğer FiLM, low-rank kadar iyi çıkarsa dürüst yorum şu olur: “karmaşık bridge şart değil, lane-conditioned modulation zaten yetiyor olabilir.”</div>
+    </section>
+
+    <section>
+      <h2>Koddaki Bağlantı</h2>
+      <pre><code># dynlaneseq_s3.py
+if bridge_type == "film":
+    self.bridge = FiLMBridge(dim)
+elif bridge_type == "low_rank_sequence":
+    self.bridge = SequenceLowRankBridge(
+        dim=dim, rank=16, kernel_size=3
+    )
+
+def bridge_evidence(evidence, queries):
+    return self.bridge(evidence, queries)</code></pre>
+      <pre><code># dynlaneseq_s2.py içindeki final yol S3'te değişir
+evidence = sampler(features, sample_x)
+evidence, debug = bridge_evidence(evidence, query)
+tokens = query + row_embedding + adapter(evidence)
+final = row_decoder(tokens)</code></pre>
+    </section>
+
+    <section>
+      <h2>Görsel Üzerinden Oku</h2>
+      <div class="gallery">
+        <div class="photo-card"><img src="assets/images/s3-a.jpg" alt="S3 sample A"><p class="caption">S3-B1: lane üstünden gelen kanıt, bridge ile query’ye göre rafine edilir.</p></div>
+        <div class="photo-card"><img src="assets/images/s3-b.jpg" alt="S3 sample B"><p class="caption">Bu çizgileri “S2 kanıt topladı, S3 o kanıtı lane özelinde düzeltti” diye oku.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>S3’te Ne Öğreniliyor?</h2>
+      <ul>
+        <li>Model doğrudan topology öğrenmiyor.</li>
+        <li>Model doğrudan diffusion adımı öğrenmiyor.</li>
+        <li>Model doğrudan “hangi evidence kanalı benim lane’im için önemli?” sorusunu öğreniyor.</li>
+        <li>Final koordinatlar yine row decoder + soft expected x ile çıkıyor.</li>
+      </ul>
+      <div class="nextprev"><a class="button" href="s2.html">S2’ye dön</a><a class="button" href="s4.html">S4’e geç</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

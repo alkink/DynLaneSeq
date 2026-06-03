@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S3 Bridge Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="layout">
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav active" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<main>
+<header>
+  <span class="pill">S3 derin anlatım</span><span class="pill">Evidence array'i değişir</span>
+  <h1>S3: Bridge çizgiyi doğrudan çizmez; evidence tensorünü değiştirir.</h1>
+  <p class="lead">S3’ü anlamanın anahtarı şu: S2’deki <code>evidence [B,20,72,256]</code> aynen gelir. S3 bridge bu tensorün içeriğini lane query’ye göre yeniden düzenler. Shape aynı kalır; bilgi değişir.</p>
+  <div class="note bad"><strong>Önemli:</strong> Bridge’in çıktısı koordinat değildir. Bridge sonrası hâlâ <code>[B,20,72,256]</code> feature vardır. Koordinat yine row decoder’dan sonra çıkar.</div>
+</header>
+
+<section>
+  <h2>1. S3 Görselini Tensorlara Ayıralım</h2>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s3-a.jpg" alt="S3 bridge">
+    <svg viewBox="0 0 800 288">
+      <path d="M180 272 C225 216 270 154 335 78" fill="none" stroke="#ffd56f" stroke-width="9" stroke-linecap="round" opacity=".42"/>
+      <path d="M184 272 C230 216 275 153 340 76" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">Sarı kalın: S2'den gelen ham evidence yolu</text>
+      <text x="28" y="62" fill="#8af09f" font-size="18" font-family="Arial">Yeşil: bridge sonrası evidence ile üretilen final lane</text>
+    </svg>
+  </div>
+  <p>Görselde bridge’i “çizgiyi biraz oynatan parça” gibi görmek cazip ama teknik olarak daha doğru cümle şudur: bridge, çizginin üstünden okunan 256 kanallı kanıt vektörlerini değiştirir.</p>
+</section>
+
+<section>
+  <h2>2. S3 Kodda S2’nin Neresine Giriyor?</h2>
+  <pre><code># dynlaneseq_s2.py akışı
+evidence = self.sampler(enc["features"], sample_x)
+evidence, bridge_debug = self.bridge_evidence(evidence, q)
+row = self.row_decoder(self.build_final_tokens(q, evidence))</code></pre>
+  <p>S2’de <code>bridge_evidence</code> sadece evidence’ı aynen döndürür:</p>
+  <pre><code># DynLaneSeqS2
+def bridge_evidence(self, evidence, queries):
+    return evidence, {}</code></pre>
+  <p>S3 bunu override eder:</p>
+  <pre><code># dynlaneseq_s3.py
+def bridge_evidence(self, evidence, queries):
+    return self.bridge(evidence, queries)</code></pre>
+  <div class="grid two">
+    <div class="card"><h3>S2</h3><p>Sampler’dan gelen evidence direkt final decoder’a gider.</p></div>
+    <div class="card"><h3>S3</h3><p>Sampler’dan gelen evidence önce bridge’den geçer, sonra final decoder’a gider.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>3. Bridge’in Girdi ve Çıktı Shape’i</h2>
+  <pre><code>input:
+  evidence = [B,20,72,256]
+  queries  = [B,20,256]
+
+output:
+  refined_evidence = [B,20,72,256]
+  debug stats = bridge_scale, mean_abs_delta_E, ...</code></pre>
+  <div class="code-map">
+    <div class="card">
+      <h3><code>evidence[b,n,p,:]</code></h3>
+      <p>n’inci lane’in p’inci row noktasından okunan 256 sayılık ham görsel kanıt.</p>
+    </div>
+    <div class="card">
+      <h3><code>queries[b,n,:]</code></h3>
+      <p>n’inci lane adayının 256 sayılık kimliği. Bridge’e “bu kanıtı hangi lane için süzüyorsun?” bilgisini verir.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>4. Low-Rank Bridge Parametreleri Ne?</h2>
+  <p>Kodda default <code>dim=256</code>, <code>rank=16</code>, <code>kernel_size=3</code>. Query’den şu parametreler üretilir:</p>
+  <pre><code># low_rank_bridge.py
+self.param_dim = dim*rank + rank*dim + rank*kernel_size
+               = 256*16 + 16*256 + 16*3
+               = 8240
+
+params = self.generator(queries)  # [B,20,8240]</code></pre>
+  <p>Yani her lane query, kendi bridge işlemi için 8240 sayı üretir. Bunlar üç parçaya bölünür:</p>
+  <pre><code>u = vec[:4096].view(256,16)
+v = vec[4096:8192].view(16,256)
+s = vec[8192:].view(16,1,3)</code></pre>
+  <div class="grid three">
+    <div class="card"><h3><code>U [256,16]</code></h3><p>256 kanallı evidence’ı 16 kanallı dar alana indirir.</p></div>
+    <div class="card"><h3><code>s [16,1,3]</code></h3><p>72 row boyunca küçük 1D filtre uygular. Komşu row kanıtlarını hesaba katar.</p></div>
+    <div class="card"><h3><code>V [16,256]</code></h3><p>Dar 16 kanalı tekrar 256 kanala açar.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>5. Bridge Tek Bir Lane İçin Ne Yapıyor?</h2>
+  <p>Loop içinde her batch ve lane slot ayrı işlenir:</p>
+  <pre><code>for bi in range(B):
+  for ni in range(20):
+    e = evidence[bi, ni]   # [72,256]
+    q = queries[bi, ni]    # [256]
+    params = generator(q)
+    ...
+    out[bi, ni] = e + bridge_scale * delta</code></pre>
+  <p>Buradaki <code>e</code>, tek bir lane adayının 72 row boyunca okuduğu tüm evidence dizisidir:</p>
+  <pre><code>e[0,:]  = en üst/alt row noktasındaki 256 feature
+e[1,:]  = sonraki row noktasındaki 256 feature
+...
+e[71,:] = son row noktasındaki 256 feature</code></pre>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s3-b.jpg" alt="Bridge one lane">
+    <svg viewBox="0 0 800 288">
+      <path d="M190 272 C230 220 275 160 340 80" fill="none" stroke="#ffd56f" stroke-width="7" opacity=".55" stroke-linecap="round"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2"><circle cx="205" cy="248" r="8"/><circle cx="240" cy="204" r="8"/><circle cx="282" cy="148" r="8"/><circle cx="328" cy="88" r="8"/></g>
+      <rect x="430" y="92" width="230" height="84" rx="8" fill="#111820" stroke="#8af09f" stroke-width="3"/>
+      <line x1="330" y1="88" x2="430" y2="118" stroke="#8af09f" stroke-width="3"/>
+      <text x="448" y="126" fill="#f2f7fb" font-size="17" font-family="Arial">e = [72,256]</text>
+      <text x="448" y="152" fill="#b8c7d3" font-size="15" font-family="Arial">tek lane'in evidence dizisi</text>
+    </svg>
+  </div>
+</section>
+
+<section>
+  <h2>6. Low-Rank İşlemi Lane Üzerinde Nasıl Canlandırılır?</h2>
+  <pre><code>e_norm = norm(e)       # [72,256]
+z = e_norm @ U         # [72,16]
+z_conv = conv1d(z, s)  # [72,16]
+delta = z_conv @ V     # [72,256]
+out = e + scale*delta  # [72,256]</code></pre>
+  <div class="grid two">
+    <div class="card">
+      <h3>Array tarafı</h3>
+      <p><code>[72,256] → [72,16] → [72,16] → [72,256]</code>.</p>
+      <p>Yani bilgi önce daraltılır, row boyunca filtrelenir, tekrar genişletilir.</p>
+    </div>
+    <div class="card">
+      <h3>Lane tarafı</h3>
+      <p>Her sarı evidence noktası tek başına değil, komşu row noktalarıyla birlikte temizlenir.</p>
+      <p>Bu, çizgi üstündeki kanıt dizisini daha tutarlı hale getirmeye çalışır.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>7. Neden “Low-Rank”?</h2>
+  <p>Full bir 256→256 dönüşüm her lane için çok büyük ve pahalı olabilir. Low-rank yaklaşım, 256 kanalı 16 kanallı dar bir ara yoldan geçirir.</p>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s3-b.jpg" alt="Low rank visual">
+    <svg viewBox="0 0 800 288">
+      <rect x="90" y="52" width="150" height="54" rx="8" fill="#111820" stroke="#ffd56f" stroke-width="3"/>
+      <rect x="330" y="52" width="120" height="54" rx="8" fill="#111820" stroke="#63d8ff" stroke-width="3"/>
+      <rect x="540" y="52" width="150" height="54" rx="8" fill="#111820" stroke="#8af09f" stroke-width="3"/>
+      <text x="120" y="86" fill="#ffd56f" font-size="17" font-family="Arial">256 kanal</text>
+      <text x="360" y="86" fill="#63d8ff" font-size="17" font-family="Arial">16 kanal</text>
+      <text x="570" y="86" fill="#8af09f" font-size="17" font-family="Arial">256 kanal</text>
+      <line x1="240" y1="79" x2="330" y2="79" stroke="#f2f7fb" stroke-width="3"/>
+      <line x1="450" y1="79" x2="540" y2="79" stroke="#f2f7fb" stroke-width="3"/>
+    </svg>
+  </div>
+  <p>Bu, “büyük filtre üretme” problemini tamamen yok etmez; onu daha küçük ve kontrollü bir dönüşüme çevirir.</p>
+</section>
+
+<section>
+  <h2>8. Bridge Debug Değerleri Ne Anlatır?</h2>
+  <pre><code>return out, {
+  "bridge_scale": self.bridge_scale.detach(),
+  "mean_abs_delta_E": mean_delta,
+  "mean_abs_E_seq": mean_e,
+  "delta_ratio": mean_delta / (mean_e + 1e-6),
+}</code></pre>
+  <div class="grid two">
+    <div class="card"><h3><code>mean_abs_E_seq</code></h3><p>Ham evidence büyüklüğü. Kanıt vektörleri genel olarak ne kadar büyük?</p></div>
+    <div class="card"><h3><code>mean_abs_delta_E</code></h3><p>Bridge’in yaptığı değişiklik büyüklüğü. Eğer çok küçükse bridge etkisiz kalıyor olabilir.</p></div>
+    <div class="card"><h3><code>delta_ratio</code></h3><p>Değişiklik / ham kanıt oranı. Bridge kanıtı ne kadar oynatıyor?</p></div>
+    <div class="card"><h3><code>bridge_scale</code></h3><p>Delta’nın ne kadar güçlü ekleneceğini öğrenen skaler.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>9. S3’ü Tek Kod Akışıyla Hatırla</h2>
+  <pre><code>evidence
+  [B,20,72,256]
+  S2 sampler'dan gelen ham lane üstü kanıt
+
+queries
+  [B,20,256]
+  her lane adayının kimliği
+
+params = generator(queries)
+  [B,20,8240]
+  her lane için U, V, s filtre parametreleri
+
+for each lane:
+  e [72,256]
+  z = e @ U       -> [72,16]
+  z = conv1d(z)   -> [72,16]
+  delta = z @ V   -> [72,256]
+  refined = e + scale*delta
+
+refined_evidence
+  [B,20,72,256]
+  shape aynı, içerik lane'e göre süzülmüş
+
+final_x = row_decoder(q + row_emb + adapter(refined_evidence))
+  [B,20,72]</code></pre>
+  <p class="lead">S3’ün özü: Bridge koordinat üretmez; lane üstünden okunan evidence vektörlerini lane query’ye göre değiştirir.</p>
+  <div class="next"><a class="btn" href="s2.html">S2’ye dön</a><a class="btn" href="s4.html">S4’e geç</a></div>
+</section>
+</main></div></body></html>

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S0 Geometry-only</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a>
+    <nav class="nav">
+      <a href="index.html">Ana fikir</a><a class="active" href="s0.html">S0: Geometry-only</a><a href="s1.html">S1: Row token sequence</a><a href="s2.html">S2: Curve evidence</a><a href="s3.html">S3: Low-rank bridge</a><a href="s4.html">S4: Zoom refinement</a>
+    </nav>
+  </aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">S0</span><span class="tag">Geometry-only sanity</span><span class="tag">Hungarian matching</span>
+        <h1>S0: Önce lane çizmeyi öğren.</h1>
+        <p class="lead">S0, projenin temel taşı. Burada evidence, bridge, zoom yok. Model sadece görüntüden aday lane slotları çıkarır ve her slot için “lane var mı, row row x nerede, lane hangi y aralığında?” sorularını cevaplar.</p>
+        <div class="note">Bunu şöyle düşün: Masada 20 boş kart var. Her kart “ben bir şerit olabilir miyim?” diye görüntüye bakıyor. Gerçek şeritlere benzeyen kartlar tutuluyor, diğerleri “boş” öğreniyor.</div>
+      </div>
+      <div class="photo-card">
+        <img src="assets/images/s0-a.jpg" alt="S0 lane prediction from 2k subset">
+        <p class="caption">S0 2k subset eğitim görseli. Bu aşamada çizgiler doğrudan slot başlıklarından geliyor; lane üstünden ayrıca evidence okunmuyor.</p>
+      </div>
+    </header>
+
+    <section>
+      <h2>S0 Hangi Sorunu Çözüyor?</h2>
+      <div class="grid two">
+        <div class="card"><h3>Ana fikir</h3><p>Modelin target builder, query, cross-attention, Hungarian matching, loss ve postprocess zinciri çalışıyor mu? S0 bunun sağlık kontrolü.</p></div>
+        <div class="card"><h3>Eski yönteme göre fark</h3><p>Şerit sayısını sabit kabul etmiyor. 20 aday slot açıyor; Hungarian matching gerçek lane’leri en uygun slotlara atıyor.</p></div>
+      </div>
+      <div class="note honest">S0 bilimsel katkının en parlak kısmı değil. Ama S0 sağlam değilse S2 evidence veya S3 bridge eklemek hatayı büyütür.</div>
+    </section>
+
+    <section>
+      <h2>Model Ne Görüyor?</h2>
+      <p>Girdi bir kamera görüntüsü. Kodda varsayılan boyut <code>800x288</code>. <code>ResNet34Backbone</code> görüntüden özellik çıkarır. <code>SimpleFPN</code> ince ve geniş bir feature map üretir. Sonra query’ler bu feature map’e attention ile bakar.</p>
+      <div class="figure">
+        <svg viewBox="0 0 980 330" role="img" aria-label="S0 query and lane slot diagram">
+          <rect width="980" height="330" fill="#081019"/>
+          <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/></marker></defs>
+          <rect x="45" y="42" width="275" height="230" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+          <path d="M94 248 C136 196, 180 134, 252 78" stroke="#5bd7ff" stroke-width="6" fill="none" stroke-linecap="round"/>
+          <path d="M210 255 C220 194, 248 126, 294 70" stroke="#7ce59a" stroke-width="6" fill="none" stroke-linecap="round"/>
+          <text x="82" y="300" fill="#aab8c8" font-family="Arial" font-size="15">Görüntü + feature map</text>
+          <g fill="#ffd36d" stroke="#081019" stroke-width="2">
+            <circle cx="420" cy="85" r="16"/><circle cx="420" cy="135" r="16"/><circle cx="420" cy="185" r="16"/><circle cx="420" cy="235" r="16"/>
+          </g>
+          <text x="385" y="276" fill="#aab8c8" font-family="Arial" font-size="15">20 query slot</text>
+          <line x1="438" y1="135" x2="595" y2="135" stroke="#5bd7ff" stroke-width="3" marker-end="url(#a)"/>
+          <rect x="605" y="62" width="315" height="185" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+          <text x="636" y="104" fill="#eef6ff" font-family="Arial" font-size="21">S0 heads</text>
+          <text x="636" y="139" fill="#aab8c8" font-family="Arial" font-size="16">exist_logits: lane var/yok</text>
+          <text x="636" y="171" fill="#aab8c8" font-family="Arial" font-size="16">row_x_logits: her row için x</text>
+          <text x="636" y="203" fill="#aab8c8" font-family="Arial" font-size="16">range_norm: y başlangıç/bitiş</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>Koddaki Yol</h2>
+      <p>Bu akışın ana dosyaları: <code>dynlaneseq_s0.py</code>, <code>backbone_resnet.py</code>, <code>fpn.py</code>, <code>cross_attention_decoder.py</code>, <code>heads_s0.py</code>, <code>matcher_s0.py</code>, <code>loss_s0.py</code>.</p>
+      <pre><code># dynlaneseq_s0.py içinde sade akış
+enc = self.encoder.forward_features(images)
+q = enc["queries"]              # lane arayan slot temsilleri
+out = self.heads(q)             # exist + row_x + range
+out["queries"] = q</code></pre>
+      <pre><code># heads_s0.py mantığı
+exist_logits = exist_head(q)    # slot lane mi boş mu?
+row_x_logits = row_x_head(q)    # 72 row için 200 x-bin skoru
+pred_x_rows = soft_expected_x(row_x_logits)
+range_norm = range_head(q)      # lane'in dikey aralığı</code></pre>
+    </section>
+
+    <section>
+      <h2>Hungarian Matching S0’da Ne Yapıyor?</h2>
+      <p>Modelin 20 tahmini var, ama görüntüde mesela 4 gerçek lane olabilir. Hangi tahmin hangi gerçek lane’e loss alacak? Burada Hungarian matching devreye girer.</p>
+      <div class="grid three">
+        <div class="card"><h3>Object cost</h3><p>Slot “lane var” demiş mi? Lane olma olasılığı düşükse maliyet artar.</p></div>
+        <div class="card"><h3>Point cost</h3><p>Predicted x satırları GT x satırlarına yakın mı?</p></div>
+        <div class="card"><h3>Range cost</h3><p>Lane başlangıç ve bitiş y aralığı tutuyor mu?</p></div>
+      </div>
+      <pre><code># matcher_s0.py fikri
+cost = lambda_obj   * (-log(p_lane))
+     + lambda_point * avg_abs(pred_x - gt_x)
+     + lambda_range * abs(pred_range - gt_range)
+
+pred_idx, gt_idx = linear_sum_assignment(cost)</code></pre>
+      <div class="note">Bu, query instability sorununu by-pass eder: query’ye sabit “sol/sağ lane” kimliği vermek yerine, her batch’te en mantıklı eşleşme bulunur.</div>
+    </section>
+
+    <section>
+      <h2>Çıktı Görselde Nasıl Düşünülmeli?</h2>
+      <div class="gallery">
+        <div class="photo-card"><img src="assets/images/s0-a.jpg" alt="S0 sample A"><p class="caption">S0: çizgiler slot başlıklarının doğrudan ürettiği row-wise x noktalarından gelir.</p></div>
+        <div class="photo-card"><img src="assets/images/s0-b.jpg" alt="S0 sample B"><p class="caption">Range filtering şeridin sadece tahmin edilen y aralığında çizilmesini sağlar.</p></div>
+      </div>
+      <p>Görseldeki her lane’i boncuk dizisi gibi düşün: 72 yatay row var. Model her row için “x burada” diyor. Sonra postprocess skor eşiği, range ve minimum nokta filtresiyle final çizgiyi bırakıyor.</p>
+    </section>
+
+    <section>
+      <h2>S0’da Ne Yok?</h2>
+      <ul>
+        <li>Curve-aligned evidence yok. Model lane üstünden ayrıca feature okumaz.</li>
+        <li>Low-rank bridge yok. Kanıtı lane’e göre modüle etmez.</li>
+        <li>Zoom refinement yok. İkinci kez bakmaz.</li>
+        <li>Topology yok. Lane bağlantılarını modellemez.</li>
+        <li>Diffusion yok. Çok adımlı üretim yapmaz.</li>
+      </ul>
+      <div class="nextprev"><a class="button" href="index.html">Ana fikre dön</a><a class="button" href="s1.html">S1’e geç</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

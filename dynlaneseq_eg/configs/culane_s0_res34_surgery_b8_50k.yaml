@@ -1,0 +1,77 @@
+output_dir: outputs/culane_s0_res34_surgery_b8_qlearned
+
+dataset:
+  name: CULane
+  root: dataset
+  lists:
+    train: list/train_gt.txt
+    val: list/val.txt
+    test: list/test.txt
+  min_valid_rows: 5
+
+augmentation:
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  affine: false
+
+dataloader:
+  num_workers: 6
+  pin_memory: true
+  shuffle: true
+  eval_batch_size: 1
+  persistent_workers: true
+  prefetch_factor: 4
+
+model:
+  name: DynLaneSeqS0
+  input_h: 288
+  input_w: 800
+  fpn_channels: 128
+  dim: 256
+  pretrained_backbone: true
+  num_slots: 20
+  num_rows: 72
+  x_bins: 200
+  token_ignore_index: -100
+  decoder_layers: 2
+  row_decoder_layers: 2
+  num_heads: 8
+  decoder_ff_dim: 1024
+  row_decoder_ff_dim: 512
+  dropout: 0.1
+  query_content_init: learned
+
+matcher:
+  lambda_obj: 2.0
+  lambda_point: 5.0
+  lambda_range: 1.0
+
+loss:
+  w_exist: 2.0
+  w_point: 5.0
+  w_range: 1.0
+  w_smooth: 0.05
+  smooth_l1_beta: 0.01
+  no_lane_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  backbone_lr: 0.00001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  total_iters: 180000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+training:
+  batch_size: 8
+  max_iters: 50000
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  clip_grad_norm: 1.0
+  log_interval: 20
+  vis_interval: 500

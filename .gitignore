@@ -1,0 +1,75 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+*.env
+.env
+.env.*
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE / OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*:Zone.Identifier
+.DS_Store
+Thumbs.db
+
+# Dataset is a local symlink / external CULane data root.
+dataset
+dataset/
+
+# Training outputs, predictions, visualizations, logs, checkpoints.
+outputs/
+runs/
+wandb/
+tensorboard/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Large dataset/media artifacts.
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Local scratch files
+tmp/
+temp/
+scratch/

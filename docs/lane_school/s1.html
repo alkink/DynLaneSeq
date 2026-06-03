@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S1 Row Token Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="layout">
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav active" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<main>
+<header>
+  <span class="pill">S1 derin anlatım</span><span class="pill">Query → 72 boncuk</span>
+  <h1>S1: Bir query vektörü, 72 row token’a açılır.</h1>
+  <p class="lead">S1’in farkı şudur: S0’da query tek MLP ile 72 row'u birden çıkarıyordu. S1’de query önce 72 ayrı token’a bölünür; her token çizginin bir yatay satırdaki parçasını temsil eder.</p>
+  <div class="note"><strong>Row token koordinat değildir.</strong> Row token <code>[256]</code> boyutlu bir temsil vektörüdür. Koordinat yine <code>row_x_logits → soft_expected_x</code> ile çıkar.</div>
+</header>
+
+<section>
+  <h2>1. S1’in Görsel Karşılığı</h2>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s1-a.jpg" alt="S1 row tokens">
+    <svg viewBox="0 0 800 288">
+      <path d="M190 272 C230 220 270 160 332 78" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+        <circle cx="202" cy="255" r="8"/><circle cx="226" cy="224" r="8"/><circle cx="252" cy="188" r="8"/><circle cx="278" cy="151" r="8"/><circle cx="305" cy="112" r="8"/><circle cx="328" cy="82" r="8"/>
+      </g>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">Sarı noktalar: row tokenların çizgiye dönüşmüş hali</text>
+      <text x="28" y="62" fill="#63d8ff" font-size="18" font-family="Arial">Mavi çizgi: 72 token çıktısının birleşimi</text>
+    </svg>
+  </div>
+  <p>Bu görselde sarı noktaları “row token” diye düşünmek iyi bir başlangıçtır; ama teknik olarak row token nokta değildir. Row token, o noktanın kararını verecek 256 sayılık vektördür.</p>
+</section>
+
+<section>
+  <h2>2. S1’de Hangi Tensorlar Var?</h2>
+  <pre><code># dynlaneseq_s1.py
+enc = self.encoder.forward_features(images)
+q = enc["queries"]                 # [B,20,256]
+row_emb = self.row_embedding.weight # [72,256]
+tokens = q.unsqueeze(2) + row_emb   # [B,20,72,256]</code></pre>
+  <div class="grid three">
+    <div class="card"><h3><code>q</code></h3><p>20 lane adayı. Her aday 256 sayı. Henüz row bilgisi yok.</p></div>
+    <div class="card"><h3><code>row_emb</code></h3><p>72 satırın öğrenilen kimliği. “Ben alt row muyum, üst row muyum?” bilgisini taşır.</p></div>
+    <div class="card"><h3><code>tokens</code></h3><p>Her lane adayı, 72 row’a kopyalanmış ve row kimliği eklenmiş hali.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>3. Broadcasting Tam Olarak Ne Yapıyor?</h2>
+  <p>Bu satır kritik:</p>
+  <pre><code>tokens = queries.unsqueeze(2) + row_emb</code></pre>
+  <p>Shape dönüşümü:</p>
+  <pre><code>queries              = [B,20,256]
+queries.unsqueeze(2)= [B,20,1,256]
+row_emb             = [1,1,72,256]
+tokens              = [B,20,72,256]</code></pre>
+  <div class="code-map">
+    <div class="card">
+      <h3>Array olarak</h3>
+      <p><code>tokens[b,n,p,:]</code> = b’inci görüntüde, n’inci lane adayı, p’inci yatay satır için 256 sayılık vektör.</p>
+      <p>Bu vektörün içinde açık x koordinatı yoktur.</p>
+    </div>
+    <div class="card">
+      <h3>Lane üzerinde</h3>
+      <p>Bir lane çizgisini 72 küçük karar noktasına bölmüş olduk.</p>
+      <p>Her karar noktası “ben bu y satırında nereye oturacağım?” sorusunu cevaplayacak.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>4. RowTokenDecoder Ne Yapıyor?</h2>
+  <pre><code># row_token_decoder.py
+b, n, p, d = row_tokens.shape       # p=72, d=256
+flat = row_tokens.view(b*n, p, d)   # [B*20,72,256]
+hidden = self.encoder(flat)         # [B*20,72,256]
+logits = self.head(hidden)          # [B*20,72,200]
+logits = logits.view(b,n,p,200)     # [B,20,72,200]
+pred_x = soft_expected_x(logits)    # [B,20,72]</code></pre>
+  <div class="grid two">
+    <div class="card">
+      <h3>Neden <code>B*20</code>?</h3>
+      <p>Her lane adayı ayrı bir 72 tokenlık sequence gibi decoder’a girer.</p>
+      <p>Yani 20 lane adayı, 20 ayrı kısa cümle gibi işlenir.</p>
+    </div>
+    <div class="card">
+      <h3>Transformer burada ne görüyor?</h3>
+      <p>Aynı lane’in 72 row token’ı birbirini görür.</p>
+      <p>Bu sayede alt row’daki karar ile üst row’daki karar daha uyumlu hale gelebilir.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>5. <code>hidden</code> Lane Üzerinde Neye Denk Geliyor?</h2>
+  <p><code>hidden</code> shape olarak <code>[B,20,72,256]</code>. Bu, her boncuğun transformer sonrası güncellenmiş iç hafızasıdır.</p>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s1-b.jpg" alt="S1 hidden visual">
+    <svg viewBox="0 0 800 288">
+      <path d="M190 272 C230 220 270 160 332 78" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+        <circle cx="210" cy="240" r="8"/><circle cx="240" cy="205" r="8"/><circle cx="274" cy="160" r="8"/><circle cx="312" cy="104" r="8"/>
+      </g>
+      <path d="M210 240 L240 205 L274 160 L312 104" fill="none" stroke="#ff83b7" stroke-width="3" stroke-dasharray="8 8"/>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">Her boncuğun 256 sayılık hidden vektörü var</text>
+      <text x="28" y="62" fill="#ff83b7" font-size="18" font-family="Arial">Transformer boncukların birbirini hesaba katmasını sağlar</text>
+    </svg>
+  </div>
+  <p>Bu vektör doğrudan çizilmez. Ama hemen ardından <code>Linear(256 → 200)</code> ile x kutusu skorlarına dönüşür.</p>
+</section>
+
+<section>
+  <h2>6. S1 Loss Neyi Öğretiyor?</h2>
+  <p>S1, S0 loss’una ek olarak token loss kullanır:</p>
+  <pre><code># loss_s1.py
+pred = logits[bi, pred_idx]        # [matched_lanes,72,200]
+tgt = targets[bi]["x_bins"][gt_idx]# [matched_lanes,72]
+loss_token = cross_entropy(pred, tgt, ignore_index=-100)</code></pre>
+  <div class="grid two">
+    <div class="card">
+      <h3><code>x_bins</code> nedir?</h3>
+      <p>GT lane x koordinatının 200 kutudan hangisine düştüğüdür.</p>
+      <p>Örnek: x=400 px ise yaklaşık bin 100.</p>
+    </div>
+    <div class="card">
+      <h3>Lane üzerinde</h3>
+      <p>Her sarı boncuk için doğru x kutusunu yüksek skorla seçmeyi öğretir.</p>
+      <p>Geçersiz row’larda <code>-100</code> ile loss ignore edilir.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>7. S0 ve S1 Arasındaki Asıl Fark</h2>
+  <table>
+    <thead><tr><th>Parça</th><th>S0</th><th>S1</th></tr></thead>
+    <tbody>
+      <tr><td>Query</td><td><code>[B,20,256]</code></td><td><code>[B,20,256]</code></td></tr>
+      <tr><td>Row temsili</td><td>Tek MLP query’den tüm row skorlarını üretir.</td><td>Query 72 token’a açılır: <code>[B,20,72,256]</code>.</td></tr>
+      <tr><td>Row ilişkisi</td><td>Row’lar head çıktısında birlikte gelir ama explicit row sequence yoktur.</td><td>72 row token transformer içinde birbirini görür.</td></tr>
+      <tr><td>Çizgi koordinatı</td><td><code>soft_expected_x(row_x_logits)</code></td><td><code>soft_expected_x(row_x_logits)</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>8. S1’i Tek Kod Akışıyla Hatırla</h2>
+  <pre><code>q = image-aware queries
+  [B,20,256]
+
+row_embedding
+  [72,256]
+
+tokens = q + row_embedding
+  [B,20,72,256]
+  lane adayını 72 row kararına böler
+
+hidden = transformer(tokens)
+  [B,20,72,256]
+  aynı lane'in row'ları birbirini görür
+
+row_x_logits = linear(hidden)
+  [B,20,72,200]
+  her row için 200 x kutusu skoru
+
+pred_x_rows = soft_expected_x(row_x_logits)
+  [B,20,72]
+  çizilebilir x koordinatları</code></pre>
+  <p class="lead">S1’in özü: Query çizgi değildir; query 72 row token’a açılır, sonra her token kendi x koordinatını üretir.</p>
+  <div class="next"><a class="btn" href="s0.html">S0’a dön</a><a class="btn" href="s2.html">S2’ye geç</a></div>
+</section>
+</main></div></body></html>

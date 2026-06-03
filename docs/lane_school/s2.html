@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S2 Evidence Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="layout">
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav active" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<main>
+<header>
+  <span class="pill">S2 derin anlatım</span><span class="pill">sample_x → E_seq</span>
+  <h1>S2: Çizgi koordinatı artık görüntüden kanıt okumak için kullanılır.</h1>
+  <p class="lead">S2’nin farkı şudur: Model sadece query ve row token ile tahmin yapmaz. Önce kaba çizgi üretir; sonra bu çizginin üstündeki feature’ları okur. Bu okunan şey <code>evidence</code> tensorüdür.</p>
+  <div class="note"><strong>Evidence koordinat değildir.</strong> Evidence, çizgi üstündeki noktalardan okunan 256 sayılık feature vektörleridir: <code>[B,20,72,256]</code>.</div>
+</header>
+
+<section>
+  <h2>1. S2 Görselini Tensorlara Ayıralım</h2>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s2-a.jpg" alt="S2 evidence visual">
+    <svg viewBox="0 0 800 288">
+      <path d="M188 272 C225 220 267 165 330 82" fill="none" stroke="#63d8ff" stroke-width="5" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2"><circle cx="205" cy="246" r="9"/><circle cx="236" cy="205" r="9"/><circle cx="276" cy="151" r="9"/><circle cx="318" cy="95" r="9"/></g>
+      <path d="M190 272 C228 219 270 163 334 80" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#63d8ff" font-size="18" font-family="Arial">coarse_x: ilk/kaba çizgi [B,20,72]</text>
+      <text x="28" y="62" fill="#ffd56f" font-size="18" font-family="Arial">sample_x/evidence noktaları: çizgi üstünden okuma</text>
+      <text x="28" y="88" fill="#8af09f" font-size="18" font-family="Arial">final_x: evidence ile üretilen son çizgi</text>
+    </svg>
+  </div>
+</section>
+
+<section>
+  <h2>2. S2 Forward Akışındaki Tensorlar</h2>
+  <pre><code># dynlaneseq_s2.py
+enc = self.encoder.forward_features(images)
+q = enc["queries"]                       # [B,20,256]
+features = enc["features"]               # [B,256,72,200]
+
+coarse_row = self.row_decoder(self.build_coarse_tokens(q))
+coarse_x = coarse_row["pred_x_rows"]      # [B,20,72]
+
+sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha)
+evidence = self.sampler(features, sample_x) # [B,20,72,256]
+
+tokens = self.build_final_tokens(q, evidence)
+row = self.row_decoder(tokens)
+final_x = row["pred_x_rows"]              # [B,20,72]</code></pre>
+  <div class="grid two">
+    <div class="card"><h3>Kod tarafı</h3><p>S2 iki kez row decoder kullanır: önce kaba x için, sonra evidence eklenmiş final x için.</p></div>
+    <div class="card"><h3>Lane tarafı</h3><p>Önce mavi kesik çizgi çıkar. Sonra sarı noktalardan görüntü okunur. Sonra yeşil final çizgi çıkar.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>3. <code>coarse_x</code> Tam Olarak Nedir?</h2>
+  <p><code>coarse_x</code>, S1’deki gibi row decoder’dan çıkan ilk x koordinatlarıdır.</p>
+  <pre><code>coarse_x[b,n,p]
+
+b = görüntü
+n = lane adayı
+p = y row
+değer = o row'daki x piksel koordinatı</code></pre>
+  <p>Örnek hayali değerler:</p>
+  <pre><code>coarse_x[0,3,:] =
+[310, 309, 307, ..., 210, 205, 199]</code></pre>
+  <p>Bu liste tek başına bir lane çizgisidir. Ama S2 bunu final saymaz; bunu görüntüden kanıt okumak için kullanır.</p>
+</section>
+
+<section>
+  <h2>4. <code>sample_x</code> Neden <code>coarse_x</code> ile Aynı Şey Değil?</h2>
+  <p>Training başında model kötü çizebilir. Eğer doğrudan kötü <code>coarse_x</code> üstünden feature okunursa yanlış kanıt gelir. Bu yüzden curriculum devreye girer.</p>
+  <pre><code># sampler_curriculum.py
+sample_x = coarse_x.clone()
+mixed = alpha * gt_x + (1 - alpha) * pred
+sample_x[b, pred_idx] = where(valid, mixed, pred)
+sample_x = clamp(sample_x, 0, input_w - 1)</code></pre>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s2-b.jpg" alt="Curriculum visual">
+    <svg viewBox="0 0 800 288">
+      <path d="M178 272 C225 218 275 150 340 78" fill="none" stroke="#ffd56f" stroke-width="6" stroke-linecap="round"/>
+      <path d="M210 272 C248 222 288 164 352 96" fill="none" stroke="#ff8a80" stroke-width="5" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <text x="28" y="36" fill="#ffd56f" font-size="18" font-family="Arial">alpha yüksekken sample_x GT'ye yakın</text>
+      <text x="28" y="62" fill="#ff8a80" font-size="18" font-family="Arial">model başta yanlış çizebilir; buna hemen güvenilmez</text>
+    </svg>
+  </div>
+  <div class="grid three">
+    <div class="card"><h3><code>alpha=1</code></h3><p>Sample noktası çoğunlukla gerçek lane üstüne konur. Öğretmen eli tutuyor.</p></div>
+    <div class="card"><h3><code>alpha=0.5</code></h3><p>Gerçek lane ve model tahmini karışır.</p></div>
+    <div class="card"><h3><code>alpha=0</code></h3><p>Model kendi tahmin ettiği çizgiden evidence okur.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>5. CurveAlignedSampler İçeride Ne Yapıyor?</h2>
+  <pre><code># curve_aligned_sampler.py
+x = sample_x_rows.clamp(0, input_w - 1)   # [B,20,72]
+y = fixed_y_rows(72, 288)                 # [72]
+y = y.view(1,1,72).expand(B,20,72)        # [B,20,72]
+grid = input_to_grid(x, y)                # [B,20,72,2]
+sampled = grid_sample(features, grid)     # feature oku
+E_seq = sampled.view(B,20,72,256)</code></pre>
+  <div class="code-map">
+    <div class="card">
+      <h3><code>x</code> ve <code>y</code></h3>
+      <p><code>x</code> model/GT karışımı sample çizgisidir.</p>
+      <p><code>y</code> sabit row koordinatlarıdır: 0,4,8,...</p>
+      <p>Birleşince 72 tane gerçek görüntü noktası oluşur.</p>
+    </div>
+    <div class="card">
+      <h3><code>grid_sample</code></h3>
+      <p>Bu noktaların feature map’teki karşılığını okur.</p>
+      <p>Görselde sarı noktaların altındaki “görüntü kanıtı” alınır.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>6. <code>evidence[b,n,p,:]</code> İçinde Ne Var?</h2>
+  <p>Tek bir evidence vektörü şöyle okunur:</p>
+  <pre><code>evidence[b,n,p,:]  # 256 sayı
+
+b: hangi görüntü
+n: hangi lane adayı
+p: lane'in hangi y row'u
+:  o noktadan okunan 256 kanallı feature</code></pre>
+  <p>Bu 256 sayının içinde insanın okuyacağı şekilde “sarı çizgi var”, “gölge var” gibi etiketler yoktur. Ama eğitim sırasında model bu vektörleri lane kararında kullanmayı öğrenir.</p>
+  <div class="lane-board">
+    <img src="../dynlaneseq_site/assets/images/s2-a.jpg" alt="Evidence vector visual">
+    <svg viewBox="0 0 800 288">
+      <circle cx="236" cy="205" r="12" fill="#ffd56f" stroke="#070a0d" stroke-width="3"/>
+      <rect x="300" y="164" width="260" height="72" rx="8" fill="#111820" stroke="#ffd56f" stroke-width="3"/>
+      <line x1="248" y1="205" x2="300" y2="200" stroke="#ffd56f" stroke-width="3"/>
+      <text x="318" y="194" fill="#f2f7fb" font-size="17" font-family="Arial">evidence[b,n,p,:]</text>
+      <text x="318" y="220" fill="#b8c7d3" font-size="15" font-family="Arial">bu noktadan okunan 256 sayı</text>
+    </svg>
+  </div>
+</section>
+
+<section>
+  <h2>7. Evidence Final Decoder’a Nasıl Ekleniyor?</h2>
+  <pre><code># dynlaneseq_s2.py / build_final_tokens
+row_emb = self.row_embedding.weight.view(1,1,72,256)
+tokens = queries.unsqueeze(2) + row_emb + self.adapter(evidence)</code></pre>
+  <div class="grid three">
+    <div class="card"><h3><code>queries.unsqueeze(2)</code></h3><p>Hangi lane adayı olduğumuz bilgisi.</p></div>
+    <div class="card"><h3><code>row_emb</code></h3><p>Hangi y satırında olduğumuz bilgisi.</p></div>
+    <div class="card"><h3><code>adapter(evidence)</code></h3><p>Bu noktada görüntünün bize söylediği bilgi.</p></div>
+  </div>
+  <p>Bu üçü toplanınca final token oluşur: “Ben şu lane adayının şu row'uyum ve altımda şu görsel kanıt var.”</p>
+</section>
+
+<section>
+  <h2>8. EvidenceAdapter Neden Var?</h2>
+  <pre><code># evidence_adapter.py
+self.gamma = learnable scalar
+return self.gamma * self.net(evidence)</code></pre>
+  <p>Evidence direkt eklenirse eğitim başında modeli bozabilir. <code>gamma</code> küçük başlar. Bu, evidence etkisini kademeli açılan bir musluk gibi düşün.</p>
+  <div class="grid two">
+    <div class="card"><h3><code>gamma</code> küçükse</h3><p>Model S1’e yakın davranır. Evidence az etki eder.</p></div>
+    <div class="card"><h3><code>gamma</code> büyürse</h3><p>Model lane üstünden okuduğu görüntü bilgisini daha çok kullanır.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>9. S2’yi Tek Kod Akışıyla Hatırla</h2>
+  <pre><code>q
+  [B,20,256]
+  görüntüye bakmış lane adayları
+
+coarse_tokens = q + row_embedding
+  [B,20,72,256]
+
+coarse_x = row_decoder(coarse_tokens)
+  [B,20,72]
+  mavi kesik çizgi
+
+sample_x = curriculum(coarse_x, gt_x, alpha)
+  [B,20,72]
+  sarı kanıt noktalarının x koordinatı
+
+evidence = grid_sample(features, sample_x, y_rows)
+  [B,20,72,256]
+  her sarı noktadan okunan feature
+
+final_tokens = q + row_embedding + adapter(evidence)
+  [B,20,72,256]
+
+final_x = row_decoder(final_tokens)
+  [B,20,72]
+  yeşil final çizgi</code></pre>
+  <p class="lead">S2’nin özü: <code>pred_x_rows</code> artık sadece çıktı değildir; görüntüden kanıt okumak için koordinat olarak da kullanılır.</p>
+  <div class="next"><a class="btn" href="s1.html">S1’e dön</a><a class="btn" href="s3.html">S3’e geç</a></div>
+</section>
+</main></div></body></html>

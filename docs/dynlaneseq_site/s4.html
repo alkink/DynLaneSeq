@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S4 Zoom-In Refinement</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+<div class="shell">
+  <aside class="side"><a class="brand" href="index.html"><strong>DynLaneSeq-EG</strong><span>Phase phase lane detection rehberi</span></a><nav class="nav"><a href="index.html">Ana fikir</a><a href="s0.html">S0: Geometry-only</a><a href="s1.html">S1: Row token sequence</a><a href="s2.html">S2: Curve evidence</a><a href="s3.html">S3: Low-rank bridge</a><a class="active" href="s4.html">S4: Zoom refinement</a></nav></aside>
+  <main class="content">
+    <header class="hero">
+      <div>
+        <span class="tag">S4</span><span class="tag">Optional</span><span class="tag">One-step refinement</span>
+        <h1>S4: Bir kez çiz, sonra daha yakından bak.</h1>
+        <p class="lead">S4, S3 üzerine opsiyonel bir ikinci okuma ekler. Stage1 bir lane tahmini üretir. Stage2 bu tahmini yeni sample curve olarak kullanır, evidence’ı tekrar okur ve final lane’i üretir.</p>
+        <div class="note">Bunu kamera zoom’u gibi düşün: İlk bakışta yolu buldun. Sonra aynı yere biraz daha odaklanıp çizgiyi düzelttin.</div>
+      </div>
+      <div class="photo-card"><img src="assets/images/s4-a.jpg" alt="S4 lane prediction"><p class="caption">S4 2k subset çıktısı. Bu phase stage1 ve stage2 mantığıyla çalışır.</p></div>
+    </header>
+
+    <section>
+      <h2>S4 Neyi Ekliyor?</h2>
+      <div class="grid two">
+        <div class="card"><h3>Stage1</h3><p>S3 gibi çalışır: coarse lane, evidence sampling, bridge, final stage1 lane.</p></div>
+        <div class="card"><h3>Stage2</h3><p>Stage1 lane’i yeni örnekleme çizgisi yapar. Evidence ikinci kez okunur. Final çıktı stage2’den gelir.</p></div>
+      </div>
+      <p>Bu diffusion değildir. Çok adımlı gürültü temizleme yapmaz. Sadece bir ekstra “tekrar bakma” adımıdır.</p>
+    </section>
+
+    <section>
+      <h2>Bunu Nasıl Yapıyor?</h2>
+      <div class="figure">
+        <svg viewBox="0 0 1100 390" role="img" aria-label="S4 stage1 stage2 refinement">
+          <rect width="1100" height="390" fill="#081019"/>
+          <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5bd7ff"/></marker></defs>
+          <rect x="54" y="56" width="330" height="270" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+          <rect x="716" y="56" width="330" height="270" rx="8" fill="#111b28" stroke="#2a3a4d"/>
+          <text x="90" y="92" fill="#eef6ff" font-family="Arial" font-size="21">Stage1: ilk okuma</text>
+          <text x="752" y="92" fill="#eef6ff" font-family="Arial" font-size="21">Stage2: tekrar okuma</text>
+          <path d="M104 282 C168 220, 220 156, 310 82" stroke="#ff82b7" stroke-width="5" fill="none" stroke-linecap="round" stroke-dasharray="9 10"/>
+          <path d="M768 282 C830 220, 890 154, 985 78" stroke="#7ce59a" stroke-width="6" fill="none" stroke-linecap="round"/>
+          <g fill="#ffd36d"><circle cx="124" cy="260" r="8"/><circle cx="178" cy="210" r="8"/><circle cx="234" cy="146" r="8"/><circle cx="296" cy="92" r="8"/></g>
+          <g fill="#5bd7ff"><circle cx="786" cy="263" r="8"/><circle cx="842" cy="205" r="8"/><circle cx="904" cy="142" r="8"/><circle cx="974" cy="88" r="8"/></g>
+          <line x1="388" y1="190" x2="712" y2="190" stroke="#5bd7ff" stroke-width="3" marker-end="url(#arr)"/>
+          <text x="468" y="168" fill="#aab8c8" font-family="Arial" font-size="15">stage1_x yeni sample curve</text>
+          <text x="463" y="216" fill="#aab8c8" font-family="Arial" font-size="15">hidden state küçük katkı verir</text>
+        </svg>
+      </div>
+      <pre><code># dynlaneseq_s4.py sade akış
+stage1 = super().forward(images, sampler_alpha=alpha)
+stage1_x = stage1["final"]["pred_x_rows"]
+
+sample_x2 = curriculum.build_sample_x(
+    stage1_x, targets, matches, alpha=beta
+)
+
+evidence2 = sampler(features, sample_x2)
+evidence2 = bridge(evidence2, query)
+
+h1 = stage1["final"]["row_hidden"].detach()
+tokens2 = query + row_embedding + adapter(evidence2) + hidden_scale * h1
+stage2 = row_decoder(tokens2)</code></pre>
+    </section>
+
+    <section>
+      <h2>Training ve Inference Farkı</h2>
+      <table>
+        <thead><tr><th>Parça</th><th>Training</th><th>Inference</th></tr></thead>
+        <tbody>
+          <tr><td>Stage1 sampling</td><td><code>alpha</code> ile GT’den prediction’a yumuşak geçiş.</td><td>GT yok; kendi coarse tahmininden okur.</td></tr>
+          <tr><td>Stage2 sampling</td><td><code>beta</code> ile GT/stage1 karışımı. Daha yavaş bırakılır.</td><td>Stage1 prediction doğrudan sample curve olur.</td></tr>
+          <tr><td>Final output</td><td>Stage2 ana loss alır; stage1 yardımcı loss alır.</td><td>Stage2 lane final çıktı kabul edilir.</td></tr>
+        </tbody>
+      </table>
+      <div class="note warn">Stage2’ye erken güvenmek risklidir. Stage1 kötü çizdiyse stage2 yanlış yerden evidence okur. Bu yüzden <code>beta</code> schedule daha temkinlidir.</div>
+    </section>
+
+    <section>
+      <h2>Loss Mantığı</h2>
+      <p>S4’te stage2 ana modeldir. Stage1 ve coarse çıktılar yardımcı kayıp alır ki sistem çökmesin.</p>
+      <pre><code># loss_s4.py fikri
+loss_stage2 = S1Loss(stage2)
+loss_stage1 = point_loss(stage1) + token_loss(stage1)
+loss_coarse = point_loss(coarse)
+
+loss_total = loss_stage2
+           + lambda_stage1 * loss_stage1
+           + lambda_coarse * loss_coarse</code></pre>
+      <p>Bu, stage2’yi güçlendirirken stage1’in de anlamlı kalmasını sağlar. Çünkü stage2’nin doğru bakması için stage1’in makul çizmesi gerekir.</p>
+    </section>
+
+    <section>
+      <h2>Görsel Üzerinden Oku</h2>
+      <div class="gallery">
+        <div class="photo-card"><img src="assets/images/s4-a.jpg" alt="S4 sample A"><p class="caption">S4: ilk çizgi ikinci evidence okumasına yol gösterir.</p></div>
+        <div class="photo-card"><img src="assets/images/s4-b.jpg" alt="S4 sample B"><p class="caption">Son çizgi stage2’den gelir; bu yüzden “tekrar bakılmış” çizgi gibi düşün.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>S4’ün Dürüst Değerlendirmesi</h2>
+      <ul>
+        <li>Potansiyel avantaj: çizgiye ikinci kez odaklanarak küçük kaymaları düzeltebilir.</li>
+        <li>Risk: stage1 yanlışsa stage2 de yanlış bölgeden evidence okur.</li>
+        <li>Maliyet: iki kez evidence/decoder yolu çalıştığı için hız ve bellek yükü artar.</li>
+        <li>Ana model olmak zorunda değil. PRD’de de optional olarak konumlanmış.</li>
+      </ul>
+      <div class="note good">Bu paper’ı tek cümlede hatırlamak istersen: “Lane’i önce tahmin et, sonra lane’in üstünden kanıt okuyarak düzelt; gerekirse bir kez daha yakından bak.”</div>
+      <div class="nextprev"><a class="button" href="s3.html">S3’e dön</a><a class="button" href="index.html">Ana sayfaya dön</a></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

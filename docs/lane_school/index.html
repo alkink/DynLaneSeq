@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lane School - DynLaneSeq</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="menu">
+    <a class="brand" href="index.html"><strong>Lane School</strong><span>Önce görsel, sonra kod</span></a>
+    <a class="nav active" href="index.html">0. Yol haritası</a>
+    <a class="nav" href="query.html">Query mikroskobu</a>
+    <a class="nav" href="s0.html">1. S0: Şerit adayı</a>
+    <a class="nav" href="s1.html">2. S1: Boncuk dizisi</a>
+    <a class="nav" href="s2.html">3. S2: Şeritten kanıt oku</a>
+    <a class="nav" href="s3.html">4. S3: Kanıtı düzelt</a>
+    <a class="nav" href="s4.html">5. S4: Bir daha bak</a>
+  </aside>
+  <main>
+    <header class="hero">
+      <div>
+        <span class="pill">Sıfırdan anlatım</span><span class="pill">Lane görseli merkezde</span><span class="pill">JS/canvas yok</span>
+        <h1>Bu sefer terim yok: önce şeride bakıyoruz.</h1>
+        <p class="lead">Her sayfada aynı düzen var: görseldeki şerit parçasını gösteriyorum, sonra kodun o parçaya ne yaptığını söylüyorum. Terimler sadece gerekli olduğu yerde, tek cümleyle.</p>
+        <div class="note bad"><strong>Önceki anlatım fazla soyuttu.</strong> Bu site onu düzeltmek için yapıldı. Ana amaç: “bu tensor/kod satırı lane üzerinde hangi hareketi yapıyor?” sorusunu görsel olarak kafaya kazımak.</div>
+      </div>
+      <div>
+        <div class="lane-board">
+          <img src="../dynlaneseq_site/assets/images/s2-a.jpg" alt="Lane prediction with overlay">
+          <svg viewBox="0 0 800 288" aria-label="Lane üstünde öğretici overlay">
+            <path d="M188 270 C225 220 267 165 330 82" fill="none" stroke="#63d8ff" stroke-width="6" stroke-linecap="round"/>
+            <path d="M480 270 C520 220 560 160 620 75" fill="none" stroke="#8af09f" stroke-width="6" stroke-linecap="round"/>
+            <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+              <circle cx="205" cy="246" r="8"/><circle cx="236" cy="205" r="8"/><circle cx="276" cy="151" r="8"/><circle cx="318" cy="95" r="8"/>
+            </g>
+            <text x="32" y="34" fill="#f2f7fb" font-size="20" font-family="Arial">Bu çizgiler modelin lane tahmini.</text>
+            <text x="32" y="60" fill="#ffd56f" font-size="16" font-family="Arial">Sarı noktalar: modelin şerit üstünden baktığı yerler.</text>
+          </svg>
+        </div>
+        <p class="caption">Bu sayfada bütün sistemi şu resim diliyle okuyacağız: çizgi = lane, nokta = row/evidence, kutu = aday şerit.</p>
+      </div>
+    </header>
+
+    <section>
+      <h2>Tek Cümlelik Ana Fikir</h2>
+      <p class="lead"><strong>DynLaneSeq-EG, şeridi ezberden çizmek yerine önce aday şeridi bulur, sonra o şeridin üstünden nokta nokta kanıt okuyup çizgiyi düzeltir.</strong></p>
+    </section>
+
+    <section>
+      <h2>5 Derslik Yol</h2>
+      <div class="grid three">
+        <div class="card"><h3>1. S0</h3><p>“Bu görüntüde şerit olabilecek çizgiler nerede?” Model 20 aday kart açar.</p></div>
+        <div class="card"><h3>2. S1</h3><p>“Çizgiyi tek parça değil, 72 boncuk gibi düşün.” Her boncuk bir yatay satırdaki x yeridir.</p></div>
+        <div class="card"><h3>3. S2</h3><p>“Tahmin ettiğin çizginin üstüne küçük kameralar koy.” Her kamera feature okur.</p></div>
+        <div class="card"><h3>4. S3</h3><p>“Toplanan kanıtı bu lane’e özel süz.” Yanlış/parazit bilgiyi azaltmaya çalışır.</p></div>
+        <div class="card"><h3>5. S4</h3><p>“İlk çizgiyi kullan, bir kez daha yakından bak.” Son düzeltme aşaması.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Okurken Sadece Şunu Hatırla</h2>
+      <div class="visual-key">
+        <div class="key-row"><span class="swatch blue"></span><span>Mavi çizgi: modelin çizdiği lane.</span></div>
+        <div class="key-row"><span class="swatch yellow"></span><span>Sarı noktalar: row row bakılan yerler. Bunlar “boncuk”.</span></div>
+        <div class="key-row"><span class="swatch green"></span><span>Yeşil çizgi: düzeltilmiş/final lane.</span></div>
+        <div class="key-row"><span class="swatch pink"></span><span>Pembe çizgi: ilk tahmin veya stage1.</span></div>
+      </div>
+      <div class="next"><span></span><a class="btn" href="s0.html">S0 dersine başla</a></div>
+      <p class="caption">Önce query’nin kodda ne olduğunu anlamak istersen: <a href="query.html"><strong>Query mikroskobu</strong></a>.</p>
+    </section>
+  </main>
+</div>
+</body>
+</html>
