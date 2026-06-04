@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -24,6 +24,7 @@ class LossConfig:
     line_iou_radius: float = 15.0
     w_seg: float = 0.0
     seg_pos_weight: float = 1.0
+    seg_extra_weights: dict[str, float] = field(default_factory=dict)
     w_quality: float = 0.0
 
 
@@ -184,14 +185,24 @@ class S0Criterion(nn.Module):
         targets: list[dict[str, torch.Tensor]],
     ) -> torch.Tensor:
         seg_logits = outputs.get("seg_logits")
-        if seg_logits is None:
+        seg_items: list[tuple[torch.Tensor, float]] = []
+        if seg_logits is not None:
+            seg_items.append((seg_logits, 1.0))
+        for scale_name, weight in self.cfg.seg_extra_weights.items():
+            extra_logits = outputs.get(f"seg_logits_{scale_name}")
+            if extra_logits is not None and float(weight) != 0.0:
+                seg_items.append((extra_logits, float(weight)))
+        if not seg_items:
             flat = outputs.get("final") or outputs.get("stage2") or {}
             seg_logits = flat.get("seg_logits") if isinstance(flat, dict) else None
-        if seg_logits is None:
+            if seg_logits is not None:
+                seg_items.append((seg_logits, 1.0))
+        if not seg_items:
             anchor = outputs.get("exist_logits")
             if anchor is None:
                 anchor = next(v for v in outputs.values() if isinstance(v, torch.Tensor))
             return anchor.sum() * 0.0
+        seg_logits = seg_items[0][0]
         valid_indices = []
         seg_targets = []
         for idx, target in enumerate(targets):
@@ -210,14 +221,21 @@ class S0Criterion(nn.Module):
             seg_targets.append(seg_mask.to(seg_logits.device, dtype=seg_logits.dtype))
         if not valid_indices:
             return seg_logits.sum() * 0.0
-        seg_logits = seg_logits[valid_indices]
         seg_target = torch.stack(seg_targets, dim=0)
-        if seg_target.shape[-2:] != seg_logits.shape[-2:]:
-            seg_target = F.interpolate(seg_target, size=seg_logits.shape[-2:], mode="nearest")
         pos_weight = None
         if self.cfg.seg_pos_weight != 1.0:
             pos_weight = torch.tensor([self.cfg.seg_pos_weight], device=seg_logits.device, dtype=seg_logits.dtype)
-        return F.binary_cross_entropy_with_logits(seg_logits, seg_target, pos_weight=pos_weight)
+        total = seg_logits.sum() * 0.0
+        for logits, weight in seg_items:
+            logits = logits[valid_indices]
+            target = seg_target
+            if target.shape[-2:] != logits.shape[-2:]:
+                target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
+            pw = pos_weight
+            if pw is not None and pw.dtype != logits.dtype:
+                pw = pw.to(dtype=logits.dtype)
+            total = total + float(weight) * F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
+        return total
 
     def compute_range_loss(
         self,

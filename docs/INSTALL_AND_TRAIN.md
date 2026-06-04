@@ -164,6 +164,23 @@ python -m dynlaneseq_eg.tools.train \
   --init-from outputs/culane_s1_res34_strong_b16_from_s0_75k/iter_0075000.pt
 ```
 
+### S3 depthwise from S2
+
+Run this after S2 produces `iter_0075000.pt`:
+
+```bash
+bash scripts/run_culane_s3_depthwise_from_s2_residual.sh
+```
+
+Manual equivalent:
+
+```bash
+python -m dynlaneseq_eg.tools.train \
+  --config dynlaneseq_eg/configs/culane_s3_depthwise_res34_strong_b16_from_s2_residual.yaml \
+  --device cuda \
+  --init-from outputs/culane_s2_res34_strong_b16_from_s1_residual/iter_0075000.pt
+```
+
 ## 7. Evaluation
 
 S1 test evaluation:
@@ -189,6 +206,19 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --device cuda \
   --score-thresh 0.5 \
   --pred-dir outputs/culane_s2_res34_strong_b16_from_s1_residual/culane_pred_test_75k_thr0.5 \
+  --categories
+```
+
+S3-depthwise test evaluation:
+
+```bash
+python -m dynlaneseq_eg.tools.evaluate_culane \
+  --config dynlaneseq_eg/configs/culane_s3_depthwise_res34_strong_b16_from_s2_residual.yaml \
+  --checkpoint outputs/culane_s3_depthwise_res34_strong_b16_from_s2_residual/iter_0075000.pt \
+  --split test \
+  --device cuda \
+  --score-thresh 0.5 \
+  --pred-dir outputs/culane_s3_depthwise_res34_strong_b16_from_s2_residual/culane_pred_test_75k_thr0.5 \
   --categories
 ```
 

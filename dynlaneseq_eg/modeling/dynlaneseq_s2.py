@@ -7,7 +7,7 @@ from torch import nn
 
 from .common import soft_expected_x
 from .dynlaneseq_s0 import DynLaneSeqEncoder
-from .evidence import CurveAlignedSampler, DynamicOffsetFusion, EvidenceAdapter, SamplerCurriculum
+from .evidence import CurveAlignedSampler, DynamicOffsetFusion, EvidenceAdapter, MultiScaleCurveAlignedSampler, SamplerCurriculum
 from .heads_s0 import ExistenceHead, RangeHead, S0Heads
 from .row_token_decoder import RowTokenDecoder
 
@@ -18,6 +18,7 @@ class DynLaneSeqS2(nn.Module):
         self.cfg = cfg
         model_cfg = cfg.get("model", cfg)
         evidence_cfg = model_cfg.get("evidence_sampler", {})
+        multi_scale_cfg = model_cfg.get("multi_scale_evidence", {})
         self.input_w = int(model_cfg.get("input_w", 800))
         self.input_h = int(model_cfg.get("input_h", 288))
         self.num_rows = int(model_cfg.get("num_rows", 72))
@@ -27,6 +28,11 @@ class DynLaneSeqS2(nn.Module):
         self.dynamic_offset_enabled = bool(local_window_cfg.get("enabled", False)) and str(
             local_window_cfg.get("aggregation", "mean")
         ).lower() in {"dynamic", "learned", "token"}
+        self.multi_scale_enabled = bool(multi_scale_cfg.get("enabled", False))
+        self.multi_scale_return_separate = bool(multi_scale_cfg.get("return_separate", False))
+        self.multi_scale_scales = list(multi_scale_cfg.get("scales", ["p2", "p3", "p4"]))
+        if self.multi_scale_enabled and self.dynamic_offset_enabled:
+            raise ValueError("multi_scale_evidence and dynamic local-window aggregation should be ablated separately")
         self.s2_mode = str(model_cfg.get("s2_mode", "direct")).lower()
         if self.s2_mode not in {"direct", "residual"}:
             raise ValueError(f"Unsupported S2 mode: {self.s2_mode}")
@@ -62,6 +68,24 @@ class DynLaneSeqS2(nn.Module):
             if self.dynamic_offset_enabled
             else None
         )
+        self.multi_scale_sampler = (
+            MultiScaleCurveAlignedSampler(
+                input_w=self.input_w,
+                input_h=self.input_h,
+                num_rows=self.num_rows,
+                dim=dim,
+                scales=self.multi_scale_scales,
+                gate_hidden_dim=int(multi_scale_cfg.get("gate_hidden_dim", dim)),
+                dropout=float(multi_scale_cfg.get("dropout", 0.0)),
+                zero_init_gate=bool(multi_scale_cfg.get("zero_init_gate", True)),
+                fusion_mode=str(multi_scale_cfg.get("fusion_mode", "weighted_sum")),
+                base_scale=str(multi_scale_cfg.get("base_scale", "p2")),
+                residual_scale_init=float(multi_scale_cfg.get("residual_scale_init", 0.0)),
+                initial_gate_bias=multi_scale_cfg.get("initial_gate_bias"),
+            )
+            if self.multi_scale_enabled and not self.multi_scale_return_separate
+            else None
+        )
         self.curriculum = SamplerCurriculum(
             noise_std=float(evidence_cfg.get("noise_std", 3.0)),
             detach_sample_coords=bool(evidence_cfg.get("detach_sample_coords", True)),
@@ -93,12 +117,31 @@ class DynLaneSeqS2(nn.Module):
 
     def sample_evidence(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor | dict[str, torch.Tensor],
         sample_x: torch.Tensor,
         queries: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.multi_scale_enabled and self.multi_scale_return_separate:
+            if not isinstance(features, dict):
+                raise TypeError("multi_scale_evidence.return_separate requires encoder multi_scale_features")
+            evidence = {}
+            debug = {}
+            for scale_name in self.multi_scale_scales:
+                if scale_name not in features:
+                    raise KeyError(f"Missing multi-scale feature: {scale_name}")
+                evidence[scale_name] = self.sampler(features[scale_name], sample_x)
+                debug[f"ms_raw_{scale_name}_abs"] = evidence[scale_name].abs().mean().detach()
+            return evidence, debug
+        if self.multi_scale_sampler is not None:
+            if not isinstance(features, dict):
+                raise TypeError("multi_scale_evidence requires encoder multi_scale_features")
+            return self.multi_scale_sampler(features, sample_x, queries, self.row_embedding.weight)
         if self.offset_fusion is None:
+            if not isinstance(features, torch.Tensor):
+                raise TypeError("single-scale evidence expects a feature tensor")
             return self.sampler(features, sample_x), {}
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("dynamic offset fusion expects a single-scale feature tensor")
         offset_samples = self.sampler.sample_local_window(features, sample_x)
         evidence, offset_debug = self.offset_fusion(offset_samples, queries, self.row_embedding.weight)
         return evidence, offset_debug
@@ -125,7 +168,8 @@ class DynLaneSeqS2(nn.Module):
             coarse = self.heads(q)
             coarse_x = coarse["pred_x_rows"]
             sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha=float(sampler_alpha))
-            evidence, offset_debug = self.sample_evidence(enc["features"], sample_x, q)
+            features_for_sampling = enc["multi_scale_features"] if self.multi_scale_enabled else enc["features"]
+            evidence, offset_debug = self.sample_evidence(features_for_sampling, sample_x, q)
             evidence, bridge_debug = self.bridge_evidence(evidence, q)
             coarse_x_embed_src = coarse_x.detach() if self.detach_coarse_x else coarse_x
             coarse_x_norm = (coarse_x_embed_src / float(self.input_w)).unsqueeze(-1)
@@ -174,7 +218,8 @@ class DynLaneSeqS2(nn.Module):
             coarse_logits = coarse_row["row_x_logits"]
             coarse_x = coarse_row["pred_x_rows"]
             sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha=float(sampler_alpha))
-            evidence, offset_debug = self.sample_evidence(enc["features"], sample_x, q)
+            features_for_sampling = enc["multi_scale_features"] if self.multi_scale_enabled else enc["features"]
+            evidence, offset_debug = self.sample_evidence(features_for_sampling, sample_x, q)
             evidence, bridge_debug = self.bridge_evidence(evidence, q)
             row = self.row_decoder(self.build_final_tokens(q, evidence), input_w=self.input_w)
             out = {
@@ -205,8 +250,11 @@ class DynLaneSeqS2(nn.Module):
             }
             if "row_visibility_logits" in row:
                 out["final"]["row_visibility_logits"] = row["row_visibility_logits"]
-        if "seg_logits" in enc:
-            out["seg_logits"] = enc["seg_logits"]
+        for key, value in enc.items():
+            if key.startswith("seg_logits"):
+                out[key] = value
         if return_features:
             out["features"] = enc["features"]
+            if "multi_scale_features" in enc:
+                out["multi_scale_features"] = enc["multi_scale_features"]
         return out

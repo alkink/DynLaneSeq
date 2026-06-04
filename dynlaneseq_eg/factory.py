@@ -61,6 +61,7 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         line_iou_radius=float(loss.get("line_iou_radius", 15.0)),
         w_seg=float(loss.get("w_seg", 0.0)),
         seg_pos_weight=float(loss.get("seg_pos_weight", 1.0)),
+        seg_extra_weights=dict(loss.get("seg_extra_weights", {})),
         w_quality=float(loss.get("w_quality", 0.0)),
     )
     if "smoothness_contiguous" in getattr(LossConfig, "__dataclass_fields__", {}):
@@ -167,6 +168,9 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
         is_evidence = evidence_lr is not None and (
             name.startswith("adapter.")
             or name.startswith("bridge.")
+            or name.startswith("multi_scale_sampler.")
+            or name.startswith("offset_fusion.")
+            or name.startswith("encoder.ms_proj.")
             or "evidence" in name
         )
         if is_evidence and is_no_decay:
