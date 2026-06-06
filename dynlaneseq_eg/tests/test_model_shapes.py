@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from dynlaneseq_eg.losses.loss_s2 import S2Criterion, S2LossConfig
 from dynlaneseq_eg.modeling import DynLaneSeqS0, DynLaneSeqS1, DynLaneSeqS2, DynLaneSeqS3
 from dynlaneseq_eg.modeling.evidence import (
     AsymmetricContextModulationBridge,
@@ -196,3 +197,87 @@ def test_s3_acm_forward_contract():
     assert "acm_scale" in out["evidence"]
     assert "seg_logits" in out
     assert "seg_logits_p3" in out
+
+
+def test_s3_final_decision_zero_init_preserves_coarse_exist():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    cfg["model"]["final_decision"] = {"enabled": True, "pooling": "range_mean", "detach_base": True}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert torch.allclose(out["final"]["exist_logits"], out["coarse"]["exist_logits"], atol=1e-6)
+    assert out["evidence"]["final_delta_exist_abs"].item() == 0.0
+
+
+def test_s3_active_corridor_forward_contract():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["evidence_gamma_init"] = 0.01
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["evidence"]["E_seq"].shape == (1, 20, 72, 256)
+    assert out["evidence"]["active_offset_logits"].shape == (1, 20, 72, 5)
+    assert out["evidence"]["active_pred_delta_x_rows"].abs().max() <= 16.0
+    assert out["evidence"]["active_offset_center_prob"].item() > 0.3
+
+
+def test_s3_active_corridor_quality_calibrator_starts_neutral():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["evidence_gamma_init"] = 0.01
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["quality_calibrator"] = {
+        "enabled": True,
+        "range_padding_px": 4.0,
+        "detach_row_hidden": True,
+        "quality_base": "none",
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert torch.allclose(out["final"]["exist_logits"], out["coarse"]["exist_logits"], atol=1e-6)
+    assert torch.allclose(out["final"]["quality_logits"], torch.zeros_like(out["final"]["quality_logits"]), atol=1e-6)
+    assert out["evidence"]["quality_calib_delta_exist_abs"].item() == 0.0
+    assert out["evidence"]["quality_calib_quality_abs"].item() == 0.0
+
+
+def test_active_corridor_offset_loss_is_finite_and_backprops():
+    cfg = _cfg("DynLaneSeqS2")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    model = DynLaneSeqS2(cfg)
+    images = torch.randn(1, 3, 288, 800)
+    targets = [
+        {
+            "x_rows": torch.full((1, 72), 120.0),
+            "valid_mask": torch.ones((1, 72), dtype=torch.bool),
+            "range_y": torch.tensor([[0.0, 287.0]]),
+            "x_bins": torch.full((1, 72), 30, dtype=torch.long),
+        }
+    ]
+    matches = [{"pred_indices": torch.tensor([0]), "gt_indices": torch.tensor([0])}]
+    outputs = model(images, targets=targets, matches=matches)
+    loss = S2Criterion(
+        S2LossConfig(w_active_offset_reg=1.0, w_active_offset_ce=0.1, active_offset_max=16.0)
+    )(outputs, targets, matches)
+    assert torch.isfinite(loss["loss_active_offset_reg"])
+    assert torch.isfinite(loss["loss_active_offset_ce"])
+    loss["loss_total"].backward()
+    assert model.active_corridor.offset_bias.grad is not None

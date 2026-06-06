@@ -89,6 +89,10 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
                 w_visibility=float(loss.get("w_visibility", 0.0)),
                 visibility_pos_weight=float(loss.get("visibility_pos_weight", 1.0)),
                 lambda_coarse=float(loss.get("lambda_coarse", 0.5)),
+                w_active_offset_reg=float(loss.get("w_active_offset_reg", 0.0)),
+                w_active_offset_ce=float(loss.get("w_active_offset_ce", 0.0)),
+                active_offset_max=float(loss.get("active_offset_max", 32.0)),
+                active_offset_label_smoothing=float(loss.get("active_offset_label_smoothing", 0.0)),
             )
         )
     if name == "DynLaneSeqS4":
@@ -170,6 +174,9 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or name.startswith("bridge.")
             or name.startswith("multi_scale_sampler.")
             or name.startswith("offset_fusion.")
+            or name.startswith("active_corridor.")
+            or name.startswith("active_corridor_sampler.")
+            or name.startswith("quality_calibrator.")
             or name.startswith("encoder.ms_proj.")
             or "evidence" in name
         )

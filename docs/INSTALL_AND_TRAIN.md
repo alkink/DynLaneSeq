@@ -181,6 +181,25 @@ python -m dynlaneseq_eg.tools.train \
   --init-from outputs/culane_s2_res34_strong_b16_from_s1_residual/iter_0075000.pt
 ```
 
+### S3 Active Corridor QualityCal from S2
+
+This is the current strongest S3 candidate. It initializes from the same S2
+checkpoint as S3-depthwise, then trains Active Corridor plus assignment-aware
+quality calibration.
+
+```bash
+bash scripts/run_culane_s3_qualitycal_from_s2_residual.sh
+```
+
+Manual equivalent:
+
+```bash
+python -m dynlaneseq_eg.tools.train \
+  --config dynlaneseq_eg/configs/culane_s3_active_corridor_qualitycal_res34_strong_b16_from_s2_residual.yaml \
+  --device cuda \
+  --init-from outputs/culane_s2_res34_strong_b16_from_s1_residual/iter_0075000.pt
+```
+
 ## 7. Evaluation
 
 S1 test evaluation:
@@ -220,6 +239,20 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --score-thresh 0.5 \
   --pred-dir outputs/culane_s3_depthwise_res34_strong_b16_from_s2_residual/culane_pred_test_75k_thr0.5 \
   --categories
+```
+
+S3 Active Corridor QualityCal validation sweep:
+
+```bash
+bash scripts/eval_culane_s3_qualitycal_val_sweep.sh
+```
+
+S3 Active Corridor QualityCal test evaluation, using the 2k-selected first
+candidate threshold:
+
+```bash
+CKPT_NAME=iter_0075000.pt SCORE_THRESH=0.55 QUALITY_POWER=0.5 \
+bash scripts/eval_culane_s3_qualitycal_test.sh
 ```
 
 ## 8. Optional: Train S0 From Scratch
