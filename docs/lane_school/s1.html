@@ -2,7 +2,7 @@
 <html lang="tr">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S1 Row Token Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="layout">
-<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav active" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="current.html">Güncel model</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav active" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
 <main>
 <header>
   <span class="pill">S1 derin anlatım</span><span class="pill">Query → 72 boncuk</span>
@@ -140,7 +140,27 @@ loss_token = cross_entropy(pred, tgt, ignore_index=-100)</code></pre>
 </section>
 
 <section>
-  <h2>8. S1’i Tek Kod Akışıyla Hatırla</h2>
+  <h2>8. Güncel S1: Residual Modda Kaba Çizgiyi Düzeltme</h2>
+  <p>Güncel S1 iki mod biliyor: <code>direct</code> ve <code>residual</code>. Residual modda row decoder sıfırdan x çizmek yerine S0/S1 kaba x skorunun üstüne düzeltme ekler.</p>
+  <pre><code># dynlaneseq_s1.py residual mode
+coarse = self.heads(q)
+coarse_x = coarse["pred_x_rows"]                  # [B,20,72]
+coarse_x_norm = coarse_x / input_w
+extra = self.coarse_x_embed(coarse_x_norm)        # [B,20,72,256]
+
+row = self.row_decoder(build_row_tokens(q, extra=extra))
+row_x_logits = coarse["row_x_logits"] + scale * row["row_x_logits"]
+pred_x_rows = soft_expected_x(row_x_logits)</code></pre>
+  <div class="grid two">
+    <div class="card"><h3>Array tarafı</h3><p><code>coarse_x_embed</code>, her row'daki kaba x'i 256 boyutlu token bilgisine çevirir. Yani row token artık “ben hangi y'deyim?” yanında “kaba x'im neresi?” bilgisini de taşır.</p></div>
+    <div class="card"><h3>Lane tarafı</h3><p>Model çizgiyi sıfırdan aramak yerine pembe taslak çizginin üstüne küçük düzeltme yapar. Bu daha stabil bir öğrenme yolu verir.</p></div>
+  </div>
+  <p class="mini-title">Local attention ne yapar?</p>
+  <p><code>RowTokenDecoder(local_attn_window)</code> açıksa bir row sadece yakın row'lara bakar. Lane üzerinde bu, alt sıradaki boncuğun çok uzaktaki üst boncuktan değil, yakın komşularından etkilenmesi demektir.</p>
+</section>
+
+<section>
+  <h2>9. S1’i Tek Kod Akışıyla Hatırla</h2>
   <pre><code>q = image-aware queries
   [B,20,256]
 

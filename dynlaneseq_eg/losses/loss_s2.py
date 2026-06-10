@@ -15,6 +15,7 @@ class S2LossConfig(S1LossConfig):
     w_active_offset_ce: float = 0.0
     active_offset_max: float = 32.0
     active_offset_label_smoothing: float = 0.0
+    cascade_matching: bool = False
 
 
 class S2Criterion(S1Criterion):
@@ -26,6 +27,7 @@ class S2Criterion(S1Criterion):
     def forward(self, outputs, targets, matches):
         final_losses = super().forward(outputs["final"], targets, matches)
         seg_loss = self.compute_seg_loss(outputs, targets)
+        centerline_loss = self.compute_centerline_loss(outputs, targets)
         coarse_point = self.compute_point_loss(outputs["coarse"], targets, matches)
         coarse_range = self.compute_range_loss(outputs["coarse"], targets, matches)
         coarse_line_iou = self.compute_line_iou_loss(outputs["coarse"], targets, matches)
@@ -35,6 +37,9 @@ class S2Criterion(S1Criterion):
         if self.cfg.w_seg > 0:
             final_losses["loss_total"] = final_losses["loss_total"] + self.cfg.w_seg * seg_loss
             final_losses["loss_seg"] = seg_loss
+        if self.cfg.w_centerline > 0:
+            final_losses["loss_total"] = final_losses["loss_total"] + self.cfg.w_centerline * centerline_loss
+            final_losses["loss_centerline"] = centerline_loss
         final_losses["loss_point_coarse"] = coarse_point
         final_losses["loss_range_coarse"] = coarse_range
         final_losses["loss_line_iou_coarse"] = coarse_line_iou
@@ -47,7 +52,7 @@ class S2Criterion(S1Criterion):
             + self.cfg.w_active_offset_reg * offset_losses["loss_active_offset_reg"]
             + self.cfg.w_active_offset_ce * offset_losses["loss_active_offset_ce"]
         )
-        return final_losses
+        return self.add_geometry_draft_loss(final_losses, outputs, targets, matches)
 
     def compute_active_offset_losses(self, outputs, targets, matches):
         evidence = outputs.get("evidence", {}) if isinstance(outputs, dict) else {}

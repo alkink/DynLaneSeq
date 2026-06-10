@@ -2,7 +2,7 @@
 <html lang="tr">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S4 Zoom Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="layout">
-<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav active" href="s4.html">5. S4: Zoom</a></aside>
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="current.html">Güncel model</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav active" href="s4.html">5. S4: Zoom</a></aside>
 <main>
 <header>
   <span class="pill">S4 derin anlatım</span><span class="pill">stage1_x → sample_x2 → stage2_x</span>
@@ -181,7 +181,16 @@ tokens2 = build_final_tokens(q, evidence2, stage_extra=hidden_scale * h1)</code>
 </section>
 
 <section>
-  <h2>9. S4’ü Tek Kod Akışıyla Hatırla</h2>
+  <h2>9. Güncel Not: Şu An Asıl Odak S3 Active Corridor Pipeline</h2>
+  <p>Güncel config'lerde güçlü hat daha çok <code>S3 + active_corridor + quality_calibrator + geometry_evidence</code> etrafında dönüyor. S4 hâlâ “ikinci bakış” fikrini anlatmak için önemli; ama güncel pratikte S3 zaten lane çevresinde zoom yapıp kaliteyi kalibre ettiği için S4'ün rolü daha deneysel okunmalı.</p>
+  <div class="grid two">
+    <div class="card"><h3>S3 zoom</h3><p>Tek stage içinde <code>center_x → active corridor → refined_x → bridge → quality</code>.</p></div>
+    <div class="card"><h3>S4 ikinci bakış</h3><p>Stage1 final çizgiyi alıp ikinci evidence okumasına koordinat yapar.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>10. S4’ü Tek Kod Akışıyla Hatırla</h2>
   <pre><code>stage1_out = S3_forward(images)
   stage1_x: [B,20,72]
   stage1_hidden: [B,20,72,256]

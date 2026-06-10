@@ -77,16 +77,18 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
 def output_debug_stats(outputs) -> dict[str, torch.Tensor]:
     stats = {}
     evidence = outputs.get("evidence") if isinstance(outputs, dict) else None
-    if isinstance(evidence, dict):
-        for key, value in evidence.items():
+    for evidence_dict in [evidence, outputs.get("geometry_evidence") if isinstance(outputs, dict) else None]:
+        if not isinstance(evidence_dict, dict):
+            continue
+        for key, value in evidence_dict.items():
             if isinstance(value, torch.Tensor) and value.numel() == 1:
                 stats[key] = value
-        if "evidence_scale" in evidence:
-            stats["evidence_scale"] = evidence["evidence_scale"]
-        if "sample_x_rows" in evidence:
-            stats["sample_x_mean"] = evidence["sample_x_rows"].detach().mean()
-        if "E_seq" in evidence:
-            stats["evidence_abs_mean"] = evidence["E_seq"].detach().abs().mean()
+        if "evidence_scale" in evidence_dict:
+            stats["evidence_scale"] = evidence_dict["evidence_scale"]
+        if "sample_x_rows" in evidence_dict:
+            stats["sample_x_mean"] = evidence_dict["sample_x_rows"].detach().mean()
+        if "E_seq" in evidence_dict:
+            stats["evidence_abs_mean"] = evidence_dict["E_seq"].detach().abs().mean()
     return stats
 
 

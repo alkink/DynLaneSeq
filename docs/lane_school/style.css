@@ -69,6 +69,14 @@ pre { margin: 0; white-space: pre-wrap; background: #071018; color: #d9efff; bor
 .wide-table th, .wide-table td { border: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }
 .wide-table th { background: #101923; color: var(--ink); }
 .wide-table td { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+th, td { border: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }
+th { background: #101923; color: var(--ink); }
+td { color: var(--muted); }
+.mini-title { color: var(--yellow); font-weight: 700; margin-top: 12px; }
+.phase-tag { display: inline-block; min-width: 38px; text-align: center; color: #061016; background: var(--yellow); border-radius: 5px; padding: 2px 6px; font-weight: 800; margin-right: 6px; }
+.formula { color: #d9efff; background: #071018; border: 1px solid #263746; border-radius: 8px; padding: 12px; margin: 10px 0; }
+.zoom-box { border: 2px solid var(--yellow); background: rgba(255,213,111,.08); }
 .tensor {
   display: grid;
   grid-template-columns: 160px 1fr;

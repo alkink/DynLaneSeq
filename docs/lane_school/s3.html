@@ -2,7 +2,7 @@
 <html lang="tr">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S3 Bridge Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="layout">
-<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav active" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="current.html">Güncel model</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav active" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
 <main>
 <header>
   <span class="pill">S3 derin anlatım</span><span class="pill">Evidence array'i değişir</span>
@@ -67,8 +67,8 @@ output:
 </section>
 
 <section>
-  <h2>4. Low-Rank Bridge Parametreleri Ne?</h2>
-  <p>Kodda default <code>dim=256</code>, <code>rank=16</code>, <code>kernel_size=3</code>. Query’den şu parametreler üretilir:</p>
+  <h2>4. Alternatif Bridge Tipi: Low-Rank Parametreleri Ne?</h2>
+  <p>Bu bölüm kodda hâlâ bulunan <code>low_rank_sequence</code> bridge tipini anlatır. Güncel güçlü config çoğunlukla <code>dynamic_depthwise_sequence</code> kullanıyor; onu aşağıda ayrıca anlattım. Low-rank'te <code>dim=256</code>, <code>rank=16</code>, <code>kernel_size=3</code>. Query’den şu parametreler üretilir:</p>
   <pre><code># low_rank_bridge.py
 self.param_dim = dim*rank + rank*dim + rank*kernel_size
                = 256*16 + 16*256 + 16*3
@@ -136,7 +136,7 @@ out = e + scale*delta  # [72,256]</code></pre>
 </section>
 
 <section>
-  <h2>7. Neden “Low-Rank”?</h2>
+  <h2>7. Neden “Low-Rank” Alternatifi Var?</h2>
   <p>Full bir 256→256 dönüşüm her lane için çok büyük ve pahalı olabilir. Low-rank yaklaşım, 256 kanalı 16 kanallı dar bir ara yoldan geçirir.</p>
   <div class="lane-board">
     <img src="../dynlaneseq_site/assets/images/s3-b.jpg" alt="Low rank visual">
@@ -171,7 +171,56 @@ out = e + scale*delta  # [72,256]</code></pre>
 </section>
 
 <section>
-  <h2>9. S3’ü Tek Kod Akışıyla Hatırla</h2>
+  <h2>9. Güncel S3: Dynamic Depthwise Bridge ile Lane Boyunca Temizleme</h2>
+  <p>Eski anlatımda low-rank bridge vardı. Güncel güçlü konfigürasyonda önemli bridge tipi <code>dynamic_depthwise_sequence</code>. Shape yine değişmez: <code>[B,20,72,256]</code> girer, <code>[B,20,72,256]</code> çıkar. Ama her lane kendi filtresini query’den üretir.</p>
+  <pre><code># dynamic_depthwise_bridge.py
+e = evidence[b, n]              # [72,256]
+params = generator(query[b,n])  # bu lane'e özel filtre
+filtered = depthwise_conv1d(e)  # 72 row boyunca komşu kanıtları süz
+out = e + bridge_scale * delta</code></pre>
+  <div class="lane-board">
+    <img src="assets/images/current-s3-quality.jpg" alt="S3 dynamic bridge">
+    <svg viewBox="0 0 800 288">
+      <path d="M175 270 C226 218 282 154 356 70" fill="none" stroke="#ffd56f" stroke-width="9" stroke-linecap="round" opacity=".34"/>
+      <path d="M180 270 C232 216 290 150 365 64" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+        <circle cx="195" cy="250" r="7"/><circle cx="238" cy="210" r="7"/><circle cx="292" cy="150" r="7"/><circle cx="350" cy="82" r="7"/>
+      </g>
+      <text x="28" y="36" fill="#ffd56f" font-size="17" font-family="Arial">evidence dizisi: 72 nokta x 256 kanal</text>
+      <text x="28" y="62" fill="#8af09f" font-size="17" font-family="Arial">bridge sonrası: aynı yol, daha temiz sinyal</text>
+    </svg>
+  </div>
+  <p class="mini-title">Bunu nasıl yapıyor?</p>
+  <p>Her row noktası tek başına karar vermiyor. Depthwise 1D filtre, lane boyunca komşu row'lardaki evidence'ı da hesaba katıyor. Yani p=40 noktasındaki sinyal, p=39 ve p=41 gibi yakın noktalarla birlikte temizleniyor.</p>
+</section>
+
+<section>
+  <h2>10. Güncel S3: Quality Calibrator ve Final Decision</h2>
+  <p>S3 çizgiyi ürettikten sonra “bu lane güvenilir mi?” sorusunu ayrıca düzeltir. Bunun için sadece x koordinatına değil, row hidden, confidence ve active corridor istatistiklerine bakar.</p>
+  <pre><code>pooled_hidden = pool(row_hidden, range_mask)
+stats = quality_scalar_stats(
+  row_conf,
+  active_offset_entropy,
+  active_offset_max_prob,
+  abs_delta,
+  final_minus_coarse,
+)
+delta_exist, delta_quality = quality_calibrator(pooled_hidden, stats)
+exist_logits = exist_logits + delta_exist
+quality_logits = quality_logits + delta_quality</code></pre>
+  <table>
+    <thead><tr><th>İstatistik</th><th>Lane üzerinde anlamı</th></tr></thead>
+    <tbody>
+      <tr><td><code>active_offset_entropy</code></td><td>Koridor seçimi kararsız mı? Her offset eşit gibiyse model emin değildir.</td></tr>
+      <tr><td><code>active_offset_max_prob</code></td><td>Bir offset açıkça seçiliyor mu? Seçiliyorsa kanıt daha net olabilir.</td></tr>
+      <tr><td><code>final_minus_coarse</code></td><td>Final çizgi kaba çizgiden çok mu uzaklaştı? Çok büyük fark risk sinyali olabilir.</td></tr>
+      <tr><td><code>row_conf</code></td><td>Row row x kararları keskin mi, yayvan mı?</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>11. S3’ü Tek Kod Akışıyla Hatırla</h2>
   <pre><code>evidence
   [B,20,72,256]
   S2 sampler'dan gelen ham lane üstü kanıt

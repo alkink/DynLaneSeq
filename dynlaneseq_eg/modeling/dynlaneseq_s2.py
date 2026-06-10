@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from .common import soft_expected_x
-from .dynlaneseq_s0 import DynLaneSeqEncoder
+from .dynlaneseq_s0 import DynLaneSeqEncoder, GeometryGuidedQueryRefiner
 from .evidence import CurveAlignedSampler, DynamicOffsetFusion, EvidenceAdapter, MultiScaleCurveAlignedSampler, SamplerCurriculum
 from .heads_s0 import ExistenceHead, RangeHead, S0Heads
 from .row_token_decoder import RowTokenDecoder
@@ -88,12 +88,17 @@ class DynLaneSeqS2(nn.Module):
         evidence_cfg = model_cfg.get("evidence_sampler", {})
         multi_scale_cfg = model_cfg.get("multi_scale_evidence", {})
         active_cfg = model_cfg.get("active_corridor", {})
+        geometry_cfg = model_cfg.get("s0_geometry_evidence", {})
+        oracle_cfg = model_cfg.get("oracle_coarse", {})
         self.input_w = int(model_cfg.get("input_w", 800))
         self.input_h = int(model_cfg.get("input_h", 288))
         self.num_rows = int(model_cfg.get("num_rows", 72))
         self.x_bins = int(model_cfg.get("x_bins", 200))
         dim = int(model_cfg.get("dim", 256))
         self.active_corridor_enabled = bool(active_cfg.get("enabled", False))
+        self.oracle_coarse_enabled = bool(oracle_cfg.get("enabled", False))
+        self.oracle_score_logit = float(oracle_cfg.get("score_logit", 8.0))
+        self.oracle_bg_logit = float(oracle_cfg.get("background_logit", 8.0))
         self.active_corridor_detach_center = bool(active_cfg.get("detach_center", True))
         self.active_corridor_detach_refined_x = bool(active_cfg.get("detach_refined_x_for_decoder", False))
         local_window_cfg = evidence_cfg.get("local_window", {})
@@ -108,6 +113,10 @@ class DynLaneSeqS2(nn.Module):
         self.s2_mode = str(model_cfg.get("s2_mode", "direct")).lower()
         if self.s2_mode not in {"direct", "residual"}:
             raise ValueError(f"Unsupported S2 mode: {self.s2_mode}")
+        if bool(geometry_cfg.get("enabled", False)) and bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False)):
+            raise ValueError("Use either dynamic_evidence v1 or s0_geometry_evidence v2, not both")
+        if bool(geometry_cfg.get("enabled", False)) and self.s2_mode != "residual":
+            raise ValueError("s0_geometry_evidence currently requires residual S2/S3 mode")
         self.encoder = DynLaneSeqEncoder(cfg)
         if self.s2_mode == "residual":
             self.heads = S0Heads(
@@ -187,6 +196,23 @@ class DynLaneSeqS2(nn.Module):
             detach_sample_coords=bool(evidence_cfg.get("detach_sample_coords", True)),
             input_w=self.input_w,
         )
+        self.s0_geometry_detach_draft = bool(geometry_cfg.get("detach_draft_x", True))
+        self.s0_geometry_refiner = (
+            GeometryGuidedQueryRefiner(
+                dim=dim,
+                input_h=self.input_h,
+                input_w=self.input_w,
+                num_rows=self.num_rows,
+                hidden_dim=int(geometry_cfg.get("hidden_dim", dim)),
+                dropout=float(geometry_cfg.get("dropout", 0.0)),
+                pooling=str(geometry_cfg.get("pooling", "mean")),
+                local_window_enabled=bool(geometry_cfg.get("local_window_enabled", False)),
+                offsets_px=geometry_cfg.get("offsets_px"),
+                local_reduce=str(geometry_cfg.get("local_reduce", "max")),
+            )
+            if bool(geometry_cfg.get("enabled", False))
+            else None
+        )
         self.adapter = EvidenceAdapter(dim=dim, gamma_init=float(model_cfg.get("evidence_gamma_init", 0.1)))
         self.row_embedding = nn.Embedding(self.num_rows, dim)
         nn.init.normal_(self.row_embedding.weight, std=0.02)
@@ -209,6 +235,51 @@ class DynLaneSeqS2(nn.Module):
         b, n, d = queries.shape
         row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
         return queries.unsqueeze(2) + row_emb
+
+    def build_oracle_coarse(
+        self,
+        queries: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        b, n, _ = queries.shape
+        device = queries.device
+        dtype = queries.dtype
+        p = self.num_rows
+        x_bins = self.x_bins
+        lane_logit = float(self.oracle_score_logit)
+        bg_logit = float(self.oracle_bg_logit)
+        exist_logits = queries.new_empty((b, n, 2))
+        exist_logits[..., 0] = -bg_logit
+        exist_logits[..., 1] = bg_logit
+        pred_x_rows = queries.new_zeros((b, n, p))
+        range_norm = queries.new_zeros((b, n, 2))
+        row_x_logits = queries.new_full((b, n, p, x_bins), -lane_logit)
+        quality_logits = queries.new_full((b, n), -bg_logit)
+        for bi, target in enumerate(targets):
+            x_rows = target["x_rows"].to(device=device, dtype=dtype)
+            valid = target["valid_mask"].to(device=device).bool()
+            x_bin_targets = target["x_bins"].to(device=device).long()
+            range_y = target["range_y"].to(device=device, dtype=dtype)
+            lanes = min(int(x_rows.shape[0]), n)
+            if lanes <= 0:
+                continue
+            exist_logits[bi, :lanes, 0] = lane_logit
+            exist_logits[bi, :lanes, 1] = -lane_logit
+            pred_x_rows[bi, :lanes] = x_rows[:lanes].clamp(0, self.input_w - 1)
+            range_norm[bi, :lanes] = (range_y[:lanes] / float(self.input_h)).clamp(0.0, 1.0)
+            quality_logits[bi, :lanes] = lane_logit
+            bins = x_bin_targets[:lanes].clamp(0, x_bins - 1)
+            row_x_logits[bi, :lanes].scatter_(-1, bins.unsqueeze(-1), lane_logit)
+            row_x_logits[bi, :lanes] = row_x_logits[bi, :lanes].masked_fill(~valid[:lanes].unsqueeze(-1), 0.0)
+        return {
+            "exist_logits": exist_logits,
+            "row_x_logits": row_x_logits,
+            "pred_x_rows": pred_x_rows,
+            "range_raw": range_norm,
+            "range_norm": range_norm,
+            "quality_logits": quality_logits,
+            "quality_pred_x_rows": pred_x_rows,
+        }
 
     def bridge_evidence(self, evidence: torch.Tensor, queries: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return evidence, {}
@@ -286,8 +357,25 @@ class DynLaneSeqS2(nn.Module):
     ) -> dict[str, dict[str, torch.Tensor]]:
         enc = self.encoder.forward_features(images)
         q = enc["queries"]
+        geometry_debug = None
+        q_pre_geometry = None
+        geometry_draft = None
         if self.s2_mode == "residual":
-            coarse = self.heads(q)
+            if self.s0_geometry_refiner is not None:
+                q_pre_geometry = q
+                geometry_draft = self.heads(q)
+                geometry_x = (
+                    geometry_draft["pred_x_rows"].detach()
+                    if self.s0_geometry_detach_draft
+                    else geometry_draft["pred_x_rows"]
+                )
+                q, geometry_debug = self.s0_geometry_refiner(q, enc["features"], geometry_x)
+            if self.oracle_coarse_enabled:
+                if targets is None:
+                    raise ValueError("oracle_coarse.enabled requires targets in forward")
+                coarse = self.build_oracle_coarse(q, targets)
+            else:
+                coarse = self.heads(q)
             coarse_x = coarse["pred_x_rows"]
             sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha=float(sampler_alpha))
             features_for_sampling = enc["multi_scale_features"] if self.multi_scale_enabled else enc["features"]
@@ -335,10 +423,15 @@ class DynLaneSeqS2(nn.Module):
                     "evidence_scale": self.adapter.gamma,
                     **offset_debug,
                     **bridge_debug,
+                    **(geometry_debug or {}),
                 },
                 "queries": q,
                 "row_delta_logits": row["row_x_logits"],
             }
+            if geometry_debug is not None:
+                out["queries_pre_geometry"] = q_pre_geometry
+                out["geometry_evidence"] = geometry_debug
+                out["s0_geometry_draft"] = geometry_draft
             if "row_visibility_logits" in row:
                 out["final"]["row_visibility_logits"] = row["row_visibility_logits"]
         else:
@@ -381,8 +474,12 @@ class DynLaneSeqS2(nn.Module):
             if "row_visibility_logits" in row:
                 out["final"]["row_visibility_logits"] = row["row_visibility_logits"]
         for key, value in enc.items():
-            if key.startswith("seg_logits"):
+            if key.startswith("seg_logits") or key == "centerline_logits":
                 out[key] = value
+        if "dynamic_evidence" in enc:
+            out["dynamic_evidence"] = enc["dynamic_evidence"]
+        if "dynamic_proposals" in enc:
+            out["dynamic_proposals"] = enc["dynamic_proposals"]
         if return_features:
             out["features"] = enc["features"]
             if "multi_scale_features" in enc:

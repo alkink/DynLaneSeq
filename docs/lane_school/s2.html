@@ -2,7 +2,7 @@
 <html lang="tr">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S2 Evidence Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="layout">
-<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav active" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="current.html">Güncel model</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav active" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
 <main>
 <header>
   <span class="pill">S2 derin anlatım</span><span class="pill">sample_x → E_seq</span>
@@ -159,7 +159,49 @@ return self.gamma * self.net(evidence)</code></pre>
 </section>
 
 <section>
-  <h2>9. S2’yi Tek Kod Akışıyla Hatırla</h2>
+  <h2>9. Güncel S2: Active Corridor ile Sağ-Sol Piksel Arama</h2>
+  <p>Güncel S2/S3'te evidence sadece kaba çizginin tam üstünden okunmayabilir. <code>ActiveCorridorSearch</code> kaba x'in sağında ve solunda küçük bir koridor açar.</p>
+  <pre><code># dynlaneseq_s2.py
+offsets = [-32,-24,-16,-8,0,8,16,24,32]
+offset_samples = sampler.sample_local_window(features, center_x)
+# [B,20,72,9,256]
+
+evidence, pred_delta, weights = active_corridor(offset_samples, q)
+refined_x = center_x + pred_delta</code></pre>
+  <div class="lane-board">
+    <img src="assets/images/current-s3-corridor.jpg" alt="S2 active corridor">
+    <svg viewBox="0 0 800 288">
+      <path d="M185 270 C230 218 282 156 350 78" fill="none" stroke="#ff83b7" stroke-width="5" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <path d="M145 270 C195 218 250 156 312 78" fill="none" stroke="#ffd56f" stroke-width="3" opacity=".7"/>
+      <path d="M225 270 C268 218 314 156 390 78" fill="none" stroke="#ffd56f" stroke-width="3" opacity=".7"/>
+      <path d="M198 270 C240 216 290 152 360 72" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#ff83b7" font-size="17" font-family="Arial">center_x: kaba lane</text>
+      <text x="28" y="62" fill="#ffd56f" font-size="17" font-family="Arial">offset_samples: x-32..x+32 noktaları</text>
+      <text x="28" y="88" fill="#8af09f" font-size="17" font-family="Arial">refined_x: ağırlıklı offset sonucu</text>
+    </svg>
+  </div>
+  <p><code>weights[b,n,p,o]</code> şu sorunun cevabıdır: “n’inci lane’in p’inci row'unda, o offset noktasına ne kadar güveniyorum?” Bu yüzden S2 artık sadece “çizgi üstünden oku” değil, “çizgi çevresinde küçük arama yap” haline geldi.</p>
+</section>
+
+<section>
+  <h2>10. Güncel S2: Multi-Scale Sampler Ne Ekliyor?</h2>
+  <p>Feature map tek çözünürlükten gelmek zorunda değil. <code>MultiScaleCurveAlignedSampler</code> aynı lane noktasını <code>p2</code>, <code>p3</code>, <code>p4</code> gibi farklı FPN seviyelerinden okur ve query+row bilgisiyle hangisine daha çok güveneceğini seçer.</p>
+  <pre><code>sampled = [
+  sample(p2, sample_x),  # daha detaylı, daha lokal
+  sample(p3, sample_x),  # orta
+  sample(p4, sample_x),  # daha geniş bağlam
+]
+gate = softmax(gate_mlp(query + row_embedding))
+evidence = sum(gate * sampled)</code></pre>
+  <div class="grid three">
+    <div class="card"><h3><code>p2</code></h3><p>Yakın detay. Şerit boyasının ince kenarını daha iyi taşıyabilir.</p></div>
+    <div class="card"><h3><code>p3</code></h3><p>Denge. Hem detay hem bağlam.</p></div>
+    <div class="card"><h3><code>p4</code></h3><p>Geniş bağlam. Yolun genel yönünü daha iyi taşıyabilir.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>11. S2’yi Tek Kod Akışıyla Hatırla</h2>
   <pre><code>q
   [B,20,256]
   görüntüye bakmış lane adayları

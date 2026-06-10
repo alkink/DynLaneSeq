@@ -94,3 +94,25 @@ class SegAuxHead(nn.Module):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         logits = self.net(features)
         return F.interpolate(logits, size=(self.input_h, self.input_w), mode="bilinear", align_corners=False)
+
+
+class CenterlineAuxHead(nn.Module):
+    """Row/bin centerline heatmap supervision head used only during training."""
+
+    def __init__(self, dim: int = 256, num_rows: int = 72, x_bins: int = 200, dropout: float = 0.1):
+        super().__init__()
+        self.num_rows = int(num_rows)
+        self.x_bins = int(x_bins)
+        self.net = nn.Sequential(
+            nn.Dropout2d(dropout),
+            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // 2, 1, kernel_size=1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        logits = self.net(features)
+        if logits.shape[-2:] != (self.num_rows, self.x_bins):
+            logits = F.interpolate(logits, size=(self.num_rows, self.x_bins), mode="bilinear", align_corners=False)
+        return logits

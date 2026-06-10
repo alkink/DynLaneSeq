@@ -23,7 +23,10 @@ Install PyTorch. Pick the CUDA wheel/channel that matches your machine. This is
 the common CUDA 12.1 conda install:
 
 ```bash
-conda install -y pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
+python -m pip uninstall -y torch torchvision torchaudio
+python -m pip cache purge
+
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Install the project dependencies and editable package:
@@ -253,6 +256,19 @@ candidate threshold:
 ```bash
 CKPT_NAME=iter_0075000.pt SCORE_THRESH=0.55 QUALITY_POWER=0.5 \
 bash scripts/eval_culane_s3_qualitycal_test.sh
+```
+
+S3 QualityCal no-exist + LineIoU matcher + RandomShadow full training:
+
+```bash
+bash scripts/run_culane_s3_qualitycal_noexist_lineiou_shadow_from_s2_residual.sh
+```
+
+Evaluate that run:
+
+```bash
+SCORE_THRESH=0.55 QUALITY_POWER=0.5 \
+bash scripts/eval_culane_s3_qualitycal_noexist_lineiou_shadow_test.sh
 ```
 
 ## 8. Optional: Train S0 From Scratch

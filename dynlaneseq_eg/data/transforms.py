@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import torch
 
 
@@ -27,6 +27,12 @@ class TransformConfig:
     affine_rotate_deg: float = 0.0
     affine_scale_min: float = 1.0
     affine_scale_max: float = 1.0
+    random_shadow_prob: float = 0.0
+    random_shadow_min_opacity: float = 0.25
+    random_shadow_max_opacity: float = 0.55
+    random_shadow_min_vertices: int = 3
+    random_shadow_max_vertices: int = 6
+    random_shadow_roi_start_y: float = 0.25
 
 
 class LaneTransforms:
@@ -77,6 +83,8 @@ class LaneTransforms:
             arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
             order = np.random.permutation(3)
             image = Image.fromarray(arr[..., order], mode="RGB")
+        if training and self.cfg.random_shadow_prob > 0 and np.random.random() < self.cfg.random_shadow_prob:
+            image = self._apply_random_shadow(image)
 
         image = image.convert("RGB").resize(
             (self.cfg.input_w, self.cfg.input_h),
@@ -153,3 +161,25 @@ class LaneTransforms:
         hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + hue_delta) % 256).astype(np.uint8)
         hsv[..., 1] = np.clip(hsv[..., 1].astype(np.float32) * sat_scale, 0, 255).astype(np.uint8)
         return Image.fromarray(hsv, mode="HSV").convert("RGB")
+
+    def _apply_random_shadow(self, image: Image.Image) -> Image.Image:
+        image = image.convert("RGB")
+        w, h = image.size
+        roi_start = int(np.clip(self.cfg.random_shadow_roi_start_y, 0.0, 1.0) * h)
+        min_vertices = max(3, int(self.cfg.random_shadow_min_vertices))
+        max_vertices = max(min_vertices, int(self.cfg.random_shadow_max_vertices))
+        num_vertices = int(np.random.randint(min_vertices, max_vertices + 1))
+        points = []
+        for _ in range(num_vertices):
+            x = int(np.random.randint(0, max(w, 1)))
+            y = int(np.random.randint(max(0, min(roi_start, h - 1)), max(h, 1)))
+            points.append((x, y))
+        min_opacity = max(0.0, self.cfg.random_shadow_min_opacity)
+        max_opacity = min(1.0, self.cfg.random_shadow_max_opacity)
+        if max_opacity < min_opacity:
+            max_opacity = min_opacity
+        opacity = float(np.random.uniform(min_opacity, max_opacity))
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        draw.polygon(points, fill=(0, 0, 0, int(255 * opacity)))
+        return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")

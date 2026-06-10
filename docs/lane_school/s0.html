@@ -2,7 +2,7 @@
 <html lang="tr">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>S0 Tensor Mikroskobu</title><link rel="stylesheet" href="style.css"></head>
 <body><div class="layout">
-<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav active" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
+<aside class="menu"><a class="brand" href="index.html"><strong>Lane School</strong><span>Koddan lane'e</span></a><a class="nav" href="index.html">0. Yol haritası</a><a class="nav" href="current.html">Güncel model</a><a class="nav" href="query.html">Query mikroskobu</a><a class="nav active" href="s0.html">1. S0: Geometry</a><a class="nav" href="s1.html">2. S1: Row token</a><a class="nav" href="s2.html">3. S2: Evidence</a><a class="nav" href="s3.html">4. S3: Bridge</a><a class="nav" href="s4.html">5. S4: Zoom</a></aside>
 <main>
 <header>
   <span class="pill">S0 derin anlatım</span><span class="pill">Tensor → çizgi</span>
@@ -156,7 +156,56 @@ cost = 2*cost_obj + 5*cost_point + 1*cost_range</code></pre>
 </section>
 
 <section>
-  <h2>7. S0’ı Tek Kod Akışıyla Hatırla</h2>
+  <h2>7. Güncel S0: Geometry Evidence Query'yi Nasıl Düzeltir?</h2>
+  <p>Yeni kodda S0 sadece <code>q → heads → pred_x_rows</code> yapmıyor. İstenirse önce bir taslak çizgi çıkarıyor, sonra bu taslak çizginin üstünden feature okuyup query'yi güncelliyor.</p>
+  <pre><code># dynlaneseq_s0.py
+draft = self.heads(q)
+sample_x = draft["pred_x_rows"]              # [B,20,72]
+q_final, geometry_debug = self.s0_geometry_refiner(q, features, sample_x)
+final = self.heads(q_final)</code></pre>
+  <div class="lane-board">
+    <img src="assets/images/current-s3-geometry.jpg" alt="S0 geometry evidence">
+    <svg viewBox="0 0 800 288">
+      <path d="M160 270 C218 220 272 154 350 76" fill="none" stroke="#ff83b7" stroke-width="6" stroke-linecap="round" stroke-dasharray="10 8"/>
+      <g fill="#ffd56f" stroke="#070a0d" stroke-width="2">
+        <circle cx="184" cy="248" r="8"/><circle cx="232" cy="208" r="8"/><circle cx="286" cy="146" r="8"/><circle cx="338" cy="88" r="8"/>
+      </g>
+      <path d="M168 270 C226 217 281 150 360 70" fill="none" stroke="#8af09f" stroke-width="5" stroke-linecap="round"/>
+      <text x="28" y="36" fill="#ff83b7" font-size="17" font-family="Arial">draft pred_x_rows: ilk taslak</text>
+      <text x="28" y="62" fill="#ffd56f" font-size="17" font-family="Arial">geometry sampler: taslak üstünden kanıt okur</text>
+      <text x="28" y="88" fill="#8af09f" font-size="17" font-family="Arial">q_final: bu kanıtla güncellenmiş query</text>
+    </svg>
+  </div>
+  <div class="grid two">
+    <div class="card"><h3><code>sample_x[b,n,p]</code></h3><p>n’inci lane adayının p’inci row’daki x koordinatı. Görselde sarı noktanın yatay yeri.</p></div>
+    <div class="card"><h3><code>geometry_evidence</code></h3><p>O sarı noktalardan okunan feature'ların query’ye geri beslenmiş hali. Query artık kendi çizdiği çizgiden haber alır.</p></div>
+  </div>
+  <p class="mini-title">Bu hangi sorunu by-pass ediyor?</p>
+  <p>Saf query bazen “hangi lane'i temsil ediyorum?” konusunda kararsız kalır. Geometry refiner bunu tamamen çözmez; problemi “soyut query kararsızlığı”ndan “taslak çizgi üstündeki kanıt query'yi nasıl değiştirsin?” sorusuna çevirir.</p>
+</section>
+
+<section>
+  <h2>8. Güncel S0 Heads: Kalite, Segmentasyon ve Centerline</h2>
+  <p>Güncel <code>S0Heads</code> artık sadece x ve existence üretmiyor. Ek yardımcı başlıklar backbone'a daha iyi yol/şerit algısı öğretmek için kullanılıyor.</p>
+  <pre><code># heads_s0.py
+exist_logits  # [B,20,2]       lane var mı?
+row_x_logits  # [B,20,72,200]  her row için x kutusu
+quality_logits# [B,20]         bu lane tahmini ne kadar iyi?
+
+seg_aux_logits     # [B,1,288,800]   piksel piksel lane maskesi
+centerline_logits  # [B,1,72,200]    row/bin heatmap</code></pre>
+  <table>
+    <thead><tr><th>Kod objesi</th><th>Lane üzerinde ne?</th><th>Neden var?</th></tr></thead>
+    <tbody>
+      <tr><td><code>quality_logits</code></td><td>Çizilen lane'e güven skoru.</td><td>İyi çizgiye yüksek, kötü çizgiye düşük skor öğretir.</td></tr>
+      <tr><td><code>seg_aux_logits</code></td><td>Tüm görüntüde lane maskesi.</td><td>Feature map'in yol/şerit dokusunu görmesini güçlendirir.</td></tr>
+      <tr><td><code>centerline_logits</code></td><td>72 row x 200 bin üstünde şerit merkezi heatmap'i.</td><td>Row tabanlı x kararını destekler.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>9. S0’ı Tek Kod Akışıyla Hatırla</h2>
   <pre><code>images [B,3,288,800]
   ↓ backbone + fpn
 features [B,256,72,200]

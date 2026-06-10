@@ -39,6 +39,8 @@ def build_matcher(cfg: dict[str, Any]) -> HungarianMatcherS0:
             lambda_obj=float(m.get("lambda_obj", 2.0)),
             lambda_point=float(m.get("lambda_point", 5.0)),
             lambda_range=float(m.get("lambda_range", 1.0)),
+            lambda_line_iou=float(m.get("lambda_line_iou", 0.0)),
+            line_iou_radius=float(m.get("line_iou_radius", cfg.get("loss", {}).get("line_iou_radius", 7.5))),
             input_w=int(model.get("input_w", 800)),
             input_h=int(model.get("input_h", 288)),
         )
@@ -63,12 +65,22 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         seg_pos_weight=float(loss.get("seg_pos_weight", 1.0)),
         seg_extra_weights=dict(loss.get("seg_extra_weights", {})),
         w_quality=float(loss.get("w_quality", 0.0)),
+        w_centerline=float(loss.get("w_centerline", 0.0)),
+        centerline_sigma_bins=float(loss.get("centerline_sigma_bins", 1.5)),
+        centerline_pos_weight=float(loss.get("centerline_pos_weight", 1.0)),
+        w_dynamic_proposal_heatmap=float(loss.get("w_dynamic_proposal_heatmap", 0.0)),
+        w_dynamic_proposal_x=float(loss.get("w_dynamic_proposal_x", 0.0)),
+        w_dynamic_proposal_range=float(loss.get("w_dynamic_proposal_range", 0.0)),
+        dynamic_proposal_sigma_bins=float(loss.get("dynamic_proposal_sigma_bins", 1.5)),
+        dynamic_proposal_seed_radius_bins=int(loss.get("dynamic_proposal_seed_radius_bins", 2)),
+        dynamic_proposal_heatmap_pos_weight=float(loss.get("dynamic_proposal_heatmap_pos_weight", 1.0)),
+        lambda_geometry_draft=float(loss.get("lambda_geometry_draft", 0.0)),
     )
     if "smoothness_contiguous" in getattr(LossConfig, "__dataclass_fields__", {}):
         base_kwargs["smoothness_contiguous"] = bool(loss.get("smoothness_contiguous", True))
     name = model.get("name", "DynLaneSeqS0")
     if name == "DynLaneSeqS0":
-        return S0Criterion(LossConfig(**base_kwargs))
+        return S0Criterion(LossConfig(**base_kwargs, lambda_coarse=float(loss.get("lambda_coarse", 0.0))))
     if name == "DynLaneSeqS1":
         return S1Criterion(
             S1LossConfig(
@@ -81,20 +93,22 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         )
     if name in {"DynLaneSeqS2", "DynLaneSeqS3"}:
         cls = S2Criterion if name == "DynLaneSeqS2" else S3Criterion
-        return cls(
-            S2LossConfig(
-                **base_kwargs,
-                w_token=float(loss.get("w_token", 0.5)),
-                token_label_smoothing=float(loss.get("token_label_smoothing", 0.0)),
-                w_visibility=float(loss.get("w_visibility", 0.0)),
-                visibility_pos_weight=float(loss.get("visibility_pos_weight", 1.0)),
-                lambda_coarse=float(loss.get("lambda_coarse", 0.5)),
-                w_active_offset_reg=float(loss.get("w_active_offset_reg", 0.0)),
-                w_active_offset_ce=float(loss.get("w_active_offset_ce", 0.0)),
-                active_offset_max=float(loss.get("active_offset_max", 32.0)),
-                active_offset_label_smoothing=float(loss.get("active_offset_label_smoothing", 0.0)),
-            )
+        s2_loss_cfg = S2LossConfig(
+            **base_kwargs,
+            w_token=float(loss.get("w_token", 0.5)),
+            token_label_smoothing=float(loss.get("token_label_smoothing", 0.0)),
+            w_visibility=float(loss.get("w_visibility", 0.0)),
+            visibility_pos_weight=float(loss.get("visibility_pos_weight", 1.0)),
+            lambda_coarse=float(loss.get("lambda_coarse", 0.5)),
+            w_active_offset_reg=float(loss.get("w_active_offset_reg", 0.0)),
+            w_active_offset_ce=float(loss.get("w_active_offset_ce", 0.0)),
+            active_offset_max=float(loss.get("active_offset_max", 32.0)),
+            active_offset_label_smoothing=float(loss.get("active_offset_label_smoothing", 0.0)),
+            cascade_matching=bool(loss.get("cascade_matching", False)),
         )
+        if name == "DynLaneSeqS3" and bool(loss.get("cascade_matching", False)):
+            return cls(s2_loss_cfg, matcher=build_matcher(cfg))
+        return cls(s2_loss_cfg)
     if name == "DynLaneSeqS4":
         return S4Criterion(
             S4LossConfig(
@@ -177,8 +191,11 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or name.startswith("active_corridor.")
             or name.startswith("active_corridor_sampler.")
             or name.startswith("quality_calibrator.")
+            or name.startswith("s0_geometry_refiner.")
+            or name.startswith("encoder.dynamic_proposal.")
             or name.startswith("encoder.ms_proj.")
             or "evidence" in name
+            or "dynamic_proposal" in name
         )
         if is_evidence and is_no_decay:
             evidence_no_decay.append(param)

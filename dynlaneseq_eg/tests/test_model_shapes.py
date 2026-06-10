@@ -45,6 +45,174 @@ def test_s0_forward_shapes():
     assert out["range_norm"].shape == (1, 20, 2)
 
 
+def test_centerline_aux_propagates_to_s3_outputs():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["centerline_aux"] = {"enabled": True, "dropout": 0.0}
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["centerline_logits"].shape == (1, 1, 72, 200)
+
+
+def test_dynamic_evidence_starts_as_query_identity():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dynamic_evidence"] = {
+        "enabled": True,
+        "num_points": 5,
+        "hidden_dim": 64,
+        "dropout": 0.0,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        enc = model.encoder.forward_features(torch.randn(1, 3, 288, 800))
+    assert enc["queries"].shape == (1, 20, 256)
+    assert torch.allclose(enc["queries"], enc["queries_pre_dynamic"], atol=1e-6)
+    assert enc["dynamic_evidence"]["dynamic_evidence_refs"].shape == (1, 20, 5, 2)
+    assert enc["dynamic_evidence"]["dynamic_evidence_delta_abs"].item() == 0.0
+
+
+def test_dynamic_proposal_outputs_are_isolated_from_static_slots():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dynamic_proposal"] = {
+        "enabled": True,
+        "top_k": 7,
+        "hidden_dim": 64,
+        "heatmap_bias_init": -4.6,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["pred_x_rows"].shape == (1, 20, 72)
+    proposals = out["dynamic_proposals"]
+    assert proposals["stage"]["pred_x_rows"].shape == (1, 7, 72)
+    assert proposals["stage"]["range_norm"].shape == (1, 7, 2)
+    assert proposals["stage"]["exist_logits"].shape == (1, 7, 2)
+    assert proposals["queries"].shape == (1, 7, 256)
+    assert proposals["dense"]["heatmap_logits"].shape == (1, 1, 72, 200)
+    assert proposals["dense"]["x_rows"].shape == (1, 72, 72, 200)
+    assert proposals["dense"]["range_norm"].shape == (1, 2, 72, 200)
+
+
+def test_dynamic_evidence_propagates_to_s3_outputs():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["dynamic_evidence"] = {"enabled": True, "num_points": 5, "hidden_dim": 64}
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["final"]["pred_x_rows"].shape == (1, 20, 72)
+    assert out["dynamic_evidence"]["dynamic_evidence_refs"].shape == (1, 20, 5, 2)
+    assert out["dynamic_evidence"]["dynamic_evidence_delta_abs"].item() == 0.0
+
+
+def test_s0_geometry_evidence_starts_as_shared_head_identity():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["s0_geometry_evidence"] = {
+        "enabled": True,
+        "hidden_dim": 64,
+        "dropout": 0.0,
+        "pooling": "mean_max",
+        "local_window_enabled": True,
+        "offsets_px": [-16.0, -8.0, 0.0, 8.0, 16.0],
+        "local_reduce": "max",
+        "detach_draft_x": True,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert "coarse" in out and "final" in out
+    assert torch.allclose(out["final"]["exist_logits"], out["coarse"]["exist_logits"], atol=1e-6)
+    assert torch.allclose(out["final"]["row_x_logits"], out["coarse"]["row_x_logits"], atol=1e-6)
+    assert torch.allclose(out["queries"], out["queries_pre_geometry"], atol=1e-6)
+    assert out["geometry_evidence"]["s0_geometry_delta_abs"].item() == 0.0
+    assert out["geometry_evidence"]["s0_geometry_local_window_abs"].item() > 0.0
+
+
+def test_s0_geometry_evidence_propagates_to_s3_outputs():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["s0_geometry_evidence"] = {
+        "enabled": True,
+        "hidden_dim": 64,
+        "dropout": 0.0,
+        "pooling": "mean_max",
+        "local_window_enabled": True,
+        "offsets_px": [-16.0, -8.0, 0.0, 8.0, 16.0],
+        "local_reduce": "max",
+        "detach_draft_x": True,
+    }
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["final"]["pred_x_rows"].shape == (1, 20, 72)
+    assert out["s0_geometry_draft"]["pred_x_rows"].shape == (1, 20, 72)
+    assert torch.allclose(out["queries"], out["queries_pre_geometry"], atol=1e-6)
+    assert out["geometry_evidence"]["s0_geometry_delta_abs"].item() == 0.0
+    assert out["geometry_evidence"]["s0_geometry_local_window_abs"].item() > 0.0
+
+
+def test_s0_geometry_evidence_propagates_to_s1_outputs():
+    cfg = _cfg("DynLaneSeqS1")
+    cfg["model"]["s1_mode"] = "residual"
+    cfg["model"]["s0_geometry_evidence"] = {
+        "enabled": True,
+        "hidden_dim": 64,
+        "dropout": 0.0,
+        "pooling": "mean_max",
+        "local_window_enabled": True,
+        "offsets_px": [-16.0, -8.0, 0.0, 8.0, 16.0],
+        "local_reduce": "max",
+        "detach_draft_x": True,
+    }
+    model = DynLaneSeqS1(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["pred_x_rows"].shape == (1, 20, 72)
+    assert out["s0_geometry_draft"]["pred_x_rows"].shape == (1, 20, 72)
+    assert torch.allclose(out["queries"], out["queries_pre_geometry"], atol=1e-6)
+    assert out["geometry_evidence"]["s0_geometry_delta_abs"].item() == 0.0
+    assert out["geometry_evidence"]["s0_geometry_local_window_abs"].item() > 0.0
+
+
+def test_s3_oracle_coarse_uses_target_geometry():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["oracle_coarse"] = {"enabled": True, "score_logit": 8.0, "background_logit": 8.0}
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    target = {
+        "x_rows": torch.full((1, 72), 123.0),
+        "x_bins": torch.full((1, 72), 31, dtype=torch.long),
+        "valid_mask": torch.ones((1, 72), dtype=torch.bool),
+        "range_y": torch.tensor([[0.0, 288.0]]),
+    }
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800), targets=[target])
+    assert torch.allclose(out["coarse"]["pred_x_rows"][0, 0], target["x_rows"][0], atol=1e-6)
+    assert out["coarse"]["exist_logits"][0, 0, 0] > out["coarse"]["exist_logits"][0, 0, 1]
+    assert out["coarse"]["exist_logits"][0, 1, 1] > out["coarse"]["exist_logits"][0, 1, 0]
+    assert torch.allclose(out["evidence"]["active_center_x_rows"][0, 0], target["x_rows"][0], atol=1e-6)
+
+
 def test_s1_s2_s3_forward_contracts():
     x = torch.randn(1, 3, 288, 800)
     for cls, name in [(DynLaneSeqS1, "DynLaneSeqS1"), (DynLaneSeqS2, "DynLaneSeqS2"), (DynLaneSeqS3, "DynLaneSeqS3")]:
@@ -252,6 +420,50 @@ def test_s3_active_corridor_quality_calibrator_starts_neutral():
     assert torch.allclose(out["final"]["quality_logits"], torch.zeros_like(out["final"]["quality_logits"]), atol=1e-6)
     assert out["evidence"]["quality_calib_delta_exist_abs"].item() == 0.0
     assert out["evidence"]["quality_calib_quality_abs"].item() == 0.0
+
+
+def test_s3_quality_calibrator_mean_max_pooling_starts_neutral():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["quality_calibrator"] = {
+        "enabled": True,
+        "pooling": "range_mean_max",
+        "calibrate_exist": False,
+        "quality_base": "none",
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert torch.allclose(out["final"]["exist_logits"], out["coarse"]["exist_logits"], atol=1e-6)
+    assert torch.allclose(out["final"]["quality_logits"], torch.zeros_like(out["final"]["quality_logits"]), atol=1e-6)
+
+
+def test_s3_quality_calibrator_curvature_feature_starts_neutral():
+    cfg = _cfg("DynLaneSeqS3")
+    cfg["model"]["s2_mode"] = "residual"
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["quality_calibrator"] = {
+        "enabled": True,
+        "pooling": "range_mean",
+        "curvature_feature": True,
+        "quality_base": "none",
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert torch.allclose(out["final"]["exist_logits"], out["coarse"]["exist_logits"], atol=1e-6)
+    assert torch.allclose(out["final"]["quality_logits"], torch.zeros_like(out["final"]["quality_logits"]), atol=1e-6)
 
 
 def test_active_corridor_offset_loss_is_finite_and_backprops():

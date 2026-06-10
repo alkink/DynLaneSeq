@@ -13,6 +13,8 @@ class MatcherConfig:
     lambda_obj: float = 2.0
     lambda_point: float = 5.0
     lambda_range: float = 1.0
+    lambda_line_iou: float = 0.0
+    line_iou_radius: float = 7.5
     input_w: int = 800
     input_h: int = 288
     eps: float = 1e-6
@@ -70,6 +72,7 @@ class HungarianMatcherS0:
                 "mean_cost_obj": torch.tensor(0.0, device=device),
                 "mean_cost_point": torch.tensor(0.0, device=device),
                 "mean_cost_range": torch.tensor(0.0, device=device),
+                "mean_cost_line_iou": torch.tensor(0.0, device=device),
             }
 
         p_lane = torch.softmax(exist_logits, dim=-1)[:, 0]
@@ -87,16 +90,46 @@ class HungarianMatcherS0:
             pred_range[:, None, 0].sub(gt_range_norm[None, :, 0]).abs()
             + pred_range[:, None, 1].sub(gt_range_norm[None, :, 1]).abs()
         )
+        cost_line_iou = self.compute_line_iou_cost(pred_x_rows, gt_x, gt_mask)
         cost = (
             self.cfg.lambda_obj * cost_obj
             + self.cfg.lambda_point * cost_point
             + self.cfg.lambda_range * cost_range
+            + self.cfg.lambda_line_iou * cost_line_iou
         )
         return cost, {
             "mean_cost_obj": cost_obj.mean().detach(),
             "mean_cost_point": cost_point.mean().detach(),
             "mean_cost_range": cost_range.mean().detach(),
+            "mean_cost_line_iou": cost_line_iou.mean().detach(),
         }
+
+    def compute_line_iou_cost(
+        self,
+        pred_x_rows: torch.Tensor,
+        gt_x: torch.Tensor,
+        gt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        n = int(pred_x_rows.shape[0])
+        m = int(gt_x.shape[0])
+        radius = float(self.cfg.line_iou_radius)
+        pred = pred_x_rows[:, None, :]
+        gt = gt_x[None, :, :]
+        px1 = pred - radius
+        px2 = pred + radius
+        gx1 = gt - radius
+        gx2 = gt + radius
+        overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
+        union = (4.0 * radius - overlap).clamp(min=self.cfg.eps)
+        iou = overlap / union
+        enclosing = (torch.maximum(px2, gx2) - torch.minimum(px1, gx1)).clamp(min=self.cfg.eps)
+        giou = iou - (enclosing - union) / enclosing
+        cost = 1.0 - giou
+        mask = gt_mask[None, :, :].expand(n, m, -1)
+        valid_count = mask.sum(dim=-1).clamp_min(1)
+        cost = (cost * mask.float()).sum(dim=-1) / valid_count
+        valid_lane = gt_mask.sum(dim=-1).view(1, m) > 0
+        return torch.where(valid_lane, cost, torch.full_like(cost, 1e6))
 
     @staticmethod
     def _linear_sum_assignment(cost: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -131,4 +164,3 @@ class HungarianMatcherS0:
                         best_rows = row_perm
             assert best_rows is not None
             return torch.tensor(best_rows, dtype=torch.long), torch.arange(m, dtype=torch.long)
-

@@ -33,12 +33,14 @@ class DynLaneSeqS3(DynLaneSeqS2):
         self.quality_calibrator_quality_base = str(quality_calib_cfg.get("quality_base", "none")).lower()
         self.quality_calibrator_range_padding_px = float(quality_calib_cfg.get("range_padding_px", 0.0))
         self.quality_calibrator_pooling = str(quality_calib_cfg.get("pooling", "range_mean")).lower()
-        self.quality_calibrator_stats_dim = 10
+        self.quality_calibrator_curvature_feature = bool(quality_calib_cfg.get("curvature_feature", False))
+        self.quality_calibrator_stats_dim = 12 if self.quality_calibrator_curvature_feature else 10
+        quality_pool_dim = dim * 2 if self.quality_calibrator_pooling == "range_mean_max" else dim
         if self.quality_calibrator_enabled:
             hidden_dim = int(quality_calib_cfg.get("hidden_dim", dim))
             dropout = float(quality_calib_cfg.get("dropout", 0.1))
             self.quality_calibrator = nn.Sequential(
-                nn.Linear(dim + self.quality_calibrator_stats_dim, hidden_dim),
+                nn.Linear(quality_pool_dim + self.quality_calibrator_stats_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -145,6 +147,8 @@ class DynLaneSeqS3(DynLaneSeqS2):
     def pool_for_quality_calibrator(self, row_hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if self.quality_calibrator_pooling == "range_max":
             return self.masked_max_rows(row_hidden, mask)
+        if self.quality_calibrator_pooling == "range_mean_max":
+            return torch.cat([self.masked_mean_rows(row_hidden, mask), self.masked_max_rows(row_hidden, mask)], dim=-1)
         if self.quality_calibrator_pooling != "range_mean":
             raise ValueError(f"Unsupported quality_calibrator.pooling: {self.quality_calibrator_pooling}")
         return self.masked_mean_rows(row_hidden, mask)
@@ -177,6 +181,11 @@ class DynLaneSeqS3(DynLaneSeqS2):
             final_coarse_diff.detach() / float(self.input_w),
             row_conf.detach(),
         ]
+        if self.quality_calibrator_curvature_feature:
+            pred_x = final["pred_x_rows"].float()
+            d2 = (pred_x[:, :, 2:] - 2.0 * pred_x[:, :, 1:-1] + pred_x[:, :, :-2]).abs()
+            curvature = torch.nn.functional.pad(d2, (1, 1), mode="constant", value=0.0)
+            stats_per_row.append(curvature.detach() / float(self.input_w))
         pooled = []
         for values in stats_per_row:
             pooled.append(self.masked_mean_rows(values, mask))

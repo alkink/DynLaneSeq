@@ -29,9 +29,10 @@ def write_predictions(
 ) -> None:
     model.eval()
     pred_dir.mkdir(parents=True, exist_ok=True)
+    pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
     for images, targets, metas in tqdm(loader, ncols=80, desc="writing predictions"):
         images = images.to(device, non_blocking=True)
-        outputs = model(images)
+        outputs = model(images, targets=targets) if pass_targets else model(images)
         write_culane_predictions(
             outputs,
             metas,

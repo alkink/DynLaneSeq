@@ -42,6 +42,11 @@ class ProposalRecallStats:
 
 def collect_prediction_stages(outputs: dict[str, Any]) -> dict[str, dict[str, torch.Tensor]]:
     stages: dict[str, dict[str, torch.Tensor]] = {}
+    dynamic = outputs.get("dynamic_proposals")
+    if isinstance(dynamic, dict):
+        stage = dynamic.get("stage")
+        if isinstance(stage, dict) and "pred_x_rows" in stage:
+            stages["dynamic_proposals"] = stage
     for key in ("s0_geometry_draft", "coarse", "stage1", "stage2", "final"):
         value = outputs.get(key)
         if isinstance(value, dict) and "pred_x_rows" in value:

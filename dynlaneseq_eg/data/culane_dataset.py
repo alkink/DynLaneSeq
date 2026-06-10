@@ -63,6 +63,12 @@ class CULaneDataset(Dataset):
                 affine_rotate_deg=float(aug.get("affine_rotate_deg", 0.0)),
                 affine_scale_min=float(aug.get("affine_scale_min", 1.0)),
                 affine_scale_max=float(aug.get("affine_scale_max", 1.0)),
+                random_shadow_prob=float(aug.get("random_shadow_prob", 0.0)),
+                random_shadow_min_opacity=float(aug.get("random_shadow_min_opacity", 0.25)),
+                random_shadow_max_opacity=float(aug.get("random_shadow_max_opacity", 0.55)),
+                random_shadow_min_vertices=int(aug.get("random_shadow_min_vertices", 3)),
+                random_shadow_max_vertices=int(aug.get("random_shadow_max_vertices", 6)),
+                random_shadow_roi_start_y=float(aug.get("random_shadow_roi_start_y", 0.25)),
             )
         )
 

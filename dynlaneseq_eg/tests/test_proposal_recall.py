@@ -52,6 +52,21 @@ def test_collect_prediction_stages_prefers_named_stages():
     assert set(stages) == {"coarse", "final"}
 
 
+def test_collect_prediction_stages_includes_dynamic_proposals():
+    outputs = {
+        "dynamic_proposals": {
+            "stage": {
+                "pred_x_rows": torch.full((1, 3, 72), 5.0),
+                "exist_logits": torch.zeros((1, 3, 2)),
+            }
+        },
+        "pred_x_rows": torch.zeros((1, 2, 72)),
+    }
+    stages = collect_prediction_stages(outputs)
+    assert set(stages) == {"dynamic_proposals", "main"}
+    assert torch.equal(stages["dynamic_proposals"]["pred_x_rows"], outputs["dynamic_proposals"]["stage"]["pred_x_rows"])
+
+
 def test_update_stage_recall_counts_per_gt_best_candidate():
     stage = {
         "pred_x_rows": torch.stack(
