@@ -100,6 +100,46 @@ def test_matcher_line_iou_cost_is_finite_for_non_overlapping_lanes():
     assert cost[1, 0] < cost[0, 0]
 
 
+def test_grouped_one_to_many_matcher_assigns_gt_once_per_group():
+    target = _target()
+    pred = torch.full((8, 72), 400.0)
+    pred[0, 10:20] = 100.0
+    pred[4, 10:20] = 100.0
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            assignment="grouped_one_to_many",
+            num_groups=2,
+            lambda_obj=0.0,
+            lambda_point=1.0,
+            lambda_range=0.0,
+        )
+    )
+    outputs = {
+        "exist_logits": torch.zeros((1, 8, 2)),
+        "pred_x_rows": pred.unsqueeze(0),
+        "range_norm": torch.zeros((1, 8, 2)),
+    }
+    matches = matcher(outputs, [target])
+    assert matches[0]["pred_indices"].tolist() == [0, 4]
+    assert matches[0]["gt_indices"].tolist() == [0, 0]
+
+
+def test_focal_exist_loss_backprops_with_grouped_matches():
+    logits = torch.zeros((1, 8, 2), requires_grad=True)
+    outputs = {
+        "exist_logits": logits,
+        "pred_x_rows": torch.zeros((1, 8, 72), requires_grad=True),
+        "range_norm": torch.zeros((1, 8, 2), requires_grad=True),
+        "row_x_logits": torch.zeros((1, 8, 72, 200), requires_grad=True),
+    }
+    matches = [{"pred_indices": torch.tensor([0, 4]), "gt_indices": torch.tensor([0, 0])}]
+    loss = S0Criterion(LossConfig(exist_loss_type="focal")).compute_exist_loss(outputs, matches)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
+
+
 def test_seg_loss_skips_missing_masks():
     outputs = {"seg_logits": torch.randn(1, 1, 288, 800, requires_grad=True)}
     targets = [

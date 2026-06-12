@@ -10,6 +10,7 @@ from .dynlaneseq_s0 import DynLaneSeqEncoder, GeometryGuidedQueryRefiner
 from .evidence import CurveAlignedSampler, DynamicOffsetFusion, EvidenceAdapter, MultiScaleCurveAlignedSampler, SamplerCurriculum
 from .heads_s0 import ExistenceHead, RangeHead, S0Heads
 from .row_token_decoder import RowTokenDecoder
+from .structured_queries import build_structured_query_head
 
 
 class ActiveCorridorSearch(nn.Module):
@@ -90,11 +91,13 @@ class DynLaneSeqS2(nn.Module):
         active_cfg = model_cfg.get("active_corridor", {})
         geometry_cfg = model_cfg.get("s0_geometry_evidence", {})
         oracle_cfg = model_cfg.get("oracle_coarse", {})
+        structured_cfg = model_cfg.get("structured_query", {})
         self.input_w = int(model_cfg.get("input_w", 800))
         self.input_h = int(model_cfg.get("input_h", 288))
         self.num_rows = int(model_cfg.get("num_rows", 72))
         self.x_bins = int(model_cfg.get("x_bins", 200))
         dim = int(model_cfg.get("dim", 256))
+        self.structured_query_head = build_structured_query_head(model_cfg)
         self.active_corridor_enabled = bool(active_cfg.get("enabled", False))
         self.oracle_coarse_enabled = bool(oracle_cfg.get("enabled", False))
         self.oracle_score_logit = float(oracle_cfg.get("score_logit", 8.0))
@@ -113,10 +116,25 @@ class DynLaneSeqS2(nn.Module):
         self.s2_mode = str(model_cfg.get("s2_mode", "direct")).lower()
         if self.s2_mode not in {"direct", "residual"}:
             raise ValueError(f"Unsupported S2 mode: {self.s2_mode}")
+        if self.structured_query_head is not None and self.s2_mode != "residual":
+            raise ValueError("structured_query currently requires residual S2/S3 mode")
         if bool(geometry_cfg.get("enabled", False)) and bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False)):
             raise ValueError("Use either dynamic_evidence v1 or s0_geometry_evidence v2, not both")
         if bool(geometry_cfg.get("enabled", False)) and self.s2_mode != "residual":
             raise ValueError("s0_geometry_evidence currently requires residual S2/S3 mode")
+        if self.structured_query_head is not None and (
+            bool(geometry_cfg.get("enabled", False))
+            or bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False))
+            or bool(model_cfg.get("dynamic_proposal", {}).get("enabled", False))
+            or self.oracle_coarse_enabled
+        ):
+            raise ValueError(
+                "structured_query must be isolated from dynamic_evidence, dynamic_proposal, s0_geometry_evidence, and oracle_coarse"
+            )
+        if self.structured_query_head is not None and int(structured_cfg.get("num_instances", model_cfg.get("num_slots", 20))) != int(
+            model_cfg.get("num_slots", 20)
+        ):
+            raise ValueError("structured_query.num_instances must match model.num_slots for S1/S2/S3 stages")
         self.encoder = DynLaneSeqEncoder(cfg)
         if self.s2_mode == "residual":
             self.heads = S0Heads(
@@ -231,7 +249,13 @@ class DynLaneSeqS2(nn.Module):
         if self.active_corridor_enabled and (self.multi_scale_enabled or self.dynamic_offset_enabled):
             raise ValueError("active_corridor should be tested separately from multi-scale and dynamic offset fusion")
 
-    def build_coarse_tokens(self, queries: torch.Tensor) -> torch.Tensor:
+    def build_coarse_tokens(
+        self,
+        queries: torch.Tensor,
+        base_row_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if base_row_tokens is not None:
+            return base_row_tokens
         b, n, d = queries.shape
         row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
         return queries.unsqueeze(2) + row_emb
@@ -339,10 +363,20 @@ class DynLaneSeqS2(nn.Module):
         }
         return evidence, refined_x, debug
 
-    def build_final_tokens(self, queries: torch.Tensor, evidence: torch.Tensor, stage_extra: torch.Tensor | None = None) -> torch.Tensor:
+    def build_final_tokens(
+        self,
+        queries: torch.Tensor,
+        evidence: torch.Tensor,
+        stage_extra: torch.Tensor | None = None,
+        base_row_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, n, _, d = evidence.shape
-        row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
-        tokens = queries.unsqueeze(2) + row_emb + self.adapter(evidence)
+        if base_row_tokens is None:
+            row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
+            tokens = queries.unsqueeze(2) + row_emb
+        else:
+            tokens = base_row_tokens
+        tokens = tokens + self.adapter(evidence)
         if stage_extra is not None:
             tokens = tokens + stage_extra
         return tokens
@@ -356,7 +390,9 @@ class DynLaneSeqS2(nn.Module):
         return_features: bool = False,
     ) -> dict[str, dict[str, torch.Tensor]]:
         enc = self.encoder.forward_features(images)
-        q = enc["queries"]
+        structured = self.structured_query_head(enc["features"]) if self.structured_query_head is not None else None
+        q = structured["queries"] if structured is not None else enc["queries"]
+        structured_row_tokens = structured["structured_row_tokens"] if structured is not None else None
         geometry_debug = None
         q_pre_geometry = None
         geometry_draft = None
@@ -375,7 +411,7 @@ class DynLaneSeqS2(nn.Module):
                     raise ValueError("oracle_coarse.enabled requires targets in forward")
                 coarse = self.build_oracle_coarse(q, targets)
             else:
-                coarse = self.heads(q)
+                coarse = structured if structured is not None else self.heads(q)
             coarse_x = coarse["pred_x_rows"]
             sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha=float(sampler_alpha))
             features_for_sampling = enc["multi_scale_features"] if self.multi_scale_enabled else enc["features"]
@@ -396,6 +432,7 @@ class DynLaneSeqS2(nn.Module):
                     q,
                     evidence,
                     stage_extra=self.coarse_x_embed(stage_x_norm),
+                    base_row_tokens=structured_row_tokens,
                 ),
                 input_w=self.input_w,
             )
@@ -428,6 +465,9 @@ class DynLaneSeqS2(nn.Module):
                 "queries": q,
                 "row_delta_logits": row["row_x_logits"],
             }
+            if structured is not None:
+                out["structured_row_tokens"] = structured_row_tokens
+                out["structured_debug"] = structured.get("structured_debug", {})
             if geometry_debug is not None:
                 out["queries_pre_geometry"] = q_pre_geometry
                 out["geometry_evidence"] = geometry_debug
@@ -437,14 +477,17 @@ class DynLaneSeqS2(nn.Module):
         else:
             exist_logits = self.exist_head(q)
             range_raw, range_norm = self.range_head(q)
-            coarse_row = self.row_decoder(self.build_coarse_tokens(q), input_w=self.input_w)
+            coarse_row = self.row_decoder(self.build_coarse_tokens(q, base_row_tokens=structured_row_tokens), input_w=self.input_w)
             coarse_logits = coarse_row["row_x_logits"]
             coarse_x = coarse_row["pred_x_rows"]
             sample_x = self.curriculum.build_sample_x(coarse_x, targets, matches, alpha=float(sampler_alpha))
             features_for_sampling = enc["multi_scale_features"] if self.multi_scale_enabled else enc["features"]
             evidence, offset_debug = self.sample_evidence(features_for_sampling, sample_x, q)
             evidence, bridge_debug = self.bridge_evidence(evidence, q)
-            row = self.row_decoder(self.build_final_tokens(q, evidence), input_w=self.input_w)
+            row = self.row_decoder(
+                self.build_final_tokens(q, evidence, base_row_tokens=structured_row_tokens),
+                input_w=self.input_w,
+            )
             out = {
                 "coarse": {
                     "exist_logits": exist_logits,

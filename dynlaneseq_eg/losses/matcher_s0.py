@@ -18,6 +18,8 @@ class MatcherConfig:
     input_w: int = 800
     input_h: int = 288
     eps: float = 1e-6
+    assignment: str = "hungarian"
+    num_groups: int = 1
 
 
 class HungarianMatcherS0:
@@ -40,6 +42,8 @@ class HungarianMatcherS0:
             if num_gt == 0:
                 pred_idx = torch.empty(0, dtype=torch.long)
                 gt_idx = torch.empty(0, dtype=torch.long)
+            elif self.cfg.assignment == "grouped_one_to_many":
+                pred_idx, gt_idx = self._grouped_assignment(cost, num_groups=max(1, int(self.cfg.num_groups)))
             else:
                 pred_idx, gt_idx = self._linear_sum_assignment(cost)
             matches.append(
@@ -164,3 +168,23 @@ class HungarianMatcherS0:
                         best_rows = row_perm
             assert best_rows is not None
             return torch.tensor(best_rows, dtype=torch.long), torch.arange(m, dtype=torch.long)
+
+    def _grouped_assignment(self, cost: torch.Tensor, num_groups: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+        n, _ = cost.shape
+        num_groups = max(1, min(int(num_groups), n))
+        edges = torch.linspace(0, n, num_groups + 1, dtype=torch.long, device=cost.device)
+        pred_parts = []
+        gt_parts = []
+        for group_idx in range(num_groups):
+            start = int(edges[group_idx].item())
+            end = int(edges[group_idx + 1].item())
+            if end <= start:
+                continue
+            row, col = self._linear_sum_assignment(cost[start:end])
+            if row.numel() == 0:
+                continue
+            pred_parts.append(row + start)
+            gt_parts.append(col)
+        if not pred_parts:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+        return torch.cat(pred_parts, dim=0), torch.cat(gt_parts, dim=0)

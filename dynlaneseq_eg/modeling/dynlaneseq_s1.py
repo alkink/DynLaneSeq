@@ -9,6 +9,7 @@ from .common import soft_expected_x
 from .dynlaneseq_s0 import DynLaneSeqEncoder, GeometryGuidedQueryRefiner
 from .heads_s0 import ExistenceHead, RangeHead, S0Heads
 from .row_token_decoder import RowTokenDecoder
+from .structured_queries import build_structured_query_head
 
 
 class DynLaneSeqS1(nn.Module):
@@ -17,19 +18,33 @@ class DynLaneSeqS1(nn.Module):
         self.cfg = cfg
         model_cfg = cfg.get("model", cfg)
         geometry_cfg = model_cfg.get("s0_geometry_evidence", {})
+        structured_cfg = model_cfg.get("structured_query", {})
         self.input_w = int(model_cfg.get("input_w", 800))
         self.input_h = int(model_cfg.get("input_h", 288))
         self.num_rows = int(model_cfg.get("num_rows", 72))
         self.x_bins = int(model_cfg.get("x_bins", 200))
         dim = int(model_cfg.get("dim", 256))
+        self.structured_query_head = build_structured_query_head(model_cfg)
         self.s1_mode = str(model_cfg.get("s1_mode", "direct")).lower()
         if self.s1_mode not in {"direct", "residual"}:
             raise ValueError(f"Unsupported S1 mode: {self.s1_mode}")
         self.encoder = DynLaneSeqEncoder(cfg)
+        if self.structured_query_head is not None and self.s1_mode != "residual":
+            raise ValueError("structured_query currently requires residual S1 mode")
         if bool(geometry_cfg.get("enabled", False)) and bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False)):
             raise ValueError("Use either dynamic_evidence v1 or s0_geometry_evidence v2, not both")
         if bool(geometry_cfg.get("enabled", False)) and self.s1_mode != "residual":
             raise ValueError("s0_geometry_evidence currently requires residual S1 mode")
+        if self.structured_query_head is not None and (
+            bool(geometry_cfg.get("enabled", False))
+            or bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False))
+            or bool(model_cfg.get("dynamic_proposal", {}).get("enabled", False))
+        ):
+            raise ValueError("structured_query must be isolated from dynamic_evidence, dynamic_proposal, and s0_geometry_evidence")
+        if self.structured_query_head is not None and int(structured_cfg.get("num_instances", model_cfg.get("num_slots", 20))) != int(
+            model_cfg.get("num_slots", 20)
+        ):
+            raise ValueError("structured_query.num_instances must match model.num_slots for S1/S2/S3 stages")
         if self.s1_mode == "residual":
             self.heads = S0Heads(
                 dim=dim,
@@ -75,17 +90,27 @@ class DynLaneSeqS1(nn.Module):
             visibility_head=bool(model_cfg.get("row_visibility", {}).get("enabled", False)),
         )
 
-    def build_row_tokens(self, queries: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
-        b, n, d = queries.shape
-        row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
-        tokens = queries.unsqueeze(2) + row_emb
+    def build_row_tokens(
+        self,
+        queries: torch.Tensor,
+        extra: torch.Tensor | None = None,
+        base_row_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if base_row_tokens is None:
+            b, n, d = queries.shape
+            row_emb = self.row_embedding.weight.view(1, 1, self.num_rows, d)
+            tokens = queries.unsqueeze(2) + row_emb
+        else:
+            tokens = base_row_tokens
         if extra is not None:
             tokens = tokens + extra
         return tokens
 
     def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
         enc = self.encoder.forward_features(images)
-        q = enc["queries"]
+        structured = self.structured_query_head(enc["features"]) if self.structured_query_head is not None else None
+        q = structured["queries"] if structured is not None else enc["queries"]
+        structured_row_tokens = structured["structured_row_tokens"] if structured is not None else None
         geometry_debug = None
         q_pre_geometry = None
         geometry_draft = None
@@ -99,11 +124,15 @@ class DynLaneSeqS1(nn.Module):
                     else geometry_draft["pred_x_rows"]
                 )
                 q, geometry_debug = self.s0_geometry_refiner(q, enc["features"], geometry_x)
-            coarse = self.heads(q)
+            coarse = structured if structured is not None else self.heads(q)
             coarse_x = coarse["pred_x_rows"].detach() if self.detach_coarse_x else coarse["pred_x_rows"]
             coarse_x_norm = (coarse_x / float(self.input_w)).unsqueeze(-1)
             row = self.row_decoder(
-                self.build_row_tokens(q, extra=self.coarse_x_embed(coarse_x_norm)),
+                self.build_row_tokens(
+                    q,
+                    extra=self.coarse_x_embed(coarse_x_norm),
+                    base_row_tokens=structured_row_tokens,
+                ),
                 input_w=self.input_w,
             )
             base_logits = coarse["row_x_logits"].detach() if self.detach_coarse_x else coarse["row_x_logits"]
@@ -122,6 +151,9 @@ class DynLaneSeqS1(nn.Module):
                 "coarse": coarse,
                 "row_delta_logits": row["row_x_logits"],
             }
+            if structured is not None:
+                out["structured_row_tokens"] = structured_row_tokens
+                out["structured_debug"] = structured.get("structured_debug", {})
             if geometry_debug is not None:
                 out["queries_pre_geometry"] = q_pre_geometry
                 out["geometry_evidence"] = geometry_debug

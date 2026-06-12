@@ -19,6 +19,9 @@ class LossConfig:
     input_w: int = 800
     input_h: int = 288
     no_lane_weight: float = 1.0
+    exist_loss_type: str = "ce"
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
     smoothness_contiguous: bool = True
     w_line_iou: float = 0.0
     line_iou_radius: float = 15.0
@@ -170,6 +173,16 @@ class S0Criterion(nn.Module):
             pred_idx = match["pred_indices"].to(logits.device)
             if pred_idx.numel() > 0:
                 target[bi, pred_idx] = 0
+        if str(self.cfg.exist_loss_type).lower() == "focal":
+            lane_target = (target == 0).to(dtype=logits.dtype)
+            lane_logit = logits[..., 0] - logits[..., 1]
+            ce = F.binary_cross_entropy_with_logits(lane_logit, lane_target, reduction="none")
+            prob = torch.sigmoid(lane_logit)
+            p_t = prob * lane_target + (1.0 - prob) * (1.0 - lane_target)
+            alpha = float(self.cfg.focal_alpha)
+            alpha_t = alpha * lane_target + (1.0 - alpha) * (1.0 - lane_target)
+            loss = alpha_t * (1.0 - p_t).pow(float(self.cfg.focal_gamma)) * ce
+            return loss.mean()
         weight = torch.tensor([1.0, self.cfg.no_lane_weight], device=logits.device, dtype=logits.dtype)
         return F.cross_entropy(logits.view(b * n, 2), target.view(b * n), weight=weight)
 

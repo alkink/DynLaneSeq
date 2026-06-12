@@ -43,6 +43,8 @@ def build_matcher(cfg: dict[str, Any]) -> HungarianMatcherS0:
             line_iou_radius=float(m.get("line_iou_radius", cfg.get("loss", {}).get("line_iou_radius", 7.5))),
             input_w=int(model.get("input_w", 800)),
             input_h=int(model.get("input_h", 288)),
+            assignment=str(m.get("assignment", "hungarian")),
+            num_groups=int(m.get("num_groups", 1)),
         )
     )
 
@@ -59,6 +61,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         input_w=int(model.get("input_w", 800)),
         input_h=int(model.get("input_h", 288)),
         no_lane_weight=float(loss.get("no_lane_weight", 1.0)),
+        exist_loss_type=str(loss.get("exist_loss_type", "ce")),
+        focal_alpha=float(loss.get("focal_alpha", 0.25)),
+        focal_gamma=float(loss.get("focal_gamma", 2.0)),
         w_line_iou=float(loss.get("w_line_iou", 0.0)),
         line_iou_radius=float(loss.get("line_iou_radius", 15.0)),
         w_seg=float(loss.get("w_seg", 0.0)),
@@ -85,6 +90,7 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         return S1Criterion(
             S1LossConfig(
                 **base_kwargs,
+                lambda_coarse=float(loss.get("lambda_coarse", 0.0)),
                 w_token=float(loss.get("w_token", 0.5)),
                 token_label_smoothing=float(loss.get("token_label_smoothing", 0.0)),
                 w_visibility=float(loss.get("w_visibility", 0.0)),
@@ -193,9 +199,11 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or name.startswith("quality_calibrator.")
             or name.startswith("s0_geometry_refiner.")
             or name.startswith("encoder.dynamic_proposal.")
+            or name.startswith("structured_query_head.")
             or name.startswith("encoder.ms_proj.")
             or "evidence" in name
             or "dynamic_proposal" in name
+            or "structured_query" in name
         )
         if is_evidence and is_no_decay:
             evidence_no_decay.append(param)

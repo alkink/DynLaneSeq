@@ -14,6 +14,7 @@ from .fpn import SimpleFPN
 from .heads_s0 import CenterlineAuxHead, S0Heads, SegAuxHead
 from .lane_queries import LaneQueries
 from .position_encoding import SinePositionEncoding2D
+from .structured_queries import build_structured_query_head
 
 
 class SlotDynamicEvidence(nn.Module):
@@ -498,8 +499,15 @@ class DynLaneSeqS0(nn.Module):
             x_bins=int(model_cfg.get("x_bins", 200)),
             input_w=int(model_cfg.get("input_w", 800)),
         )
+        self.structured_query_head = build_structured_query_head(model_cfg)
         if bool(geometry_cfg.get("enabled", False)) and bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False)):
             raise ValueError("Use either dynamic_evidence v1 or s0_geometry_evidence v2, not both")
+        if self.structured_query_head is not None and (
+            bool(geometry_cfg.get("enabled", False))
+            or bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False))
+            or bool(model_cfg.get("dynamic_proposal", {}).get("enabled", False))
+        ):
+            raise ValueError("structured_query must be isolated from dynamic_evidence, dynamic_proposal, and s0_geometry_evidence")
         self.s0_geometry_detach_draft = bool(geometry_cfg.get("detach_draft_x", True))
         self.s0_geometry_refiner = (
             GeometryGuidedQueryRefiner(
@@ -520,21 +528,27 @@ class DynLaneSeqS0(nn.Module):
 
     def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
         enc = self.encoder.forward_features(images)
-        q = enc["queries"]
-        if self.s0_geometry_refiner is not None:
-            draft = self.heads(q)
-            sample_x = draft["pred_x_rows"].detach() if self.s0_geometry_detach_draft else draft["pred_x_rows"]
-            q_final, geometry_debug = self.s0_geometry_refiner(q, enc["features"], sample_x)
-            final = self.heads(q_final)
-            out = dict(final)
-            out["coarse"] = draft
-            out["final"] = final
-            out["queries_pre_geometry"] = q
-            out["queries"] = q_final
-            out["geometry_evidence"] = geometry_debug
+        if self.structured_query_head is not None:
+            out = self.structured_query_head(enc["features"])
+            out["memory"] = enc["memory"]
+            out["memory_key"] = enc["memory_key"]
+            out["q0"] = enc["q0"]
         else:
-            out = self.heads(q)
-            out["queries"] = q
+            q = enc["queries"]
+            if self.s0_geometry_refiner is not None:
+                draft = self.heads(q)
+                sample_x = draft["pred_x_rows"].detach() if self.s0_geometry_detach_draft else draft["pred_x_rows"]
+                q_final, geometry_debug = self.s0_geometry_refiner(q, enc["features"], sample_x)
+                final = self.heads(q_final)
+                out = dict(final)
+                out["coarse"] = draft
+                out["final"] = final
+                out["queries_pre_geometry"] = q
+                out["queries"] = q_final
+                out["geometry_evidence"] = geometry_debug
+            else:
+                out = self.heads(q)
+                out["queries"] = q
         if "seg_logits" in enc:
             out["seg_logits"] = enc["seg_logits"]
         if "centerline_logits" in enc:

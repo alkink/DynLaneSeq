@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from dynlaneseq_eg.config import load_config
+from dynlaneseq_eg.factory import build_criterion, build_matcher, build_model
 from dynlaneseq_eg.losses.loss_s2 import S2Criterion, S2LossConfig
 from dynlaneseq_eg.modeling import DynLaneSeqS0, DynLaneSeqS1, DynLaneSeqS2, DynLaneSeqS3
 from dynlaneseq_eg.modeling.evidence import (
@@ -93,6 +95,170 @@ def test_dynamic_proposal_outputs_are_isolated_from_static_slots():
     assert proposals["dense"]["heatmap_logits"].shape == (1, 1, 72, 200)
     assert proposals["dense"]["x_rows"].shape == (1, 72, 72, 200)
     assert proposals["dense"]["range_norm"].shape == (1, 2, 72, 200)
+
+
+def test_structured_query_s0_forward_shapes():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dim"] = 64
+    cfg["model"]["fpn_channels"] = 64
+    cfg["model"]["num_slots"] = 16
+    cfg["model"]["num_heads"] = 4
+    cfg["model"]["decoder_layers"] = 0
+    cfg["model"]["decoder_ff_dim"] = 128
+    cfg["model"]["structured_query"] = {
+        "enabled": True,
+        "num_instances": 16,
+        "num_groups": 4,
+        "num_layers": 1,
+        "num_heads": 4,
+        "ff_dim": 128,
+        "dropout": 0.0,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["exist_logits"].shape == (1, 16, 2)
+    assert out["row_x_logits"].shape == (1, 16, 72, 200)
+    assert out["pred_x_rows"].shape == (1, 16, 72)
+    assert out["range_norm"].shape == (1, 16, 2)
+    assert out["queries"].shape == (1, 16, 64)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+
+
+def test_structured_query_debug_config_builds():
+    cfg = load_config("dynlaneseq_eg/configs/debug/culane_s0_structured_query_2k.yaml")
+    cfg["model"]["pretrained_backbone"] = False
+    cfg["model"]["dim"] = 64
+    cfg["model"]["fpn_channels"] = 64
+    cfg["model"]["num_heads"] = 4
+    cfg["model"]["decoder_ff_dim"] = 128
+    cfg["model"]["structured_query"]["num_heads"] = 4
+    cfg["model"]["structured_query"]["ff_dim"] = 128
+    cfg["model"]["structured_query"]["num_layers"] = 1
+    model = build_model(cfg).eval()
+    matcher = build_matcher(cfg)
+    criterion = build_criterion(cfg)
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["exist_logits"].shape == (1, 64, 2)
+    assert out["pred_x_rows"].shape == (1, 64, 72)
+    assert matcher.cfg.assignment == "grouped_one_to_many"
+    assert matcher.cfg.num_groups == 4
+    assert criterion.cfg.exist_loss_type == "focal"
+
+
+def test_structured_stage_debug_configs_build():
+    paths = [
+        "dynlaneseq_eg/configs/debug/culane_s1_residual_structured_query_2k_init_structured.yaml",
+        "dynlaneseq_eg/configs/debug/culane_s2_residual_structured_query_2k_from_s1.yaml",
+        "dynlaneseq_eg/configs/debug/culane_s3_active_corridor_qualitycal_structured_query_2k_from_s2.yaml",
+    ]
+    for path in paths:
+        cfg = load_config(path)
+        cfg["model"]["pretrained_backbone"] = False
+        model = build_model(cfg)
+        matcher = build_matcher(cfg)
+        criterion = build_criterion(cfg)
+        assert model.structured_query_head.num_instances == 64
+        assert matcher.cfg.assignment == "grouped_one_to_many"
+        assert matcher.cfg.num_groups == 4
+        assert criterion.cfg.exist_loss_type == "focal"
+
+
+def test_structured_full_configs_build():
+    paths = [
+        "dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16.yaml",
+        "dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_continue_75k.yaml",
+        "dynlaneseq_eg/configs/culane_s1_residual_structured_query_res34_b16_from_s0.yaml",
+        "dynlaneseq_eg/configs/culane_s2_residual_structured_query_res34_b16_from_s1.yaml",
+        "dynlaneseq_eg/configs/culane_s3_active_corridor_qualitycal_structured_query_res34_b16_from_s2.yaml",
+    ]
+    for path in paths:
+        cfg = load_config(path)
+        cfg["model"]["pretrained_backbone"] = False
+        model = build_model(cfg)
+        matcher = build_matcher(cfg)
+        criterion = build_criterion(cfg)
+        assert model.structured_query_head.num_instances == 64
+        assert matcher.cfg.assignment == "grouped_one_to_many"
+        assert matcher.cfg.num_groups == 4
+        assert criterion.cfg.exist_loss_type == "focal"
+
+
+def _structured_stage_cfg(name: str):
+    cfg = _cfg(name)
+    cfg["model"].update(
+        {
+            "dim": 64,
+            "fpn_channels": 64,
+            "num_slots": 16,
+            "num_heads": 4,
+            "decoder_layers": 0,
+            "decoder_ff_dim": 128,
+            "row_decoder_ff_dim": 128,
+            "structured_query": {
+                "enabled": True,
+                "num_instances": 16,
+                "num_groups": 4,
+                "num_layers": 1,
+                "num_heads": 4,
+                "ff_dim": 128,
+                "dropout": 0.0,
+            },
+        }
+    )
+    if name == "DynLaneSeqS1":
+        cfg["model"]["s1_mode"] = "residual"
+    else:
+        cfg["model"]["s2_mode"] = "residual"
+    return cfg
+
+
+def test_structured_query_propagates_to_s1_outputs():
+    cfg = _structured_stage_cfg("DynLaneSeqS1")
+    model = DynLaneSeqS1(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["exist_logits"].shape == (1, 16, 2)
+    assert out["pred_x_rows"].shape == (1, 16, 72)
+    assert out["coarse"]["pred_x_rows"].shape == (1, 16, 72)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+    assert out["row_hidden"].shape == (1, 16, 72, 64)
+
+
+def test_structured_query_propagates_to_s2_outputs():
+    cfg = _structured_stage_cfg("DynLaneSeqS2")
+    model = DynLaneSeqS2(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["coarse"]["pred_x_rows"].shape == (1, 16, 72)
+    assert out["final"]["pred_x_rows"].shape == (1, 16, 72)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+    assert out["evidence"]["E_seq"].shape == (1, 16, 72, 64)
+
+
+def test_structured_query_propagates_to_s3_outputs():
+    cfg = _structured_stage_cfg("DynLaneSeqS3")
+    cfg["model"]["active_corridor"] = {
+        "enabled": True,
+        "offsets_px": [-16, -8, 0, 8, 16],
+        "center_init_bias": 2.0,
+    }
+    cfg["model"]["quality_calibrator"] = {
+        "enabled": True,
+        "range_padding_px": 4.0,
+        "detach_row_hidden": True,
+        "quality_base": "none",
+    }
+    cfg["model"]["bridge"] = {"type": "dynamic_depthwise_sequence", "kernel_size": 3, "bridge_scale_init": 0.0}
+    model = DynLaneSeqS3(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["coarse"]["pred_x_rows"].shape == (1, 16, 72)
+    assert out["final"]["pred_x_rows"].shape == (1, 16, 72)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+    assert out["evidence"]["active_offset_logits"].shape == (1, 16, 72, 5)
+    assert torch.allclose(out["final"]["quality_logits"], torch.zeros_like(out["final"]["quality_logits"]), atol=1e-6)
 
 
 def test_dynamic_evidence_propagates_to_s3_outputs():

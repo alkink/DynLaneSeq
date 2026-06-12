@@ -1,0 +1,125 @@
+output_dir: outputs/debug_s1_residual_structured_query_2k_init_structured
+
+dataset:
+  name: CULane
+  root: dataset
+  lists:
+    train: list/train_2k.txt
+    val: list/test_2k.txt
+    test: list/test_2k.txt
+  min_valid_rows: 5
+  cut_height: 270
+  infer_seg_labels: true
+
+augmentation:
+  cut_height: 270
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  channel_shuffle_prob: 0.1
+  hue_saturation_prob: 0.7
+  blur_prob: 0.2
+  affine_prob: 0.7
+  affine_translate_x: 0.1
+  affine_translate_y: 0.1
+  affine_rotate_deg: 3.0
+  affine_scale_min: 0.8
+  affine_scale_max: 1.2
+
+dataloader:
+  num_workers: 2
+  pin_memory: true
+  shuffle: true
+  eval_batch_size: 1
+
+model:
+  name: DynLaneSeqS1
+  s1_mode: residual
+  input_h: 288
+  input_w: 800
+  fpn_channels: 128
+  dim: 256
+  pretrained_backbone: true
+  freeze_backbone_bn: true
+  num_slots: 64
+  num_rows: 72
+  x_bins: 200
+  token_ignore_index: -100
+  decoder_layers: 0
+  row_decoder_layers: 2
+  num_heads: 8
+  decoder_ff_dim: 1024
+  row_decoder_ff_dim: 512
+  dropout: 0.1
+  query_content_init: learned
+  memory_value_with_pos: false
+  residual_logit_scale: 1.0
+  zero_init_residual_head: true
+  detach_coarse_x: true
+  structured_query:
+    enabled: true
+    num_instances: 64
+    num_groups: 4
+    num_layers: 2
+    num_heads: 8
+    ff_dim: 1024
+    dropout: 0.1
+    use_x_pos: true
+    exist_prior_prob: 0.01
+  seg_aux:
+    enabled: true
+    dropout: 0.1
+  centerline_aux:
+    enabled: true
+    dropout: 0.1
+
+matcher:
+  assignment: grouped_one_to_many
+  num_groups: 4
+  lambda_obj: 2.0
+  lambda_point: 5.0
+  lambda_range: 1.0
+  lambda_line_iou: 1.0
+  line_iou_radius: 7.5
+
+loss:
+  exist_loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  w_exist: 2.0
+  w_point: 5.0
+  w_range: 1.0
+  w_token: 0.25
+  w_smooth: 0.05
+  w_line_iou: 2.0
+  w_seg: 1.0
+  w_centerline: 0.25
+  w_quality: 0.0
+  centerline_sigma_bins: 1.5
+  centerline_pos_weight: 2.0
+  line_iou_radius: 7.5
+  seg_pos_weight: 4.0
+  smooth_l1_beta: 0.01
+  no_lane_weight: 1.0
+  smoothness_contiguous: true
+
+optimizer:
+  base_lr: 0.00004
+  row_decoder_lr: 0.00008
+  evidence_lr: 0.00012
+  backbone_lr: 0.000004
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+postprocess:
+  lane_nms_distance_thresh_px: 20.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4
+
+training:
+  batch_size: 4
+  max_iters: 12000
+  amp: true
+  clip_grad_norm: 1.0
+  log_interval: 50
+  vis_interval: 500
+  checkpoint_interval: 3000
