@@ -168,6 +168,7 @@ def test_structured_stage_debug_configs_build():
 def test_structured_full_configs_build():
     paths = [
         "dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16.yaml",
+        "dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_local_speedtest.yaml",
         "dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_continue_75k.yaml",
         "dynlaneseq_eg/configs/culane_s1_residual_structured_query_res34_b16_from_s0.yaml",
         "dynlaneseq_eg/configs/culane_s2_residual_structured_query_res34_b16_from_s1.yaml",

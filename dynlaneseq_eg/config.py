@@ -11,6 +11,17 @@ def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
+    base_paths = cfg.pop("_base_", None)
+    if base_paths is not None:
+        if isinstance(base_paths, (str, Path)):
+            base_paths = [base_paths]
+        merged: dict[str, Any] = {}
+        for base_path in base_paths:
+            base_path = Path(base_path)
+            if not base_path.is_absolute():
+                base_path = path.parent / base_path
+            merged = deep_update(merged, load_config(base_path))
+        cfg = deep_update(merged, cfg)
     cfg["_config_path"] = str(path)
     return cfg
 
@@ -32,4 +43,3 @@ def get_cfg(cfg: dict[str, Any], dotted: str, default: Any = None) -> Any:
             return default
         cur = cur[part]
     return cur
-

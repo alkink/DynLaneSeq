@@ -1,0 +1,13 @@
+_base_: culane_s2_residual_structured_query_2k_from_s1.yaml
+
+output_dir: outputs/debug_s2_residual_structured_query_sota96_2k_from_s1
+
+model:
+  num_slots: 96
+  structured_query:
+    num_instances: 96
+    num_groups: 6
+    num_layers: 3
+
+matcher:
+  num_groups: 6
