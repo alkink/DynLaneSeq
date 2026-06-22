@@ -1,0 +1,53 @@
+_base_: culane_s1_residual_structured_query_2k_init_structured.yaml
+
+output_dir: outputs/debug_s1_igt_structured_query_2k_from_s0_frozen
+
+augmentation:
+  random_shadow_prob: 0.35
+  random_shadow_min_opacity: 0.20
+  random_shadow_max_opacity: 0.50
+  random_shadow_roi_start_y: 0.25
+  gamma_jitter_prob: 0.25
+  gamma_jitter_range: [0.65, 1.55]
+  low_light_prob: 0.20
+  motion_blur_prob: 0.15
+  motion_blur_kernel_choices: [3, 5, 7]
+  random_occlusion_prob: 0.15
+  random_occlusion_roi_y: [0.35, 1.0]
+
+model:
+  freeze_s0_frontend: true
+  s1_refiner_type: igt
+  residual_logit_scale: 0.5
+  row_visibility:
+    enabled: true
+  igt_refiner:
+    hidden_dim: 512
+    num_blocks: 3
+    kernel_size: 9
+    dilations: [1, 2, 4]
+    dropout: 0.1
+    zero_init: true
+    num_groups: 4
+    detach_quality_base: true
+    visibility_head: true
+
+loss:
+  w_exist: 0.0
+  w_range: 0.0
+  w_token: 0.1
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.25
+  w_visibility: 0.05
+  visibility_pos_weight: 1.0
+  w_tangent: 0.20
+  w_curvature: 0.05
+  w_delta_l2: 0.01
+  lambda_coarse: 0.0
+
+optimizer:
+  base_lr: 0.00004
+  row_decoder_lr: 0.00004
+  evidence_lr: 0.00004
+  backbone_lr: 0.0

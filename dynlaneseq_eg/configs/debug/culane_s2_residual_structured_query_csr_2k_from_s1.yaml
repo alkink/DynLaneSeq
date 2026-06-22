@@ -1,0 +1,23 @@
+_base_: culane_s2_residual_structured_query_2k_from_s1.yaml
+
+output_dir: outputs/debug_s2_residual_structured_query_csr_2k_from_s1
+
+model:
+  s2_refiner_type: csr_conv1d
+  s2_csr:
+    hidden_dim: 512
+    num_blocks: 3
+    kernel_size: 9
+    dilations: [1, 2, 4]
+    dropout: 0.1
+    zero_init: true
+    quality_base: coarse
+    detach_quality_base: true
+  evidence_sampler:
+    local_window:
+      enabled: false
+      offsets_px: [-8, -4, 0, 4, 8]
+
+loss:
+  w_quality: 0.25
+

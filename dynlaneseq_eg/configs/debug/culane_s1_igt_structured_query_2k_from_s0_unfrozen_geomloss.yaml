@@ -1,0 +1,9 @@
+_base_: culane_s1_igt_structured_query_2k_from_s0_unfrozen_fair.yaml
+
+output_dir: outputs/debug_s1_igt_structured_query_2k_from_s0_unfrozen_geomloss
+
+loss:
+  w_quality: 0.25
+  w_tangent: 0.20
+  w_curvature: 0.05
+  w_delta_l2: 0.01

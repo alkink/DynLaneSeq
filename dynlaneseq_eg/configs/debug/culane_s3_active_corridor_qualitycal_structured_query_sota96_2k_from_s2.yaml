@@ -1,6 +1,6 @@
 _base_: culane_s3_active_corridor_qualitycal_structured_query_2k_from_s2.yaml
 
-output_dir: outputs/debug_s3_active_corridor_qualitycal_structured_query_sota96_2k_from_s2
+output_dir: outputs/debug_s3_active_corridor_qualitycal_structured_query_sota96_2k_from_s2_fast
 
 model:
   num_slots: 96
@@ -11,3 +11,13 @@ model:
 
 matcher:
   num_groups: 6
+
+dataloader:
+  num_workers: 6
+  persistent_workers: true
+  prefetch_factor: 4
+
+training:
+  tf32: true
+  cudnn_benchmark: true
+  compile_model: false

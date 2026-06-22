@@ -33,6 +33,13 @@ class TransformConfig:
     random_shadow_min_vertices: int = 3
     random_shadow_max_vertices: int = 6
     random_shadow_roi_start_y: float = 0.25
+    gamma_jitter_prob: float = 0.0
+    gamma_jitter_range: tuple[float, float] = (0.65, 1.55)
+    low_light_prob: float = 0.0
+    motion_blur_prob: float = 0.0
+    motion_blur_kernel_choices: tuple[int, ...] = (3, 5, 7)
+    random_occlusion_prob: float = 0.0
+    random_occlusion_roi_y: tuple[float, float] = (0.35, 1.0)
 
 
 class LaneTransforms:
@@ -77,14 +84,22 @@ class LaneTransforms:
             image = ImageEnhance.Contrast(image).enhance(factor)
         if training and self.cfg.hue_saturation_prob > 0 and np.random.random() < self.cfg.hue_saturation_prob:
             image = self._jitter_hue_saturation(image)
+        if training and self.cfg.gamma_jitter_prob > 0 and np.random.random() < self.cfg.gamma_jitter_prob:
+            image = self._apply_gamma_jitter(image)
+        if training and self.cfg.low_light_prob > 0 and np.random.random() < self.cfg.low_light_prob:
+            image = self._apply_low_light(image)
         if training and self.cfg.blur_prob > 0 and np.random.random() < self.cfg.blur_prob:
             image = image.filter(ImageFilter.GaussianBlur(radius=float(np.random.uniform(0.4, 1.2))))
+        if training and self.cfg.motion_blur_prob > 0 and np.random.random() < self.cfg.motion_blur_prob:
+            image = self._apply_motion_blur(image)
         if training and self.cfg.channel_shuffle_prob > 0 and np.random.random() < self.cfg.channel_shuffle_prob:
             arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
             order = np.random.permutation(3)
             image = Image.fromarray(arr[..., order], mode="RGB")
         if training and self.cfg.random_shadow_prob > 0 and np.random.random() < self.cfg.random_shadow_prob:
             image = self._apply_random_shadow(image)
+        if training and self.cfg.random_occlusion_prob > 0 and np.random.random() < self.cfg.random_occlusion_prob:
+            image = self._apply_random_occlusion(image)
 
         image = image.convert("RGB").resize(
             (self.cfg.input_w, self.cfg.input_h),
@@ -162,6 +177,49 @@ class LaneTransforms:
         hsv[..., 1] = np.clip(hsv[..., 1].astype(np.float32) * sat_scale, 0, 255).astype(np.uint8)
         return Image.fromarray(hsv, mode="HSV").convert("RGB")
 
+    def _apply_gamma_jitter(self, image: Image.Image) -> Image.Image:
+        lo, hi = self.cfg.gamma_jitter_range
+        lo = max(float(lo), 1e-3)
+        hi = max(float(hi), lo)
+        gamma = float(np.random.uniform(lo, hi))
+        arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        arr = np.clip(arr, 0.0, 1.0) ** gamma
+        return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode="RGB")
+
+    @staticmethod
+    def _apply_low_light(image: Image.Image) -> Image.Image:
+        image = image.convert("RGB")
+        brightness = float(np.random.uniform(0.45, 0.90))
+        contrast = float(np.random.uniform(0.80, 1.15))
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+        return ImageEnhance.Contrast(image).enhance(contrast)
+
+    def _apply_motion_blur(self, image: Image.Image) -> Image.Image:
+        choices = tuple(int(k) for k in self.cfg.motion_blur_kernel_choices if int(k) >= 3 and int(k) % 2 == 1)
+        if not choices:
+            return image
+        k = int(np.random.choice(choices))
+        mode = int(np.random.randint(0, 4))
+        radius = k // 2
+        if mode == 0:
+            offsets = [(0, dx) for dx in range(-radius, radius + 1)]
+        elif mode == 1:
+            offsets = [(dy, 0) for dy in range(-radius, radius + 1)]
+        elif mode == 2:
+            offsets = [(d, d) for d in range(-radius, radius + 1)]
+        else:
+            offsets = [(d, -d) for d in range(-radius, radius + 1)]
+        arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+        padded = np.pad(arr, ((radius, radius), (radius, radius), (0, 0)), mode="edge")
+        acc = np.zeros_like(arr, dtype=np.float32)
+        h, w = arr.shape[:2]
+        for dy, dx in offsets:
+            y0 = radius + dy
+            x0 = radius + dx
+            acc += padded[y0 : y0 + h, x0 : x0 + w]
+        acc /= float(len(offsets))
+        return Image.fromarray(np.clip(acc, 0, 255).astype(np.uint8), mode="RGB")
+
     def _apply_random_shadow(self, image: Image.Image) -> Image.Image:
         image = image.convert("RGB")
         w, h = image.size
@@ -182,4 +240,27 @@ class LaneTransforms:
         overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         draw.polygon(points, fill=(0, 0, 0, int(255 * opacity)))
+        return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+
+    def _apply_random_occlusion(self, image: Image.Image) -> Image.Image:
+        image = image.convert("RGB")
+        w, h = image.size
+        y0_ratio, y1_ratio = self.cfg.random_occlusion_roi_y
+        y0 = int(np.clip(float(y0_ratio), 0.0, 1.0) * h)
+        y1 = int(np.clip(float(y1_ratio), 0.0, 1.0) * h)
+        if y1 <= y0:
+            y0, y1 = 0, h
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        num_rects = int(np.random.randint(1, 3))
+        for _ in range(num_rects):
+            rect_w = int(np.random.uniform(0.06, 0.22) * w)
+            rect_h = int(np.random.uniform(0.04, 0.16) * h)
+            x0 = int(np.random.randint(0, max(1, w - max(1, rect_w))))
+            yy0 = int(np.random.randint(y0, max(y0 + 1, y1)))
+            x1 = min(w, x0 + max(1, rect_w))
+            yy1 = min(h, yy0 + max(1, rect_h))
+            shade = int(np.random.randint(0, 96))
+            alpha = int(np.random.uniform(96, 210))
+            draw.rectangle((x0, yy0, x1, yy1), fill=(shade, shade, shade, alpha))
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")

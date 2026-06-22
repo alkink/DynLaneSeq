@@ -1,0 +1,20 @@
+_base_: culane_igsr_gate_geometry_authoritative_2k.yaml
+
+output_dir: outputs/debug_igsr_gate_lateral_profile_2k
+
+model:
+  active_corridor:
+    scorer_type: lateral_profile
+    profile_dim: 64
+    profile_blocks: 2
+    profile_kernel_size: 3
+    dropout: 0.05
+    zero_init: true
+    center_init_bias: 0.0
+    authoritative_geometry: true
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 12000
+  checkpoint_interval: 3000

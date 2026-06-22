@@ -1,0 +1,16 @@
+_base_: culane_s2_residual_structured_query_sota96_2k_from_s1.yaml
+
+output_dir: outputs/debug_s2_residual_structured_query_sota96_decision_2k_from_s1
+
+model:
+  s2_decision_refiner:
+    enabled: true
+    hidden_dim: 256
+    dropout: 0.1
+    zero_init: true
+    detach_base: true
+    exist_delta_scale: 0.5
+    quality_base: coarse
+
+loss:
+  w_quality: 0.25

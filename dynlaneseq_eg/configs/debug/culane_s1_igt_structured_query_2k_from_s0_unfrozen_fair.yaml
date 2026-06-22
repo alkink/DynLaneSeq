@@ -1,0 +1,17 @@
+_base_: culane_s1_residual_structured_query_2k_init_structured.yaml
+
+output_dir: outputs/debug_s1_igt_structured_query_2k_from_s0_unfrozen_fair
+
+model:
+  s1_refiner_type: igt
+  residual_logit_scale: 1.0
+  igt_refiner:
+    hidden_dim: 512
+    num_blocks: 3
+    kernel_size: 9
+    dilations: [1, 2, 4]
+    dropout: 0.1
+    zero_init: true
+    num_groups: 4
+    detach_quality_base: true
+    visibility_head: false

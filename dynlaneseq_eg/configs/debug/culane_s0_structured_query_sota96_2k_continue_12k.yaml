@@ -1,6 +1,6 @@
 _base_: culane_s0_structured_query_2k_continue_12k.yaml
 
-output_dir: outputs/debug_s0_structured_query_sota96_2k_continue_12k
+output_dir: outputs/debug_s0_structured_query_sota96_2k_continue_12k_fast_compile
 
 model:
   num_slots: 96
@@ -11,3 +11,13 @@ model:
 
 matcher:
   num_groups: 6
+
+dataloader:
+  num_workers: 6
+  persistent_workers: true
+  prefetch_factor: 4
+
+training:
+  tf32: true
+  cudnn_benchmark: true
+  compile_model: false

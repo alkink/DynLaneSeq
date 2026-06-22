@@ -1,0 +1,36 @@
+_base_: culane_s3_active_corridor_qualitycal_structured_query_2k_from_s2.yaml
+
+output_dir: outputs/debug_igsr_gate_geometry_joint_2k
+
+model:
+  freeze_s0_frontend: false
+  detach_coarse_x: false
+  active_corridor:
+    detach_center: false
+    detach_refined_x_for_decoder: false
+  evidence_sampler:
+    detach_sample_coords: false
+  quality_calibrator:
+    enabled: false
+
+loss:
+  w_quality: 0.0
+  w_active_offset_reg: 3.0
+  w_active_offset_ce: 0.25
+  lambda_coarse: 0.5
+
+optimizer:
+  base_lr: 0.00002
+  structured_lr: 0.00002
+  row_decoder_lr: 0.00006
+  evidence_lr: 0.00006
+  backbone_lr: 0.0
+
+postprocess:
+  quality_score_power: 0.0
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 12000
+  checkpoint_interval: 3000

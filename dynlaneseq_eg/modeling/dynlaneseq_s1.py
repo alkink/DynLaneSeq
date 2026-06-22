@@ -8,6 +8,7 @@ from torch import nn
 from .common import soft_expected_x
 from .dynlaneseq_s0 import DynLaneSeqEncoder, GeometryGuidedQueryRefiner
 from .heads_s0 import ExistenceHead, RangeHead, S0Heads
+from .instance_geometry_refiner import build_instance_geometry_refiner
 from .row_token_decoder import RowTokenDecoder
 from .structured_queries import build_structured_query_head
 
@@ -26,9 +27,20 @@ class DynLaneSeqS1(nn.Module):
         dim = int(model_cfg.get("dim", 256))
         self.structured_query_head = build_structured_query_head(model_cfg)
         self.s1_mode = str(model_cfg.get("s1_mode", "direct")).lower()
+        self.s1_refiner_type = str(model_cfg.get("s1_refiner_type", "row_transformer")).lower()
+        self.igt_refiner_enabled = self.s1_refiner_type in {"igt", "instance_geometry_topology"}
+        igt_cfg = model_cfg.get("igt_refiner", {})
+        self.igt_detach_quality_base = bool(igt_cfg.get("detach_quality_base", True))
         if self.s1_mode not in {"direct", "residual"}:
             raise ValueError(f"Unsupported S1 mode: {self.s1_mode}")
+        if self.s1_refiner_type not in {"row_transformer", "transformer", "igt", "instance_geometry_topology"}:
+            raise ValueError(f"Unsupported s1_refiner_type: {self.s1_refiner_type}")
+        if self.igt_refiner_enabled and self.s1_mode != "residual":
+            raise ValueError("s1_refiner_type=igt requires residual S1 mode")
+        if self.igt_refiner_enabled and self.structured_query_head is None:
+            raise ValueError("s1_refiner_type=igt requires structured_query.enabled=true")
         self.encoder = DynLaneSeqEncoder(cfg)
+        self.freeze_s0_frontend = bool(model_cfg.get("freeze_s0_frontend", False))
         if self.structured_query_head is not None and self.s1_mode != "residual":
             raise ValueError("structured_query currently requires residual S1 mode")
         if bool(geometry_cfg.get("enabled", False)) and bool(model_cfg.get("dynamic_evidence", {}).get("enabled", False)):
@@ -77,18 +89,45 @@ class DynLaneSeqS1(nn.Module):
         )
         self.row_embedding = nn.Embedding(self.num_rows, dim)
         nn.init.normal_(self.row_embedding.weight, std=0.02)
-        self.row_decoder = RowTokenDecoder(
-            num_rows=self.num_rows,
-            dim=dim,
-            x_bins=self.x_bins,
-            num_layers=int(model_cfg.get("row_decoder_layers", 2)),
-            num_heads=int(model_cfg.get("num_heads", 8)),
-            ff_dim=int(model_cfg.get("row_decoder_ff_dim", 512)),
-            dropout=float(model_cfg.get("dropout", 0.1)),
-            zero_init_head=bool(model_cfg.get("zero_init_residual_head", self.s1_mode == "residual")),
-            local_attn_window=int(model_cfg.get("row_local_attn_window", 0)),
-            visibility_head=bool(model_cfg.get("row_visibility", {}).get("enabled", False)),
+        if self.igt_refiner_enabled:
+            self.row_embedding.weight.requires_grad_(False)
+        self.igt_refiner = build_instance_geometry_refiner(model_cfg) if self.igt_refiner_enabled else None
+        self.row_decoder = (
+            RowTokenDecoder(
+                num_rows=self.num_rows,
+                dim=dim,
+                x_bins=self.x_bins,
+                num_layers=int(model_cfg.get("row_decoder_layers", 2)),
+                num_heads=int(model_cfg.get("num_heads", 8)),
+                ff_dim=int(model_cfg.get("row_decoder_ff_dim", 512)),
+                dropout=float(model_cfg.get("dropout", 0.1)),
+                zero_init_head=bool(model_cfg.get("zero_init_residual_head", self.s1_mode == "residual")),
+                local_attn_window=int(model_cfg.get("row_local_attn_window", 0)),
+                visibility_head=bool(model_cfg.get("row_visibility", {}).get("enabled", False)),
+            )
+            if not self.igt_refiner_enabled
+            else None
         )
+        if self.freeze_s0_frontend:
+            self._freeze_s0_frontend()
+
+    def _freeze_s0_frontend(self) -> None:
+        for module in [self.encoder, self.structured_query_head, getattr(self, "heads", None)]:
+            if module is None:
+                continue
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and self.freeze_s0_frontend:
+            self.encoder.eval()
+            if self.structured_query_head is not None:
+                self.structured_query_head.eval()
+            if getattr(self, "heads", None) is not None:
+                self.heads.eval()
+        return self
 
     def build_row_tokens(
         self,
@@ -107,8 +146,13 @@ class DynLaneSeqS1(nn.Module):
         return tokens
 
     def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
-        enc = self.encoder.forward_features(images)
-        structured = self.structured_query_head(enc["features"]) if self.structured_query_head is not None else None
+        if self.freeze_s0_frontend:
+            with torch.no_grad():
+                enc = self.encoder.forward_features(images)
+                structured = self.structured_query_head(enc["features"]) if self.structured_query_head is not None else None
+        else:
+            enc = self.encoder.forward_features(images)
+            structured = self.structured_query_head(enc["features"]) if self.structured_query_head is not None else None
         q = structured["queries"] if structured is not None else enc["queries"]
         structured_row_tokens = structured["structured_row_tokens"] if structured is not None else None
         geometry_debug = None
@@ -127,25 +171,40 @@ class DynLaneSeqS1(nn.Module):
             coarse = structured if structured is not None else self.heads(q)
             coarse_x = coarse["pred_x_rows"].detach() if self.detach_coarse_x else coarse["pred_x_rows"]
             coarse_x_norm = (coarse_x / float(self.input_w)).unsqueeze(-1)
-            row = self.row_decoder(
-                self.build_row_tokens(
+            if self.igt_refiner is not None:
+                if structured_row_tokens is None:
+                    raise RuntimeError("IGT S1 requires structured_row_tokens")
+                row = self.igt_refiner(
                     q,
-                    extra=self.coarse_x_embed(coarse_x_norm),
-                    base_row_tokens=structured_row_tokens,
-                ),
-                input_w=self.input_w,
-            )
+                    structured_row_tokens,
+                    coarse_x_norm,
+                    coarse_quality_logits=coarse.get("quality_logits"),
+                    range_norm=coarse.get("range_norm"),
+                )
+            else:
+                row = self.row_decoder(
+                    self.build_row_tokens(
+                        q,
+                        extra=self.coarse_x_embed(coarse_x_norm),
+                        base_row_tokens=structured_row_tokens,
+                    ),
+                    input_w=self.input_w,
+                )
             base_logits = coarse["row_x_logits"].detach() if self.detach_coarse_x else coarse["row_x_logits"]
             row_x_logits = base_logits + self.residual_logit_scale * row["row_x_logits"]
             pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
+            quality_logits = coarse["quality_logits"]
+            if "quality_delta_logits" in row:
+                base_quality = coarse["quality_logits"].detach() if self.igt_detach_quality_base else coarse["quality_logits"]
+                quality_logits = base_quality + row["quality_delta_logits"]
             out = {
                 "exist_logits": coarse["exist_logits"],
                 "row_x_logits": row_x_logits,
                 "pred_x_rows": pred_x_rows,
                 "range_raw": coarse["range_raw"],
                 "range_norm": coarse["range_norm"],
-                "quality_logits": coarse["quality_logits"],
-                "quality_pred_x_rows": coarse["pred_x_rows"],
+                "quality_logits": quality_logits,
+                "quality_pred_x_rows": pred_x_rows if "quality_delta_logits" in row else coarse["pred_x_rows"],
                 "row_hidden": row["row_hidden"],
                 "queries": q,
                 "coarse": coarse,
@@ -160,6 +219,8 @@ class DynLaneSeqS1(nn.Module):
                 out["s0_geometry_draft"] = geometry_draft
             if "row_visibility_logits" in row:
                 out["row_visibility_logits"] = row["row_visibility_logits"]
+            if "igt_debug" in row:
+                out["igt_debug"] = row["igt_debug"]
         else:
             range_raw, range_norm = self.range_head(q)
             row = self.row_decoder(self.build_row_tokens(q), input_w=self.input_w)

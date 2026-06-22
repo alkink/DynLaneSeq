@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="val")
+    parser.add_argument("--list-path", default="", help="Override the configured list for the selected split.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--top-k", type=int, default=0, help="0 means use every slot/proposal.")
     parser.add_argument(
@@ -125,6 +126,8 @@ def with_category_list(cfg: dict, list_path: Path) -> dict:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.list_path:
+        cfg.setdefault("dataset", {}).setdefault("lists", {})[args.split] = str(Path(args.list_path).resolve())
     device = torch.device(args.device)
     model = build_model(cfg).to(device)
     load_checkpoint(args.checkpoint, model, strict=False)
@@ -134,6 +137,8 @@ def main() -> None:
     print(f"config: {args.config}")
     print(f"checkpoint: {args.checkpoint}")
     print(f"split: {args.split}")
+    if args.list_path:
+        print(f"list_path: {Path(args.list_path).resolve()}")
     print(f"top_k: {args.top_k}")
     print(f"rank_by: {args.rank_by}")
     print(f"line_width: {args.line_width}")

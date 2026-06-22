@@ -55,27 +55,19 @@ class DynamicDepthwiseBridge(nn.Module):
         params = self.generator(queries)
         if self.param_clip is not None:
             params = params.clamp(min=-self.param_clip, max=self.param_clip)
-        out = torch.empty_like(evidence)
         cursor_gamma = self.kernel_dim
         cursor_beta = cursor_gamma + c
-        for bi in range(b):
-            for ni in range(n):
-                vec = params[bi, ni]
-                kernel = vec[: self.kernel_dim].view(c, 1, self.kernel_size)
-                gamma = vec[cursor_gamma:cursor_beta].view(1, c)
-                beta = vec[cursor_beta:].view(1, c)
-                e = evidence[bi, ni]
-                e_norm = self.norm(e)
-                filtered = F.conv1d(
-                    e_norm.transpose(0, 1).unsqueeze(0),
-                    kernel,
-                    padding=self.kernel_size // 2,
-                    groups=c,
-                ).squeeze(0).transpose(0, 1)
-                delta = filtered * (1.0 + gamma) + beta
-                if self.delta_clip is not None:
-                    delta = delta.clamp(min=-self.delta_clip, max=self.delta_clip)
-                out[bi, ni] = e + self.bridge_scale * delta
+        kernel = params[..., : self.kernel_dim].view(b, n, c, self.kernel_size)
+        gamma = params[..., cursor_gamma:cursor_beta].view(b, n, 1, c)
+        beta = params[..., cursor_beta:].view(b, n, 1, c)
+        e_norm = self.norm(evidence).permute(0, 1, 3, 2)
+        pad = self.kernel_size // 2
+        windows = F.pad(e_norm, (pad, pad)).unfold(dimension=-1, size=self.kernel_size, step=1)
+        filtered = (windows * kernel.unsqueeze(3)).sum(dim=-1).permute(0, 1, 3, 2)
+        delta = filtered * (1.0 + gamma) + beta
+        if self.delta_clip is not None:
+            delta = delta.clamp(min=-self.delta_clip, max=self.delta_clip)
+        out = evidence + self.bridge_scale * delta
         delta_all = out - evidence
         mean_e = evidence.abs().mean()
         mean_delta = delta_all.abs().mean()

@@ -1,0 +1,3 @@
+_base_: culane_s3_unified_fair_2k_from_s0continue_phase1_12k.yaml
+
+output_dir: outputs/debug_s3_unified_fair_2k_from_s0continue_phase3_12k

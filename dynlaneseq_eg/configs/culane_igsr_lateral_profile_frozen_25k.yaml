@@ -1,0 +1,26 @@
+_base_: debug/culane_igsr_gate_lateral_profile_2k.yaml
+
+output_dir: outputs/culane_igsr_lateral_profile_frozen_25k
+
+dataset:
+  lists:
+    train: list/train_gt.txt
+    val: list/test_2k.txt
+    test: list/test.txt
+
+dataloader:
+  num_workers: 12
+  pin_memory: true
+  shuffle: true
+  eval_batch_size: 1
+  persistent_workers: true
+  prefetch_factor: 4
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 25000
+  checkpoint_interval: 5000
+  log_interval: 50
+  vis_interval: 1000
+

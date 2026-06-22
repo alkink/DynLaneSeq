@@ -69,6 +69,13 @@ class CULaneDataset(Dataset):
                 random_shadow_min_vertices=int(aug.get("random_shadow_min_vertices", 3)),
                 random_shadow_max_vertices=int(aug.get("random_shadow_max_vertices", 6)),
                 random_shadow_roi_start_y=float(aug.get("random_shadow_roi_start_y", 0.25)),
+                gamma_jitter_prob=float(aug.get("gamma_jitter_prob", 0.0)),
+                gamma_jitter_range=tuple(aug.get("gamma_jitter_range", [0.65, 1.55])),
+                low_light_prob=float(aug.get("low_light_prob", 0.0)),
+                motion_blur_prob=float(aug.get("motion_blur_prob", 0.0)),
+                motion_blur_kernel_choices=tuple(aug.get("motion_blur_kernel_choices", [3, 5, 7])),
+                random_occlusion_prob=float(aug.get("random_occlusion_prob", 0.0)),
+                random_occlusion_roi_y=tuple(aug.get("random_occlusion_roi_y", [0.35, 1.0])),
             )
         )
 

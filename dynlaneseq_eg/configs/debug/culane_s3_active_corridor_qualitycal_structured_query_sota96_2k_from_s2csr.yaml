@@ -1,0 +1,4 @@
+_base_: culane_s3_active_corridor_qualitycal_structured_query_sota96_2k_from_s2.yaml
+
+output_dir: outputs/debug_s3_active_corridor_qualitycal_structured_query_sota96_2k_from_s2csr
+

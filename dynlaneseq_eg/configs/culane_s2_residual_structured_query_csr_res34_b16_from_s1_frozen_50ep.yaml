@@ -1,0 +1,55 @@
+_base_: culane_s2_residual_structured_query_res34_b16_from_s1.yaml
+
+output_dir: outputs/culane_s2_residual_structured_query_csr_res34_b16_from_s1_frozen_50ep
+
+model:
+  freeze_s0_frontend: true
+  s2_refiner_type: csr_conv1d
+  residual_logit_scale: 0.5
+  detach_coarse_x: true
+  s2_csr:
+    hidden_dim: 512
+    num_blocks: 3
+    kernel_size: 9
+    dilations: [1, 2, 4]
+    dropout: 0.1
+    zero_init: true
+    quality_base: coarse
+    detach_quality_base: true
+  evidence_sampler:
+    noise_std: 2.0
+    detach_sample_coords: true
+    local_window:
+      enabled: false
+      offsets_px: [-8, -4, 0, 4, 8]
+
+loss:
+  w_exist: 0.0
+  w_point: 5.0
+  w_range: 0.0
+  w_token: 0.1
+  w_smooth: 0.05
+  w_line_iou: 2.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.25
+  lambda_coarse: 0.0
+
+optimizer:
+  base_lr: 0.00003
+  row_decoder_lr: 0.00004
+  evidence_lr: 0.00004
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+training:
+  max_iters: 278000
+  log_interval: 50
+  checkpoint_interval: 25000

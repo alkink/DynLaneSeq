@@ -1,0 +1,18 @@
+_base_: culane_igsr_gate_geometry_joint_2k.yaml
+
+output_dir: outputs/debug_igsr_gate_selection_joint_2k
+
+model:
+  quality_calibrator:
+    enabled: true
+    detach_base: false
+    detach_row_hidden: false
+    calibrate_exist: true
+    exist_delta_scale: 1.0
+    quality_base: none
+
+loss:
+  w_quality: 0.0
+
+postprocess:
+  quality_score_power: 0.0

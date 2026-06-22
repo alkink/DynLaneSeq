@@ -1,0 +1,10 @@
+_base_: culane_igsr_pixel_only_frozen_100kimg.yaml
+
+output_dir: outputs/culane_igsr_pixel_only_mixed_jitter_frozen_100kimg
+
+model:
+  active_corridor:
+    train_center_jitter_px: 24.0
+    train_center_jitter_knots: 5
+    train_center_jitter_prob: 0.5
+

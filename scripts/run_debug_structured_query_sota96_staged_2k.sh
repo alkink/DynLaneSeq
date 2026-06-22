@@ -5,6 +5,10 @@ cd "$(dirname "$0")/.."
 
 DEVICE="${DEVICE:-cuda}"
 STAGES="${STAGES:-s0 s0_continue s1 s2 s3}"
+S0_CONTINUE_INIT_FROM="${S0_CONTINUE_INIT_FROM:-outputs/debug_s0_structured_query_sota96_2k/last.pt}"
+S1_INIT_FROM="${S1_INIT_FROM:-outputs/debug_s0_structured_query_sota96_2k_continue_12k/last.pt}"
+S2_INIT_FROM="${S2_INIT_FROM:-outputs/debug_s1_residual_structured_query_sota96_2k_init_structured/last.pt}"
+S3_INIT_FROM="${S3_INIT_FROM:-outputs/debug_s2_residual_structured_query_sota96_2k_from_s1/last.pt}"
 
 run_stage() {
   local stage="$1"
@@ -18,25 +22,25 @@ run_stage() {
       python -m dynlaneseq_eg.tools.train \
         --config dynlaneseq_eg/configs/debug/culane_s0_structured_query_sota96_2k_continue_12k.yaml \
         --device "${DEVICE}" \
-        --init-from outputs/debug_s0_structured_query_sota96_2k/last.pt
+        --init-from "${S0_CONTINUE_INIT_FROM}"
       ;;
     s1)
       python -m dynlaneseq_eg.tools.train \
         --config dynlaneseq_eg/configs/debug/culane_s1_residual_structured_query_sota96_2k_init_structured.yaml \
         --device "${DEVICE}" \
-        --init-from outputs/debug_s0_structured_query_sota96_2k_continue_12k/last.pt
+        --init-from "${S1_INIT_FROM}"
       ;;
     s2)
       python -m dynlaneseq_eg.tools.train \
         --config dynlaneseq_eg/configs/debug/culane_s2_residual_structured_query_sota96_2k_from_s1.yaml \
         --device "${DEVICE}" \
-        --init-from outputs/debug_s1_residual_structured_query_sota96_2k_init_structured/last.pt
+        --init-from "${S2_INIT_FROM}"
       ;;
     s3)
       python -m dynlaneseq_eg.tools.train \
         --config dynlaneseq_eg/configs/debug/culane_s3_active_corridor_qualitycal_structured_query_sota96_2k_from_s2.yaml \
         --device "${DEVICE}" \
-        --init-from outputs/debug_s2_residual_structured_query_sota96_2k_from_s1/last.pt
+        --init-from "${S3_INIT_FROM}"
       ;;
     *)
       echo "Unknown stage '${stage}'. Use one of: s0 s0_continue s1 s2 s3" >&2

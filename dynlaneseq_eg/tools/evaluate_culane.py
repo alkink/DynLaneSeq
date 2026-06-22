@@ -26,6 +26,7 @@ def write_predictions(
     top_k: int,
     row_visibility_thresh: float,
     quality_score_power: float,
+    output_stage: str = "final",
 ) -> None:
     model.eval()
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -33,6 +34,11 @@ def write_predictions(
     for images, targets, metas in tqdm(loader, ncols=80, desc="writing predictions"):
         images = images.to(device, non_blocking=True)
         outputs = model(images, targets=targets) if pass_targets else model(images)
+        if output_stage != "final":
+            stage_outputs = outputs.get(output_stage)
+            if not isinstance(stage_outputs, dict):
+                raise KeyError(f"Model output has no stage named {output_stage!r}")
+            outputs = stage_outputs
         write_culane_predictions(
             outputs,
             metas,
@@ -77,6 +83,8 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="val")
+    parser.add_argument("--list-path", default="", help="Override the configured list for the selected split.")
+    parser.add_argument("--output-stage", choices=["final", "coarse", "stage2"], default="final")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--pred-dir", default="")
     parser.add_argument("--score-thresh", type=float, default=0.5)
@@ -95,6 +103,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.list_path:
+        list_path_override = Path(args.list_path).expanduser().resolve()
+        cfg.setdefault("dataset", {}).setdefault("lists", {})[args.split] = str(list_path_override)
     device = torch.device(args.device)
     post_cfg = cfg.get("postprocess", {})
     nms_distance_thresh_px = (
@@ -136,6 +147,7 @@ def main() -> None:
             top_k,
             row_visibility_thresh,
             quality_score_power,
+            args.output_stage,
         )
 
     list_path = resolve_list_path(cfg, args.split)
@@ -156,6 +168,7 @@ def main() -> None:
     print(f"top_k: {top_k}")
     print(f"row_visibility_thresh: {row_visibility_thresh}")
     print(f"quality_score_power: {quality_score_power}")
+    print(f"output_stage: {args.output_stage}")
     print(format_results(results))
 
     if args.categories:

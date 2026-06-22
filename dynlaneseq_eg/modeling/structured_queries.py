@@ -208,8 +208,8 @@ class StructuredLaneQueryHead(nn.Module):
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
             "structured_debug": {
-                "structured_row_abs": row_tokens.detach().abs().mean(),
-                "structured_feature_abs": row_value_features.detach().abs().mean(),
+                "structured_row_abs": row_tokens.detach()[..., :16].abs().mean(),
+                "structured_feature_abs": row_value_features.detach()[..., :16].abs().mean(),
             },
         }
 

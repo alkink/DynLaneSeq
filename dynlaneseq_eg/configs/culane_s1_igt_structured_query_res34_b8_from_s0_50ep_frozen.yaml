@@ -1,0 +1,6 @@
+_base_: culane_s1_igt_structured_query_res34_b16_from_s0_50ep_frozen.yaml
+
+output_dir: outputs/culane_s1_igt_structured_query_res34_b8_from_s0_50ep_frozen
+
+training:
+  batch_size: 8

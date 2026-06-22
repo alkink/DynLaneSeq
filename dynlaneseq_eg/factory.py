@@ -95,6 +95,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
                 token_label_smoothing=float(loss.get("token_label_smoothing", 0.0)),
                 w_visibility=float(loss.get("w_visibility", 0.0)),
                 visibility_pos_weight=float(loss.get("visibility_pos_weight", 1.0)),
+                w_tangent=float(loss.get("w_tangent", 0.0)),
+                w_curvature=float(loss.get("w_curvature", 0.0)),
+                w_delta_l2=float(loss.get("w_delta_l2", 0.0)),
             )
         )
     if name in {"DynLaneSeqS2", "DynLaneSeqS3"}:
@@ -106,10 +109,23 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
             w_visibility=float(loss.get("w_visibility", 0.0)),
             visibility_pos_weight=float(loss.get("visibility_pos_weight", 1.0)),
             lambda_coarse=float(loss.get("lambda_coarse", 0.5)),
+            coarse_anchor_mode=str(loss.get("coarse_anchor_mode", "legacy")),
+            coarse_dense_anchor=bool(loss.get("coarse_dense_anchor", False)),
             w_active_offset_reg=float(loss.get("w_active_offset_reg", 0.0)),
             w_active_offset_ce=float(loss.get("w_active_offset_ce", 0.0)),
             active_offset_max=float(loss.get("active_offset_max", 32.0)),
             active_offset_label_smoothing=float(loss.get("active_offset_label_smoothing", 0.0)),
+            active_offset_reg_beta_px=float(loss.get("active_offset_reg_beta_px", 0.0)),
+            active_offset_reg_normalizer_px=float(loss.get("active_offset_reg_normalizer_px", 0.0)),
+            active_offset_non_center_weight=float(loss.get("active_offset_non_center_weight", 1.0)),
+            active_offset_soft_target_sigma_px=float(loss.get("active_offset_soft_target_sigma_px", 0.0)),
+            active_offset_fine_target_sigma_px=float(loss.get("active_offset_fine_target_sigma_px", 0.0)),
+            active_offset_fine_weight=float(loss.get("active_offset_fine_weight", 1.0)),
+            active_offset_magnitude_weight=float(loss.get("active_offset_magnitude_weight", 0.0)),
+            w_active_offset_tangent=float(loss.get("w_active_offset_tangent", 0.0)),
+            w_active_gate=float(loss.get("w_active_gate", 0.0)),
+            active_gate_error_threshold_px=float(loss.get("active_gate_error_threshold_px", 4.0)),
+            active_gate_pos_weight=float(loss.get("active_gate_pos_weight", 1.0)),
             cascade_matching=bool(loss.get("cascade_matching", False)),
         )
         if name == "DynLaneSeqS3" and bool(loss.get("cascade_matching", False)):
@@ -163,6 +179,10 @@ def build_dataloader(cfg: dict[str, Any], split: str = "train", training: bool =
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", False))
         kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
+    if training:
+        generator = torch.Generator()
+        generator.manual_seed(int(train_cfg.get("seed", 0)))
+        kwargs["generator"] = generator
     return DataLoader(dataset, **kwargs)
 
 
@@ -174,6 +194,8 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
     row_decoder_lr = float(row_decoder_lr) if row_decoder_lr is not None else None
     evidence_lr = opt_cfg.get("evidence_lr")
     evidence_lr = float(evidence_lr) if evidence_lr is not None else None
+    structured_lr = opt_cfg.get("structured_lr")
+    structured_lr = float(structured_lr) if structured_lr is not None else None
     wd = float(opt_cfg.get("weight_decay", 1e-4))
     decay = []
     no_decay = []
@@ -183,12 +205,20 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
     row_no_decay = []
     evidence_decay = []
     evidence_no_decay = []
+    structured_decay = []
+    structured_no_decay = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         is_no_decay = param.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower()
         is_backbone = ".backbone." in name or name.startswith("encoder.backbone")
         is_row_decoder = row_decoder_lr is not None and (name.startswith("row_decoder.") or name.startswith("row_embedding."))
+        is_structured = structured_lr is not None and (
+            name.startswith("structured_query_head.")
+            or name.startswith("encoder.fpn.")
+            or name.startswith("encoder.proj.")
+            or name.startswith("encoder.ms_proj.")
+        )
         is_evidence = evidence_lr is not None and (
             name.startswith("adapter.")
             or name.startswith("bridge.")
@@ -197,6 +227,8 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or name.startswith("active_corridor.")
             or name.startswith("active_corridor_sampler.")
             or name.startswith("quality_calibrator.")
+            or name.startswith("csr_refiner.")
+            or name.startswith("igt_refiner.")
             or name.startswith("s0_geometry_refiner.")
             or name.startswith("encoder.dynamic_proposal.")
             or name.startswith("structured_query_head.")
@@ -204,8 +236,12 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or "evidence" in name
             or "dynamic_proposal" in name
             or "structured_query" in name
-        )
-        if is_evidence and is_no_decay:
+        ) and not is_structured
+        if is_structured and is_no_decay:
+            structured_no_decay.append(param)
+        elif is_structured:
+            structured_decay.append(param)
+        elif is_evidence and is_no_decay:
             evidence_no_decay.append(param)
         elif is_evidence:
             evidence_decay.append(param)
@@ -228,6 +264,8 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
         {"params": row_no_decay, "lr": row_decoder_lr or base_lr, "weight_decay": 0.0, "name": "row_decoder_no_decay"},
         {"params": evidence_decay, "lr": evidence_lr or base_lr, "weight_decay": wd, "name": "evidence_decay"},
         {"params": evidence_no_decay, "lr": evidence_lr or base_lr, "weight_decay": 0.0, "name": "evidence_no_decay"},
+        {"params": structured_decay, "lr": structured_lr or base_lr, "weight_decay": wd, "name": "structured_decay"},
+        {"params": structured_no_decay, "lr": structured_lr or base_lr, "weight_decay": 0.0, "name": "structured_no_decay"},
         {"params": decay, "lr": base_lr, "weight_decay": wd, "name": "model_decay"},
         {"params": no_decay, "lr": base_lr, "weight_decay": 0.0, "name": "model_no_decay"},
     ]

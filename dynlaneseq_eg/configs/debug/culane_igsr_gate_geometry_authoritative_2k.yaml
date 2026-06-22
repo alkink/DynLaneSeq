@@ -1,0 +1,26 @@
+_base_: culane_igsr_gate_geometry_frozen_2k.yaml
+
+output_dir: outputs/debug_igsr_gate_geometry_authoritative_2k
+
+model:
+  active_corridor:
+    authoritative_geometry: true
+    center_init_bias: 0.0
+
+loss:
+  w_token: 0.0
+  w_active_offset_reg: 1.0
+  w_active_offset_ce: 0.25
+  active_offset_reg_beta_px: 4.0
+  active_offset_non_center_weight: 2.0
+  active_offset_label_smoothing: 0.0
+
+optimizer:
+  row_decoder_lr: 0.0
+  evidence_lr: 0.00006
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 12000
+  checkpoint_interval: 3000

@@ -1,0 +1,15 @@
+_base_: culane_s0_structured_query_2k_continue_12k.yaml
+
+output_dir: outputs/debug_igsr_gate_s0_continue_2k
+
+optimizer:
+  base_lr: 0.00002
+  structured_lr: 0.00002
+  evidence_lr: 0.00002
+  backbone_lr: 0.0
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 12000
+  checkpoint_interval: 3000

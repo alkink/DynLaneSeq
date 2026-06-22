@@ -89,6 +89,9 @@ class DynLaneSeqS3(DynLaneSeqS2):
             )
         else:
             raise ValueError(f"Unsupported S3 bridge type: {bridge_type}")
+        # S3 creates bridge/calibration modules after the S2 constructor has run.
+        if self.active_corridor_freeze_non_active:
+            self._freeze_non_active_corridor()
 
     def bridge_evidence(self, evidence: torch.Tensor, queries: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if isinstance(self.bridge, AsymmetricContextModulationBridge):

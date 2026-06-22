@@ -1,0 +1,44 @@
+_base_: culane_igsr_gate_geometry_authoritative_2k.yaml
+
+output_dir: outputs/debug_igsr_gate_coarse_to_fine_2k
+
+model:
+  active_corridor:
+    scorer_type: coarse_to_fine_2d
+    offsets_px: [-32, -24, -16, -8, 0, 8, 16, 24, 32]
+    fine_offsets_px: [-8, -4, -2, 0, 2, 4, 8]
+    profile_dim: 64
+    profile_blocks: 3
+    row_kernel_size: 5
+    profile_kernel_size: 3
+    prior_channels: 2
+    use_dense_priors: true
+    detach_coarse_for_fine: true
+    freeze_non_active_modules: true
+    skip_row_decoder: true
+    center_init_bias: 0.0
+    dropout: 0.05
+    zero_init: true
+    authoritative_geometry: true
+
+loss:
+  w_active_offset_reg: 2.0
+  w_active_offset_ce: 0.5
+  w_active_offset_tangent: 0.15
+  active_offset_max: 32.0
+  active_offset_reg_beta_px: 2.0
+  active_offset_soft_target_sigma_px: 6.0
+  active_offset_fine_target_sigma_px: 2.0
+  active_offset_fine_weight: 1.5
+  active_offset_non_center_weight: 1.25
+  active_offset_magnitude_weight: 1.0
+  active_offset_label_smoothing: 0.0
+
+optimizer:
+  evidence_lr: 0.00008
+
+training:
+  seed: 3407
+  batch_size: 4
+  max_iters: 12000
+  checkpoint_interval: 3000
