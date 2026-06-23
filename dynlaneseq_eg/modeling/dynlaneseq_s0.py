@@ -323,6 +323,7 @@ class DynLaneSeqEncoder(nn.Module):
         self.query_content_init = str(model_cfg.get("query_content_init", "learned")).lower()
         self.memory_value_with_pos = bool(model_cfg.get("memory_value_with_pos", False))
         self.freeze_backbone_bn = bool(model_cfg.get("freeze_backbone_bn", False))
+        self.freeze_all_bn = bool(model_cfg.get("freeze_all_bn", False))
         seg_aux_cfg = model_cfg.get("seg_aux", {})
         centerline_aux_cfg = model_cfg.get("centerline_aux", {})
         dynamic_evidence_cfg = model_cfg.get("dynamic_evidence", {})
@@ -416,19 +417,33 @@ class DynLaneSeqEncoder(nn.Module):
             ff_dim=int(model_cfg.get("decoder_ff_dim", 1024)),
             dropout=float(model_cfg.get("dropout", 0.1)),
         )
-        if self.freeze_backbone_bn:
+        if self.freeze_all_bn:
+            self._set_all_bn_eval()
+        elif self.freeze_backbone_bn:
             self._set_backbone_bn_eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if mode and self.freeze_backbone_bn:
-            self._set_backbone_bn_eval()
+        if mode:
+            if self.freeze_all_bn:
+                self._set_all_bn_eval()
+            elif self.freeze_backbone_bn:
+                self._set_backbone_bn_eval()
         return self
 
     def _set_backbone_bn_eval(self) -> None:
         for module in self.backbone.modules():
-            if isinstance(module, nn.BatchNorm2d):
+            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 module.eval()
+
+    def _set_all_bn_eval(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                module.eval()
+                if hasattr(module, "weight") and module.weight is not None:
+                    module.weight.requires_grad_(False)
+                if hasattr(module, "bias") and module.bias is not None:
+                    module.bias.requires_grad_(False)
 
     def forward_features(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         feats = self.backbone(images)

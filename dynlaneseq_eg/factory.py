@@ -126,6 +126,8 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
             w_active_gate=float(loss.get("w_active_gate", 0.0)),
             active_gate_error_threshold_px=float(loss.get("active_gate_error_threshold_px", 4.0)),
             active_gate_pos_weight=float(loss.get("active_gate_pos_weight", 1.0)),
+            w_active_gate_no_harm=float(loss.get("w_active_gate_no_harm", 0.0)),
+            no_harm_margin_px=float(loss.get("no_harm_margin_px", 1.0)),
             cascade_matching=bool(loss.get("cascade_matching", False)),
         )
         if name == "DynLaneSeqS3" and bool(loss.get("cascade_matching", False)):

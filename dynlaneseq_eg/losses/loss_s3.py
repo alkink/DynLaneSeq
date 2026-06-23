@@ -47,10 +47,17 @@ class S3Criterion(S2Criterion):
         final_losses["loss_total"] = final_losses["loss_total"] + self.cfg.lambda_coarse * coarse
         offset_losses = self.compute_active_offset_losses(outputs, targets, matches_coarse)
         final_losses.update(offset_losses)
+        gate_loss = self.compute_active_gate_loss(outputs, targets, matches_coarse)
+        no_harm_loss = self.compute_active_gate_no_harm_loss(outputs, targets, matches_coarse)
+        final_losses["loss_active_gate"] = gate_loss
+        final_losses["loss_active_gate_no_harm"] = no_harm_loss
         final_losses["loss_total"] = (
             final_losses["loss_total"]
             + self.cfg.w_active_offset_reg * offset_losses["loss_active_offset_reg"]
             + self.cfg.w_active_offset_ce * offset_losses["loss_active_offset_ce"]
+            + getattr(self.cfg, "w_active_offset_tangent", 0.0) * offset_losses.get("loss_active_offset_tangent", 0.0)
+            + self.cfg.w_active_gate * gate_loss
+            + self.cfg.w_active_gate_no_harm * no_harm_loss
         )
         final_losses = self.add_geometry_draft_loss(final_losses, outputs, targets, matches_coarse)
         final_losses["cascade_match_changed_ratio"] = self.compute_match_changed_ratio(

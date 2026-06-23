@@ -1,0 +1,84 @@
+_base_: culane_igsr_evidence_tower_frozen_100kimg.yaml
+
+output_dir: outputs/culane_igsr_joint_controlled_noharm_25k
+
+dataset:
+  lists:
+    train: list/train_gt.txt
+    val: list/val.txt
+    test: list/test.txt
+
+model:
+  freeze_backbone_bn: true
+  freeze_all_bn: true
+  freeze_s0_frontend: false
+  detach_coarse_x: true
+  active_corridor:
+    detach_center: true
+    detach_refined_x_for_decoder: true
+    freeze_non_active_modules: false
+    train_center_jitter_px: 0.0
+    train_center_jitter_prob: 0.0
+    gate_enabled: true
+    gate_bias: -1.0
+  quality_calibrator:
+    enabled: false
+
+loss:
+  # Final and coarse geometry use the same S0 objective. The original S0
+  # dense heads are anchored separately from the trainable evidence tower.
+  coarse_anchor_mode: full
+  coarse_dense_anchor: true
+  lambda_coarse: 2.0
+  w_exist: 2.0
+  w_point: 5.0
+  w_range: 1.0
+  w_token: 0.0
+  w_smooth: 0.05
+  w_line_iou: 2.0
+  w_seg: 1.0
+  w_centerline: 0.25
+  w_quality: 0.5
+  w_active_offset_reg: 2.0
+  w_active_offset_ce: 0.1
+  w_active_offset_tangent: 0.15
+  w_active_gate: 0.0
+  w_active_gate_no_harm: 2.0
+  no_harm_margin_px: 1.0
+
+optimizer:
+  base_lr: 1.0e-6
+  row_decoder_lr: 1.0e-6
+  evidence_lr: 1.0e-4
+  structured_lr: 1.0e-6
+  backbone_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 25000
+  checkpoint_interval: 5000
+  log_interval: 50
+  vis_interval: 1000
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: optimizer_groups
+
+postprocess:
+  score_thresh: 0.50
+  lane_nms_distance_thresh_px: 20.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4
+  row_visibility_thresh: 0.0
+  quality_score_power: 0.0

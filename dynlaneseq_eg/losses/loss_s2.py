@@ -28,6 +28,8 @@ class S2LossConfig(S1LossConfig):
     w_active_gate: float = 0.0
     active_gate_error_threshold_px: float = 4.0
     active_gate_pos_weight: float = 1.0
+    w_active_gate_no_harm: float = 0.0
+    no_harm_margin_px: float = 1.0
     cascade_matching: bool = False
 
 
@@ -67,13 +69,16 @@ class S2Criterion(S1Criterion):
         offset_losses = self.compute_active_offset_losses(outputs, targets, matches)
         final_losses.update(offset_losses)
         gate_loss = self.compute_active_gate_loss(outputs, targets, matches)
+        no_harm_loss = self.compute_active_gate_no_harm_loss(outputs, targets, matches)
         final_losses["loss_active_gate"] = gate_loss
+        final_losses["loss_active_gate_no_harm"] = no_harm_loss
         final_losses["loss_total"] = (
             final_losses["loss_total"]
             + self.cfg.w_active_offset_reg * offset_losses["loss_active_offset_reg"]
             + self.cfg.w_active_offset_ce * offset_losses["loss_active_offset_ce"]
             + self.cfg.w_active_offset_tangent * offset_losses["loss_active_offset_tangent"]
             + self.cfg.w_active_gate * gate_loss
+            + self.cfg.w_active_gate_no_harm * no_harm_loss
         )
         return self.add_geometry_draft_loss(final_losses, outputs, targets, matches)
 
@@ -112,13 +117,16 @@ class S2Criterion(S1Criterion):
         offset_losses = self.compute_active_offset_losses(outputs, targets, matches)
         losses.update(offset_losses)
         gate_loss = self.compute_active_gate_loss(outputs, targets, matches)
+        no_harm_loss = self.compute_active_gate_no_harm_loss(outputs, targets, matches)
         losses["loss_active_gate"] = gate_loss
+        losses["loss_active_gate_no_harm"] = no_harm_loss
         losses["loss_total"] = (
             losses["loss_total"]
             + self.cfg.w_active_offset_reg * offset_losses["loss_active_offset_reg"]
             + self.cfg.w_active_offset_ce * offset_losses["loss_active_offset_ce"]
             + self.cfg.w_active_offset_tangent * offset_losses["loss_active_offset_tangent"]
             + self.cfg.w_active_gate * gate_loss
+            + self.cfg.w_active_gate_no_harm * no_harm_loss
         )
         return losses
 
@@ -309,6 +317,36 @@ class S2Criterion(S1Criterion):
                 pos_weight=pos_weight.float(),
                 reduction="none",
             )
+            valid_f = valid.to(loss.dtype)
+            total = total + (loss * valid_f).sum()
+            count = count + valid_f.sum()
+        return total / count.clamp_min(1.0)
+
+    def compute_active_gate_no_harm_loss(self, outputs, targets, matches):
+        evidence = outputs.get("evidence", {}) if isinstance(outputs, dict) else {}
+        raw_delta = evidence.get("active_ungated_pred_delta_x_rows")
+        if raw_delta is None:
+            raw_delta = evidence.get("active_pred_delta_x_rows")
+        center_x = evidence.get("active_center_x_rows")
+        anchor = outputs["final"]["pred_x_rows"]
+        zero = anchor.sum() * 0.0
+        if raw_delta is None or center_x is None:
+            return zero
+        total = raw_delta.sum() * 0.0
+        count = raw_delta.new_tensor(0.0)
+        margin = float(self.cfg.no_harm_margin_px)
+        for bi, match in enumerate(matches):
+            pred_idx = match["pred_indices"].to(raw_delta.device)
+            gt_idx = match["gt_indices"].to(raw_delta.device)
+            if pred_idx.numel() == 0:
+                continue
+            gt_x = targets[bi]["x_rows"].to(raw_delta.device, dtype=center_x.dtype)[gt_idx]
+            valid = targets[bi]["valid_mask"].to(raw_delta.device)[gt_idx].bool()
+            lane_center = center_x[bi, pred_idx]
+            lane_delta = raw_delta[bi, pred_idx]
+            error_coarse = (gt_x - lane_center).abs()
+            error_final = (gt_x - (lane_center + lane_delta)).abs()
+            loss = torch.relu(error_final - error_coarse + margin)
             valid_f = valid.to(loss.dtype)
             total = total + (loss * valid_f).sum()
             count = count + valid_f.sum()
