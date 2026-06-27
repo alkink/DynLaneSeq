@@ -58,15 +58,23 @@ class S0Criterion(nn.Module):
             outputs = outputs["final"]
         elif "stage2" in outputs:
             outputs = outputs["stage2"]
-        loss_exist = self.compute_exist_loss(outputs, matches)
-        loss_point = self.compute_point_loss(outputs, targets, matches)
-        loss_range = self.compute_range_loss(outputs, targets, matches)
-        loss_smooth = self.compute_smoothness_loss(outputs, targets, matches)
-        loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches)
-        loss_seg = self.compute_seg_loss(raw_outputs, targets)
-        loss_quality = self.compute_quality_loss(outputs, targets, matches)
-        loss_centerline = self.compute_centerline_loss(raw_outputs, targets)
-        dynamic_proposal_losses = self.compute_dynamic_proposal_losses(raw_outputs, targets)
+        zero = self._zero_anchor(raw_outputs).sum() * 0.0
+        loss_exist = self.compute_exist_loss(outputs, matches) if self.cfg.w_exist != 0 else zero
+        loss_point = self.compute_point_loss(outputs, targets, matches) if self.cfg.w_point != 0 else zero
+        loss_range = self.compute_range_loss(outputs, targets, matches) if self.cfg.w_range != 0 else zero
+        loss_smooth = self.compute_smoothness_loss(outputs, targets, matches) if self.cfg.w_smooth != 0 else zero
+        loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches) if self.cfg.w_line_iou != 0 else zero
+        loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
+        loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
+        loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
+        if (
+            self.cfg.w_dynamic_proposal_heatmap != 0
+            or self.cfg.w_dynamic_proposal_x != 0
+            or self.cfg.w_dynamic_proposal_range != 0
+        ):
+            dynamic_proposal_losses = self.compute_dynamic_proposal_losses(raw_outputs, targets)
+        else:
+            dynamic_proposal_losses = {"heatmap": zero, "x": zero, "range": zero}
         total = (
             self.cfg.w_exist * loss_exist
             + self.cfg.w_point * loss_point
@@ -96,12 +104,12 @@ class S0Criterion(nn.Module):
         }
         if self.cfg.lambda_coarse > 0 and isinstance(raw_outputs.get("coarse"), dict):
             coarse = raw_outputs["coarse"]
-            coarse_exist = self.compute_exist_loss(coarse, matches)
-            coarse_point = self.compute_point_loss(coarse, targets, matches)
-            coarse_range = self.compute_range_loss(coarse, targets, matches)
-            coarse_smooth = self.compute_smoothness_loss(coarse, targets, matches)
-            coarse_line_iou = self.compute_line_iou_loss(coarse, targets, matches)
-            coarse_quality = self.compute_quality_loss(coarse, targets, matches)
+            coarse_exist = self.compute_exist_loss(coarse, matches) if self.cfg.w_exist != 0 else zero
+            coarse_point = self.compute_point_loss(coarse, targets, matches) if self.cfg.w_point != 0 else zero
+            coarse_range = self.compute_range_loss(coarse, targets, matches) if self.cfg.w_range != 0 else zero
+            coarse_smooth = self.compute_smoothness_loss(coarse, targets, matches) if self.cfg.w_smooth != 0 else zero
+            coarse_line_iou = self.compute_line_iou_loss(coarse, targets, matches) if self.cfg.w_line_iou != 0 else zero
+            coarse_quality = self.compute_quality_loss(coarse, targets, matches) if self.cfg.w_quality != 0 else zero
             coarse_total = (
                 self.cfg.w_exist * coarse_exist
                 + self.cfg.w_point * coarse_point
@@ -136,12 +144,13 @@ class S0Criterion(nn.Module):
         if self.cfg.lambda_geometry_draft <= 0 or not isinstance(outputs.get("s0_geometry_draft"), dict):
             return losses
         draft = outputs["s0_geometry_draft"]
-        draft_exist = self.compute_exist_loss(draft, matches)
-        draft_point = self.compute_point_loss(draft, targets, matches)
-        draft_range = self.compute_range_loss(draft, targets, matches)
-        draft_smooth = self.compute_smoothness_loss(draft, targets, matches)
-        draft_line_iou = self.compute_line_iou_loss(draft, targets, matches)
-        draft_quality = self.compute_quality_loss(draft, targets, matches)
+        zero = self._zero_anchor(draft).sum() * 0.0
+        draft_exist = self.compute_exist_loss(draft, matches) if self.cfg.w_exist != 0 else zero
+        draft_point = self.compute_point_loss(draft, targets, matches) if self.cfg.w_point != 0 else zero
+        draft_range = self.compute_range_loss(draft, targets, matches) if self.cfg.w_range != 0 else zero
+        draft_smooth = self.compute_smoothness_loss(draft, targets, matches) if self.cfg.w_smooth != 0 else zero
+        draft_line_iou = self.compute_line_iou_loss(draft, targets, matches) if self.cfg.w_line_iou != 0 else zero
+        draft_quality = self.compute_quality_loss(draft, targets, matches) if self.cfg.w_quality != 0 else zero
         draft_total = (
             self.cfg.w_exist * draft_exist
             + self.cfg.w_point * draft_point
@@ -186,6 +195,18 @@ class S0Criterion(nn.Module):
         weight = torch.tensor([1.0, self.cfg.no_lane_weight], device=logits.device, dtype=logits.dtype)
         return F.cross_entropy(logits.view(b * n, 2), target.view(b * n), weight=weight)
 
+    @staticmethod
+    def _zero_anchor(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        for value in outputs.values():
+            if isinstance(value, torch.Tensor):
+                return value
+            if isinstance(value, dict):
+                try:
+                    return S0Criterion._zero_anchor(value)
+                except StopIteration:
+                    continue
+        raise StopIteration
+
     def compute_point_loss(
         self,
         outputs: dict[str, torch.Tensor],
@@ -194,7 +215,7 @@ class S0Criterion(nn.Module):
     ) -> torch.Tensor:
         pred_x = outputs["pred_x_rows"]
         total = pred_x.sum() * 0.0
-        count = 0
+        count = pred_x.new_tensor(0.0)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_x.device)
             gt_idx = match["gt_indices"].to(pred_x.device)
@@ -204,15 +225,11 @@ class S0Criterion(nn.Module):
             mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
             pred = pred_x[bi, pred_idx] / float(self.cfg.input_w)
             gt = gt_x / float(self.cfg.input_w)
-            if mask.any():
-                total = total + F.smooth_l1_loss(
-                    pred[mask],
-                    gt[mask],
-                    beta=self.cfg.smooth_l1_beta,
-                    reduction="sum",
-                )
-                count += int(mask.sum().item())
-        return total / max(count, 1)
+            valid = mask.to(dtype=pred.dtype)
+            loss = F.smooth_l1_loss(pred, gt, beta=self.cfg.smooth_l1_beta, reduction="none")
+            total = total + (loss * valid).sum()
+            count = count + valid.sum()
+        return total / count.clamp_min(1.0)
 
     def compute_line_iou_loss(
         self,
@@ -222,7 +239,7 @@ class S0Criterion(nn.Module):
     ) -> torch.Tensor:
         pred_x = outputs["pred_x_rows"]
         total = pred_x.sum() * 0.0
-        count = 0
+        count = pred_x.new_tensor(0.0)
         radius = float(self.cfg.line_iou_radius)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_x.device)
@@ -232,20 +249,22 @@ class S0Criterion(nn.Module):
             gt_x = targets[bi]["x_rows"].to(pred_x.device)[gt_idx]
             mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
             pred = pred_x[bi, pred_idx]
-            for pred_lane, gt_lane, lane_mask in zip(pred, gt_x, mask):
-                if lane_mask.any():
-                    px1 = pred_lane[lane_mask] - radius
-                    px2 = pred_lane[lane_mask] + radius
-                    gx1 = gt_lane[lane_mask] - radius
-                    gx2 = gt_lane[lane_mask] + radius
-                    overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
-                    union = (4.0 * radius - overlap).clamp(min=1e-6)
-                    iou = overlap / union
-                    enclosing = (torch.maximum(px2, gx2) - torch.minimum(px1, gx1)).clamp(min=1e-6)
-                    giou = iou - (enclosing - union) / enclosing
-                    total = total + (1.0 - giou).mean()
-                    count += 1
-        return total / max(count, 1)
+            px1 = pred - radius
+            px2 = pred + radius
+            gx1 = gt_x - radius
+            gx2 = gt_x + radius
+            overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
+            union = (4.0 * radius - overlap).clamp(min=1e-6)
+            iou = overlap / union
+            enclosing = (torch.maximum(px2, gx2) - torch.minimum(px1, gx1)).clamp(min=1e-6)
+            giou = iou - (enclosing - union) / enclosing
+            valid = mask.to(dtype=pred_x.dtype)
+            valid_count = valid.sum(dim=-1)
+            lane_loss = ((1.0 - giou) * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+            valid_lane = valid_count > 0
+            total = total + (lane_loss * valid_lane.to(dtype=lane_loss.dtype)).sum()
+            count = count + valid_lane.to(dtype=count.dtype).sum()
+        return total / count.clamp_min(1.0)
 
     def compute_quality_loss(
         self,
@@ -268,19 +287,17 @@ class S0Criterion(nn.Module):
             gt_x = targets[bi]["x_rows"].to(pred_x.device, dtype=pred_x.dtype)[gt_idx]
             mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
             pred = pred_x[bi, pred_idx]
-            qualities = []
-            for pred_lane, gt_lane, lane_mask in zip(pred, gt_x, mask):
-                if not lane_mask.any():
-                    qualities.append(pred_lane.sum() * 0.0)
-                    continue
-                px1 = pred_lane[lane_mask] - radius
-                px2 = pred_lane[lane_mask] + radius
-                gx1 = gt_lane[lane_mask] - radius
-                gx2 = gt_lane[lane_mask] + radius
-                overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
-                union = (4.0 * radius - overlap).clamp(min=1e-6)
-                qualities.append((overlap / union).mean())
-            target_quality[bi, pred_idx] = torch.stack(qualities).detach().to(dtype=target_quality.dtype)
+            px1 = pred - radius
+            px2 = pred + radius
+            gx1 = gt_x - radius
+            gx2 = gt_x + radius
+            overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
+            union = (4.0 * radius - overlap).clamp(min=1e-6)
+            valid = mask.to(dtype=pred_x.dtype)
+            valid_count = valid.sum(dim=-1)
+            qualities = ((overlap / union) * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+            qualities = qualities * (valid_count > 0).to(dtype=qualities.dtype)
+            target_quality[bi, pred_idx] = qualities.detach().to(dtype=target_quality.dtype)
         return F.binary_cross_entropy_with_logits(quality_logits, target_quality)
 
     def compute_seg_loss(

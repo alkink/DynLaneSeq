@@ -21,6 +21,23 @@ def _format_duration(seconds: float) -> str:
     return f"{secs:d}s"
 
 
+def clip_optimizer_gradients(model, optimizer, max_norm: float, mode: str = "global") -> torch.Tensor:
+    mode = str(mode).lower()
+    if mode == "global":
+        return clip_grad_norm_(model.parameters(), max_norm)
+    if mode not in {"optimizer_group", "optimizer_groups", "per_group"}:
+        raise ValueError(f"Unsupported clip_grad_norm_mode: {mode}")
+
+    group_norms = []
+    for group in optimizer.param_groups:
+        params = [param for param in group["params"] if param.grad is not None]
+        if params:
+            group_norms.append(clip_grad_norm_(params, max_norm).detach().float())
+    if not group_norms:
+        return torch.tensor(0.0)
+    return torch.linalg.vector_norm(torch.stack(group_norms))
+
+
 def _sampler_alpha(cfg: dict[str, Any], iteration: int) -> float:
     sched = cfg.get("sampler_curriculum", {})
     warmup = int(sched.get("warmup_iters", 1000))
@@ -110,7 +127,10 @@ def train_one_epoch(
 ) -> int:
     model.train()
     amp = bool(cfg.get("training", {}).get("amp", False))
+    channels_last = bool(cfg.get("training", {}).get("channels_last", False) and device.type == "cuda")
     clip_norm = float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
+    clip_mode = str(cfg.get("training", {}).get("clip_grad_norm_mode", "global"))
+    accumulation_steps = max(int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)), 1)
     log_interval = int(cfg.get("training", {}).get("log_interval", 10))
     iteration = start_iter
     max_iters = max_iters or int(cfg.get("training", {}).get("max_iters", len(dataloader)))
@@ -118,26 +138,40 @@ def train_one_epoch(
     wall_start = time.perf_counter()
     loader_len = max(len(dataloader), 1) if hasattr(dataloader, "__len__") else 1
     processed_images = 0
+    micro_in_step = 0
+    optimizer.zero_grad(set_to_none=True)
     while iteration < end_iter:
         for images, targets, metas in dataloader:
             if iteration >= end_iter:
                 break
             processed_images += int(images.shape[0])
-            images = images.to(device, non_blocking=True)
+            if channels_last:
+                images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+            else:
+                images = images.to(device, non_blocking=True)
             targets = nested_to_device(targets, device)
-            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp):
                 outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, iteration)
                 loss_dict = criterion(outputs, targets, matches)
                 loss = loss_dict["loss_total"]
             if not torch.isfinite(loss):
                 print(f"iter {iteration + 1:07d} | non-finite loss; skipping optimizer step")
+                optimizer.zero_grad(set_to_none=True)
+                micro_in_step = 0
                 iteration += 1
                 continue
+            backward_loss = loss / float(accumulation_steps)
             if scaler is not None and amp:
-                scaler.scale(loss).backward()
+                scaler.scale(backward_loss).backward()
+            else:
+                backward_loss.backward()
+            micro_in_step += 1
+            if micro_in_step < accumulation_steps:
+                continue
+
+            if scaler is not None and amp:
                 scaler.unscale_(optimizer)
-                grad_norm = clip_grad_norm_(model.parameters(), clip_norm)
+                grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
                 if torch.isfinite(grad_norm):
                     scaler.step(optimizer)
                     scaler.update()
@@ -146,12 +180,12 @@ def train_one_epoch(
                 else:
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
+                    micro_in_step = 0
                     scaler.update()
                     iteration += 1
                     continue
             else:
-                loss.backward()
-                grad_norm = clip_grad_norm_(model.parameters(), clip_norm)
+                grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
                 if torch.isfinite(grad_norm):
                     optimizer.step()
                     if scheduler is not None:
@@ -159,8 +193,11 @@ def train_one_epoch(
                 else:
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
+                    micro_in_step = 0
                     iteration += 1
                     continue
+            optimizer.zero_grad(set_to_none=True)
+            micro_in_step = 0
             if logger is not None:
                 stats = {k: v for k, v in loss_dict.items()}
                 stats.update(match_stats(outputs, matches))
@@ -176,7 +213,7 @@ def train_one_epoch(
                     img_per_sec = processed_images / max(elapsed, 1e-6)
                     eta = sec_per_iter * max(total - done, 0)
                     pct = 100.0 * done / total
-                    epoch = float(iteration + 1) / float(loader_len)
+                    epoch = float((iteration + 1) * accumulation_steps) / float(loader_len)
                     prefix = (
                         f"iter {iteration + 1:07d}/{end_iter:07d} "
                         f"({pct:5.1f}%) | epoch {epoch:.2f} | "

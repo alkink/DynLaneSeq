@@ -34,6 +34,11 @@ def main() -> None:
             except Exception:
                 pass
     model = build_model(cfg).to(device)
+    train_model = model
+    channels_last = bool(train_cfg.get("channels_last", False) and device.type == "cuda")
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        train_model = model
     matcher = build_matcher(cfg)
     criterion = build_criterion(cfg)
     optimizer = build_optimizer(cfg, model)
@@ -51,8 +56,16 @@ def main() -> None:
         print(f"initialized compatible weights from {args.init_from}: {stats}")
     if args.resume:
         start_iter = load_checkpoint(args.resume, model, optimizer, scaler, strict=False, scheduler=scheduler)
+    if bool(train_cfg.get("compile_model", False)):
+        compile_kwargs = {}
+        if train_cfg.get("compile_backend") is not None:
+            compile_kwargs["backend"] = str(train_cfg.get("compile_backend"))
+        if train_cfg.get("compile_mode") is not None:
+            compile_kwargs["mode"] = str(train_cfg.get("compile_mode"))
+        train_model = torch.compile(model, **compile_kwargs)
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
-    approx_epochs = planned_iters / max(len(loader), 1)
+    accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
+    approx_epochs = planned_iters * accumulation_steps / max(len(loader), 1)
     print(
         {
             "model": cfg.get("model", {}).get("name", "DynLaneSeq"),
@@ -60,10 +73,16 @@ def main() -> None:
             "device": str(device),
             "train_images": len(loader.dataset),
             "batch_size": batch_size,
+            "gradient_accumulation_steps": accumulation_steps,
+            "effective_batch_size": batch_size * accumulation_steps,
             "iters": planned_iters,
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),
             "amp": bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda"),
+            "channels_last": channels_last,
+            "compile_model": bool(train_cfg.get("compile_model", False)),
+            "clip_grad_norm": float(train_cfg.get("clip_grad_norm", 1.0)),
+            "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),
             "scheduler": cfg.get("scheduler", {"name": "none"}),
         }
@@ -80,7 +99,7 @@ def main() -> None:
             save_checkpoint(out_dir / f"iter_{iteration:07d}.pt", model, optimizer, scaler, iteration, cfg, scheduler=scheduler)
 
     end_iter = train_one_epoch(
-        model,
+        train_model,
         loader,
         matcher,
         criterion,
