@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_1024x384.yaml}"
+CKPT="${CKPT:-outputs/culane_s0_structured_query_res34_b16_1024x384/iter_0025000.pt}"
+DEVICE="${DEVICE:-cuda}"
+SCORE_THRESH="${SCORE_THRESH:-0.40}"
+QUALITY_POWER="${QUALITY_POWER:-0.25}"
+
+CKPT_TAG="$(basename "${CKPT%.pt}")"
+SCORE_TAG="${SCORE_THRESH/./p}"
+QUALITY_TAG="${QUALITY_POWER/./p}"
+PRED_DIR="${PRED_DIR:-outputs/culane_s0_structured_query_res34_b16_1024x384/val_eval_${CKPT_TAG}_thr${SCORE_TAG}_q${QUALITY_TAG}}"
+
+python -m dynlaneseq_eg.tools.evaluate_culane \
+  --config "${CONFIG}" \
+  --checkpoint "${CKPT}" \
+  --split val \
+  --list-path dataset/list/val.txt \
+  --device "${DEVICE}" \
+  --score-thresh "${SCORE_THRESH}" \
+  --quality-score-power "${QUALITY_POWER}" \
+  --pred-dir "${PRED_DIR}"
