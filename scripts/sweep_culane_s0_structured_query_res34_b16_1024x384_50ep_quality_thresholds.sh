@@ -3,15 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_1024x384.yaml}"
-CKPT="${CKPT:-outputs/culane_s0_structured_query_res34_b16_1024x384/iter_0025000.pt}"
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_1024x384_50ep.yaml}"
+CKPT="${CKPT:-outputs/culane_s0_structured_query_res34_b16_1024x384_50ep/iter_0025000.pt}"
 SPLIT="${SPLIT:-val}"
 EVAL_LIST="${EVAL_LIST:-dataset/list/val.txt}"
 DEVICE="${DEVICE:-cuda}"
 CACHE_DIR="${CACHE_DIR:-outputs/diagnostic_cache}"
 
 CKPT_TAG="$(basename "${CKPT%.pt}")"
-OUT_JSON="${OUT_JSON:-outputs/culane_s0_structured_query_res34_b16_1024x384/quality_threshold_sweep_${CKPT_TAG}.json}"
+OUT_JSON="${OUT_JSON:-outputs/culane_s0_structured_query_res34_b16_1024x384_50ep/quality_threshold_sweep_${CKPT_TAG}.json}"
 
 python -u -m dynlaneseq_eg.tools.analyze_oracle_topk \
   --config "${CONFIG}" \
