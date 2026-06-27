@@ -40,6 +40,18 @@ class LossConfig:
     dynamic_proposal_heatmap_pos_weight: float = 1.0
     lambda_coarse: float = 0.0
     lambda_geometry_draft: float = 0.0
+    # Faz-1: all-proposal soft quality target
+    # Her slot için en yakın GT'ye olan satır-IoU'su quality head'e soft target olarak verilir.
+    # Matched-only quality loss'un aksine tüm 64 slota supervision gider; bu sayede
+    # mevcut representation'ın TP/FP ayrımını öğrenip öğrenemeyeceği test edilir.
+    w_allprop_quality: float = 0.0
+    # Faz-1: pairwise ranking loss
+    # Matched bir TP ile unmatched bir FP seçilir; TP'nin quality skoru FP'den yüksek
+    # olmaması durumunda margin=ranking_margin kadar ceza uygulanır.
+    w_ranking: float = 0.0
+    ranking_margin: float = 0.1
+    # Allprop quality için satır-IoU radius (piksel, line_iou_radius'dan bağımsız ayarlanabilir)
+    allprop_iou_radius: float = 15.0
 
 
 class S0Criterion(nn.Module):
@@ -67,6 +79,16 @@ class S0Criterion(nn.Module):
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
+        loss_allprop_quality = (
+            self.compute_allprop_soft_quality_loss(outputs, targets)
+            if self.cfg.w_allprop_quality != 0
+            else zero
+        )
+        loss_ranking = (
+            self.compute_ranking_loss(outputs, targets, matches)
+            if self.cfg.w_ranking != 0
+            else zero
+        )
         if (
             self.cfg.w_dynamic_proposal_heatmap != 0
             or self.cfg.w_dynamic_proposal_x != 0
@@ -84,6 +106,8 @@ class S0Criterion(nn.Module):
             + self.cfg.w_seg * loss_seg
             + self.cfg.w_quality * loss_quality
             + self.cfg.w_centerline * loss_centerline
+            + self.cfg.w_allprop_quality * loss_allprop_quality
+            + self.cfg.w_ranking * loss_ranking
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
             + self.cfg.w_dynamic_proposal_x * dynamic_proposal_losses["x"]
             + self.cfg.w_dynamic_proposal_range * dynamic_proposal_losses["range"]
@@ -98,6 +122,8 @@ class S0Criterion(nn.Module):
             "loss_seg": loss_seg,
             "loss_quality": loss_quality,
             "loss_centerline": loss_centerline,
+            "loss_allprop_quality": loss_allprop_quality,
+            "loss_ranking": loss_ranking,
             "loss_dynamic_proposal_heatmap": dynamic_proposal_losses["heatmap"],
             "loss_dynamic_proposal_x": dynamic_proposal_losses["x"],
             "loss_dynamic_proposal_range": dynamic_proposal_losses["range"],
@@ -287,6 +313,103 @@ class S0Criterion(nn.Module):
             qualities = qualities * (valid_count > 0).to(dtype=qualities.dtype)
             target_quality[bi, pred_idx] = qualities.detach().to(dtype=target_quality.dtype)
         return F.binary_cross_entropy_with_logits(quality_logits, target_quality)
+
+    def compute_allprop_soft_quality_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """All-proposal soft quality loss (Faz 1).
+
+        Mevcut compute_quality_loss yalnızca matcher'ın eşleştirdiği slotlara
+        supervision verir. Bu fonksiyon ise tüm 64 slota, en yakın GT şeridine
+        göre hesaplanan satır-IoU'sunu soft target olarak atar.
+
+        Bağlantısız (FP) slotlar sıfır target alır; near-miss slotlar 0-1 arası
+        kısmi target alır. Bu sayede quality head'in mevcut geometrik representation'dan
+        TP/FP ayrımı öğrenip öğrenemeyeceği ölçülür.
+
+        Gradyan YALNIZCA quality head'e gider; pred_x_rows.detach() ile
+        proposal geometrisi dondurulur.
+        """
+        logits = outputs.get("quality_logits")
+        if logits is None:
+            return outputs["pred_x_rows"].sum() * 0.0
+        quality_logits = logits.float()
+        b, n = quality_logits.shape
+        # Proposal geometrisini dondur — sadece scorer'ı eğit, geometriyi değil
+        pred_x = outputs["pred_x_rows"].detach().float()
+        radius = float(self.cfg.allprop_iou_radius)
+        target_quality = torch.zeros_like(quality_logits)  # [B, N]
+        for bi in range(b):
+            gt_x = targets[bi]["x_rows"].to(pred_x.device, dtype=pred_x.dtype)  # [M, R]
+            gt_mask = targets[bi]["valid_mask"].to(pred_x.device).bool()  # [M, R]
+            m = int(gt_x.shape[0])
+            if m == 0:
+                # Görüntüde GT yok; tüm slotlar 0 target alır (hepsi FP olmali)
+                continue
+            # pred_x: [N, R], gt_x: [M, R]
+            # IoU hesabı: her slot x her GT için
+            p = pred_x[bi]  # [N, R]
+            px1 = p[:, None, :] - radius   # [N, M, R]
+            px2 = p[:, None, :] + radius
+            gx1 = gt_x[None, :, :] - radius  # [N, M, R]
+            gx2 = gt_x[None, :, :] + radius
+            overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
+            union = (4.0 * radius - overlap).clamp(min=1e-6)
+            iou = overlap / union  # [N, M, R]
+            # Sadece GT'nin geçerli satırlarını kullan
+            valid = gt_mask[None, :, :].float()  # [1, M, R] -> [N, M, R]
+            valid_count = valid.sum(dim=-1).clamp_min(1.0)  # [N, M]
+            lane_iou = (iou * valid).sum(dim=-1) / valid_count  # [N, M]
+            has_gt = (gt_mask.sum(dim=-1) > 0)[None, :].float()  # [1, M]
+            lane_iou = lane_iou * has_gt  # sıfır satırlı GT'leri bastır
+            # Her slot için en yakın GT'nin IoU'sunu al (max over M)
+            best_iou, _ = lane_iou.max(dim=1)  # [N]
+            target_quality[bi] = best_iou.to(dtype=target_quality.dtype)
+        return F.binary_cross_entropy_with_logits(quality_logits, target_quality)
+
+    def compute_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Pairwise ranking loss (Faz 1).
+
+        Matched TP slotlarının quality skoru, unmatched FP slotlarının quality
+        skorundan `ranking_margin` kadar yüksek olmasını zorlar.
+
+        Sadece quality head'e gradient gider; pred_x_rows dokunulmaz.
+        """
+        logits = outputs.get("quality_logits")
+        if logits is None:
+            return outputs["pred_x_rows"].sum() * 0.0
+        quality_logits = logits.float()  # [B, N]
+        b, n = quality_logits.shape
+        margin = float(self.cfg.ranking_margin)
+        total = quality_logits.sum() * 0.0
+        count = quality_logits.new_tensor(0.0)
+        for bi, match in enumerate(matches):
+            pred_idx = match["pred_indices"].to(quality_logits.device)  # matched (TP) slot indexleri
+            if pred_idx.numel() == 0:
+                continue
+            # Unmatched slotlar = tüm slotlar - matched slotlar
+            all_idx = torch.arange(n, device=quality_logits.device)
+            matched_mask = torch.zeros(n, dtype=torch.bool, device=quality_logits.device)
+            matched_mask[pred_idx] = True
+            unmatched_idx = all_idx[~matched_mask]  # FP slotları
+            if unmatched_idx.numel() == 0:
+                continue
+            tp_scores = torch.sigmoid(quality_logits[bi, pred_idx])    # [n_tp]
+            fp_scores = torch.sigmoid(quality_logits[bi, unmatched_idx])  # [n_fp]
+            # Tüm (TP, FP) çiftleri için margin ranking loss: max(0, fp - tp + margin)
+            # Broadcasting: [n_tp, 1] - [1, n_fp]
+            diff = fp_scores[None, :] - tp_scores[:, None] + margin  # [n_tp, n_fp]
+            loss = diff.clamp(min=0.0)
+            total = total + loss.mean()
+            count = count + 1.0
+        return total / count.clamp_min(1.0)
 
     def compute_seg_loss(
         self,

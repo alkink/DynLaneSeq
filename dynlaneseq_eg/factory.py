@@ -85,7 +85,16 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         base_kwargs["smoothness_contiguous"] = bool(loss.get("smoothness_contiguous", True))
     name = model.get("name", "DynLaneSeqS0")
     if name == "DynLaneSeqS0":
-        return S0Criterion(LossConfig(**base_kwargs, lambda_coarse=float(loss.get("lambda_coarse", 0.0))))
+        return S0Criterion(
+            LossConfig(
+                **base_kwargs,
+                lambda_coarse=float(loss.get("lambda_coarse", 0.0)),
+                w_allprop_quality=float(loss.get("w_allprop_quality", 0.0)),
+                w_ranking=float(loss.get("w_ranking", 0.0)),
+                ranking_margin=float(loss.get("ranking_margin", 0.1)),
+                allprop_iou_radius=float(loss.get("allprop_iou_radius", 15.0)),
+            )
+        )
     if name == "DynLaneSeqS1":
         return S1Criterion(
             S1LossConfig(
@@ -215,8 +224,16 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
         is_no_decay = param.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower()
         is_backbone = ".backbone." in name or name.startswith("encoder.backbone")
         is_row_decoder = row_decoder_lr is not None and (name.startswith("row_decoder.") or name.startswith("row_embedding."))
+        is_dynamic_row_evidence = name.startswith("structured_query_head.dynamic_row_evidence_head.")
+        is_orthogonal_grounder = name.startswith("structured_query_head.orthogonal_grounder.")
+        is_orthogonal_verifier = name.startswith("structured_query_head.orthogonal_verifier.")
         is_structured = structured_lr is not None and (
-            name.startswith("structured_query_head.")
+            (
+                name.startswith("structured_query_head.")
+                and not is_dynamic_row_evidence
+                and not is_orthogonal_grounder
+                and not is_orthogonal_verifier
+            )
             or name.startswith("encoder.fpn.")
             or name.startswith("encoder.proj.")
             or name.startswith("encoder.ms_proj.")
@@ -231,11 +248,16 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             or name.startswith("quality_calibrator.")
             or name.startswith("csr_refiner.")
             or name.startswith("igt_refiner.")
+            or name.startswith("igar_refiner.")
             or name.startswith("s0_geometry_refiner.")
+            or is_dynamic_row_evidence
+            or is_orthogonal_grounder
+            or is_orthogonal_verifier
             or name.startswith("encoder.dynamic_proposal.")
             or name.startswith("structured_query_head.")
             or name.startswith("encoder.ms_proj.")
             or "evidence" in name
+            or "igar" in name
             or "dynamic_proposal" in name
             or "structured_query" in name
         ) and not is_structured

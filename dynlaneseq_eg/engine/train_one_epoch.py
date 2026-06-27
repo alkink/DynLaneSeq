@@ -100,7 +100,12 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
 def output_debug_stats(outputs) -> dict[str, torch.Tensor]:
     stats = {}
     evidence = outputs.get("evidence") if isinstance(outputs, dict) else None
-    for evidence_dict in [evidence, outputs.get("geometry_evidence") if isinstance(outputs, dict) else None]:
+    for evidence_dict in [
+        evidence,
+        outputs.get("geometry_evidence") if isinstance(outputs, dict) else None,
+        outputs.get("igar") if isinstance(outputs, dict) else None,
+        outputs.get("structured_debug") if isinstance(outputs, dict) else None,
+    ]:
         if not isinstance(evidence_dict, dict):
             continue
         for key, value in evidence_dict.items():

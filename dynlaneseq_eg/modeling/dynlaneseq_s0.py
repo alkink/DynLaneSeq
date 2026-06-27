@@ -205,6 +205,125 @@ class GeometryGuidedQueryRefiner(nn.Module):
         return queries + delta, debug
 
 
+class ImageGroundedAffineRefiner(nn.Module):
+    """Geometry-only affine correction from curve-aligned image evidence.
+
+    The refiner deliberately predicts only two numbers per lane instance:
+    a horizontal shift and a lane-level tilt.  It does not change existence,
+    quality, range, or the number/order of proposals.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        input_w: int = 800,
+        input_h: int = 288,
+        num_rows: int = 72,
+        hidden_dim: int = 128,
+        dropout: float = 0.0,
+        offsets_px: list[float] | None = None,
+        max_shift_px: float = 32.0,
+        max_tilt_px: float = 24.0,
+        local_reduce: str = "mean_max",
+        row_pooling: str = "mean_max",
+        detach_sample_x: bool = True,
+        detach_base_x: bool = True,
+        y_norm_mode: str = "centered",
+        use_query: bool = False,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.input_h = int(input_h)
+        self.num_rows = int(num_rows)
+        self.max_shift_px = float(max_shift_px)
+        self.max_tilt_px = float(max_tilt_px)
+        self.detach_sample_x = bool(detach_sample_x)
+        self.detach_base_x = bool(detach_base_x)
+        self.use_query = bool(use_query)
+        self.local_reduce = str(local_reduce).lower()
+        if self.local_reduce not in {"mean", "max", "mean_max"}:
+            raise ValueError("igar.local_reduce must be 'mean', 'max', or 'mean_max'")
+        self.row_pooling = str(row_pooling).lower()
+        if self.row_pooling not in {"mean", "max", "mean_max"}:
+            raise ValueError("igar.row_pooling must be 'mean', 'max', or 'mean_max'")
+        self.y_norm_mode = str(y_norm_mode).lower()
+        if self.y_norm_mode not in {"centered", "zero_one"}:
+            raise ValueError("igar.y_norm_mode must be 'centered' or 'zero_one'")
+        self.sampler = CurveAlignedSampler(
+            input_w=input_w,
+            input_h=input_h,
+            num_rows=num_rows,
+            local_window_enabled=True,
+            offsets_px=offsets_px or [-16.0, -8.0, 0.0, 8.0, 16.0],
+        )
+        local_dim = self.dim * (2 if self.local_reduce == "mean_max" else 1)
+        pooled_dim = local_dim * (2 if self.row_pooling == "mean_max" else 1)
+        if self.use_query:
+            pooled_dim += self.dim
+        self.net = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 2),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _reduce_offsets(self, samples: torch.Tensor) -> torch.Tensor:
+        if self.local_reduce == "mean":
+            return samples.mean(dim=3)
+        if self.local_reduce == "max":
+            return samples.amax(dim=3)
+        return torch.cat([samples.mean(dim=3), samples.amax(dim=3)], dim=-1)
+
+    def _pool_rows(self, row_features: torch.Tensor) -> torch.Tensor:
+        if self.row_pooling == "mean":
+            return row_features.mean(dim=2)
+        if self.row_pooling == "max":
+            return row_features.amax(dim=2)
+        return torch.cat([row_features.mean(dim=2), row_features.amax(dim=2)], dim=-1)
+
+    def _y_norm(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.y_norm_mode == "zero_one":
+            return torch.linspace(0.0, 1.0, self.num_rows, device=device, dtype=dtype)
+        return torch.linspace(-1.0, 1.0, self.num_rows, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        coarse_x_rows: torch.Tensor,
+        features: torch.Tensor,
+        queries: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        sample_x = coarse_x_rows.detach() if self.detach_sample_x else coarse_x_rows
+        local_samples = self.sampler.sample_local_window(features, sample_x)
+        row_features = self._reduce_offsets(local_samples)
+        pooled = self._pool_rows(row_features)
+        if self.use_query:
+            if queries is None:
+                raise RuntimeError("IGAR configured with use_query=True but queries were not provided")
+            pooled = torch.cat([pooled, queries.to(dtype=pooled.dtype)], dim=-1)
+        raw = self.net(pooled)
+        shift = torch.tanh(raw[..., 0]) * self.max_shift_px
+        tilt = torch.tanh(raw[..., 1]) * self.max_tilt_px
+        y_norm = self._y_norm(coarse_x_rows.device, coarse_x_rows.dtype).view(1, 1, self.num_rows)
+        delta = shift.unsqueeze(-1).to(dtype=coarse_x_rows.dtype) + tilt.unsqueeze(-1).to(dtype=coarse_x_rows.dtype) * y_norm
+        base = coarse_x_rows.detach() if self.detach_base_x else coarse_x_rows
+        final_x = (base + delta).clamp(0.0, float(self.input_w - 1))
+        debug = {
+            "igar_shift_abs": shift.detach().abs().mean(),
+            "igar_tilt_abs": tilt.detach().abs().mean(),
+            "igar_delta_abs": delta.detach().abs().mean(),
+            "igar_evidence_abs": local_samples.detach().abs().mean(),
+            "igar_sample_x_mean": sample_x.detach().mean(),
+        }
+        return final_x, debug
+
+
 class DynamicProposalGenerator(nn.Module):
     """Dense, image-conditioned lane proposal head kept separate from static slots."""
 
@@ -507,6 +626,11 @@ class DynLaneSeqS0(nn.Module):
         self.cfg = cfg
         model_cfg = cfg.get("model", cfg)
         geometry_cfg = model_cfg.get("s0_geometry_evidence", {})
+        igar_cfg = model_cfg.get("igar", {})
+        structured_cfg = model_cfg.get("structured_query", {})
+        dynamic_row_evidence_cfg = structured_cfg.get("dynamic_row_evidence", {})
+        orthogonal_grounder_cfg = structured_cfg.get("orthogonal_grounder", {})
+        orthogonal_verifier_cfg = structured_cfg.get("orthogonal_verifier", {})
         self.encoder = DynLaneSeqEncoder(cfg)
         self.heads = S0Heads(
             dim=int(model_cfg.get("dim", 256)),
@@ -540,6 +664,85 @@ class DynLaneSeqS0(nn.Module):
             if bool(geometry_cfg.get("enabled", False))
             else None
         )
+        self.igar_refiner = (
+            ImageGroundedAffineRefiner(
+                dim=int(model_cfg.get("dim", 256)),
+                input_h=int(model_cfg.get("input_h", 288)),
+                input_w=int(model_cfg.get("input_w", 800)),
+                num_rows=int(model_cfg.get("num_rows", 72)),
+                hidden_dim=int(igar_cfg.get("hidden_dim", 128)),
+                dropout=float(igar_cfg.get("dropout", 0.0)),
+                offsets_px=igar_cfg.get("offsets_px"),
+                max_shift_px=float(igar_cfg.get("max_shift_px", 32.0)),
+                max_tilt_px=float(igar_cfg.get("max_tilt_px", 24.0)),
+                local_reduce=str(igar_cfg.get("local_reduce", "mean_max")),
+                row_pooling=str(igar_cfg.get("row_pooling", "mean_max")),
+                detach_sample_x=bool(igar_cfg.get("detach_sample_x", True)),
+                detach_base_x=bool(igar_cfg.get("detach_base_x", True)),
+                y_norm_mode=str(igar_cfg.get("y_norm_mode", "centered")),
+                use_query=bool(igar_cfg.get("use_query", False)),
+            )
+            if bool(igar_cfg.get("enabled", False))
+            else None
+        )
+        if bool(igar_cfg.get("freeze_base", False)):
+            if self.igar_refiner is None:
+                raise ValueError("igar.freeze_base requires igar.enabled=true")
+            self.freeze_non_igar_parameters()
+        if bool(dynamic_row_evidence_cfg.get("freeze_base", False)):
+            if self.structured_query_head is None or self.structured_query_head.dynamic_row_evidence_head is None:
+                raise ValueError(
+                    "structured_query.dynamic_row_evidence.freeze_base requires dynamic_row_evidence.enabled=true"
+                )
+            self.freeze_non_dynamic_row_evidence_parameters()
+        if bool(orthogonal_grounder_cfg.get("freeze_base", False)):
+            if self.structured_query_head is None or self.structured_query_head.orthogonal_grounder is None:
+                raise ValueError(
+                    "structured_query.orthogonal_grounder.freeze_base requires orthogonal_grounder.enabled=true"
+                )
+            self.freeze_non_orthogonal_grounder_parameters()
+        if bool(orthogonal_verifier_cfg.get("freeze_base", False)):
+            if self.structured_query_head is None or self.structured_query_head.orthogonal_verifier is None:
+                raise ValueError(
+                    "structured_query.orthogonal_verifier.freeze_base requires orthogonal_verifier.enabled=true"
+                )
+            self.freeze_non_orthogonal_verifier_parameters()
+
+    def freeze_non_igar_parameters(self) -> None:
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name.startswith("igar_refiner."))
+
+    def freeze_non_dynamic_row_evidence_parameters(self) -> None:
+        prefix = "structured_query_head.dynamic_row_evidence_head."
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name.startswith(prefix))
+
+    def freeze_non_orthogonal_grounder_parameters(self) -> None:
+        prefix = "structured_query_head.orthogonal_grounder."
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name.startswith(prefix))
+
+    def freeze_non_orthogonal_verifier_parameters(self) -> None:
+        prefix = "structured_query_head.orthogonal_verifier."
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name.startswith(prefix))
+
+    def apply_igar(self, coarse: dict[str, torch.Tensor], features: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.igar_refiner is None:
+            return coarse
+        final_x, igar_debug = self.igar_refiner(
+            coarse["pred_x_rows"],
+            features,
+            queries=coarse.get("queries"),
+        )
+        final = dict(coarse)
+        final["pred_x_rows"] = final_x
+        final["quality_pred_x_rows"] = final_x
+        out = dict(final)
+        out["coarse"] = coarse
+        out["final"] = final
+        out["igar"] = igar_debug
+        return out
 
     def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
         enc = self.encoder.forward_features(images)
@@ -564,6 +767,7 @@ class DynLaneSeqS0(nn.Module):
             else:
                 out = self.heads(q)
                 out["queries"] = q
+        out = self.apply_igar(out, enc["features"])
         if "seg_logits" in enc:
             out["seg_logits"] = enc["seg_logits"]
         if "centerline_logits" in enc:

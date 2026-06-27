@@ -1,0 +1,155 @@
+output_dir: outputs/culane_faz1_soft_quality
+
+# ---------------------------------------------------------------------------
+# Faz 1: Representation Kapasitesi Testi
+#
+# Soru: Mevcut S0 row_token representation'ı, doğru target verilince TP/FP
+#       ayrımını quality head aracılığıyla öğrenebilir mi?
+#
+# Yöntem:
+#   - S0 backbone + FPN + structured_query_head TAM DONDURULUR
+#   - Sadece quality head (3 linear katman) eğitilir
+#   - w_exist=0, w_point=0, w_range=0 → geometri hiç değişmez
+#   - w_allprop_quality: tüm 64 slota soft lane-IoU target
+#   - w_ranking: TP slotları FP slotlardan yüksek skora zorla
+#
+# Beklenti:
+#   - Eğer quality head iyi ayrışıyorsa → representation yeterli,
+#     loss/target sorunundu, mimari değiştirme
+#   - Eğer quality head ayrışamıyorsa → representation yetersiz,
+#     HAWP-inspired verifier gerekli
+# ---------------------------------------------------------------------------
+
+dataset:
+  name: CULane
+  root: dataset
+  lists:
+    train: list/train_gt.txt
+    val: list/val.txt
+    test: list/test.txt
+  min_valid_rows: 5
+  cut_height: 270
+  infer_seg_labels: false  # seg head yok, kapatıldı
+
+augmentation:
+  cut_height: 270
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  channel_shuffle_prob: 0.1
+  hue_saturation_prob: 0.7
+  blur_prob: 0.2
+  affine_prob: 0.7
+  affine_translate_x: 0.1
+  affine_translate_y: 0.1
+  affine_rotate_deg: 3.0
+  affine_scale_min: 0.8
+  affine_scale_max: 1.2
+
+dataloader:
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+  eval_batch_size: 1
+  persistent_workers: true
+  prefetch_factor: 4
+
+model:
+  name: DynLaneSeqS0
+  input_h: 288
+  input_w: 800
+  fpn_channels: 128
+  dim: 256
+  pretrained_backbone: false  # init_from ile yükleniyor
+  freeze_backbone_bn: true
+  num_slots: 64
+  num_rows: 72
+  x_bins: 200
+  token_ignore_index: -100
+  decoder_layers: 0
+  row_decoder_layers: 2
+  num_heads: 8
+  decoder_ff_dim: 1024
+  row_decoder_ff_dim: 512
+  dropout: 0.1
+  query_content_init: learned
+  memory_value_with_pos: false
+  structured_query:
+    enabled: true
+    num_instances: 64
+    num_groups: 4
+    num_layers: 2
+    num_heads: 8
+    ff_dim: 1024
+    dropout: 0.1
+    use_x_pos: true
+    exist_prior_prob: 0.01
+  seg_aux:
+    enabled: false  # frozen, açık bırakmaya gerek yok
+  centerline_aux:
+    enabled: false
+
+matcher:
+  assignment: grouped_one_to_many
+  num_groups: 4
+  lambda_obj: 2.0
+  lambda_point: 5.0
+  lambda_range: 1.0
+  lambda_line_iou: 1.0
+  line_iou_radius: 7.5
+
+loss:
+  # Geometri tamamen kapalı — S0 frozen olduğu için gradient gitmemeli
+  # ama exist_loss matcher için gerekli; matcher gradyan etkilemez
+  w_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  # Eski matched-only quality loss: kıyaslama için açık bırak
+  w_quality: 0.5
+  line_iou_radius: 15.0
+  smooth_l1_beta: 0.01
+  no_lane_weight: 1.0
+  exist_loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  # --- FAZ 1 YENİ LOSS'LAR ---
+  # Tüm 64 slota soft lane-IoU target: Near-miss slotlar 0.3-0.5 arası target alır
+  w_allprop_quality: 2.0
+  allprop_iou_radius: 15.0  # line_iou_radius ile aynı tutuldu
+  # Pairwise ranking: TP slotları FP slotlardan daha yüksek skorlanmalı
+  w_ranking: 1.0
+  ranking_margin: 0.1
+
+optimizer:
+  # Sadece quality head eğitiliyor (3 linear, ~50K parametre)
+  # Yüksek LR uygun; backbone dondurulduğu için risk yok
+  base_lr: 0.0005
+  backbone_lr: 0.0  # backbone dondurulmuş
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  total_iters: 50000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+postprocess:
+  lane_nms_distance_thresh_px: 20.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4
+
+training:
+  batch_size: 16
+  max_iters: 50000
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  clip_grad_norm: 1.0
+  log_interval: 50
+  vis_interval: 2000
+  checkpoint_interval: 10000
+  seed: 42

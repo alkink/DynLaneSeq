@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from dynlaneseq_eg.evaluation.candidate_diagnostics import (
@@ -14,6 +15,7 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     load_or_collect_cache,
     official_proposal_gt_iou_matrix,
     proposal_gt_iou_matrix,
+    recall_from_ids,
     stage_lane_points,
     trace_postprocess,
     unique_candidate_labels,
@@ -58,6 +60,17 @@ def test_invalid_range_candidate_is_not_selected_by_oracle():
     oracle = cardinality_oracle_assignment(iou, threshold=0.5, top_k=1, candidate_valid=candidate_valid)
     assert candidate_valid.tolist() == [False, True]
     assert oracle.proposal_ids == (1,)
+
+
+def test_oracle_handles_all_invalid_candidates():
+    oracle = cardinality_oracle_assignment(
+        torch.tensor([[0.9, 0.8]]),
+        threshold=0.5,
+        top_k=1,
+        candidate_valid=torch.zeros(2, dtype=torch.bool),
+    )
+    assert oracle.hit_count == 0
+    assert oracle.proposal_ids == ()
 
 
 def test_unique_candidate_labels_separate_duplicates_from_primary_tp():
@@ -205,3 +218,11 @@ def test_oracle_and_deployed_hungarian_are_intentionally_distinct():
     deployed = evaluator_hungarian_assignment(iou, proposal_ids=[0, 1], threshold=0.5)
     assert oracle.hit_count == 2
     assert deployed.hit_count == 1
+
+
+def test_model_recall_count_is_duplicate_safe():
+    iou = torch.tensor([[0.90], [0.80]])
+    hits, gt_count, best = recall_from_ids(iou, proposal_ids=[0], threshold=0.5)
+    assert hits == 1
+    assert gt_count == 2
+    assert best.tolist() == pytest.approx([0.90, 0.80])

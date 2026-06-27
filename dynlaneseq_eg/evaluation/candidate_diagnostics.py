@@ -383,7 +383,14 @@ def cardinality_oracle_assignment(
     top_k: int,
     candidate_valid: torch.Tensor | None = None,
 ) -> OracleSelection:
-    """Maximum-cardinality GT/proposal matching using fast Hungarian assignment."""
+    """Maximum-cardinality GT/proposal matching using Hungarian assignment.
+
+    Qualified edges receive a reward larger than the maximum possible sum of
+    all IoU tie-breakers.  This makes the optimization lexicographic: maximize
+    the number of matches at ``threshold`` first, then maximize their IoU.
+    Running ordinary maximum-IoU Hungarian matching and thresholding afterward
+    is not equivalent and can discard an otherwise valid extra match.
+    """
     gt_count, proposal_count = iou_matrix.shape
     if gt_count == 0 or proposal_count == 0 or top_k <= 0:
         return OracleSelection((), (), 0, 0.0)
@@ -391,14 +398,28 @@ def cardinality_oracle_assignment(
         candidate_valid = torch.ones(proposal_count, dtype=torch.bool, device=iou_matrix.device)
 
     valid_ids = [idx for idx in range(proposal_count) if bool(candidate_valid[idx])]
-    assignment = evaluator_hungarian_assignment(iou_matrix, valid_ids, threshold=threshold)
-    
-    # If the number of matches exceeds top_k, keep the ones with the highest IoU
-    pairs = list(assignment.pairs)
+    if not valid_ids:
+        return OracleSelection((), (), 0, 0.0)
+    selected = iou_matrix[:, valid_ids].detach().cpu().numpy()
+    assignment_size = min(int(selected.shape[0]), int(selected.shape[1]))
+    # CULane's evaluator counts a TP only when IoU is strictly greater than
+    # the threshold, so the diagnostic oracle must use the same boundary.
+    qualified = selected > float(threshold)
+    cardinality_bonus = float(assignment_size + 1)
+    reward = qualified.astype(np.float64) * cardinality_bonus + selected.astype(np.float64)
+    gt_indices, local_proposal_indices = linear_sum_assignment(-reward)
+    pairs = [
+        (int(gt_idx), int(valid_ids[local_idx]))
+        for gt_idx, local_idx in zip(gt_indices.tolist(), local_proposal_indices.tolist())
+        if bool(qualified[gt_idx, local_idx])
+    ]
+
+    # Top-K caps deployable lane count.  Cardinality is already maximal; when
+    # more than K valid pairs exist, retain the best-localized K pairs.
     if len(pairs) > top_k:
         pairs.sort(key=lambda pair: float(iou_matrix[pair[0], pair[1]]), reverse=True)
         pairs = pairs[:top_k]
-        
+
     iou_sum = sum(float(iou_matrix[gt, prop]) for gt, prop in pairs)
     proposal_ids = tuple(prop for _gt, prop in pairs)
     return OracleSelection(proposal_ids, tuple(pairs), len(pairs), iou_sum)
@@ -536,7 +557,11 @@ def recall_from_ids(iou_matrix: torch.Tensor, proposal_ids: Iterable[int], thres
         best = iou_matrix.new_zeros((gt_count,))
     else:
         best = iou_matrix[:, ids].max(dim=1).values
-    return int((best >= float(threshold)).sum()), gt_count, best
+    # Recall must be duplicate-safe: one selected proposal cannot recover two
+    # GT lanes.  Keep per-GT best IoU for localization summaries, but use the
+    # same one-to-one Hungarian counting rule as CULane for hits.
+    assignment = evaluator_hungarian_assignment(iou_matrix, ids, threshold=float(threshold))
+    return int(assignment.hit_count), gt_count, best
 
 
 def unique_candidate_labels(
