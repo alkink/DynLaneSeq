@@ -62,6 +62,7 @@ model:
     ff_dim: 1024
     dropout: 0.1
     use_x_pos: true
+    evidence_x_bins: 256
     exist_prior_prob: 0.01
   seg_aux:
     enabled: true
@@ -125,6 +126,9 @@ training:
   amp: true
   tf32: true
   cudnn_benchmark: true
+  channels_last: true
+  compile_model: false
+  check_finite_grad: false
   clip_grad_norm: 1.0
   log_interval: 50
   vis_interval: 1000

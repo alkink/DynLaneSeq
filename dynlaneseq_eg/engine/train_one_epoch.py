@@ -130,6 +130,7 @@ def train_one_epoch(
     channels_last = bool(cfg.get("training", {}).get("channels_last", False) and device.type == "cuda")
     clip_norm = float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
     clip_mode = str(cfg.get("training", {}).get("clip_grad_norm_mode", "global"))
+    check_finite_grad = bool(cfg.get("training", {}).get("check_finite_grad", True))
     accumulation_steps = max(int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)), 1)
     log_interval = int(cfg.get("training", {}).get("log_interval", 10))
     iteration = start_iter
@@ -174,30 +175,28 @@ def train_one_epoch(
             if scaler is not None and amp:
                 scaler.unscale_(optimizer)
                 grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
-                if torch.isfinite(grad_norm):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    if scheduler is not None:
-                        scheduler.step()
-                else:
+                if check_finite_grad and not bool(torch.isfinite(grad_norm).detach().cpu()):
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0
                     scaler.update()
                     iteration += 1
                     continue
+                scaler.step(optimizer)
+                scaler.update()
+                if scheduler is not None:
+                    scheduler.step()
             else:
                 grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
-                if torch.isfinite(grad_norm):
-                    optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
-                else:
+                if check_finite_grad and not bool(torch.isfinite(grad_norm).detach().cpu()):
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0
                     iteration += 1
                     continue
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             micro_in_step = 0
             if logger is not None:

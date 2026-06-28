@@ -106,6 +106,7 @@ class StructuredLaneQueryHead(nn.Module):
         ff_dim: int = 1024,
         dropout: float = 0.1,
         use_x_pos: bool = True,
+        evidence_x_bins: int | None = None,
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
     ):
@@ -114,12 +115,15 @@ class StructuredLaneQueryHead(nn.Module):
         self.num_instances = int(num_instances)
         self.num_rows = int(num_rows)
         self.x_bins = int(x_bins)
+        self.evidence_x_bins = int(evidence_x_bins) if evidence_x_bins is not None else self.x_bins
         self.input_w = int(input_w)
         self.use_x_pos = bool(use_x_pos)
         self.num_groups = int(num_groups)
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
+        if self.evidence_x_bins < 1:
+            raise ValueError("structured_query.evidence_x_bins must be >= 1")
         if self.num_instances % self.num_groups != 0:
             raise ValueError(
                 f"structured_query.num_instances={self.num_instances} must be divisible by num_groups={self.num_groups}"
@@ -129,7 +133,7 @@ class StructuredLaneQueryHead(nn.Module):
 
         self.instance_tokens = nn.Embedding(self.num_instances, self.dim)
         self.row_tokens = nn.Embedding(self.num_rows, self.dim)
-        self.x_tokens = nn.Embedding(self.x_bins, self.dim) if self.use_x_pos else None
+        self.x_tokens = nn.Embedding(self.evidence_x_bins, self.dim) if self.use_x_pos else None
         nn.init.normal_(self.instance_tokens.weight, std=0.02)
         nn.init.normal_(self.row_tokens.weight, std=0.02)
         if self.x_tokens is not None:
@@ -167,8 +171,8 @@ class StructuredLaneQueryHead(nn.Module):
 
     def _row_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.feature_proj(features)
-        if feat.shape[-2:] != (self.num_rows, self.x_bins):
-            feat = F.interpolate(feat, size=(self.num_rows, self.x_bins), mode="bilinear", align_corners=False)
+        if feat.shape[-2:] != (self.num_rows, self.evidence_x_bins):
+            feat = F.interpolate(feat, size=(self.num_rows, self.evidence_x_bins), mode="bilinear", align_corners=False)
         b, c, r, x = feat.shape
         feat_value = feat.permute(0, 2, 3, 1).contiguous()
         feat_key = feat_value
@@ -229,6 +233,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         ff_dim=int(structured_cfg.get("ff_dim", model_cfg.get("decoder_ff_dim", 1024))),
         dropout=float(structured_cfg.get("dropout", model_cfg.get("dropout", 0.1))),
         use_x_pos=bool(structured_cfg.get("use_x_pos", True)),
+        evidence_x_bins=int(structured_cfg.get("evidence_x_bins", structured_cfg.get("attn_x_bins", model_cfg.get("x_bins", 200)))),
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
     )
