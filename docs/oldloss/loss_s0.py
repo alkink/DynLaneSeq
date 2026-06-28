@@ -30,8 +30,6 @@ class LossConfig:
     seg_extra_weights: dict[str, float] = field(default_factory=dict)
     w_quality: float = 0.0
     w_centerline: float = 0.0
-    w_row_dfl: float = 0.0
-    row_dfl_warmup_iters: int = 0
     centerline_sigma_bins: float = 1.5
     centerline_pos_weight: float = 1.0
     w_dynamic_proposal_heatmap: float = 0.0
@@ -48,17 +46,6 @@ class S0Criterion(nn.Module):
     def __init__(self, cfg: LossConfig | None = None):
         super().__init__()
         self.cfg = cfg or LossConfig()
-        self._iteration = 0
-
-    def set_iteration(self, iteration: int) -> None:
-        self._iteration = int(iteration)
-
-    def row_dfl_weight(self) -> float:
-        weight = float(self.cfg.w_row_dfl)
-        warmup = int(self.cfg.row_dfl_warmup_iters)
-        if weight == 0.0 or warmup <= 0:
-            return weight
-        return weight * min(1.0, float(self._iteration + 1) / float(warmup))
 
     def forward(
         self,
@@ -80,8 +67,6 @@ class S0Criterion(nn.Module):
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
-        row_dfl_weight = self.row_dfl_weight()
-        loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
         if (
             self.cfg.w_dynamic_proposal_heatmap != 0
             or self.cfg.w_dynamic_proposal_x != 0
@@ -99,7 +84,6 @@ class S0Criterion(nn.Module):
             + self.cfg.w_seg * loss_seg
             + self.cfg.w_quality * loss_quality
             + self.cfg.w_centerline * loss_centerline
-            + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
             + self.cfg.w_dynamic_proposal_x * dynamic_proposal_losses["x"]
             + self.cfg.w_dynamic_proposal_range * dynamic_proposal_losses["range"]
@@ -114,8 +98,6 @@ class S0Criterion(nn.Module):
             "loss_seg": loss_seg,
             "loss_quality": loss_quality,
             "loss_centerline": loss_centerline,
-            "loss_row_dfl": loss_row_dfl,
-            "weight_row_dfl": zero.new_tensor(row_dfl_weight),
             "loss_dynamic_proposal_heatmap": dynamic_proposal_losses["heatmap"],
             "loss_dynamic_proposal_x": dynamic_proposal_losses["x"],
             "loss_dynamic_proposal_range": dynamic_proposal_losses["range"],
@@ -128,7 +110,6 @@ class S0Criterion(nn.Module):
             coarse_smooth = self.compute_smoothness_loss(coarse, targets, matches) if self.cfg.w_smooth != 0 else zero
             coarse_line_iou = self.compute_line_iou_loss(coarse, targets, matches) if self.cfg.w_line_iou != 0 else zero
             coarse_quality = self.compute_quality_loss(coarse, targets, matches) if self.cfg.w_quality != 0 else zero
-            coarse_row_dfl = self.compute_row_dfl_loss(coarse, targets, matches) if row_dfl_weight != 0 else zero
             coarse_total = (
                 self.cfg.w_exist * coarse_exist
                 + self.cfg.w_point * coarse_point
@@ -136,7 +117,6 @@ class S0Criterion(nn.Module):
                 + self.cfg.w_smooth * coarse_smooth
                 + self.cfg.w_line_iou * coarse_line_iou
                 + self.cfg.w_quality * coarse_quality
-                + row_dfl_weight * coarse_row_dfl
             )
             total = total + self.cfg.lambda_coarse * coarse_total
             out.update(
@@ -149,7 +129,6 @@ class S0Criterion(nn.Module):
                     "loss_smooth_coarse": coarse_smooth,
                     "loss_line_iou_coarse": coarse_line_iou,
                     "loss_quality_coarse": coarse_quality,
-                    "loss_row_dfl_coarse": coarse_row_dfl,
                 }
             )
         out = self.add_geometry_draft_loss(out, raw_outputs, targets, matches)
@@ -172,8 +151,6 @@ class S0Criterion(nn.Module):
         draft_smooth = self.compute_smoothness_loss(draft, targets, matches) if self.cfg.w_smooth != 0 else zero
         draft_line_iou = self.compute_line_iou_loss(draft, targets, matches) if self.cfg.w_line_iou != 0 else zero
         draft_quality = self.compute_quality_loss(draft, targets, matches) if self.cfg.w_quality != 0 else zero
-        row_dfl_weight = self.row_dfl_weight()
-        draft_row_dfl = self.compute_row_dfl_loss(draft, targets, matches) if row_dfl_weight != 0 else zero
         draft_total = (
             self.cfg.w_exist * draft_exist
             + self.cfg.w_point * draft_point
@@ -181,7 +158,6 @@ class S0Criterion(nn.Module):
             + self.cfg.w_smooth * draft_smooth
             + self.cfg.w_line_iou * draft_line_iou
             + self.cfg.w_quality * draft_quality
-            + row_dfl_weight * draft_row_dfl
         )
         losses = dict(losses)
         losses["loss_total"] = losses["loss_total"] + self.cfg.lambda_geometry_draft * draft_total
@@ -194,7 +170,6 @@ class S0Criterion(nn.Module):
                 "loss_smooth_geometry_draft": draft_smooth,
                 "loss_line_iou_geometry_draft": draft_line_iou,
                 "loss_quality_geometry_draft": draft_quality,
-                "loss_row_dfl_geometry_draft": draft_row_dfl,
             }
         )
         return losses
@@ -220,18 +195,6 @@ class S0Criterion(nn.Module):
         weight = torch.tensor([1.0, self.cfg.no_lane_weight], device=logits.device, dtype=logits.dtype)
         return F.cross_entropy(logits.view(b * n, 2), target.view(b * n), weight=weight)
 
-    @staticmethod
-    def _zero_anchor(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        for value in outputs.values():
-            if isinstance(value, torch.Tensor):
-                return value
-            if isinstance(value, dict):
-                try:
-                    return S0Criterion._zero_anchor(value)
-                except StopIteration:
-                    continue
-        raise StopIteration
-
     def compute_point_loss(
         self,
         outputs: dict[str, torch.Tensor],
@@ -254,56 +217,6 @@ class S0Criterion(nn.Module):
             loss = F.smooth_l1_loss(pred, gt, beta=self.cfg.smooth_l1_beta, reduction="none")
             total = total + (loss * valid).sum()
             count = count + valid.sum()
-        return total / count.clamp_min(1.0)
-
-    def compute_row_dfl_loss(
-        self,
-        outputs: dict[str, torch.Tensor],
-        targets: list[dict[str, torch.Tensor]],
-        matches: list[dict[str, torch.Tensor]],
-    ) -> torch.Tensor:
-        logits = outputs.get("row_x_logits")
-        if logits is None:
-            return outputs["pred_x_rows"].sum() * 0.0
-        b, n, num_rows, x_bins = logits.shape
-        del b, n
-        logits_f = logits.float()
-        total = logits_f.sum() * 0.0
-        count = logits_f.new_tensor(0.0)
-        bin_width = float(self.cfg.input_w) / float(x_bins)
-        for bi, match in enumerate(matches):
-            pred_idx = match["pred_indices"].to(logits.device)
-            gt_idx = match["gt_indices"].to(logits.device)
-            if pred_idx.numel() == 0:
-                continue
-            gt_x = targets[bi]["x_rows"].to(logits.device, dtype=logits_f.dtype)[gt_idx]
-            mask = targets[bi]["valid_mask"].to(logits.device)[gt_idx].bool()
-            row_count = min(int(gt_x.shape[-1]), int(num_rows))
-            if row_count <= 0:
-                continue
-            pred_logits = logits_f[bi, pred_idx, :row_count]
-            gt_x = gt_x[:, :row_count]
-            mask = mask[:, :row_count]
-            valid = mask & torch.isfinite(gt_x) & (gt_x >= 0.0) & (gt_x <= float(self.cfg.input_w))
-            if not valid.any():
-                continue
-
-            target_bin = (gt_x / bin_width).clamp(0.0, float(x_bins - 1))
-            left = target_bin.floor().long()
-            right = (left + 1).clamp(max=x_bins - 1)
-            right_w = target_bin - left.to(dtype=target_bin.dtype)
-            left_w = 1.0 - right_w
-            same = right == left
-            left_w = torch.where(same, torch.ones_like(left_w), left_w)
-            right_w = torch.where(same, torch.zeros_like(right_w), right_w)
-
-            log_probs = F.log_softmax(pred_logits, dim=-1)
-            left_lp = log_probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)
-            right_lp = log_probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
-            loss = -(left_w * left_lp + right_w * right_lp)
-            valid_f = valid.to(dtype=loss.dtype)
-            total = total + (loss * valid_f).sum()
-            count = count + valid_f.sum()
         return total / count.clamp_min(1.0)
 
     def compute_line_iou_loss(
@@ -590,7 +503,7 @@ class S0Criterion(nn.Module):
     ) -> torch.Tensor:
         pred_range = sort_range_norm(outputs["range_norm"])
         total = pred_range.sum() * 0.0
-        count = 0
+        count = pred_range.new_tensor(0.0)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_range.device)
             gt_idx = match["gt_indices"].to(pred_range.device)
@@ -599,8 +512,8 @@ class S0Criterion(nn.Module):
             gt_range = targets[bi]["range_y"].to(pred_range.device)[gt_idx] / float(self.cfg.input_h)
             pred = pred_range[bi, pred_idx]
             total = total + F.smooth_l1_loss(pred, gt_range, beta=self.cfg.smooth_l1_beta, reduction="sum")
-            count += int(pred.numel())
-        return total / max(count, 1)
+            count = count + float(pred.numel())
+        return total / count.clamp_min(1.0)
 
     def compute_smoothness_loss(
         self,
@@ -610,23 +523,26 @@ class S0Criterion(nn.Module):
     ) -> torch.Tensor:
         pred_x = outputs["pred_x_rows"]
         total = pred_x.sum() * 0.0
-        count = 0
+        count = pred_x.new_tensor(0.0)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_x.device)
             gt_idx = match["gt_indices"].to(pred_x.device)
-            for pidx, gidx in zip(pred_idx.tolist(), gt_idx.tolist()):
-                mask = targets[bi]["valid_mask"].to(pred_x.device)[gidx].bool()
-                if not self.cfg.smoothness_contiguous:
+            if pred_idx.numel() == 0:
+                continue
+            if not self.cfg.smoothness_contiguous:
+                for pidx, gidx in zip(pred_idx.tolist(), gt_idx.tolist()):
+                    mask = targets[bi]["valid_mask"].to(pred_x.device)[gidx].bool()
                     if int(mask.sum().item()) >= 3:
                         lane_x = pred_x[bi, pidx][mask]
                         d2 = lane_x[2:] - 2.0 * lane_x[1:-1] + lane_x[:-2]
                         total = total + (d2 / float(self.cfg.input_w)).abs().mean()
-                        count += 1
-                    continue
-                triplet_mask = mask[2:] & mask[1:-1] & mask[:-2]
-                if triplet_mask.any():
-                    lane_x = pred_x[bi, pidx]
-                    d2 = lane_x[2:] - 2.0 * lane_x[1:-1] + lane_x[:-2]
-                    total = total + (d2[triplet_mask] / float(self.cfg.input_w)).abs().sum()
-                    count += int(triplet_mask.sum().item())
-        return total / max(count, 1)
+                        count = count + 1.0
+                continue
+            mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
+            triplet_mask = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
+            lane_x = pred_x[bi, pred_idx]
+            d2 = lane_x[:, 2:] - 2.0 * lane_x[:, 1:-1] + lane_x[:, :-2]
+            valid = triplet_mask.to(dtype=pred_x.dtype)
+            total = total + ((d2 / float(self.cfg.input_w)).abs() * valid).sum()
+            count = count + valid.sum()
+        return total / count.clamp_min(1.0)

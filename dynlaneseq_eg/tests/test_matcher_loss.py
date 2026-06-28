@@ -84,6 +84,30 @@ def test_line_iou_has_gradient_for_non_overlapping_intervals():
     assert pred_x.grad.abs().sum() > 0
 
 
+def test_row_dfl_loss_backprops_to_row_logits_with_soft_bin_target():
+    row_x_logits = torch.zeros((1, 1, 4, 8), requires_grad=True)
+    outputs = {
+        "exist_logits": torch.zeros((1, 1, 2), requires_grad=True),
+        "pred_x_rows": torch.zeros((1, 1, 4), requires_grad=True),
+        "range_norm": torch.zeros((1, 1, 2), requires_grad=True),
+        "row_x_logits": row_x_logits,
+    }
+    targets = [
+        {
+            "x_rows": torch.tensor([[0.0, 10.0, 15.0, -1.0]]),
+            "valid_mask": torch.tensor([[True, True, True, False]]),
+            "range_y": torch.zeros((1, 2)),
+        }
+    ]
+    matches = [{"pred_indices": torch.tensor([0]), "gt_indices": torch.tensor([0])}]
+    criterion = S0Criterion(LossConfig(input_w=80, w_row_dfl=1.0))
+    loss = criterion.compute_row_dfl_loss(outputs, targets, matches)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert row_x_logits.grad is not None
+    assert row_x_logits.grad.abs().sum() > 0
+
+
 def test_matcher_line_iou_cost_is_finite_for_non_overlapping_lanes():
     target = _target()
     pred = torch.full((2, 72), 400.0)

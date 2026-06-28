@@ -152,6 +152,8 @@ def train_one_epoch(
             targets = nested_to_device(targets, device)
             with torch.autocast(device_type=device.type, enabled=amp):
                 outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, iteration)
+                if hasattr(criterion, "set_iteration"):
+                    criterion.set_iteration(iteration)
                 loss_dict = criterion(outputs, targets, matches)
                 loss = loss_dict["loss_total"]
             if not torch.isfinite(loss):

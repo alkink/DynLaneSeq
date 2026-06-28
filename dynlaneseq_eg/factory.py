@@ -71,6 +71,8 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         seg_extra_weights=dict(loss.get("seg_extra_weights", {})),
         w_quality=float(loss.get("w_quality", 0.0)),
         w_centerline=float(loss.get("w_centerline", 0.0)),
+        w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
+        row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),
         centerline_sigma_bins=float(loss.get("centerline_sigma_bins", 1.5)),
         centerline_pos_weight=float(loss.get("centerline_pos_weight", 1.0)),
         w_dynamic_proposal_heatmap=float(loss.get("w_dynamic_proposal_heatmap", 0.0)),

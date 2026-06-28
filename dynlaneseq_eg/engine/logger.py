@@ -12,14 +12,18 @@ class SmoothedLogger:
     def update(self, **kwargs) -> None:
         for k, v in kwargs.items():
             if isinstance(v, torch.Tensor):
-                v = float(v.detach().cpu())
-            self.values[k].append(float(v))
+                self.values[k].append(v.detach())
+            else:
+                self.values[k].append(float(v))
 
     def format_and_reset(self, prefix: str = "") -> str:
         parts = []
         for key, vals in sorted(self.values.items()):
             if vals:
-                value = sum(vals) / len(vals)
+                if isinstance(vals[0], torch.Tensor):
+                    value = float(torch.stack([v.float() for v in vals]).mean().detach().cpu())
+                else:
+                    value = sum(vals) / len(vals)
                 parts.append(f"{key} {_format_value(value)}")
         self.values.clear()
         return prefix + " | ".join(parts)

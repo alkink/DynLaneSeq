@@ -23,10 +23,14 @@ def write_culane_predictions(
 ) -> list[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    input_w = int(metas[0].get("input_w", 800)) if metas else 800
+    input_h = int(metas[0].get("input_h", 288)) if metas else 288
     lanes_batch = predictions_to_lanes(
         outputs,
         score_thresh=score_thresh,
         min_pred_points=min_pred_points,
+        input_w=input_w,
+        input_h=input_h,
         nms_distance_thresh_px=nms_distance_thresh_px,
         nms_min_overlap_points=nms_min_overlap_points,
         top_k=top_k,
