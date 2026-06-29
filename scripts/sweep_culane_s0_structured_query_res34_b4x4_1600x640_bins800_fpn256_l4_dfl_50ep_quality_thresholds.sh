@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_b16_1024x384_bins512_fpn256_l4_dfl_50ep.yaml}"
-CKPT="${CKPT:-outputs/culane_s0_structured_query_res34_b16_1024x384_bins512_fpn256_l4_dfl_50ep/iter_0025000.pt}"
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_b4x4_1600x640_bins800_fpn256_l4_dfl_50ep.yaml}"
+CKPT="${CKPT:-outputs/culane_s0_structured_query_res34_b4x4_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0025000.pt}"
 SPLIT="${SPLIT:-val}"
 EVAL_LIST="${EVAL_LIST:-dataset/list/val.txt}"
 DEVICE="${DEVICE:-cuda}"
@@ -18,7 +18,9 @@ NMS_MIN_OVERLAP_POINTS="${NMS_MIN_OVERLAP_POINTS:-5}"
 EXACT_POSTPROCESS="${EXACT_POSTPROCESS:-0}"
 
 CKPT_TAG="$(basename "${CKPT%.pt}")"
-OUT_JSON="${OUT_JSON:-outputs/culane_s0_structured_query_res34_b16_1024x384_bins512_fpn256_l4_dfl_50ep/quality_threshold_sweep_${CKPT_TAG}.json}"
+CKPT_DIR="$(dirname "${CKPT}")"
+OUT_ROOT="${OUT_ROOT:-${CKPT_DIR}}"
+OUT_JSON="${OUT_JSON:-${OUT_ROOT}/quality_threshold_sweep_${CKPT_TAG}.json}"
 
 EXTRA_ARGS=()
 if [[ "${EXACT_POSTPROCESS}" == "1" || "${EXACT_POSTPROCESS}" == "true" || "${EXACT_POSTPROCESS}" == "TRUE" ]]; then

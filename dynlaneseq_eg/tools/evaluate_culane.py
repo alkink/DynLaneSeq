@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ from dynlaneseq_eg.evaluation.culane_writer import write_culane_predictions
 from dynlaneseq_eg.factory import build_dataloader, build_model
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def write_predictions(
     model,
     loader,
@@ -26,12 +27,16 @@ def write_predictions(
     top_k: int,
     row_visibility_thresh: float,
     quality_score_power: float,
+    channels_last: bool = False,
 ) -> None:
     model.eval()
     pred_dir.mkdir(parents=True, exist_ok=True)
     pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
     for images, targets, metas in tqdm(loader, ncols=80, desc="writing predictions"):
-        images = images.to(device, non_blocking=True)
+        if channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
         outputs = model(images, targets=targets) if pass_targets else model(images)
         write_culane_predictions(
             outputs,
@@ -75,7 +80,7 @@ def category_lists(root: Path) -> dict[str, Path]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Write DynLaneSeq predictions and evaluate CULane F1.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default="")
     parser.add_argument("--split", default="val")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--pred-dir", default="")
@@ -86,16 +91,37 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--row-visibility-thresh", type=float, default=None)
     parser.add_argument("--quality-score-power", type=float, default=None)
+    parser.add_argument("--eval-batch-size", type=int, default=0)
     parser.add_argument("--width", type=int, default=30)
     parser.add_argument("--iou-thresholds", type=float, nargs="+", default=[0.5])
     parser.add_argument("--continuous", action="store_true", help="Use shapely continuous IoU instead of CULane-style raster IoU.")
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--skip-write", action="store_true", help="Evaluate existing files in --pred-dir.")
     parser.add_argument("--categories", action="store_true", help="Also evaluate CULane official test_split categories.")
+    parser.add_argument("--output-txt", default="", help="Write a compact evaluation report to this text file.")
+    parser.add_argument("--output-json", default="", help="Write metrics and metadata to this JSON file.")
     args = parser.parse_args()
+
+    if not args.skip_write and not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --skip-write is set.")
+    if args.skip_write and not args.pred_dir:
+        raise ValueError("--pred-dir is required when --skip-write is set.")
 
     cfg = load_config(args.config)
     device = torch.device(args.device)
+    train_cfg = cfg.get("training", {})
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", False))
+        if bool(train_cfg.get("tf32", False)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+    if args.eval_batch_size > 0:
+        cfg.setdefault("dataloader", {})["eval_batch_size"] = int(args.eval_batch_size)
+    channels_last = bool(train_cfg.get("channels_last", False) and device.type == "cuda")
     post_cfg = cfg.get("postprocess", {})
     nms_distance_thresh_px = (
         float(args.nms_distance_thresh_px)
@@ -122,6 +148,8 @@ def main() -> None:
 
     if not args.skip_write:
         model = build_model(cfg).to(device)
+        if channels_last:
+            model = model.to(memory_format=torch.channels_last)
         load_checkpoint(args.checkpoint, model, strict=False)
         loader = build_dataloader(cfg, split=args.split, training=False)
         write_predictions(
@@ -136,6 +164,7 @@ def main() -> None:
             top_k,
             row_visibility_thresh,
             quality_score_power,
+            channels_last=channels_last,
         )
 
     list_path = resolve_list_path(cfg, args.split)
@@ -149,14 +178,23 @@ def main() -> None:
         official=not args.continuous,
         sequential=args.sequential,
     )
-    print(f"pred_dir: {pred_dir}")
-    print(f"anno_dir: {anno_dir}")
-    print(f"list_path: {list_path}")
-    print(f"lane_nms_distance_thresh_px: {nms_distance_thresh_px}")
-    print(f"top_k: {top_k}")
-    print(f"row_visibility_thresh: {row_visibility_thresh}")
-    print(f"quality_score_power: {quality_score_power}")
-    print(format_results(results))
+    report_lines = [
+        f"config: {args.config}",
+        f"checkpoint: {args.checkpoint}" if args.checkpoint else "checkpoint: <skip-write>",
+        f"split: {args.split}",
+        f"pred_dir: {pred_dir}",
+        f"anno_dir: {anno_dir}",
+        f"list_path: {list_path}",
+        f"lane_nms_distance_thresh_px: {nms_distance_thresh_px}",
+        f"top_k: {top_k}",
+        f"row_visibility_thresh: {row_visibility_thresh}",
+        f"quality_score_power: {quality_score_power}",
+        f"score_thresh: {args.score_thresh}",
+        f"eval_batch_size: {cfg.get('dataloader', {}).get('eval_batch_size', 1)}",
+        f"channels_last: {channels_last}",
+        format_results(results),
+    ]
+    category_report = ""
 
     if args.categories:
         cat_results = {}
@@ -174,8 +212,42 @@ def main() -> None:
                 sequential=args.sequential,
             )
         if cat_results:
-            print("categories:")
-            print(format_category_results(cat_results))
+            category_report = format_category_results(cat_results)
+            report_lines.extend(["categories:", category_report])
+    else:
+        cat_results = {}
+
+    report = "\n".join(report_lines)
+    print(report)
+
+    if args.output_txt:
+        output_txt = Path(args.output_txt)
+        output_txt.parent.mkdir(parents=True, exist_ok=True)
+        output_txt.write_text(report + "\n", encoding="utf-8")
+        print(f"output_txt: {output_txt}")
+
+    if args.output_json:
+        output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config": args.config,
+            "checkpoint": args.checkpoint,
+            "split": args.split,
+            "pred_dir": str(pred_dir),
+            "anno_dir": str(anno_dir),
+            "list_path": str(list_path),
+            "score_thresh": args.score_thresh,
+            "lane_nms_distance_thresh_px": nms_distance_thresh_px,
+            "top_k": top_k,
+            "row_visibility_thresh": row_visibility_thresh,
+            "quality_score_power": quality_score_power,
+            "eval_batch_size": cfg.get("dataloader", {}).get("eval_batch_size", 1),
+            "channels_last": channels_last,
+            "results": results,
+            "categories": cat_results,
+        }
+        output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"output_json: {output_json}")
 
 
 if __name__ == "__main__":

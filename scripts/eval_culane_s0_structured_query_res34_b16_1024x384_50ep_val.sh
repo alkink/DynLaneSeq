@@ -13,7 +13,11 @@ CKPT_TAG="$(basename "${CKPT%.pt}")"
 SCORE_TAG="${SCORE_THRESH/./p}"
 QUALITY_TAG="${QUALITY_POWER/./p}"
 PRED_DIR="${PRED_DIR:-outputs/culane_s0_structured_query_res34_b16_1024x384_50ep/val_eval_${CKPT_TAG}_thr${SCORE_TAG}_q${QUALITY_TAG}}"
+LOG_FILE="${LOG_FILE:-${PRED_DIR}/eval.log}"
+RESULT_TXT="${RESULT_TXT:-${PRED_DIR}/metrics.txt}"
+RESULT_JSON="${RESULT_JSON:-${PRED_DIR}/metrics.json}"
 
+mkdir -p "${PRED_DIR}"
 python -m dynlaneseq_eg.tools.evaluate_culane \
   --config "${CONFIG}" \
   --checkpoint "${CKPT}" \
@@ -21,4 +25,7 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --device "${DEVICE}" \
   --score-thresh "${SCORE_THRESH}" \
   --quality-score-power "${QUALITY_POWER}" \
-  --pred-dir "${PRED_DIR}"
+  --pred-dir "${PRED_DIR}" \
+  --output-txt "${RESULT_TXT}" \
+  --output-json "${RESULT_JSON}" \
+  2>&1 | tee "${LOG_FILE}"

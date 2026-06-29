@@ -71,19 +71,24 @@ def predictions_to_lanes(
     y_rows = fixed_y_rows(pred_x.shape[-1], input_h, device=pred_x.device, dtype=pred_x.dtype)
     batch_lanes: list[list[list[tuple[float, float]]]] = []
     for b in range(pred_x.shape[0]):
+        p_lane_b = p_lane[b].detach().cpu()
+        pred_x_b = pred_x[b].detach().cpu()
+        ranges_b = ranges[b].detach().cpu()
+        y_rows_cpu = y_rows.detach().cpu()
+        row_visibility_b = row_visibility[b].detach().cpu() if row_visibility is not None else None
         candidates: list[tuple[float, list[tuple[float, float]]]] = []
         for n in range(pred_x.shape[1]):
-            score = float(p_lane[b, n])
+            score = float(p_lane_b[n])
             if score < score_thresh:
                 continue
-            y_min = float(ranges[b, n, 0] * input_h)
-            y_max = float(ranges[b, n, 1] * input_h)
-            mask = (y_rows >= y_min) & (y_rows <= y_max)
-            if row_visibility is not None:
-                mask = mask & row_visibility[b, n].to(device=mask.device)
+            y_min = float(ranges_b[n, 0] * input_h)
+            y_max = float(ranges_b[n, 1] * input_h)
+            mask = (y_rows_cpu >= y_min) & (y_rows_cpu <= y_max)
+            if row_visibility_b is not None:
+                mask = mask & row_visibility_b[n]
             if int(mask.sum().item()) < min_pred_points:
                 continue
-            lane = [(float(x), float(y)) for x, y in zip(pred_x[b, n, mask].cpu(), y_rows[mask].cpu())]
+            lane = [(float(x), float(y)) for x, y in zip(pred_x_b[n, mask], y_rows_cpu[mask])]
             candidates.append((score, lane))
         batch_lanes.append(
             lane_nms(

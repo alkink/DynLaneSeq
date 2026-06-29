@@ -20,8 +20,24 @@ def main() -> None:
     parser.add_argument("--resume", default="")
     parser.add_argument("--init-from", default="", help="Initialize compatible model weights only; optimizer and iteration stay fresh.")
     parser.add_argument("--max-iters", type=int, default=0)
+    parser.add_argument("--output-dir", default="", help="Override cfg.output_dir.")
+    parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
+    parser.add_argument(
+        "--grad-accum",
+        "--gradient-accumulation-steps",
+        dest="grad_accum",
+        type=int,
+        default=0,
+        help="Override training.gradient_accumulation_steps.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.output_dir:
+        cfg["output_dir"] = args.output_dir
+    if args.batch_size > 0:
+        cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
+    if args.grad_accum > 0:
+        cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
     device = torch.device(args.device)
     train_cfg = cfg.get("training", {})
     if device.type == "cuda":
