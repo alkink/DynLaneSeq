@@ -9,10 +9,10 @@ DEVICE="${DEVICE:-cuda}"
 SCORE_THRESH="${SCORE_THRESH:-0.40}"
 QUALITY_POWER="${QUALITY_POWER:-0.25}"
 TOP_K="${TOP_K:-4}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 NMS_DISTANCE_THRESH_PX="${NMS_DISTANCE_THRESH_PX:-20.0}"
 NMS_MIN_OVERLAP_POINTS="${NMS_MIN_OVERLAP_POINTS:-5}"
-CATEGORIES="${CATEGORIES:---categories}"
+CATEGORIES="${CATEGORIES:-}"
 
 CKPT_TAG="$(basename "${CKPT%.pt}")"
 CKPT_DIR="$(dirname "${CKPT}")"
@@ -26,6 +26,14 @@ RESULT_TXT="${RESULT_TXT:-${PRED_DIR}/metrics.txt}"
 RESULT_JSON="${RESULT_JSON:-${PRED_DIR}/metrics.json}"
 
 mkdir -p "${PRED_DIR}"
+EXTRA_ARGS=()
+if [[ "${SKIP_WRITE:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--skip-write)
+fi
+if [[ -n "${CATEGORIES}" ]]; then
+  EXTRA_ARGS+=(${CATEGORIES})
+fi
+
 python -m dynlaneseq_eg.tools.evaluate_culane \
   --config "${CONFIG}" \
   --checkpoint "${CKPT}" \
@@ -40,5 +48,5 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --pred-dir "${PRED_DIR}" \
   --output-txt "${RESULT_TXT}" \
   --output-json "${RESULT_JSON}" \
-  ${CATEGORIES} \
+  "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_FILE}"
