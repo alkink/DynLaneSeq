@@ -20,6 +20,9 @@ class RowAwareCrossAttentionLayer(nn.Module):
         ff_dim: int = 1024,
         dropout: float = 0.1,
         num_groups: int = 1,
+        cross_gate: bool = False,
+        cross_gate_init: float = 2.0,
+        cross_key_norm: bool = False,
     ):
         super().__init__()
         self.num_groups = int(num_groups)
@@ -39,6 +42,14 @@ class RowAwareCrossAttentionLayer(nn.Module):
         self.norm_intra = nn.LayerNorm(dim)
         self.norm_ffn = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
+        self.cross_key_norm = nn.LayerNorm(dim) if bool(cross_key_norm) else None
+        self.cross_gate = nn.Linear(dim, 1) if bool(cross_gate) else None
+        if self.cross_gate is not None:
+            nn.init.zeros_(self.cross_gate.weight)
+            nn.init.constant_(self.cross_gate.bias, float(cross_gate_init))
+        self.last_cross_gate_mean: torch.Tensor | None = None
+        self.last_cross_gate_min: torch.Tensor | None = None
+        self.last_cross_gate_max: torch.Tensor | None = None
 
     def _grouped_inter_attention(self, q: torch.Tensor, batch_rows: int, num_instances: int) -> torch.Tensor:
         if self.num_groups == 1:
@@ -69,7 +80,16 @@ class RowAwareCrossAttentionLayer(nn.Module):
         q_norm = self.norm_cross(q)
         key = row_key_features.reshape(b * r, x_bins, c)
         value = row_value_features.reshape(b * r, x_bins, c)
-        q = q + self.drop(self.cross_attn(q_norm, key, value, need_weights=False)[0])
+        if self.cross_key_norm is not None:
+            key = self.cross_key_norm(key)
+        cross_delta = self.cross_attn(q_norm, key, value, need_weights=False)[0]
+        if self.cross_gate is not None:
+            gate = torch.sigmoid(self.cross_gate(q_norm))
+            self.last_cross_gate_mean = gate.detach().mean()
+            self.last_cross_gate_min = gate.detach().amin()
+            self.last_cross_gate_max = gate.detach().amax()
+            cross_delta = gate * cross_delta
+        q = q + self.drop(cross_delta)
 
         # Group-isolated interaction avoids letting one-to-many training groups suppress each other.
         q_norm = self.norm_inter(q)
@@ -109,6 +129,9 @@ class StructuredLaneQueryHead(nn.Module):
         evidence_x_bins: int | None = None,
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
+        cross_gate: bool = False,
+        cross_gate_init: float = 2.0,
+        cross_key_norm: bool = False,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -152,6 +175,9 @@ class StructuredLaneQueryHead(nn.Module):
                     ff_dim=int(ff_dim),
                     dropout=float(dropout),
                     num_groups=self.num_groups,
+                    cross_gate=bool(cross_gate),
+                    cross_gate_init=float(cross_gate_init),
+                    cross_key_norm=bool(cross_key_norm),
                 )
                 for _ in range(int(num_layers))
             ]
@@ -202,6 +228,19 @@ class StructuredLaneQueryHead(nn.Module):
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
         quality_logits = self.quality(lane_query).squeeze(-1)
+        structured_debug = {
+            "structured_row_abs": row_tokens.detach().abs().mean(),
+            "structured_feature_abs": row_value_features.detach().abs().mean(),
+        }
+        gate_means = []
+        for layer_idx, layer in enumerate(self.layers):
+            gate_mean = getattr(layer, "last_cross_gate_mean", None)
+            if gate_mean is None:
+                continue
+            structured_debug[f"structured_cross_gate_l{layer_idx}_mean"] = gate_mean
+            gate_means.append(gate_mean)
+        if gate_means:
+            structured_debug["structured_cross_gate_mean"] = torch.stack(gate_means).mean()
         return {
             "exist_logits": self.exist(lane_query),
             "row_x_logits": row_x_logits,
@@ -211,10 +250,7 @@ class StructuredLaneQueryHead(nn.Module):
             "quality_logits": quality_logits,
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
-            "structured_debug": {
-                "structured_row_abs": row_tokens.detach().abs().mean(),
-                "structured_feature_abs": row_value_features.detach().abs().mean(),
-            },
+            "structured_debug": structured_debug,
         }
 
 
@@ -236,4 +272,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         evidence_x_bins=int(structured_cfg.get("evidence_x_bins", structured_cfg.get("attn_x_bins", model_cfg.get("x_bins", 200)))),
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
+        cross_gate=bool(structured_cfg.get("cross_gate", False)),
+        cross_gate_init=float(structured_cfg.get("cross_gate_init", 2.0)),
+        cross_key_norm=bool(structured_cfg.get("cross_key_norm", False)),
     )

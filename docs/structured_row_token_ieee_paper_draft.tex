@@ -1,0 +1,905 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{url}
+
+\newcommand{\method}{SRTD}
+\newcommand{\ie}{i.e.,}
+\newcommand{\eg}{e.g.,}
+
+\begin{document}
+
+\title{Structured Row-Token Decoding for Line-Anchor-Free 2D Lane Detection}
+
+\author{
+\IEEEauthorblockN{Author Name$^{1}$, Advisor Name$^{1}$}
+\IEEEauthorblockA{
+$^{1}$Department / University Name\\
+Email: author@email.com, advisor@email.com
+}
+}
+
+\maketitle
+
+\begin{abstract}
+Lane detection is a fundamental perception task for autonomous driving. Existing methods often represent lane geometry using dense segmentation maps, hand-designed line anchors, parametric curves, or holistic transformer queries that compress the complete lane shape into a single vector. However, lanes in perspective images are long, thin, and naturally organized as ordered row-wise structures. Compressing the full geometry of a lane into a single global representation can therefore be suboptimal, especially under curvature, occlusion, shadows, low illumination, and crowded traffic.
+
+We propose a structured row-token decoder for 2D lane detection. Instead of representing each lane candidate with a single holistic query, we factorize each lane into a global instance token and an ordered sequence of row-position tokens. The instance token provides lane-candidate identity, while the row tokens provide ordered vertical row information. After fusion, each lane-row token reads row-local visual evidence from image features and predicts a discrete distribution over horizontal positions. Lane-level decisions are predicted from an aggregated lane representation derived from the updated row states and the instance token. For matched lane candidates, valid annotated rows are supervised with soft-bin distributional targets to improve localization precision. The resulting representation provides an explicit inductive bias for lane geometry without relying on hand-designed line anchors.
+
+Current internal experiments on CULane with a ResNet-34 backbone suggest that the full structured model improves over the current unstructured query baseline and reaches a competitive performance regime without EMA or test-time augmentation. The main contribution of this work is not merely high-resolution training or distributional regression; rather, it is the explicit decomposition of lane representation into instance-level identity and ordered row-level states for geometry inside the decoder.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Lane detection, autonomous driving, transformer decoder, row-wise localization, structured representation, instance token, row token, distributional regression.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Lane detection is a key component of autonomous driving perception systems. It provides geometric information for lane keeping, path planning, map alignment, and downstream decision making. Although the task appears simple, robust lane detection is difficult in real traffic scenes. Lane markings may be partially occluded by vehicles, degraded by shadows or illumination changes, confused with road boundaries, or completely absent in intersections and no-line regions.
+
+Many lane detection methods formulate the problem as semantic segmentation, anchor regression, row-wise classification, or parametric curve fitting. Segmentation-based methods preserve spatial detail but require additional instance separation and post-processing. Anchor-based methods can be accurate but depend on manually designed line anchors and refinement heuristics. Parametric curve methods provide compact representations but may struggle with local irregularities. Transformer-based methods reduce hand-designed priors by using learned queries, but many such methods still represent a complete lane with one holistic query vector.
+
+This work starts from a simple observation: in a front-view image, a lane can be naturally represented as an ordered sequence of horizontal row positions. At each predefined row, the main geometric unknown is the horizontal coordinate of the lane. Therefore, a lane representation should not necessarily compress the entire geometry into one vector. Instead, it can explicitly separate global lane identity from row-wise geometry.
+
+We propose a structured row-token decoder, denoted as \method. Each lane candidate is represented by an instance token and an ordered sequence of row tokens. The instance token provides lane-candidate identity, while the row tokens provide ordered vertical row information. After fusion, the resulting lane-row tokens interact with image features through row-local attention and exchange vertical context along the same lane. Lane-level objectness, range, and quality are predicted from an aggregated lane representation derived from the updated row states and the instance token. This produces a structured latent representation aligned with the geometry of the task.
+
+The contributions of this work are:
+
+\begin{itemize}
+    \item We introduce an instance-to-row token factorization for 2D lane detection, where each lane is represented by a global instance token and ordered row-level states.
+    \item We design a structured decoder that combines row-local visual evidence, same-row lane interaction, and same-lane vertical context to model lane geometry.
+    \item We use row-wise distributional localization, where each lane-row token predicts a discrete horizontal position distribution; during training, matched candidates receive soft-bin supervision on valid annotated rows.
+    \item We define an experimental protocol to isolate the effect of the structured representation from resolution, capacity, decoder depth, and distributional supervision.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Segmentation-Based Lane Detection}
+
+Early deep lane detection systems often formulate lane detection as semantic or instance segmentation. These methods use dense pixel-level supervision and can preserve fine spatial boundaries. However, they typically require additional clustering or post-processing to recover lane instances, and their computational cost can be high for real-time applications.
+
+\subsection{Row-Wise Lane Localization}
+
+Row-wise methods exploit the fact that lanes in front-view images can be described by their horizontal positions at predefined vertical rows. UFLD-style approaches reformulate lane detection as a row-wise classification problem. This representation is efficient and well aligned with common lane annotations. However, purely row-wise classifiers may have limited instance-level interaction and global geometric reasoning.
+
+\subsection{Anchor-Based Lane Detection}
+
+Anchor-based methods define a set of line anchors and train the model to classify and refine them. Such methods, including strong refinement-based systems, can achieve high accuracy. Their limitation is that the representation depends on anchor design, refinement stages, and post-processing choices. Our method avoids hand-designed line anchors and instead uses learnable instance tokens.
+
+\subsection{Transformer and Query-Based Lane Detection}
+
+Transformer-based methods introduce learned queries to represent lane candidates. A query can attend to image features and produce a lane prediction. While this reduces the need for dense anchors, a single query may still be an overly compressed representation for a long and curved lane. Our method keeps the query-based formulation but decomposes each lane query into a global instance token and ordered row-level states.
+
+\subsection{Hierarchical and Point-Level Queries}
+
+Hierarchical query representations have appeared in related perception tasks such as vectorized map construction and 3D lane modeling. These works motivate the idea that an object can be represented by both instance-level and point-level components. Our work adapts this principle to 2D front-view lane detection by binding point-level tokens to fixed horizontal image rows, thereby removing permutation ambiguity and introducing a task-specific geometric prior.
+
+\subsection{Positioning of This Work}
+
+The proposed method is closest in spirit to the intersection of row-wise lane detection and query-based transformer decoding. However, its representation is different from both a standard row-wise classifier and a standard lane-query transformer. A standard row-wise classifier predicts horizontal locations at predefined rows but does not maintain an explicit lane-conditioned token state for each row. A standard lane-query transformer maintains a lane-level query, but the entire lane geometry is compressed into that single query. In contrast, the proposed decoder maintains a structured latent state for each pair of lane candidate and image row.
+
+Table~\ref{tab:paradigm} summarizes the conceptual difference.
+
+\begin{table*}[t]
+\centering
+\caption{Conceptual comparison of lane representation paradigms.}
+\label{tab:paradigm}
+\begin{tabularx}{\linewidth}{lXXX}
+\toprule
+Paradigm & Lane Representation & Main Strength & Limitation Addressed by This Work \\
+\midrule
+Segmentation-based & Pixel-level lane mask & Preserves spatial detail & Requires instance separation and post-processing \\
+Anchor-based & Predefined line anchors refined by the model & Strong accuracy with mature refinement pipelines & Depends on manually designed line anchors \\
+Row-wise classification & Horizontal position per predefined row & Efficient and aligned with lane annotations & Often lacks explicit lane-conditioned row states \\
+Parametric curve & Polynomial, Bezier, or spline parameters & Compact and smooth representation & Can be restrictive for irregular local geometry \\
+Holistic query transformer & One query vector per lane candidate & Learnable and end-to-end & Compresses complete lane geometry into one vector \\
+\textbf{Proposed} & \textbf{Instance token + ordered row tokens} & \textbf{Separates lane identity from row-wise geometry} & \textbf{Keeps a structured decoder state for the lane curve} \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\section{Method}
+
+\subsection{Problem Formulation}
+
+Given an input image $I \in \mathbb{R}^{H \times W \times 3}$, the goal is to predict a set of lane instances. Each lane is represented by a sequence of horizontal coordinates at predefined vertical rows:
+
+\begin{equation}
+    L_i = \{x_{i,r}\}_{r=1}^{R},
+\end{equation}
+
+where $i$ indexes the lane instance and $r$ indexes the row. Some rows may be invalid if the lane is not visible at that vertical position. The model also predicts lane-level existence, valid vertical range, and confidence information.
+
+\subsection{Overview}
+
+The proposed architecture is shown conceptually in Fig.~\ref{fig:overview}. A CNN backbone extracts visual features, which are fused by a feature pyramid. The structured decoder then uses instance tokens and ordered row tokens to produce lane predictions.
+
+\begin{figure*}[t]
+\centering
+\fbox{
+\begin{minipage}{0.94\linewidth}
+\centering
+\vspace{0.5em}
+\textbf{Input Image}
+$\rightarrow$
+\textbf{ResNet/FPN Features}
+$\rightarrow$
+\textbf{Structured Row-Token Decoder}
+$\rightarrow$
+\textbf{Lane Outputs}\\
+\vspace{0.5em}
+\begin{tabular}{c c c}
+Image features & Instance + row tokens & Existence, range, quality, row-wise x distributions
+\end{tabular}
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Conceptual overview of the proposed structured row-token decoder. This schematic should be replaced with a polished graphical diagram in the final paper.}
+\label{fig:overview}
+\end{figure*}
+
+\subsection{Terminology for a CNN Reader}
+
+The terms token and query are often unfamiliar to readers trained primarily on CNN-based vision models. In this work, a token can be understood as a learnable feature vector with a role. It is not a piece of source code and it is not a cropped image patch. It is a latent vector that the network updates using visual evidence and other tokens.
+
+Table~\ref{tab:terms} defines the main terms used throughout the paper.
+
+\begin{table}[t]
+\centering
+\caption{Conceptual meaning of the main token types.}
+\label{tab:terms}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Term & Meaning in this paper \\
+\midrule
+Instance token & A global lane-candidate vector. It provides candidate identity and contributes to the aggregated lane representation used by lane-level heads. \\
+Row token & A learned row-position vector. It represents a predefined horizontal image row and provides geometric order. \\
+Lane-row token & A lane-specific row representation. It describes one lane candidate at one vertical row. \\
+Row-local evidence & Visual features from the corresponding horizontal row of the image feature map. \\
+Distributional x prediction & A probability distribution over horizontal bins instead of a single scalar x value. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Instance Tokens}
+
+An instance token represents a lane candidate at the global level. It provides candidate identity and later contributes to the aggregated representation used by lane-level prediction heads. If the model uses $N$ lane candidates, it maintains $N$ learnable instance tokens:
+
+\begin{equation}
+    \mathbf{e}_i \in \mathbb{R}^{C}, \quad i=1,\dots,N.
+\end{equation}
+
+The instance token should be interpreted as a learned slot for a potential lane. It does not correspond to a fixed semantic class such as ``left lane'' or ``right lane'' before training. During training, assignment provides supervision that allows slots to specialize into useful lane candidates; in the current grouped one-to-many setting, different groups may still learn candidates for the same ground-truth lane.
+
+\subsection{Ordered Row Tokens}
+
+A row token represents a predefined vertical row in the image. If the lane is sampled at $R$ rows, the model maintains an ordered sequence of row tokens:
+
+\begin{equation}
+    \mathbf{r}_j \in \mathbb{R}^{C}, \quad j=1,\dots,R.
+\end{equation}
+
+Unlike generic point tokens, row tokens have a fixed order and a fixed geometric meaning. The first token corresponds to an upper row, while later tokens correspond to lower rows. This order is essential because lane geometry is continuous along the vertical direction.
+
+\subsection{Instance-to-Row Factorization}
+
+For each lane candidate and each row, we form a lane-row representation by combining lane identity and row position:
+
+\begin{equation}
+    \mathbf{z}_{i,j}^{0} = \phi(\mathbf{e}_i, \mathbf{r}_j),
+\end{equation}
+
+where $\phi(\cdot)$ denotes a lightweight fusion operation. In the current design, this fusion follows the standard content-plus-position construction used in transformer models:
+
+\begin{equation}
+    \mathbf{z}_{i,j}^{0} = \mathbf{e}_i + \mathbf{r}_j.
+    \label{eq:addition}
+\end{equation}
+
+Conceptually, this representation means:
+
+\begin{quote}
+``the geometry token of lane candidate $i$ at row $j$.''
+\end{quote}
+
+This factorization is the central idea of the method. The model does not store the whole lane geometry in a single vector. Instead, it creates a structured grid of latent tokens:
+
+\begin{equation}
+    \mathbf{Z}^{0} \in \mathbb{R}^{N \times R \times C}.
+\end{equation}
+
+Fig.~\ref{fig:factorization} illustrates this representation.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+\begin{tabular}{c|cccc}
+ & Row 1 & Row 2 & $\cdots$ & Row $R$ \\
+\hline
+Instance 1 & $\bullet$ & $\bullet$ & $\cdots$ & $\bullet$ \\
+Instance 2 & $\bullet$ & $\bullet$ & $\cdots$ & $\bullet$ \\
+$\vdots$   & $\vdots$ & $\vdots$ & $\ddots$ & $\vdots$ \\
+Instance $N$ & $\bullet$ & $\bullet$ & $\cdots$ & $\bullet$
+\end{tabular}
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Instance-to-row token factorization. Each dot is a lane-row token representing one lane candidate at one vertical row.}
+\label{fig:factorization}
+\end{figure}
+
+\subsection{Why Use Addition Instead of Concatenation?}
+
+The addition in (\ref{eq:addition}) is an important design choice. A natural alternative would be concatenation:
+
+\begin{equation}
+    [\mathbf{e}_i ; \mathbf{r}_j] \in \mathbb{R}^{2C}.
+\end{equation}
+
+However, concatenation doubles the channel width of every lane-row token. This increases the cost of all later attention, linear projection, and feed-forward layers. More importantly, the next linear layer would still have to learn how to mix the two parts:
+
+\begin{equation}
+    \mathbf{W}[\mathbf{e}_i ; \mathbf{r}_j]
+    =
+    \mathbf{W}_{e}\mathbf{e}_i + \mathbf{W}_{r}\mathbf{r}_j.
+\end{equation}
+
+Thus, concatenation mainly postpones the fusion to the next projection layer. Element-wise addition performs this fusion immediately while keeping the token dimension fixed at $C$.
+
+This is the same principle used in standard transformers. A word embedding carries content, and a positional embedding carries order. Their sum gives a single vector that contains both what the token is and where it is. In this work, the instance token plays the role of content, while the row token plays the role of position:
+
+\begin{equation}
+    \underbrace{\mathbf{z}_{i,j}^{0}}_{\text{lane-row token}}
+    =
+    \underbrace{\mathbf{e}_i}_{\text{which lane candidate}}
+    +
+    \underbrace{\mathbf{r}_j}_{\text{which image row}}.
+\end{equation}
+
+For a reader familiar with CNNs, this can be interpreted as assigning each latent cell in an $N \times R$ lane grid both an identity coordinate and a vertical coordinate. The identity coordinate says which lane candidate is being described. The row coordinate says which horizontal image row is being described.
+
+\begin{table}[t]
+\centering
+\caption{Toy example of element-wise instance--row addition with $C=4$. The real model uses a higher-dimensional embedding, but the operation is identical.}
+\label{tab:addition-example}
+\begin{tabular}{lc}
+\toprule
+Vector & Value \\
+\midrule
+Instance token $\mathbf{e}_{1}$ & $[0.15,\;-0.42,\;0.88,\;-0.05]$ \\
+Row token $\mathbf{r}_{15}$ & $[1.20,\;0.05,\;-0.90,\;0.40]$ \\
+Lane-row token $\mathbf{z}_{1,15}^{0}$ & $[1.35,\;-0.37,\;-0.02,\;0.35]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At the tensor level, if there are $N$ lane candidates and $R$ sampled rows, the result is an $N \times R \times C$ latent grid. Every location in this grid represents one specific lane candidate at one specific row. This is the core structured representation used by the decoder.
+
+\subsection{Why Combine Instance and Row Information?}
+
+A row token alone only knows the vertical position. An instance token alone only knows the lane candidate identity. Lane detection requires both:
+
+\begin{equation}
+    \text{lane-row state} = \text{which lane candidate} + \text{which row}.
+\end{equation}
+
+This is analogous to combining content and position information in transformer models. The row component provides geometric order, while the instance component makes the row representation lane-specific. Therefore, the representation can distinguish the same row for different lane candidates.
+
+For a CNN analogy, a lane-row token can be viewed as a feature cell whose spatial coordinate is not a 2D image pixel, but a structured coordinate in a lane-candidate-by-row grid. The row part gives the vertical location, while the instance part gives the lane identity. This is why the method should not be interpreted as a generic transformer block inserted into a CNN. The decoder state itself is structured according to the lane geometry.
+
+\subsection{Row-Local Image Attention}
+
+Each lane-row token reads image evidence from the corresponding horizontal row of the feature map. For a reader familiar with CNNs, the backbone and feature pyramid can be viewed as producing a compressed visual map of the input image. The decoder token does not directly inspect raw pixels. In the current implementation, the FPN feature map is projected and resized to the row-evidence grid before attention. Thus, ``row-local'' means local in the vertical feature-row sense, not a cropped raw-pixel window around a predicted x-coordinate. Instead, the token asks the feature map a question:
+
+\begin{quote}
+``For lane candidate $i$ at row $j$, which horizontal position in this row looks relevant?''
+\end{quote}
+
+In transformer terminology, the lane-row token is the query, while the CNN/FPN features along the corresponding row provide keys and values. Attention then assigns weights to horizontal positions in that row. Positions that look more compatible with the lane-row token receive higher weight.
+
+Instead of letting every token attend to the full image, row-local attention restricts the visual search to the row associated with that token. This introduces a useful geometric prior: at a fixed vertical row, the key unknown is the horizontal location of the lane.
+
+Conceptually, for row $j$, the lane-row tokens attend to the horizontal feature sequence:
+
+\begin{equation}
+    \mathbf{F}_{j,:} = \{\mathbf{f}_{j,k}\}_{k=1}^{M},
+\end{equation}
+
+where $k$ indexes horizontal positions in the feature map. This enables each lane-row token to collect row-specific visual cues. In the current configuration, this attention evidence grid has 400 horizontal bins, while the final row-wise x-distribution head predicts 800 horizontal bins. Therefore, the cross-attention evidence resolution and the final localization-output resolution are related but not identical.
+
+A simplified attention update can be written as:
+
+\begin{equation}
+    \tilde{\mathbf{z}}_{i,j}
+    =
+    \sum_{k=1}^{M}
+    \alpha_{i,j,k}\mathbf{v}_{j,k},
+\end{equation}
+
+where $\alpha_{i,j,k}$ is the attention weight for horizontal position $k$, and $\mathbf{v}_{j,k}$ is the visual feature value at that position. This equation is not intended as an implementation detail; it explains the information flow. The lane-row token becomes a weighted summary of visual evidence along its assigned row. When horizontal positional embeddings are enabled, they are added to the attention keys so that the attention operation can distinguish positions along the row.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+CNN/FPN feature row $j$:\\
+$\mathbf{f}_{j,1}\;\mathbf{f}_{j,2}\;\cdots\;\mathbf{f}_{j,k}\;\cdots\;\mathbf{f}_{j,M}$\\
+\vspace{0.4em}
+$\uparrow\quad\uparrow\quad\cdots\quad\uparrow\quad\cdots\quad\uparrow$\\
+attention weights from lane-row token $\mathbf{z}_{i,j}$\\
+\vspace{0.4em}
+$\Downarrow$\\
+updated lane-row token for candidate $i$ at row $j$
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Conceptual view of row-local attention. A lane-row token reads a weighted summary from one horizontal feature row instead of searching the entire image.}
+\label{fig:rowlocal}
+\end{figure}
+
+\subsection{Same-Row Lane Interaction}
+
+At the same vertical row, multiple lane candidates may compete for nearby horizontal evidence. Same-row interaction allows lane candidates to communicate at a fixed row. This supports duplicate reduction and encourages different candidates to explain different lane structures. In the current grouped training configuration, this interaction is group-isolated rather than fully global across all lane candidates. Without this interaction, two candidate slots may independently select the same visible lane marking.
+
+\subsection{Same-Lane Vertical Interaction}
+
+A lane is continuous across rows. Therefore, the row tokens belonging to the same lane candidate exchange vertical context. This supports curvature, continuity, and occlusion recovery because each row prediction is informed by neighboring and distant rows along the same lane.
+
+These two interactions solve different problems. Same-row interaction is mainly about competition between lane candidates at one height. Same-lane vertical interaction is mainly about continuity of one lane over height. Fig.~\ref{fig:interactiongrid} illustrates the difference.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+\begin{tabular}{c|cccc}
+ & Row 1 & Row 2 & Row 3 & Row 4 \\
+\hline
+Lane 1 & $\circ$ & $\circ$ & $\circ$ & $\circ$ \\
+Lane 2 & $\circ$ & $\circ$ & $\circ$ & $\circ$ \\
+Lane 3 & $\circ$ & $\circ$ & $\circ$ & $\circ$
+\end{tabular}\\
+\vspace{0.5em}
+horizontal direction in the table: same-lane vertical continuity\\
+vertical direction in the table: same-row competition
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Interaction structure in the lane-candidate by row grid. Same-row interaction supports candidate competition; same-lane vertical interaction supports lane continuity.}
+\label{fig:interactiongrid}
+\end{figure}
+
+Fig.~\ref{fig:decoderblock} summarizes the decoder block.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+Lane-row tokens\\
+$\downarrow$\\
+Row-local image attention\\
+$\downarrow$\\
+Same-row lane interaction\\
+$\downarrow$\\
+Same-lane vertical interaction\\
+$\downarrow$\\
+Feed-forward update
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Conceptual structure of one decoder block. The final implementation may use standard transformer normalization and feed-forward operations, but the key idea is the separation of row-local, same-row, and vertical interactions.}
+\label{fig:decoderblock}
+\end{figure}
+
+\subsection{Row-Wise Distributional Localization}
+
+Each updated lane-row token predicts a discrete probability distribution over horizontal bins:
+
+\begin{equation}
+    p_{i,j}(x) = P(x_{i,j}=x \mid \mathbf{z}_{i,j}),
+\end{equation}
+
+where $x$ indexes horizontal bins. In the current head, the final row coordinate is obtained as the expected value of this distribution. The distribution logits are also supervised directly by the soft-bin loss. This is different from a pure scalar-regression head, where only the final coordinate receives supervision.
+
+The reason for using a distribution is practical. A direct regression head predicts one scalar value for each row. This is simple, but it does not constrain the underlying horizontal probability mass. In real road images, lane markings may be blurred, occluded, shadowed, overexposed, or partially missing. A distribution over horizontal bins allows the model to learn a localized probability mass around the target position; its entropy can also be inspected as a diagnostic uncertainty signal, although the current inference pipeline does not directly use entropy for filtering.
+
+\begin{table}[t]
+\centering
+\caption{Conceptual difference between scalar regression and distributional row-wise localization.}
+\label{tab:regression-vs-distribution}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Prediction type & Interpretation \\
+\midrule
+Scalar $x=241.3$ & The model outputs one coordinate, but the shape of the underlying horizontal evidence is not represented. \\
+Distribution over bins & The model assigns probability mass to possible horizontal positions, exposing both location and distribution sharpness. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+For training, the ground-truth coordinate is converted into a soft-bin target. If the true position falls between two neighboring bins, the target mass is linearly distributed between them. This supervises localized probability mass without forcing a hard one-bin label.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+\begin{tabular}{c|cccccc}
+Bin & $b-2$ & $b-1$ & $b$ & $b+1$ & $b+2$ & $\cdots$ \\
+\hline
+Target & 0 & 0 & 0.75 & 0.25 & 0 & $\cdots$
+\end{tabular}
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Soft-bin supervision for row-wise horizontal localization. If the ground-truth point lies between two bins, both bins receive fractional target mass.}
+\label{fig:softbin}
+\end{figure}
+
+\subsection{Lane-Level Prediction Heads}
+
+The row tokens of a lane candidate are aggregated into a lane-level representation. In the current head, this lane-level representation combines a global summary of the row tokens with the original instance-token residual. The row-wise x-distribution head is applied to individual row tokens, while the lane-level heads are applied to the aggregated lane representation. This representation predicts:
+
+\begin{itemize}
+    \item existence score: whether the candidate is a lane,
+    \item vertical range: the valid visible region of the lane,
+    \item quality score: the geometric reliability of the prediction.
+\end{itemize}
+
+The row-wise outputs and lane-level outputs are complementary. Row-wise distributions provide geometry, while lane-level scores support filtering and ranking.
+
+The quality score should be interpreted as a learned reliability proxy rather than an independently calibrated metric. During training, matched candidates receive an overlap-based soft quality target, while unmatched candidates receive a zero target.
+
+\subsection{Why This Is Lane-Level Anchor-Free}
+
+The term anchor-free must be used carefully. The proposed method does not use predefined line anchors such as fixed lane shapes, fixed starting points, or handcrafted lane priors that are refined during inference. In that sense, it is lane-level anchor-free.
+
+However, the method still uses sampled image rows and horizontal bins to parameterize coordinates. These rows and bins are not lane anchors. They are a coordinate system for reading and predicting lane geometry. This distinction is important because otherwise row-wise discretization could be confused with anchor-based lane proposals.
+
+\begin{table}[t]
+\centering
+\caption{Distinction between line anchors and row-wise coordinate parameterization.}
+\label{tab:anchorfree}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Concept & Meaning \\
+\midrule
+Line anchor & A predefined lane-shaped proposal that the model refines into a final lane. \\
+Row coordinate & A sampled horizontal image row where the model predicts the lane's x-position. \\
+Horizontal bin & A discretized coordinate used to express the x-position distribution at a row. \\
+Proposed method & Does not start from predefined lane shapes; it predicts lane geometry from instance and row tokens. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{High-Level Architecture Configuration}
+
+Table~\ref{tab:config} gives the high-level configuration used for the current best internal run. These values are listed to clarify the experimental setting, not as the core novelty.
+
+\begin{table}[t]
+\centering
+\caption{High-level configuration of the current best internal run.}
+\label{tab:config}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X}
+\toprule
+Component & Setting \\
+\midrule
+Backbone & ResNet-34, ImageNet-pretrained, backbone BN frozen \\
+Network input resolution after preprocessing & $1600 \times 640$ \\
+FPN channels & 256 \\
+Lane candidates & 32 \\
+Number of rows & 160 \\
+Horizontal bins & 800 \\
+Row-evidence bins for attention & 400 \\
+Original slot decoder layers & 0 \\
+Structured row-aware decoder layers & 4 \\
+EMA & No \\
+Test-time augmentation & No \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Training Objective}
+
+\subsection{Assignment}
+
+The model predicts a fixed number of lane candidates, while each image contains a variable number of ground-truth lanes. Therefore, predictions must be matched with ground truth during training. The assignment cost combines lane confidence, row-wise localization distance, vertical range consistency, and line-level overlap. In the current main configuration, training uses grouped one-to-many assignment with four groups: each group can assign candidates to ground-truth lanes, so one annotated lane may supervise more than one candidate across groups. Matched predictions are trained as lane instances; unmatched predictions are trained as background or no-lane candidates.
+
+This assignment step answers a basic training question: if the model outputs many lane candidates, which candidate should learn from which annotated lane? Conceptually, the training process selects low-cost predicted candidates for annotated lanes and applies geometry losses only to those matched candidates. Predictions that are not assigned to any ground-truth lane are trained to have low lane confidence.
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.92\linewidth}
+\centering
+\vspace{0.5em}
+Predicted lane candidates\\
+$\{\hat{L}_1,\hat{L}_2,\ldots,\hat{L}_N\}$\\
+\vspace{0.4em}
+$\Downarrow$ assignment by confidence, distance, range, and overlap\\
+\vspace{0.4em}
+Ground-truth lanes\\
+$\{L_1,L_2,\ldots,L_M\}$\\
+\vspace{0.4em}
+matched candidates: lane geometry losses\\
+unmatched candidates: no-lane confidence loss
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{Conceptual training assignment. The model always predicts a fixed set of candidates, but only candidates matched to ground-truth lanes receive lane-geometry supervision. In the current grouped one-to-many setting, the same ground-truth lane may supervise one candidate per group.}
+\label{fig:assignment}
+\end{figure}
+
+\subsection{Loss Components}
+
+The training objective contains the following conceptual components:
+
+\begin{itemize}
+    \item \textbf{Existence loss}: teaches which candidates correspond to real lanes.
+    \item \textbf{Point localization loss}: aligns predicted row-wise coordinates with ground truth.
+    \item \textbf{Line overlap loss}: encourages the predicted lane as a curve to overlap with the target lane.
+    \item \textbf{Range loss}: learns the valid vertical extent of each lane.
+    \item \textbf{Smoothness loss}: discourages physically implausible row-to-row jitter.
+    \item \textbf{Distributional row loss}: applies soft-bin supervision to matched candidates on valid annotated rows.
+    \item \textbf{Auxiliary segmentation and centerline losses}: improve the visual features used by the decoder.
+\end{itemize}
+
+Geometry and distributional losses are applied only to matched candidates and valid target rows. Unmatched candidates mainly receive no-lane confidence supervision and zero-quality targets. The auxiliary losses are used only to improve training; they do not change the final lane representation.
+
+\section{Inference}
+
+At inference time, the model outputs a fixed set of lane candidates. Each candidate has row-wise coordinates and lane-level scores. The final predictions are obtained by:
+
+\begin{enumerate}
+    \item computing lane confidence from existence and quality scores,
+    \item filtering low-confidence candidates,
+    \item removing duplicate lanes with lane-level non-maximum suppression,
+    \item keeping the top-ranked predictions.
+\end{enumerate}
+
+The threshold and ranking parameters should be selected on a validation set and then fixed for test evaluation.
+
+\section{Experiments}
+
+\subsection{Datasets and Metrics}
+
+The primary benchmark is CULane. Additional datasets such as TuSimple, LLAMAS, and CurveLanes should be used to evaluate generalization.
+
+The main metrics are precision, recall, and F1 score under the official evaluation protocol. Because the proposed method aims to improve localization, tighter overlap metrics such as F1 at higher IoU thresholds should also be reported. Category-wise results are important for understanding failure modes under normal, crowded, highlight, shadow, no-line, arrow, curve, crossroad, and night scenes.
+
+The Cross category requires special care. In the official CULane protocol, crossroad images do not contain annotated lane lines. Therefore, any predicted lane in this split is counted as a false positive. For this reason, Cross is commonly reported as a false-positive count rather than an F1 score. Lower Cross values are better. This category is a direct test of hallucination control.
+
+\subsection{Validation Protocol}
+
+Checkpoint selection, confidence threshold, quality-score weight, and non-maximum suppression parameters must be selected on the validation set. The test set should be used only for final reporting. This is necessary to avoid optimistic test-set tuning.
+
+\subsection{Implementation Details}
+
+Unless otherwise stated, the main model uses an ImageNet-pretrained ResNet-34 backbone with frozen backbone batch-normalization, and the structured decoder/head is trained on the same CULane split as the baseline. The current best internal setting uses high-resolution input, a 256-channel feature pyramid, 32 lane candidates, ordered row tokens, and four structured decoder layers. EMA and test-time augmentation are not used in the current preliminary result. This point should be explicitly stated because it separates the architecture result from test-time tricks.
+
+For the final paper, this subsection should report optimizer, learning rate schedule, batch size, augmentation, input resolution, training iterations, and inference settings. These details should be concise but complete enough to make the comparison reproducible.
+
+\subsection{Comparison with Existing AI Lane Detectors}
+
+This section is intended for paper positioning. Public numbers in Table~\ref{tab:public} are included as a draft literature context and must be independently checked against the corresponding papers or official repositories before final submission, because input resolution, backbone, training schedule, and post-processing may differ across works. The proposed-method row is the only row taken from the current local experiment log. The purpose of the table is not to claim final superiority at this stage, but to show where the proposed method sits among established AI-based lane detectors.
+
+\begin{table*}[t]
+\centering
+\caption{Draft comparison with representative AI-based lane detection models on CULane test. Public rows are literature-context rows and must be source-checked before final submission; only the proposed row is from the current local run.}
+\label{tab:public}
+\begin{tabular}{lllccl}
+\toprule
+Method & Venue/Year & Backbone & Paradigm & F1 & Comment \\
+\midrule
+SCNN & AAAI 2018 & VGG-like & Segmentation / message passing & 71.60 & Early spatial propagation baseline \\
+UFLD & ECCV 2020 & ResNet-34 & Row-wise classification & 72.30 & Efficient row-wise formulation \\
+LaneATT & CVPR 2021 & ResNet-34 & Anchor-based attention & 76.68 & Strong anchor baseline \\
+CondLaneNet & ICCV 2021 & ResNet-34 & Conditional row-wise head & 78.74 & Close instance-first row-wise prior \\
+CLRNet & CVPR 2022 & ResNet-34 & Anchor refinement & 79.73 & Strong line-anchor refinement model \\
+BSNet & 2023 & ResNet-34 & Spline / curve modeling & 79.89 & Curve-based representation \\
+Lane2Seq & CVPR 2024 & ViT-Base & Sequence generation & 79.64 & Tokenized output generation \\
+\textbf{Proposed \method} & -- & ResNet-34 & Structured row-token decoder & \textbf{79.98} & Iter. 225k, no EMA/TTA in current internal result \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:archcompare} compares representation choices rather than only scores. This table is important because the proposed method is not intended to be framed as a pure score-chasing modification. Its claim is representational.
+
+\begin{table*}[t]
+\centering
+\caption{Architecture-level comparison with selected related methods.}
+\label{tab:archcompare}
+\begin{tabularx}{\linewidth}{lXXX}
+\toprule
+Method & Lane Identity Modeling & Geometry Modeling & Difference from Proposed Method \\
+\midrule
+UFLD & Implicit lane slots & Row-wise grid classification & Efficient row-wise prediction, but no explicit instance-to-row decoder state \\
+CondLaneNet & Instance-first proposal & Conditional convolution row-wise shape & Conceptually close, but geometry is generated by conditional heads rather than ordered row tokens \\
+CLRNet & Anchor proposals & Iterative line-anchor refinement & Strong refinement model, but relies on predefined line anchors \\
+CondLSTR & Transformer lane queries & Dynamic kernels produce row-wise heatmaps/offsets & Close neighboring paradigm; does not explicitly maintain ordered row tokens as decoder states \\
+Lane2Seq & Sequence-level tokens & Autoregressive or sequence-style output tokens & Tokenizes outputs, but does not use parallel lane-conditioned row-token geometry \\
+\textbf{Proposed \method} & \textbf{Learned instance tokens} & \textbf{Ordered row tokens with row-wise distributions} & \textbf{Explicitly factorizes lane identity and row geometry inside the decoder} \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+Fig.~\ref{fig:methodcomparison} summarizes the difference between the proposed method and two strong neighboring paradigms. This figure is included because score tables alone do not explain the architectural distinction.
+
+\begin{figure*}[t]
+\centering
+\fbox{
+\begin{minipage}{0.96\linewidth}
+\centering
+\vspace{0.5em}
+\begin{tabularx}{\linewidth}{lXX}
+\textbf{CLRNet} &
+predefined line anchors $\rightarrow$ cross-layer refinement $\rightarrow$ final lanes &
+anchor refinement paradigm \\
+\textbf{CondLSTR} &
+lane query $\rightarrow$ dynamic kernels $\rightarrow$ dense heatmap/offset maps &
+query-generated dynamic head paradigm \\
+\textbf{Proposed} &
+instance token $+$ ordered row tokens $\rightarrow$ row-wise x distributions &
+structured instance-to-row decoder paradigm
+\end{tabularx}
+\vspace{0.5em}
+\end{minipage}
+}
+\caption{High-level architectural distinction from strong related methods. The proposed method does not refine predefined line anchors and does not generate dynamic convolution kernels. It explicitly represents each lane as an instance token plus an ordered sequence of row tokens.}
+\label{fig:methodcomparison}
+\end{figure*}
+
+\subsection{Preliminary Internal Results}
+
+Table~\ref{tab:prelim} summarizes the current preliminary status. These numbers should be treated as internal results until the final validation-based protocol is fixed.
+
+\begin{table}[t]
+\centering
+\caption{Preliminary CULane test results with ResNet-34. The final paper should report results selected using validation-set model selection.}
+\label{tab:prelim}
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X c c c >{\raggedright\arraybackslash}X}
+\toprule
+Model & EMA & TTA & F1 & Note \\
+\midrule
+Unstructured S0 & No & No & 75.25 & Retest under final protocol \\
+Structured SRTD & No & No & 79.98 & 225k iter., no EMA/TTA \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The preliminary improvement suggests that the structured instance-to-row representation is promising. However, the final claim must be supported by controlled ablations. Otherwise, the improvement could be attributed to input resolution, decoder capacity, distributional supervision, or threshold selection.
+
+\subsection{CULane Category-Wise Comparison}
+
+Total F1 is not sufficient to understand the behavior of a lane detector. CULane contains categories such as normal, crowded, dazzle/highlight, shadow, no-line, arrow, curve, crossroad, and night. Therefore, the paper must not only report the global F1 score; it must show where the model improves and where it still fails. Table~\ref{tab:category} follows the detailed CULane reporting style used by strong prior work such as CLRNet. The Cross column reports the number of false positives because the crossroad split contains images without lane annotations; therefore lower is better for Cross, while higher is better for all other category columns.
+
+\begin{table*}[t]
+\centering
+\caption{CULane category-wise comparison on the official test split. Public method values are draft literature-context values and must be source-checked before final submission. The Cross column reports false positives; lower is better. The proposed-method row uses the current 225k internal result and must be finalized using validation-selected checkpoint and threshold before submission.}
+\label{tab:category}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{llcccccccccc}
+\toprule
+Method & Backbone & F1 & Normal & Crowd & Dazzle & Shadow & No-line & Arrow & Curve & Cross FP & Night \\
+\midrule
+SCNN & VGG16 & 71.60 & 90.60 & 69.70 & 58.50 & 66.90 & 43.40 & 84.10 & 64.40 & 1990 & 66.10 \\
+UFLD & ResNet-34 & 72.30 & 90.70 & 70.20 & 59.50 & 69.30 & 44.40 & 85.70 & 69.50 & 2037 & 66.70 \\
+LaneATT & ResNet-34 & 76.68 & 92.14 & 75.03 & 66.47 & 78.15 & 49.39 & 88.38 & 67.72 & 1330 & 70.72 \\
+CondLaneNet & ResNet-34 & 78.74 & 93.38 & 77.14 & 71.17 & 79.93 & 51.85 & 89.89 & 73.88 & 1387 & 73.92 \\
+GANet & ResNet-34 & 79.39 & 93.73 & 77.92 & 71.64 & 79.49 & 52.63 & 90.37 & 76.32 & 1368 & 73.67 \\
+CLRNet & ResNet-34 & 79.73 & 93.49 & 78.06 & 74.57 & 79.92 & 54.01 & 90.59 & 72.77 & 1216 & 75.02 \\
+\textbf{Proposed \method} & \textbf{ResNet-34} & \textbf{79.98} & \textbf{93.81} & \textbf{78.75} & \textbf{75.73} & \textbf{81.28} & 52.93 & 90.30 & 75.59 & \textbf{1038} & 74.94 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The current result is not uniformly better than every public model in every category. This matters for the paper narrative. The proposed decoder is competitive overall and has a relatively low Cross false-positive count in the current run, but the table should still be read conservatively because final checkpoint and threshold selection must be fixed on validation. The defensible claim is that the proposed structured row-token representation reaches a competitive ResNet-34 CULane result while avoiding handcrafted line anchors and while providing a clear internal improvement over the unstructured S0 baseline. The category table also defines the next diagnostic target: if future changes improve global F1 but degrade Cross or No-line heavily, they should not be accepted blindly.
+
+\subsection{Cross-Dataset Comparison Plan}
+
+Strong lane detection papers typically report more than one benchmark or at least include detailed CULane split analysis. For a complete submission, the same model family should also be evaluated on TuSimple, LLAMAS, or CurveLanes. Table~\ref{tab:crossdataset} gives the planned reporting format.
+
+\begin{table}[t]
+\centering
+\caption{Planned cross-dataset reporting format. This is not an experimental-result table yet.}
+\label{tab:crossdataset}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X c c c}
+\toprule
+Method & CULane & TuSimple & CurveLanes \\
+\midrule
+Representative prior work & -- & -- & -- \\
+Unstructured S0 baseline & -- & -- & -- \\
+Proposed \method & -- & -- & -- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Ablation Study Design}
+
+The main ablations required for a convincing paper are shown in Table~\ref{tab:ablation-main}.
+
+\begin{table*}[t]
+\centering
+\caption{Core ablations required to isolate the contribution of the proposed representation. This is an experiment plan, not a completed result table.}
+\label{tab:ablation-main}
+\begin{tabular}{lccccp{5.5cm}}
+\toprule
+Variant & Instance Token & Ordered Row Tokens & Distributional Loss & Key Control & Purpose \\
+\midrule
+Unstructured baseline & Yes & No & No & same recipe & Tests holistic query representation \\
+Instance-only variant & Yes & No & optional & same capacity where possible & Tests lane identity without row decomposition \\
+Structured without distributional loss & Yes & Yes & No & same decoder depth & Isolates ordered row-token representation \\
+Structured with distributional loss & Yes & Yes & Yes & same decoder depth & Tests row-wise distributional localization \\
+Shallow structured decoder & Yes & Yes & Yes & 1--2 layers & Tests insufficient interaction depth \\
+Final structured decoder & Yes & Yes & Yes & 4 layers & Main configuration \\
+Deeper structured decoder & Yes & Yes & Yes & 6 layers & Tests whether extra depth still helps \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Component Ablation}
+
+The final paper should include a compact component ablation similar to the ablation tables used in strong lane detection papers. The goal is to show which part of the method contributes to the final score.
+
+\begin{table}[t]
+\centering
+\caption{Planned component ablation. This table should be filled with validation-selected test results.}
+\label{tab:component}
+\begin{tabular}{lcccc}
+\toprule
+Variant & Row Tokens & DFL & Aux. Heads & F1 \\
+\midrule
+Unstructured baseline & No & No & Yes/No & -- \\
+Structured, direct regression & Yes & No & Yes & -- \\
+Structured, distributional & Yes & Yes & Yes & -- \\
+Structured, no auxiliary heads & Yes & Yes & No & -- \\
+Final model & Yes & Yes & Yes & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Capacity and Resolution Control}
+
+Table~\ref{tab:capacity} defines the capacity and resolution controls. These are necessary because a reviewer may argue that the performance gain is due to higher input resolution or a larger decoder rather than the structured representation.
+
+\begin{table}[t]
+\centering
+\caption{Resolution and capacity control experiments. This table defines planned controls rather than completed results.}
+\label{tab:capacity}
+\begin{tabular}{lccc}
+\toprule
+Setting & Input & Rows & X bins \\
+\midrule
+Low resolution & 800$\times$288 & 72 & 200 \\
+Medium resolution & 1024$\times$384 & 96 & 512 \\
+High resolution & 1600$\times$640 & 160 & 800 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Slot Count and Decoder Depth}
+
+The number of lane candidates controls the precision--recall trade-off. Too few slots may reduce recall; too many slots may increase duplicate predictions and false positives. Decoder depth controls the amount of iterative interaction among tokens. The expected behavior is shown in Table~\ref{tab:slot-depth}.
+
+\begin{table}[t]
+\centering
+\caption{Recommended slot-count and decoder-depth ablations. This table reports expected diagnostic value, not measured scores.}
+\label{tab:slot-depth}
+\begin{tabular}{l p{5.3cm}}
+\toprule
+Ablation & Expected diagnostic value \\
+\midrule
+20 slots & Cleaner predictions, possible recall loss \\
+32 slots & Balanced setting for CULane-style scenes \\
+64 slots & Higher recall potential, higher duplicate risk \\
+1--2 layers & Tests whether the decoder lacks context \\
+4 layers & Main balance between accuracy and cost \\
+6 layers & Tests saturation and marginal gains \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Efficiency Comparison}
+
+Since the proposed representation increases the number of row-level tokens, the final paper should also report parameters, FLOPs, FPS, and memory. This is necessary to avoid presenting only accuracy while hiding computational cost.
+
+\begin{table}[t]
+\centering
+\caption{Planned efficiency comparison. This is not an experimental-result table yet.}
+\label{tab:efficiency}
+\begin{tabular}{lcccc}
+\toprule
+Method & Params & FLOPs & FPS & Input \\
+\midrule
+LaneATT & -- & -- & -- & -- \\
+CLRNet & -- & -- & -- & -- \\
+Proposed \method & -- & -- & -- & $1600{\times}640$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Qualitative and Diagnostic Analysis}
+
+The paper should include qualitative comparisons and diagnostic plots, not only total F1. The following figures are recommended:
+
+\begin{itemize}
+    \item overall architecture diagram,
+    \item holistic query vs. structured row-token representation,
+    \item instance-to-row token grid,
+    \item decoder interaction diagram,
+    \item row-wise probability heatmaps,
+    \item category-wise gain/loss plot,
+    \item threshold sensitivity curve,
+    \item success and failure visualizations.
+\end{itemize}
+
+Failure cases should be analyzed explicitly. The structured prior may improve continuity in difficult lanes, but it may also hallucinate lanes in no-line or crossroad scenes. This trade-off should be shown rather than hidden.
+
+Fig.~\ref{fig:requiredfigs} summarizes the minimum figure set expected for a complete version of the paper.
+
+\begin{figure*}[t]
+\centering
+\fbox{
+\begin{minipage}{0.95\linewidth}
+\centering
+\vspace{0.4em}
+\begin{tabular}{lll}
+\textbf{Figure A} & Overall architecture & Image $\rightarrow$ backbone/FPN $\rightarrow$ structured decoder $\rightarrow$ lanes \\
+\textbf{Figure B} & Holistic vs. structured query & Single lane query vs. instance + ordered row tokens \\
+\textbf{Figure C} & Decoder block & Row-local evidence, same-row interaction, vertical interaction \\
+\textbf{Figure D} & Probability heatmap & Row index vs. horizontal bin probability \\
+\textbf{Figure E} & Qualitative results & Baseline vs. proposed success/failure examples \\
+\textbf{Figure F} & Category-wise delta & Improvement and degradation by CULane category \\
+\end{tabular}
+\vspace{0.4em}
+\end{minipage}
+}
+\caption{Recommended figure set for the final paper. The final version should replace these schematic boxes with actual diagrams and plots.}
+\label{fig:requiredfigs}
+\end{figure*}
+
+\section{Discussion}
+
+The proposed method should be positioned as a representation-level contribution. The main claim is not that high-resolution training or distributional loss alone improves CULane performance. Rather, the key claim is that lane detection benefits from decomposing a lane into global identity and ordered row-wise geometry.
+
+This distinction is important for publication. If the paper is framed as ``we used DFL and higher resolution,'' the contribution will appear incremental. If the paper is framed as ``we introduce a structured instance-to-row decoder that changes how lane geometry is represented,'' the contribution is stronger and more defensible.
+
+\section{Limitations}
+
+The method has several limitations:
+
+\begin{itemize}
+    \item It assumes that lane geometry can be represented by one horizontal position per row.
+    \item The strong row-wise lane prior may produce false positives in scenes without visible lane markings.
+    \item One-to-many style training may improve recall but can make confidence calibration harder.
+    \item High row and bin counts increase training cost.
+    \item Final reported results must avoid test-set threshold tuning.
+\end{itemize}
+
+\section{Conclusion}
+
+We presented a structured row-token decoder for 2D lane detection. The method decomposes each lane into a global instance token and an ordered sequence of row-level states. This representation aligns the decoder state with the natural row-wise structure of lane geometry. The fused lane-row tokens read row-local visual evidence and produce distributional horizontal predictions, while lane-level heads estimate existence, range, and quality from an aggregated lane representation. Current internal results suggest that the full structured model improves over the current unstructured query baseline. Future work should complete controlled ablations, cross-dataset evaluation, backbone scaling, and validation-based threshold selection.
+
+\end{document}

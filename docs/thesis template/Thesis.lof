@@ -1,0 +1,7 @@
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\contentsline {figure}{\numberline {4.1}{\ignorespaces Probability field for the partition at the mouth of a gourami. Top: The magnitude of the proposal function is depicted with shades of gray. For demonstration purposes, the scaling factor is chosen higher than the actual implementation. Bottom: 3D plot of the probability field.\relax }}{6}{figure.caption.23}
+\contentsline {figure}{\numberline {4.2}{\ignorespaces Comparison of average error on platty for the proposed algorithm (10 particles), PFFL (50 particles) and SPOT. Data markers depict the average relative error for 12 partitions for each frame.\relax }}{7}{figure.caption.25}
+\addvspace {10\p@ }

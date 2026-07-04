@@ -94,6 +94,7 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
 def output_debug_stats(outputs) -> dict[str, torch.Tensor]:
     stats = {}
     evidence = outputs.get("evidence") if isinstance(outputs, dict) else None
+    structured_debug = outputs.get("structured_debug") if isinstance(outputs, dict) else None
     for evidence_dict in [evidence, outputs.get("geometry_evidence") if isinstance(outputs, dict) else None]:
         if not isinstance(evidence_dict, dict):
             continue
@@ -106,6 +107,10 @@ def output_debug_stats(outputs) -> dict[str, torch.Tensor]:
             stats["sample_x_mean"] = evidence_dict["sample_x_rows"].detach().mean()
         if "E_seq" in evidence_dict:
             stats["evidence_abs_mean"] = evidence_dict["E_seq"].detach().abs().mean()
+    if isinstance(structured_debug, dict):
+        for key, value in structured_debug.items():
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                stats[key] = value
     return stats
 
 
