@@ -135,5 +135,5 @@ training:
   check_finite_grad: false
   clip_grad_norm: 1.0
   log_interval: 50
-  vis_interval: 1000
+  vis_interval: 25000
   checkpoint_interval: 25000

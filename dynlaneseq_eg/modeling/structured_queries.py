@@ -48,8 +48,6 @@ class RowAwareCrossAttentionLayer(nn.Module):
             nn.init.zeros_(self.cross_gate.weight)
             nn.init.constant_(self.cross_gate.bias, float(cross_gate_init))
         self.last_cross_gate_mean: torch.Tensor | None = None
-        self.last_cross_gate_min: torch.Tensor | None = None
-        self.last_cross_gate_max: torch.Tensor | None = None
 
     def _grouped_inter_attention(self, q: torch.Tensor, batch_rows: int, num_instances: int) -> torch.Tensor:
         if self.num_groups == 1:
@@ -86,8 +84,6 @@ class RowAwareCrossAttentionLayer(nn.Module):
         if self.cross_gate is not None:
             gate = torch.sigmoid(self.cross_gate(q_norm))
             self.last_cross_gate_mean = gate.detach().mean()
-            self.last_cross_gate_min = gate.detach().amin()
-            self.last_cross_gate_max = gate.detach().amax()
             cross_delta = gate * cross_delta
         q = q + self.drop(cross_delta)
 
@@ -228,10 +224,7 @@ class StructuredLaneQueryHead(nn.Module):
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
         quality_logits = self.quality(lane_query).squeeze(-1)
-        structured_debug = {
-            "structured_row_abs": row_tokens.detach().abs().mean(),
-            "structured_feature_abs": row_value_features.detach().abs().mean(),
-        }
+        structured_debug = {}
         gate_means = []
         for layer_idx, layer in enumerate(self.layers):
             gate_mean = getattr(layer, "last_cross_gate_mean", None)
