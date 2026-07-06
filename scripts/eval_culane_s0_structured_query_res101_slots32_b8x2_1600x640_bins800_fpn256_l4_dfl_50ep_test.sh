@@ -50,5 +50,6 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --pred-dir "${PRED_DIR}" \
   --output-txt "${RESULT_TXT}" \
   --output-json "${RESULT_JSON}" \
+  --no-pretrained-init \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_FILE}"

@@ -100,6 +100,11 @@ def main() -> None:
     parser.add_argument("--categories", action="store_true", help="Also evaluate CULane official test_split categories.")
     parser.add_argument("--output-txt", default="", help="Write a compact evaluation report to this text file.")
     parser.add_argument("--output-json", default="", help="Write metrics and metadata to this JSON file.")
+    parser.add_argument(
+        "--no-pretrained-init",
+        action="store_true",
+        help="Do not initialize the backbone from torchvision pretrained weights before loading the checkpoint.",
+    )
     args = parser.parse_args()
 
     if not args.skip_write and not args.checkpoint:
@@ -108,6 +113,10 @@ def main() -> None:
         raise ValueError("--pred-dir is required when --skip-write is set.")
 
     cfg = load_config(args.config)
+    if args.no_pretrained_init and not args.skip_write:
+        model_cfg = cfg.setdefault("model", {})
+        model_cfg["pretrained_backbone"] = False
+        model_cfg["require_pretrained_backbone"] = False
     device = torch.device(args.device)
     train_cfg = cfg.get("training", {})
     if device.type == "cuda":
@@ -192,6 +201,7 @@ def main() -> None:
         f"score_thresh: {args.score_thresh}",
         f"eval_batch_size: {cfg.get('dataloader', {}).get('eval_batch_size', 1)}",
         f"channels_last: {channels_last}",
+        f"no_pretrained_init: {args.no_pretrained_init}",
         format_results(results),
     ]
     category_report = ""
@@ -243,6 +253,7 @@ def main() -> None:
             "quality_score_power": quality_score_power,
             "eval_batch_size": cfg.get("dataloader", {}).get("eval_batch_size", 1),
             "channels_last": channels_last,
+            "no_pretrained_init": args.no_pretrained_init,
             "results": results,
             "categories": cat_results,
         }
