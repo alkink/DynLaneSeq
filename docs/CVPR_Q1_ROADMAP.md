@@ -153,6 +153,7 @@ core ablation, fair comparison, tight metrics, generalization, writing
 | Unstructured val sweeps 175k/200k/225k/250k | Done | 225k selected for paired comparison |
 | Result manifest | Done | `docs/result_manifest.md` |
 | ResNet18 backbone config/scripts | Done | Ready for remote training |
+| ResNet101 backbone config/scripts | Done | Separate branch; ready for optional/parallel remote training |
 | Structured no-DFL | Postponed | Keep in TODO; not the next run |
 | Structured L2/L6 depth ablation | Postponed | Keep in TODO; run after backbone pass |
 
@@ -171,10 +172,11 @@ Reason:
 1. Finalize the paired structured vs holistic test table.
 2. Add tight metrics for the paired holistic baseline: F1@0.70 and mF1.
 3. Run ResNet18 structured backbone scaling.
-4. Then run DLA34 if the implementation path is stable.
-5. Later: structured no-DFL.
-6. Later: decoder depth ablation L2 / L4 / L6.
-7. Later: FPN128 vs FPN256 or 1024x384 vs 1600x640 fairness check.
+4. Optionally run ResNet101 structured backbone scaling in parallel if compute is available.
+5. Then run DLA34 if the implementation path is stable.
+6. Later: structured no-DFL.
+7. Later: decoder depth ablation L2 / L4 / L6.
+8. Later: FPN128 vs FPN256 or 1024x384 vs 1600x640 fairness check.
 
 ## 5. Phase 1 — Paired structured vs holistic baseline
 
@@ -431,10 +433,25 @@ scripts/eval_culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn2
 scripts/eval_culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_test.sh
 ```
 
+ResNet101 parallel branch files:
+
+```text
+dynlaneseq_eg/configs/culane_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+scripts/run_culane_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
+scripts/eval_culane_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_val.sh
+scripts/eval_culane_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_test.sh
+```
+
 Run command:
 
 ```bash
 bash scripts/run_culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
+```
+
+ResNet101 run command:
+
+```bash
+bash scripts/run_culane_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
 ```
 
 Validation checkpoints:
@@ -835,12 +852,14 @@ bash scripts/run_culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_
 ```
 
 4. Evaluate ResNet18 at fixed checkpoints using the ResNet18 val script.
-5. If ResNet18 is stable, prepare DLA34.
-6. Later: prepare structured no-DFL config/script.
-7. Later: prepare structured L2 and L6 configs/scripts.
+5. Optionally run/evaluate ResNet101 in parallel if the remote machine has enough memory.
+6. If ResNet18/ResNet101 scaling is stable, prepare DLA34.
+7. Later: prepare structured no-DFL config/script.
+8. Later: prepare structured L2 and L6 configs/scripts.
 
 Backbone recommendation:
 
 - Current action: run ResNet18 first.
+- Optional parallel action: run ResNet101 if compute is free; monitor OOM risk.
 - If the goal is stronger final score / closer public baseline comparison: run DLA34 next.
-- Do not prioritize ResNet101 before DLA34 and core ablations; it is expensive and does not directly prove the main idea.
+- Do not let ResNet101 block DLA34 and core ablations; it is expensive and does not directly prove the main idea.

@@ -340,7 +340,7 @@ class DynLaneSeqEncoder(nn.Module):
             pretrained=bool(model_cfg.get("pretrained_backbone", True)),
             require_pretrained=bool(model_cfg.get("require_pretrained_backbone", False)),
         )
-        self.fpn = SimpleFPN(out_channels=fpn_channels)
+        self.fpn = SimpleFPN(in_channels=self.backbone.out_channels, out_channels=fpn_channels)
         self.proj = nn.Conv2d(fpn_channels, dim, 1)
         self.ms_proj = nn.ModuleDict(
             {

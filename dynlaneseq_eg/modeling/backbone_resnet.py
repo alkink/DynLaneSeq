@@ -32,42 +32,85 @@ class BasicBlock(nn.Module):
         return self.act(out + identity)
 
 
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        expanded_channels = out_channels * self.expansion
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, expanded_channels, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(expanded_channels)
+        self.act = nn.ReLU(inplace=True)
+        self.downsample = None
+        if stride != 1 or in_channels != expanded_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, expanded_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(expanded_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.act(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+        return self.act(out + identity)
+
+
 class ResNetBackbone(nn.Module):
-    """ResNet-18/34 feature extractor returning C2-C5 at PRD strides."""
+    """ResNet feature extractor returning C2-C5 at PRD strides."""
 
     out_channels = {"c2": 64, "c3": 128, "c4": 256, "c5": 512}
-    _depth_to_blocks = {
-        18: (2, 2, 2, 2),
-        34: (3, 4, 6, 3),
+    _depth_to_spec = {
+        18: (BasicBlock, (2, 2, 2, 2)),
+        34: (BasicBlock, (3, 4, 6, 3)),
+        50: (Bottleneck, (3, 4, 6, 3)),
+        101: (Bottleneck, (3, 4, 23, 3)),
     }
 
     def __init__(self, depth: int = 34, pretrained: bool = True, require_pretrained: bool = False):
         super().__init__()
         depth = int(depth)
-        if depth not in self._depth_to_blocks:
-            raise ValueError(f"Unsupported ResNet depth for BasicBlock backbone: {depth}. Supported: {sorted(self._depth_to_blocks)}")
+        if depth not in self._depth_to_spec:
+            raise ValueError(f"Unsupported ResNet depth: {depth}. Supported: {sorted(self._depth_to_spec)}")
         self.depth = depth
         self.require_pretrained = bool(require_pretrained)
-        blocks = self._depth_to_blocks[depth]
+        block, blocks = self._depth_to_spec[depth]
+        self.out_channels = {
+            "c2": 64 * block.expansion,
+            "c3": 128 * block.expansion,
+            "c4": 256 * block.expansion,
+            "c5": 512 * block.expansion,
+        }
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(3, stride=2, padding=1),
         )
-        self.layer1 = self._make_layer(64, 64, blocks=blocks[0], stride=1)
-        self.layer2 = self._make_layer(64, 128, blocks=blocks[1], stride=2)
-        self.layer3 = self._make_layer(128, 256, blocks=blocks[2], stride=2)
-        self.layer4 = self._make_layer(256, 512, blocks=blocks[3], stride=2)
+        in_channels = 64
+        self.layer1 = self._make_layer(block, in_channels, 64, blocks=blocks[0], stride=1)
+        in_channels = 64 * block.expansion
+        self.layer2 = self._make_layer(block, in_channels, 128, blocks=blocks[1], stride=2)
+        in_channels = 128 * block.expansion
+        self.layer3 = self._make_layer(block, in_channels, 256, blocks=blocks[2], stride=2)
+        in_channels = 256 * block.expansion
+        self.layer4 = self._make_layer(block, in_channels, 512, blocks=blocks[3], stride=2)
         self._init_weights()
         if pretrained:
             self._try_load_torchvision()
 
     @staticmethod
-    def _make_layer(in_channels: int, out_channels: int, blocks: int, stride: int) -> nn.Sequential:
-        layers = [BasicBlock(in_channels, out_channels, stride=stride)]
+    def _make_layer(block: type[nn.Module], in_channels: int, out_channels: int, blocks: int, stride: int) -> nn.Sequential:
+        layers = [block(in_channels, out_channels, stride=stride)]
+        expanded_channels = out_channels * block.expansion
         for _ in range(1, blocks):
-            layers.append(BasicBlock(out_channels, out_channels, stride=1))
+            layers.append(block(expanded_channels, out_channels, stride=1))
         return nn.Sequential(*layers)
 
     def _init_weights(self) -> None:
@@ -88,6 +131,14 @@ class ResNetBackbone(nn.Module):
                 from torchvision.models import ResNet34_Weights, resnet34
 
                 tv = resnet34(weights=ResNet34_Weights.DEFAULT)
+            elif self.depth == 50:
+                from torchvision.models import ResNet50_Weights, resnet50
+
+                tv = resnet50(weights=ResNet50_Weights.DEFAULT)
+            elif self.depth == 101:
+                from torchvision.models import ResNet101_Weights, resnet101
+
+                tv = resnet101(weights=ResNet101_Weights.DEFAULT)
             else:  # Should be unreachable due to constructor validation.
                 raise ValueError(f"Unsupported ResNet depth: {self.depth}")
             self.stem[0].load_state_dict(tv.conv1.state_dict())
@@ -123,3 +174,10 @@ class ResNet18Backbone(ResNetBackbone):
 
     def __init__(self, pretrained: bool = True, require_pretrained: bool = False):
         super().__init__(depth=18, pretrained=pretrained, require_pretrained=require_pretrained)
+
+
+class ResNet101Backbone(ResNetBackbone):
+    """ResNet-101 wrapper for backbone scaling ablations."""
+
+    def __init__(self, pretrained: bool = True, require_pretrained: bool = False):
+        super().__init__(depth=101, pretrained=pretrained, require_pretrained=require_pretrained)
