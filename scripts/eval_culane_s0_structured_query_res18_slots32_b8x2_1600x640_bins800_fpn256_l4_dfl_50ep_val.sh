@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml}"
-CKPT="${CKPT:-outputs/culane_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0225000.pt}"
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml}"
+CKPT="${CKPT:-outputs/culane_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0225000.pt}"
 DEVICE="${DEVICE:-cuda}"
 SCORE_THRESH="${SCORE_THRESH:-0.30}"
 QUALITY_POWER="${QUALITY_POWER:-0.50}"

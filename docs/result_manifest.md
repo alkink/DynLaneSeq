@@ -39,13 +39,23 @@ This is the branch before the later crossgate experiment. Crossgate results are 
 | Val-final script | `scripts/eval_culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_val.sh` |
 | Optional val sweep script | `scripts/sweep_culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_quality_thresholds.sh` |
 
-## 3. Frozen evaluation protocol
+## 3. Frozen evaluation protocol and validation selection
 
-No additional sweep is required for this manifest. The frozen protocol is:
+The frozen protocol was selected from validation, not from test.  The compact
+validation grid used for the paper-facing protocol is:
+
+| Parameter | Grid |
+|---|---|
+| Score threshold | `0.30 0.35 0.40 0.45 0.50 0.55 0.60` |
+| Quality score power | `0.25 0.50 0.75` |
+| Validation selection metric | primary `F1@0.50`; tie-break by `mF1`, then `F1@0.70` |
+| mF1 thresholds | `0.50:0.05:0.95` |
+
+The selected frozen protocol is:
 
 | Parameter | Value |
 |---|---:|
-| Split | `test` |
+| Final split | `test` |
 | IoU threshold | `0.50` |
 | Score threshold | `0.30` |
 | Quality score power | `0.50` |
@@ -55,7 +65,17 @@ No additional sweep is required for this manifest. The frozen protocol is:
 | Eval batch size | `8` |
 | Channels-last eval | `True` |
 
-Selection note: `score_thresh=0.30` and `quality_score_power=0.50` are treated as the final validation-selected protocol according to the experiment decision. This workspace does not contain a validation sweep artifact for this exact claim, so this manifest does not invent or report validation numbers.
+Validation sweep artifacts:
+
+| Artifact | Purpose |
+|---|---|
+| `outputs/paper_val_sweeps/structured_iter_0225000_val_sweep.json` | Structured final validation selection |
+| `outputs/paper_val_sweeps/unstructured_iter_0175000_val_sweep.json` | Holistic baseline validation audit |
+| `outputs/paper_val_sweeps/unstructured_iter_0200000_val_sweep.json` | Holistic baseline validation audit |
+| `outputs/paper_val_sweeps/unstructured_iter_0225000_val_sweep.json` | Main paired holistic baseline validation selection |
+| `outputs/paper_val_sweeps/unstructured_iter_0250000_val_sweep.json` | Holistic baseline validation audit |
+
+Selection note: `score_thresh=0.30` and `quality_score_power=0.50` are validation-selected under the fixed compact grid above.  Test metrics must not be used to choose thresholds or checkpoints.
 
 The SOTA val/test scripts default to this final protocol. If different thresholds are needed for debugging, override `SCORE_THRESH` and `QUALITY_POWER` explicitly.
 
@@ -79,14 +99,38 @@ EVAL_BATCH_SIZE=8 \
 bash scripts/eval_culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_val.sh
 ```
 
-Optional validation sweep command, only if the final protocol needs to be re-audited:
+Validation sweep command:
 
 ```bash
-CKPT=outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0225000.pt \
-QUALITY_POWERS="0.25 0.50 0.75" \
-SCORE_THRESHOLDS="0.28 0.29 0.30 0.31 0.32" \
-bash scripts/sweep_culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep_quality_thresholds.sh
+bash scripts/sweep_paper_val_thresholds_s0_1600x640.sh
 ```
+
+Single-case example for the main paired unstructured checkpoint:
+
+```bash
+ONLY_CASES="unstructured_iter_0225000" \
+bash scripts/sweep_paper_val_thresholds_s0_1600x640.sh
+```
+
+## 3.1 Validation sweep summary
+
+These numbers are validation results. They are used only for protocol and checkpoint selection.
+
+| Model/checkpoint | q | Score thr. | Val TP@0.50 | Val FP@0.50 | Val FN@0.50 | Val P@0.50 | Val R@0.50 | Val F1@0.50 | Val F1@0.70 | Val mF1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Structured 225k | 0.50 | 0.30 | 25486 | 3776 | 7196 | 0.8710 | 0.7798 | 0.8229 | 0.6847 | 0.5549 |
+| Holistic unstructured 175k | 0.50 | 0.30 | 24679 | 3880 | 8003 | 0.8641 | 0.7551 | 0.8060 | 0.6500 | 0.5158 |
+| Holistic unstructured 200k | 0.50 | 0.30 | 24614 | 3704 | 8068 | 0.8692 | 0.7531 | 0.8070 | 0.6661 | 0.5322 |
+| Holistic unstructured 225k | 0.50 | 0.30 | 24751 | 3918 | 7931 | 0.8633 | 0.7573 | 0.8069 | 0.6642 | 0.5319 |
+| Holistic unstructured 250k | 0.50 | 0.30 | 24855 | 4060 | 7827 | 0.8596 | 0.7605 | 0.8070 | 0.6632 | 0.5321 |
+
+Validation interpretation:
+
+- For the structured model, `q=0.50`, `score_thr=0.30` is the best validation setting by `F1@0.50`.
+- For all audited unstructured checkpoints, `q=0.50`, `score_thr=0.30` is also the best validation setting by `F1@0.50`.
+- The unstructured 200k, 225k, and 250k validation F1 values differ by less than `0.02` absolute F1 points. This difference is negligible for checkpoint selection.
+- The main paired ablation therefore uses the unstructured 225k checkpoint because it matches the structured 225k training budget while having practically identical validation performance to nearby checkpoints.
+- This paired choice is based on validation behavior and training-budget matching, not on test-set performance.
 
 ## 4. Final selected test result
 
@@ -94,11 +138,11 @@ Source:
 
 `outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/test_eval_iter_0225000_thr0p30_q0p50_nms20p0/metrics.txt`
 
-| Iteration | Threshold | Quality power | TP | FP | FN | Precision | Recall | F1 |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 225000 | 0.30 | 0.50 | 77765 | 11813 | 27121 | 0.8681 | 0.7414 | 0.7998 |
+| Iteration | Threshold | Quality power | TP | FP | FN | Precision | Recall | F1@0.50 | F1@0.70 | mF1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 225000 | 0.30 | 0.50 | 77761 | 11813 | 27125 | 0.8681 | 0.7414 | 0.7998 | 0.6791 | 0.5497 |
 
-Final headline score: **79.98 F1 on CULane test**.
+Final headline score: **79.98 F1@0.50 on CULane test**. The same run gives **67.91 F1@0.70** and **54.97 mF1** over IoU thresholds `0.50:0.05:0.95`.
 
 ## 5. Category-wise test result for final selected checkpoint
 
@@ -162,14 +206,15 @@ Proven by current artifacts:
 - The non-crossgate structured row-token model reaches **79.98 F1** on CULane test under the frozen protocol.
 - The best recorded checkpoint is `iter_0225000.pt`, not the last available checkpoint.
 - The model is precision-heavy at the selected threshold/quality setting: `P=86.81`, `R=74.14`.
+- The paper-facing threshold protocol `q=0.50`, `score_thr=0.30` is supported by validation sweeps.
+- A same-condition holistic unstructured validation audit exists for nearby checkpoints, and the main paired checkpoint is selected from validation/training-budget logic.
 
 Not proven yet by this manifest:
 
-- It does not prove the full paper claim against a same-condition unstructured baseline.
+- It does not by itself complete the full paper claim; the same-condition holistic baseline still needs to be integrated into the final paper tables with test, category, and tight-IoU reporting.
 - It does not prove that DFL alone is responsible for the gain.
 - It does not prove cross-dataset generalization.
 - It does not include EMA or TTA effects.
-- It does not include a formal validation sweep artifact for the selected `0.30/0.50` protocol.
 
 ## 8. Paper-critical experiments still required
 
@@ -177,7 +222,7 @@ These are not needed for freezing the SOTA result, but they are required for a d
 
 | Priority | Experiment | Status | Why it matters |
 |---:|---|---|---|
-| 1 | Same-condition unstructured baseline at `1600x640`, FPN256, L4, rows/bins matched where possible | Setup added; training not complete | Separates structured row-token contribution from resolution/capacity |
+| 1 | Same-condition holistic unstructured baseline at `1600x640`, FPN256, L4, rows/bins matched where possible | Validation sweeps recorded for 175k/200k/225k/250k; main paired checkpoint selected as 225k | Separates structured row-token contribution from resolution/capacity |
 | 2 | Structured model without DFL | Not complete | Shows whether DFL is auxiliary or the main driver |
 | 3 | Decoder depth ablation: L2/L4/L6 | L4 complete | Tests whether the architecture saturates near 4 layers |
 | 4 | FPN128 vs FPN256 under same setup | Not complete | Separates capacity gain from structured representation |

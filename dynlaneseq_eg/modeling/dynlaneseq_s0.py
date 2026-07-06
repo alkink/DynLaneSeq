@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .backbone_resnet import ResNet34Backbone
+from .backbone_resnet import ResNetBackbone
 from .common import input_to_grid, sort_range_norm
 from .cross_attention_decoder import LaneCrossAttentionDecoder
 from .evidence import CurveAlignedSampler
@@ -335,7 +335,11 @@ class DynLaneSeqEncoder(nn.Module):
         self.dynamic_evidence_enabled = bool(dynamic_evidence_cfg.get("enabled", False))
         self.dynamic_proposal_enabled = bool(dynamic_proposal_cfg.get("enabled", False))
         self.seg_aux_extra_scales = list(seg_aux_cfg.get("extra_scales", []))
-        self.backbone = ResNet34Backbone(pretrained=bool(model_cfg.get("pretrained_backbone", True)))
+        self.backbone = ResNetBackbone(
+            depth=int(model_cfg.get("resnet_depth", 34)),
+            pretrained=bool(model_cfg.get("pretrained_backbone", True)),
+            require_pretrained=bool(model_cfg.get("require_pretrained_backbone", False)),
+        )
         self.fpn = SimpleFPN(out_channels=fpn_channels)
         self.proj = nn.Conv2d(fpn_channels, dim, 1)
         self.ms_proj = nn.ModuleDict(

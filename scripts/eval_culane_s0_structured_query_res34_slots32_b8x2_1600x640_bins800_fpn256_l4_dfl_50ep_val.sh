@@ -12,6 +12,7 @@ TOP_K="${TOP_K:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 NMS_DISTANCE_THRESH_PX="${NMS_DISTANCE_THRESH_PX:-20.0}"
 NMS_MIN_OVERLAP_POINTS="${NMS_MIN_OVERLAP_POINTS:-5}"
+IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.5}"
 
 CKPT_TAG="$(basename "${CKPT%.pt}")"
 CKPT_DIR="$(dirname "${CKPT}")"
@@ -36,6 +37,7 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --top-k "${TOP_K}" \
   --nms-distance-thresh-px "${NMS_DISTANCE_THRESH_PX}" \
   --nms-min-overlap-points "${NMS_MIN_OVERLAP_POINTS}" \
+  --iou-thresholds ${IOU_THRESHOLDS} \
   --pred-dir "${PRED_DIR}" \
   --output-txt "${RESULT_TXT}" \
   --output-json "${RESULT_JSON}" \
