@@ -127,6 +127,7 @@ training:
   gradient_accumulation_steps: 2
   max_iters: 278000
   amp: true
+  amp_dtype: bfloat16
   tf32: true
   cudnn_benchmark: true
   channels_last: true
