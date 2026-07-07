@@ -161,6 +161,9 @@ def train_one_epoch(
                 print(f"iter {iteration + 1:07d} | non-finite loss; skipping optimizer step")
                 optimizer.zero_grad(set_to_none=True)
                 micro_in_step = 0
+                del outputs, matches, loss_dict, loss
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 iteration += 1
                 continue
             backward_loss = loss / float(accumulation_steps)
@@ -180,6 +183,8 @@ def train_one_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0
                     scaler.update()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     iteration += 1
                     continue
                 scaler.step(optimizer)
@@ -192,6 +197,8 @@ def train_one_epoch(
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     iteration += 1
                     continue
                 optimizer.step()
