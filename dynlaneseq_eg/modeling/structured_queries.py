@@ -157,9 +157,13 @@ class StructuredLaneQueryHead(nn.Module):
             nn.GroupNorm(8, self.dim),
             nn.GELU(),
         )
-        self.scale_logits = (
-            nn.Parameter(torch.zeros(len(self.multi_scale_scales))) if self.multi_scale_enabled else None
-        )
+        if self.multi_scale_enabled:
+            init_scale_logits = torch.zeros(len(self.multi_scale_scales))
+            if "p2" in self.multi_scale_scales:
+                init_scale_logits[self.multi_scale_scales.index("p2")] = 2.0
+            self.scale_logits = nn.Parameter(init_scale_logits)
+        else:
+            self.scale_logits = None
         self.layers = nn.ModuleList(
             [
                 RowAwareCrossAttentionLayer(
