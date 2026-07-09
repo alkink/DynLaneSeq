@@ -109,6 +109,9 @@ class StructuredLaneQueryHead(nn.Module):
         evidence_x_bins: int | None = None,
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
+        multi_scale_enabled: bool = False,
+        multi_scale_scales: list[str] | tuple[str, ...] | None = None,
+        multi_scale_fusion: str = "static_softmax",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -120,6 +123,9 @@ class StructuredLaneQueryHead(nn.Module):
         self.use_x_pos = bool(use_x_pos)
         self.num_groups = int(num_groups)
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
+        self.multi_scale_enabled = bool(multi_scale_enabled)
+        self.multi_scale_scales = tuple(multi_scale_scales or ("p2", "p3", "p4"))
+        self.multi_scale_fusion = str(multi_scale_fusion).lower()
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -130,6 +136,13 @@ class StructuredLaneQueryHead(nn.Module):
             )
         if self.exist_prior_prob is not None and not 0.0 < self.exist_prior_prob < 1.0:
             raise ValueError("structured_query.exist_prior_prob must be between 0 and 1")
+        if self.multi_scale_enabled:
+            if len(self.multi_scale_scales) < 1:
+                raise ValueError("structured_query.multi_scale.scales must not be empty")
+            if self.multi_scale_fusion != "static_softmax":
+                raise ValueError(
+                    "Only structured_query.multi_scale.fusion='static_softmax' is implemented in this branch"
+                )
 
         self.instance_tokens = nn.Embedding(self.num_instances, self.dim)
         self.row_tokens = nn.Embedding(self.num_rows, self.dim)
@@ -143,6 +156,9 @@ class StructuredLaneQueryHead(nn.Module):
             nn.Conv2d(self.dim, self.dim, kernel_size=1),
             nn.GroupNorm(8, self.dim),
             nn.GELU(),
+        )
+        self.scale_logits = (
+            nn.Parameter(torch.zeros(len(self.multi_scale_scales))) if self.multi_scale_enabled else None
         )
         self.layers = nn.ModuleList(
             [
@@ -169,19 +185,54 @@ class StructuredLaneQueryHead(nn.Module):
                 lane_logit = 0.5 * math.log(self.exist_prior_prob / (1.0 - self.exist_prior_prob))
                 self.exist[-1].bias.copy_(self.exist[-1].bias.new_tensor([lane_logit, -lane_logit]))
 
-    def _row_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_row_features(self, features: torch.Tensor) -> torch.Tensor:
         feat = self.feature_proj(features)
         if feat.shape[-2:] != (self.num_rows, self.evidence_x_bins):
             feat = F.interpolate(feat, size=(self.num_rows, self.evidence_x_bins), mode="bilinear", align_corners=False)
-        b, c, r, x = feat.shape
-        feat_value = feat.permute(0, 2, 3, 1).contiguous()
+        return feat.permute(0, 2, 3, 1).contiguous()
+
+    def _row_features(
+        self,
+        features: torch.Tensor,
+        multi_scale_features: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        debug: dict[str, torch.Tensor] = {}
+        if self.multi_scale_enabled:
+            if multi_scale_features is None:
+                raise ValueError("structured_query.multi_scale is enabled but encoder did not provide multi_scale_features")
+            row_values = []
+            used_scales = []
+            for scale in self.multi_scale_scales:
+                if scale == "p2":
+                    scale_features = multi_scale_features.get("p2", features)
+                else:
+                    if scale not in multi_scale_features:
+                        raise KeyError(f"multi_scale_features is missing required scale {scale!r}")
+                    scale_features = multi_scale_features[scale]
+                row_values.append(self._project_row_features(scale_features))
+                used_scales.append(scale)
+            stacked = torch.stack(row_values, dim=0)
+            assert self.scale_logits is not None
+            scale_weights = torch.softmax(self.scale_logits[: len(row_values)], dim=0).to(
+                device=features.device, dtype=features.dtype
+            )
+            feat_value = (stacked * scale_weights.view(-1, 1, 1, 1, 1)).sum(dim=0)
+            for scale, weight in zip(used_scales, scale_weights.detach()):
+                debug[f"structured_ms_weight_{scale}"] = weight
+        else:
+            feat_value = self._project_row_features(features)
+        b, r, x, c = feat_value.shape
         feat_key = feat_value
         if self.x_tokens is not None:
             x_pos = self.x_tokens.weight.to(device=features.device, dtype=features.dtype).view(1, 1, x, c)
             feat_key = feat_key + x_pos
-        return feat_value, feat_key
+        return feat_value, feat_key, debug
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        features: torch.Tensor,
+        multi_scale_features: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         b = int(features.shape[0])
         dtype = features.dtype
         device = features.device
@@ -189,7 +240,7 @@ class StructuredLaneQueryHead(nn.Module):
         row = self.row_tokens.weight.to(device=device, dtype=dtype)
         row_tokens = instance[:, None, :] + row[None, :, :]
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
-        row_value_features, row_key_features = self._row_features(features)
+        row_value_features, row_key_features, row_feature_debug = self._row_features(features, multi_scale_features)
 
         for layer in self.layers:
             row_tokens = layer(row_tokens, row_value_features, row_key_features)
@@ -214,6 +265,7 @@ class StructuredLaneQueryHead(nn.Module):
             "structured_debug": {
                 "structured_row_abs": row_tokens.detach().abs().mean(),
                 "structured_feature_abs": row_value_features.detach().abs().mean(),
+                **row_feature_debug,
             },
         }
 
@@ -222,6 +274,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
     structured_cfg = model_cfg.get("structured_query", {})
     if not bool(structured_cfg.get("enabled", False)):
         return None
+    multi_scale_cfg = structured_cfg.get("multi_scale", {})
     return StructuredLaneQueryHead(
         dim=int(model_cfg.get("dim", 256)),
         num_instances=int(structured_cfg.get("num_instances", model_cfg.get("num_slots", 20))),
@@ -236,4 +289,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         evidence_x_bins=int(structured_cfg.get("evidence_x_bins", structured_cfg.get("attn_x_bins", model_cfg.get("x_bins", 200)))),
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
+        multi_scale_enabled=bool(multi_scale_cfg.get("enabled", False)),
+        multi_scale_scales=list(multi_scale_cfg.get("scales", ["p2", "p3", "p4"])),
+        multi_scale_fusion=str(multi_scale_cfg.get("fusion", "static_softmax")),
     )

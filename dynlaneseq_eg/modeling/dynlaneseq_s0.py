@@ -533,7 +533,7 @@ class DynLaneSeqS0(nn.Module):
     def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
         enc = self.encoder.forward_features(images)
         if self.structured_query_head is not None:
-            out = self.structured_query_head(enc["features"])
+            out = self.structured_query_head(enc["features"], enc.get("multi_scale_features"))
             out["memory"] = enc["memory"]
             out["memory_key"] = enc["memory_key"]
             out["q0"] = enc["q0"]
@@ -563,4 +563,6 @@ class DynLaneSeqS0(nn.Module):
             out["dynamic_proposals"] = enc["dynamic_proposals"]
         if return_features:
             out["features"] = enc["features"]
+            if "multi_scale_features" in enc:
+                out["multi_scale_features"] = enc["multi_scale_features"]
         return out
