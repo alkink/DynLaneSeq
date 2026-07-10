@@ -112,6 +112,8 @@ class StructuredLaneQueryHead(nn.Module):
         multi_scale_enabled: bool = False,
         multi_scale_scales: list[str] | tuple[str, ...] | None = None,
         multi_scale_fusion: str = "static_softmax",
+        multi_scale_layer_scales: list[str] | tuple[str, ...] | None = None,
+        multi_scale_pos_encoding: str = "learned",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -126,6 +128,9 @@ class StructuredLaneQueryHead(nn.Module):
         self.multi_scale_enabled = bool(multi_scale_enabled)
         self.multi_scale_scales = tuple(multi_scale_scales or ("p2", "p3", "p4"))
         self.multi_scale_fusion = str(multi_scale_fusion).lower()
+        self.num_layers = int(num_layers)
+        self.multi_scale_layer_scales = tuple(multi_scale_layer_scales or ())
+        self.multi_scale_pos_encoding = str(multi_scale_pos_encoding).lower()
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -139,14 +144,36 @@ class StructuredLaneQueryHead(nn.Module):
         if self.multi_scale_enabled:
             if len(self.multi_scale_scales) < 1:
                 raise ValueError("structured_query.multi_scale.scales must not be empty")
-            if self.multi_scale_fusion != "static_softmax":
+            if self.multi_scale_fusion not in {"static_softmax", "layerwise_native"}:
                 raise ValueError(
-                    "Only structured_query.multi_scale.fusion='static_softmax' is implemented in this branch"
+                    "structured_query.multi_scale.fusion must be 'static_softmax' or 'layerwise_native'"
                 )
+            if self.multi_scale_fusion == "layerwise_native":
+                if len(self.multi_scale_layer_scales) != self.num_layers:
+                    raise ValueError(
+                        "structured_query.multi_scale.layer_scales must contain exactly one scale per decoder layer "
+                        f"({self.num_layers}), got {len(self.multi_scale_layer_scales)}"
+                    )
+                unknown_scales = sorted(set(self.multi_scale_layer_scales) - set(self.multi_scale_scales))
+                if unknown_scales:
+                    raise ValueError(
+                        "structured_query.multi_scale.layer_scales contains scales not exposed by "
+                        f"model.multi_scale_evidence.scales: {unknown_scales}"
+                    )
+                if self.use_x_pos and self.multi_scale_pos_encoding != "normalized_sine":
+                    raise ValueError(
+                        "layerwise_native fusion requires multi_scale.pos_encoding='normalized_sine' when x position is enabled"
+                    )
+        if self.multi_scale_pos_encoding not in {"learned", "normalized_sine"}:
+            raise ValueError("structured_query.multi_scale.pos_encoding must be 'learned' or 'normalized_sine'")
 
         self.instance_tokens = nn.Embedding(self.num_instances, self.dim)
         self.row_tokens = nn.Embedding(self.num_rows, self.dim)
-        self.x_tokens = nn.Embedding(self.evidence_x_bins, self.dim) if self.use_x_pos else None
+        self.x_tokens = (
+            nn.Embedding(self.evidence_x_bins, self.dim)
+            if self.use_x_pos and self.multi_scale_pos_encoding == "learned"
+            else None
+        )
         nn.init.normal_(self.instance_tokens.weight, std=0.02)
         nn.init.normal_(self.row_tokens.weight, std=0.02)
         if self.x_tokens is not None:
@@ -157,7 +184,7 @@ class StructuredLaneQueryHead(nn.Module):
             nn.GroupNorm(8, self.dim),
             nn.GELU(),
         )
-        if self.multi_scale_enabled:
+        if self.multi_scale_enabled and self.multi_scale_fusion == "static_softmax":
             init_scale_logits = torch.zeros(len(self.multi_scale_scales))
             if "p2" in self.multi_scale_scales:
                 init_scale_logits[self.multi_scale_scales.index("p2")] = 2.0
@@ -173,7 +200,7 @@ class StructuredLaneQueryHead(nn.Module):
                     dropout=float(dropout),
                     num_groups=self.num_groups,
                 )
-                for _ in range(int(num_layers))
+                for _ in range(self.num_layers)
             ]
         )
         self.row_norm = nn.LayerNorm(self.dim)
@@ -189,21 +216,85 @@ class StructuredLaneQueryHead(nn.Module):
                 lane_logit = 0.5 * math.log(self.exist_prior_prob / (1.0 - self.exist_prior_prob))
                 self.exist[-1].bias.copy_(self.exist[-1].bias.new_tensor([lane_logit, -lane_logit]))
 
-    def _project_row_features(self, features: torch.Tensor) -> torch.Tensor:
+    def _project_row_features(self, features: torch.Tensor, preserve_width: bool = False) -> torch.Tensor:
         feat = self.feature_proj(features)
-        if feat.shape[-2:] != (self.num_rows, self.evidence_x_bins):
-            feat = F.interpolate(feat, size=(self.num_rows, self.evidence_x_bins), mode="bilinear", align_corners=False)
+        target_width = int(feat.shape[-1]) if preserve_width else self.evidence_x_bins
+        if feat.shape[-2:] != (self.num_rows, target_width):
+            feat = F.interpolate(feat, size=(self.num_rows, target_width), mode="bilinear", align_corners=False)
         return feat.permute(0, 2, 3, 1).contiguous()
+
+    def _normalized_sine_x_position(self, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Continuous x encoding shared by pyramid levels with different widths."""
+        compute_dtype = torch.float32
+        x = (torch.arange(width, device=device, dtype=compute_dtype) + 0.5) / float(width)
+        x = x * (2.0 * math.pi)
+        half_dim = (self.dim + 1) // 2
+        if half_dim == 1:
+            frequency = torch.ones(1, device=device, dtype=compute_dtype)
+        else:
+            frequency = torch.exp(
+                -math.log(10000.0)
+                * torch.arange(half_dim, device=device, dtype=compute_dtype)
+                / float(half_dim - 1)
+            )
+        angles = x[:, None] * frequency[None, :]
+        pos = torch.cat((angles.sin(), angles.cos()), dim=-1)[:, : self.dim]
+        return pos.to(dtype=dtype).view(1, 1, width, self.dim)
+
+    def _add_x_position(self, feat_value: torch.Tensor) -> torch.Tensor:
+        if not self.use_x_pos:
+            return feat_value
+        _, _, width, channels = feat_value.shape
+        if self.x_tokens is not None:
+            if width != self.evidence_x_bins:
+                raise ValueError(
+                    f"learned x position has {self.evidence_x_bins} bins but row evidence has width {width}"
+                )
+            x_pos = self.x_tokens.weight.to(device=feat_value.device, dtype=feat_value.dtype).view(
+                1, 1, width, channels
+            )
+        else:
+            x_pos = self._normalized_sine_x_position(
+                width=width,
+                device=feat_value.device,
+                dtype=feat_value.dtype,
+            )
+        return feat_value + x_pos
 
     def _row_features(
         self,
         features: torch.Tensor,
         multi_scale_features: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], dict[str, torch.Tensor]]:
         debug: dict[str, torch.Tensor] = {}
         if self.multi_scale_enabled:
             if multi_scale_features is None:
                 raise ValueError("structured_query.multi_scale is enabled but encoder did not provide multi_scale_features")
+            if self.multi_scale_fusion == "layerwise_native":
+                row_banks: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                for scale in dict.fromkeys(self.multi_scale_layer_scales):
+                    if scale == "p2":
+                        scale_features = multi_scale_features.get("p2", features)
+                    else:
+                        if scale not in multi_scale_features:
+                            raise KeyError(f"multi_scale_features is missing required scale {scale!r}")
+                        scale_features = multi_scale_features[scale]
+                    feat_value = self._project_row_features(scale_features, preserve_width=True)
+                    row_banks[scale] = (feat_value, self._add_x_position(feat_value))
+                    debug[f"structured_ms_feature_{scale}_abs"] = feat_value.detach().abs().mean()
+
+                layer_banks = [row_banks[scale] for scale in self.multi_scale_layer_scales]
+                for layer_index, (scale, (feat_value, _)) in enumerate(
+                    zip(self.multi_scale_layer_scales, layer_banks)
+                ):
+                    debug[f"structured_ms_layer_{layer_index}_scale_index"] = feat_value.new_tensor(
+                        float(self.multi_scale_scales.index(scale))
+                    )
+                    debug[f"structured_ms_layer_{layer_index}_width"] = feat_value.new_tensor(
+                        float(feat_value.shape[2])
+                    )
+                return layer_banks, debug
+
             row_values = []
             used_scales = []
             for scale in self.multi_scale_scales:
@@ -225,12 +316,8 @@ class StructuredLaneQueryHead(nn.Module):
                 debug[f"structured_ms_weight_{scale}"] = weight
         else:
             feat_value = self._project_row_features(features)
-        b, r, x, c = feat_value.shape
-        feat_key = feat_value
-        if self.x_tokens is not None:
-            x_pos = self.x_tokens.weight.to(device=features.device, dtype=features.dtype).view(1, 1, x, c)
-            feat_key = feat_key + x_pos
-        return feat_value, feat_key, debug
+        feat_key = self._add_x_position(feat_value)
+        return [(feat_value, feat_key)] * self.num_layers, debug
 
     def forward(
         self,
@@ -244,9 +331,9 @@ class StructuredLaneQueryHead(nn.Module):
         row = self.row_tokens.weight.to(device=device, dtype=dtype)
         row_tokens = instance[:, None, :] + row[None, :, :]
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
-        row_value_features, row_key_features, row_feature_debug = self._row_features(features, multi_scale_features)
+        layer_row_features, row_feature_debug = self._row_features(features, multi_scale_features)
 
-        for layer in self.layers:
+        for layer, (row_value_features, row_key_features) in zip(self.layers, layer_row_features):
             row_tokens = layer(row_tokens, row_value_features, row_key_features)
 
         row_tokens = self.row_norm(row_tokens)
@@ -268,7 +355,9 @@ class StructuredLaneQueryHead(nn.Module):
             "structured_row_tokens": row_tokens,
             "structured_debug": {
                 "structured_row_abs": row_tokens.detach().abs().mean(),
-                "structured_feature_abs": row_value_features.detach().abs().mean(),
+                "structured_feature_abs": torch.stack(
+                    [value.detach().abs().mean() for value, _ in layer_row_features]
+                ).mean(),
                 **row_feature_debug,
             },
         }
@@ -296,4 +385,6 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         multi_scale_enabled=bool(multi_scale_cfg.get("enabled", False)),
         multi_scale_scales=list(multi_scale_cfg.get("scales", ["p2", "p3", "p4"])),
         multi_scale_fusion=str(multi_scale_cfg.get("fusion", "static_softmax")),
+        multi_scale_layer_scales=list(multi_scale_cfg.get("layer_scales", [])),
+        multi_scale_pos_encoding=str(multi_scale_cfg.get("pos_encoding", "learned")),
     )

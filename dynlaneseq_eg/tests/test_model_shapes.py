@@ -125,6 +125,42 @@ def test_structured_query_s0_forward_shapes():
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
 
 
+def test_structured_query_layerwise_native_row_pyramid_contract():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dim"] = 64
+    cfg["model"]["fpn_channels"] = 64
+    cfg["model"]["num_slots"] = 16
+    cfg["model"]["num_heads"] = 4
+    cfg["model"]["decoder_layers"] = 0
+    cfg["model"]["decoder_ff_dim"] = 128
+    cfg["model"]["multi_scale_evidence"] = {"enabled": True, "scales": ["p2", "p3"]}
+    cfg["model"]["structured_query"] = {
+        "enabled": True,
+        "num_instances": 16,
+        "num_groups": 4,
+        "num_layers": 4,
+        "num_heads": 4,
+        "ff_dim": 128,
+        "dropout": 0.0,
+        "evidence_x_bins": 200,
+        "multi_scale": {
+            "enabled": True,
+            "scales": ["p2", "p3"],
+            "fusion": "layerwise_native",
+            "layer_scales": ["p3", "p3", "p2", "p2"],
+            "pos_encoding": "normalized_sine",
+        },
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    debug = out["structured_debug"]
+    assert out["row_x_logits"].shape == (1, 16, 72, 200)
+    assert [debug[f"structured_ms_layer_{i}_width"].item() for i in range(4)] == [100.0, 100.0, 200.0, 200.0]
+    assert model.structured_query_head.scale_logits is None
+    assert model.structured_query_head.x_tokens is None
+
+
 def test_structured_query_debug_config_builds():
     cfg = load_config("dynlaneseq_eg/configs/debug/culane_s0_structured_query_2k.yaml")
     cfg["model"]["pretrained_backbone"] = False
