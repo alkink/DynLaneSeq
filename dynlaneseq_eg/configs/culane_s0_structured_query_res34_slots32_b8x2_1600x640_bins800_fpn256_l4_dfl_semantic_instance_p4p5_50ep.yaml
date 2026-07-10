@@ -1,0 +1,25 @@
+_base_: culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_semantic_instance_p4p5_50ep
+
+model:
+  # P2 remains the only row-geometry memory. P4/P5 are exposed exclusively
+  # to the score-only semantic instance branch.
+  multi_scale_evidence:
+    enabled: true
+    scales: ["p4", "p5"]
+  structured_query:
+    semantic_instance:
+      enabled: true
+      scales: ["p4", "p5"]
+      after_layer: 1
+      detach_query: true
+      num_heads: 8
+      ff_dim: 1024
+      dropout: 0.1
+
+loss:
+  # Ten percent of the weighted main existence objective (main w_exist=2.0).
+  # This trains the zero-impact semantic branch before its decision adapter
+  # begins to influence the final existence/quality logits.
+  w_semantic_aux_exist: 0.2

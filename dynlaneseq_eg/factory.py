@@ -78,6 +78,7 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         w_dynamic_proposal_heatmap=float(loss.get("w_dynamic_proposal_heatmap", 0.0)),
         w_dynamic_proposal_x=float(loss.get("w_dynamic_proposal_x", 0.0)),
         w_dynamic_proposal_range=float(loss.get("w_dynamic_proposal_range", 0.0)),
+        w_semantic_aux_exist=float(loss.get("w_semantic_aux_exist", 0.0)),
         dynamic_proposal_sigma_bins=float(loss.get("dynamic_proposal_sigma_bins", 1.5)),
         dynamic_proposal_seed_radius_bins=int(loss.get("dynamic_proposal_seed_radius_bins", 2)),
         dynamic_proposal_heatmap_pos_weight=float(loss.get("dynamic_proposal_heatmap_pos_weight", 1.0)),

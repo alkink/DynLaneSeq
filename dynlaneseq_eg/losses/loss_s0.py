@@ -37,6 +37,7 @@ class LossConfig:
     w_dynamic_proposal_heatmap: float = 0.0
     w_dynamic_proposal_x: float = 0.0
     w_dynamic_proposal_range: float = 0.0
+    w_semantic_aux_exist: float = 0.0
     dynamic_proposal_sigma_bins: float = 1.5
     dynamic_proposal_seed_radius_bins: int = 2
     dynamic_proposal_heatmap_pos_weight: float = 1.0
@@ -90,6 +91,14 @@ class S0Criterion(nn.Module):
             dynamic_proposal_losses = self.compute_dynamic_proposal_losses(raw_outputs, targets)
         else:
             dynamic_proposal_losses = {"heatmap": zero, "x": zero, "range": zero}
+        semantic_aux_logits = raw_outputs.get("semantic_aux_exist_logits")
+        if self.cfg.w_semantic_aux_exist != 0 and isinstance(semantic_aux_logits, torch.Tensor):
+            loss_semantic_aux_exist = self.compute_exist_loss(
+                {"exist_logits": semantic_aux_logits},
+                matches,
+            )
+        else:
+            loss_semantic_aux_exist = zero
         total = (
             self.cfg.w_exist * loss_exist
             + self.cfg.w_point * loss_point
@@ -103,6 +112,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
             + self.cfg.w_dynamic_proposal_x * dynamic_proposal_losses["x"]
             + self.cfg.w_dynamic_proposal_range * dynamic_proposal_losses["range"]
+            + self.cfg.w_semantic_aux_exist * loss_semantic_aux_exist
         )
         out = {
             "loss_total": total,
@@ -119,6 +129,8 @@ class S0Criterion(nn.Module):
             "loss_dynamic_proposal_heatmap": dynamic_proposal_losses["heatmap"],
             "loss_dynamic_proposal_x": dynamic_proposal_losses["x"],
             "loss_dynamic_proposal_range": dynamic_proposal_losses["range"],
+            "loss_semantic_aux_exist": loss_semantic_aux_exist,
+            "weight_semantic_aux_exist": zero.new_tensor(float(self.cfg.w_semantic_aux_exist)),
         }
         if self.cfg.lambda_coarse > 0 and isinstance(raw_outputs.get("coarse"), dict):
             coarse = raw_outputs["coarse"]

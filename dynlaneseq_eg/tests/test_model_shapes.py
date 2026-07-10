@@ -125,6 +125,122 @@ def test_structured_query_s0_forward_shapes():
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
 
 
+def _semantic_structured_cfg():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"].update(
+        {
+            "input_h": 64,
+            "input_w": 128,
+            "dim": 64,
+            "fpn_channels": 64,
+            "num_slots": 8,
+            "num_rows": 16,
+            "x_bins": 32,
+            "num_heads": 4,
+            "decoder_layers": 0,
+            "decoder_ff_dim": 128,
+            "multi_scale_evidence": {"enabled": True, "scales": ["p4", "p5"]},
+            "structured_query": {
+                "enabled": True,
+                "num_instances": 8,
+                "num_groups": 2,
+                "num_layers": 2,
+                "num_heads": 4,
+                "ff_dim": 128,
+                "dropout": 0.0,
+                "evidence_x_bins": 32,
+                "exist_prior_prob": 0.01,
+                "semantic_instance": {
+                    "enabled": True,
+                    "scales": ["p4", "p5"],
+                    "after_layer": 1,
+                    "detach_query": True,
+                    "num_heads": 4,
+                    "ff_dim": 128,
+                    "dropout": 0.0,
+                },
+            },
+        }
+    )
+    return cfg
+
+
+def test_structured_semantic_instance_is_score_only_at_initialization():
+    cfg = _semantic_structured_cfg()
+    model = DynLaneSeqS0(cfg).eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 64, 128), return_features=True)
+
+    assert out["row_x_logits"].shape == (1, 8, 16, 32)
+    assert out["semantic_instance_tokens"].shape == (1, 8, 64)
+    assert out["semantic_aux_exist_logits"].shape == (1, 8, 2)
+    assert set(out["multi_scale_features"]) == {"p2", "p4", "p5"}
+    # The optional semantic path cannot change geometry, range, or decision
+    # scores at initialization because its decision adapter is exactly zero.
+    assert torch.allclose(out["decision_queries"], out["queries"], atol=0.0, rtol=0.0)
+    debug = out["structured_debug"]
+    assert debug["structured_semantic_decision_delta_abs"].item() == 0.0
+    assert torch.allclose(debug["structured_semantic_weight_p4"], torch.tensor(0.5))
+    assert torch.allclose(debug["structured_semantic_weight_p5"], torch.tensor(0.5))
+
+
+def test_structured_semantic_instance_preserves_loaded_p2_baseline_outputs():
+    semantic_cfg = _semantic_structured_cfg()
+    baseline_cfg = _semantic_structured_cfg()
+    baseline_cfg["model"].pop("multi_scale_evidence")
+    baseline_cfg["model"]["structured_query"].pop("semantic_instance")
+    baseline = DynLaneSeqS0(baseline_cfg).eval()
+    semantic = DynLaneSeqS0(semantic_cfg).eval()
+    incompatible = semantic.load_state_dict(baseline.state_dict(), strict=False)
+    assert all(key.startswith("encoder.ms_proj.p3.") for key in incompatible.unexpected_keys)
+    assert all(
+        key.startswith("encoder.ms_proj.")
+        or key.startswith("structured_query_head.semantic_query_norm.")
+        or key.startswith("structured_query_head.semantic_instance.")
+        for key in incompatible.missing_keys
+    )
+
+    image = torch.randn(1, 3, 64, 128)
+    with torch.no_grad():
+        baseline_out = baseline(image)
+        semantic_out = semantic(image)
+    for key in ("exist_logits", "quality_logits", "row_x_logits", "pred_x_rows", "range_norm"):
+        assert torch.allclose(semantic_out[key], baseline_out[key], atol=0.0, rtol=0.0)
+
+
+def test_structured_semantic_aux_loss_reaches_coarse_cross_attention():
+    cfg = _semantic_structured_cfg()
+    cfg["loss"] = {
+        "w_exist": 0.0,
+        "w_point": 0.0,
+        "w_range": 0.0,
+        "w_semantic_aux_exist": 0.2,
+        "exist_loss_type": "focal",
+    }
+    model = DynLaneSeqS0(cfg).train()
+    criterion = build_criterion(cfg)
+    outputs = model(torch.randn(1, 3, 64, 128))
+    targets = [
+        {
+            "x_rows": torch.zeros((1, 16)),
+            "valid_mask": torch.ones((1, 16), dtype=torch.bool),
+            "range_y": torch.zeros((1, 2)),
+        }
+    ]
+    matches = [{"pred_indices": torch.tensor([0, 4]), "gt_indices": torch.tensor([0, 0])}]
+    losses = criterion(outputs, targets, matches)
+    losses["loss_total"].backward()
+    grad = model.structured_query_head.semantic_instance.cross_attn.in_proj_weight.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+    assert grad.abs().sum() > 0
+    norm_grad = model.structured_query_head.semantic_query_norm.weight.grad
+    assert norm_grad is not None
+    assert norm_grad.abs().sum() > 0
+    row_grad = model.structured_query_head.layers[0].cross_attn.in_proj_weight.grad
+    assert row_grad is None or row_grad.abs().sum() == 0
+
+
 def test_structured_query_debug_config_builds():
     cfg = load_config("dynlaneseq_eg/configs/debug/culane_s0_structured_query_2k.yaml")
     cfg["model"]["pretrained_backbone"] = False
@@ -184,6 +300,26 @@ def test_structured_full_configs_build():
         assert matcher.cfg.assignment == "grouped_one_to_many"
         assert matcher.cfg.num_groups == 4
         assert criterion.cfg.exist_loss_type == "focal"
+
+
+def test_structured_semantic_instance_full_config_builds():
+    path = (
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_"
+        "fpn256_l4_dfl_semantic_instance_p4p5_50ep.yaml"
+    )
+    cfg = load_config(path)
+    cfg["model"]["pretrained_backbone"] = False
+    model = build_model(cfg)
+    matcher = build_matcher(cfg)
+    criterion = build_criterion(cfg)
+    assert model.structured_query_head.num_instances == 32
+    assert model.structured_query_head.semantic_instance is not None
+    assert model.structured_query_head.semantic_instance.scales == ("p4", "p5")
+    assert model.structured_query_head.semantic_instance_detach_query is True
+    assert matcher.cfg.assignment == "grouped_one_to_many"
+    assert matcher.cfg.num_groups == 4
+    assert criterion.cfg.w_semantic_aux_exist == 0.2
 
 
 def _structured_stage_cfg(name: str):

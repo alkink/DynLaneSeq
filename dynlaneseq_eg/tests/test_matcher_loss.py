@@ -164,6 +164,38 @@ def test_focal_exist_loss_backprops_with_grouped_matches():
     assert logits.grad.abs().sum() > 0
 
 
+def test_semantic_aux_exist_loss_backprops_independently():
+    semantic_logits = torch.zeros((1, 8, 2), requires_grad=True)
+    outputs = {
+        "exist_logits": torch.zeros((1, 8, 2), requires_grad=True),
+        "semantic_aux_exist_logits": semantic_logits,
+        "pred_x_rows": torch.zeros((1, 8, 72), requires_grad=True),
+        "range_norm": torch.zeros((1, 8, 2), requires_grad=True),
+        "row_x_logits": torch.zeros((1, 8, 72, 200), requires_grad=True),
+    }
+    targets = [_target()]
+    matches = [{"pred_indices": torch.tensor([0, 4]), "gt_indices": torch.tensor([0, 0])}]
+    criterion = S0Criterion(
+        LossConfig(
+            w_exist=0.0,
+            w_point=0.0,
+            w_range=0.0,
+            w_semantic_aux_exist=0.2,
+            exist_loss_type="focal",
+        )
+    )
+    losses = criterion(outputs, targets, matches)
+    assert torch.isfinite(losses["loss_total"])
+    assert losses["loss_semantic_aux_exist"].item() > 0.0
+    assert torch.allclose(
+        losses["loss_total"],
+        0.2 * losses["loss_semantic_aux_exist"],
+    )
+    losses["loss_total"].backward()
+    assert semantic_logits.grad is not None
+    assert semantic_logits.grad.abs().sum() > 0
+
+
 def test_seg_loss_skips_missing_masks():
     outputs = {"seg_logits": torch.randn(1, 1, 288, 800, requires_grad=True)}
     targets = [
