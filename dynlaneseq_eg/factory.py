@@ -165,6 +165,10 @@ def build_dataloader(cfg: dict[str, Any], split: str = "train", training: bool =
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", False))
         kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
+    if "seed" in train_cfg:
+        generator = torch.Generator()
+        generator.manual_seed(int(train_cfg["seed"]) + (0 if training else 100_000))
+        kwargs["generator"] = generator
     return DataLoader(dataset, **kwargs)
 
 

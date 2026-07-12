@@ -222,6 +222,11 @@ def train_one_epoch(
                 stats.update(output_debug_stats(outputs))
                 stats["grad_norm"] = grad_norm
                 stats["lr_model"] = optimizer.param_groups[-1]["lr"]
+                group_lrs = {str(group.get("name", "")): group["lr"] for group in optimizer.param_groups}
+                if "backbone_decay" in group_lrs:
+                    stats["lr_backbone"] = group_lrs["backbone_decay"]
+                if "evidence_decay" in group_lrs:
+                    stats["lr_evidence"] = group_lrs["evidence_decay"]
                 logger.update(**stats)
                 if (iteration + 1) % log_interval == 0:
                     done = max(iteration + 1 - start_iter, 1)

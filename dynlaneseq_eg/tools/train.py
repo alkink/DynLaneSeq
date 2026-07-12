@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from dynlaneseq_eg.config import load_config
@@ -11,6 +13,15 @@ from dynlaneseq_eg.engine.logger import SmoothedLogger
 from dynlaneseq_eg.engine.train_one_epoch import train_one_epoch
 from dynlaneseq_eg.engine.visualizer import save_prediction_visuals
 from dynlaneseq_eg.factory import build_criterion, build_dataloader, build_matcher, build_model, build_optimizer, build_scheduler
+
+
+def seed_everything(seed: int) -> None:
+    """Seed the RNGs used by model initialization and data augmentation."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main() -> None:
@@ -38,8 +49,12 @@ def main() -> None:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
-    device = torch.device(args.device)
     train_cfg = cfg.get("training", {})
+    seed_value = train_cfg.get("seed")
+    seed = int(seed_value) if seed_value is not None else None
+    if seed is not None:
+        seed_everything(seed)
+    device = torch.device(args.device)
     amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
     amp_dtype_is_bf16 = amp_dtype_name in {"bf16", "bfloat16"}
     if device.type == "cuda":
@@ -98,6 +113,7 @@ def main() -> None:
             "batch_size": batch_size,
             "gradient_accumulation_steps": accumulation_steps,
             "effective_batch_size": batch_size * accumulation_steps,
+            "seed": seed,
             "iters": planned_iters,
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),
@@ -110,6 +126,10 @@ def main() -> None:
             "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),
             "scheduler": cfg.get("scheduler", {"name": "none"}),
+            "optimizer_lrs": {
+                str(group.get("name", index)): float(group["lr"])
+                for index, group in enumerate(optimizer.param_groups)
+            },
         }
     )
 
