@@ -13,6 +13,7 @@ heads, losses, matcher, augmentations, optimizer, and LR schedule are retained.
 - Main/evidence/backbone LR: `1e-4 / 2e-4 / 1e-5`
 - Scheduler: original 278k cosine horizon, 1k warmup, 0.01 minimum ratio
 - Fixed comparison checkpoint: 225k
+- Periodic checkpoint interval: 12.5k iterations
 - Batch/accumulation: `8 x 2`
 - AMP: original ResNet-34 FP16/GradScaler path; no ResNet-101 BF16 setting
 

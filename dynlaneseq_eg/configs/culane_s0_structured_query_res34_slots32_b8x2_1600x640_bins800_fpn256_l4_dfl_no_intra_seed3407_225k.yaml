@@ -15,3 +15,4 @@ model:
 # cosine horizon.  Therefore the LR at iteration 225k matches the main run.
 training:
   max_iters: 225000
+  checkpoint_interval: 12500

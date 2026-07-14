@@ -10,3 +10,4 @@ model:
 
 training:
   max_iters: 225000
+  checkpoint_interval: 12500
