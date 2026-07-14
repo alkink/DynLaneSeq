@@ -12,7 +12,8 @@ heads, losses, matcher, augmentations, optimizer, and LR schedule are retained.
 - Explicit fresh-run seed: `3407`
 - Main/evidence/backbone LR: `1e-4 / 2e-4 / 1e-5`
 - Scheduler: original 278k cosine horizon, 1k warmup, 0.01 minimum ratio
-- Fixed comparison checkpoint: 225k
+- Total training length: 278k (the original 50-epoch protocol)
+- Fixed primary comparison checkpoint: 225k
 - Periodic checkpoint interval: 12.5k iterations
 - Batch/accumulation: `8 x 2`
 - AMP: original ResNet-34 FP16/GradScaler path; no ResNet-101 BF16 setting
@@ -28,38 +29,38 @@ Smoke test in an isolated output directory:
 ```bash
 MAX_ITERS=200 \
 OUT_DIR=outputs/smoke_aaai27_no_intra_seed3407 \
-bash scripts/run_culane_s0_structured_res34_l4_no_intra_seed3407_225k.sh
+bash scripts/run_culane_s0_structured_res34_l4_no_intra_seed3407_278k.sh
 ```
 
 Full no-intra run:
 
 ```bash
-bash scripts/run_culane_s0_structured_res34_l4_no_intra_seed3407_225k.sh
+bash scripts/run_culane_s0_structured_res34_l4_no_intra_seed3407_278k.sh
 ```
 
 Optional same-seed full control on a second GPU/server:
 
 ```bash
-bash scripts/run_culane_s0_structured_res34_l4_full_seed3407_225k.sh
+bash scripts/run_culane_s0_structured_res34_l4_full_seed3407_278k.sh
 ```
 
 Resume the same-seed full control:
 
 ```bash
-bash scripts/resume_culane_s0_structured_res34_l4_full_seed3407_to225k.sh
+bash scripts/resume_culane_s0_structured_res34_l4_full_seed3407_to278k.sh
 ```
 
 Resume automatically from the largest zero-padded `iter_*.pt` checkpoint:
 
 ```bash
-bash scripts/resume_culane_s0_structured_res34_l4_no_intra_seed3407_to225k.sh
+bash scripts/resume_culane_s0_structured_res34_l4_no_intra_seed3407_to278k.sh
 ```
 
 Fixed-protocol validation and test:
 
 ```bash
-bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_225k_val.sh
-bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_225k_test.sh
+bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_278k_val.sh
+bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_278k_test.sh
 ```
 
 Do not use intermediate test results to select a checkpoint or threshold.

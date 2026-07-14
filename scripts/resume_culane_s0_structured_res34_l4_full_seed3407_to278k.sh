@@ -6,9 +6,9 @@ cd "$(dirname "$0")/.."
 export PYTHONHASHSEED="${PYTHONHASHSEED:-3407}"
 
 DEVICE="${DEVICE:-cuda}"
-CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k.yaml}"
-OUT_DIR="${OUT_DIR:-outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k}"
-TARGET_ITERS="${TARGET_ITERS:-225000}"
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_full_seed3407_278k.yaml}"
+OUT_DIR="${OUT_DIR:-outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_full_seed3407_278k}"
+TARGET_ITERS="${TARGET_ITERS:-278000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 
@@ -37,8 +37,8 @@ if (( START_ITER <= 0 )); then
   echo "Refusing to resume checkpoint with iteration=${START_ITER}: ${RESUME}" >&2
   exit 1
 fi
-if [[ "${CKPT_INTRA}" != "False" ]]; then
-  echo "Refusing checkpoint: use_intra_attention=${CKPT_INTRA}, expected False." >&2
+if [[ "${CKPT_INTRA}" != "True" ]]; then
+  echo "Refusing checkpoint: use_intra_attention=${CKPT_INTRA}, expected True." >&2
   exit 1
 fi
 if [[ "${CKPT_SEED}" != "3407" ]]; then

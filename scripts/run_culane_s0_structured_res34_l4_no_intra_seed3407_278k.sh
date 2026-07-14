@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 export PYTHONHASHSEED="${PYTHONHASHSEED:-3407}"
 
 DEVICE="${DEVICE:-cuda}"
-CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k.yaml}"
-OUT_DIR="${OUT_DIR:-outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k}"
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_278k.yaml}"
+OUT_DIR="${OUT_DIR:-outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_278k}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 

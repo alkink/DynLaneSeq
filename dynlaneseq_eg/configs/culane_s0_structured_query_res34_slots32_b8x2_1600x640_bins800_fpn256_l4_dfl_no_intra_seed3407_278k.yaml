@@ -5,15 +5,15 @@ _base_: culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4
 # when an additional GPU is available.
 seed: 3407
 
-output_dir: outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k
+output_dir: outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_278k
 
 model:
   structured_query:
     use_intra_attention: false
 
-# Stop at the frozen paper checkpoint while inheriting the original 278k
-# cosine horizon.  Therefore the LR at iteration 225k matches the main run.
+# Complete the original 50-epoch run.  Iteration 225k remains the frozen
+# paper-comparison checkpoint while the full 278k trajectory is retained.
 training:
-  max_iters: 225000
+  max_iters: 278000
   vis_interval: 25000
   checkpoint_interval: 12500
