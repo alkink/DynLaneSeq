@@ -125,6 +125,37 @@ def test_structured_query_s0_forward_shapes():
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
 
 
+def test_structured_query_can_disable_only_intra_lane_attention():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dim"] = 64
+    cfg["model"]["fpn_channels"] = 64
+    cfg["model"]["num_slots"] = 16
+    cfg["model"]["num_heads"] = 4
+    cfg["model"]["decoder_layers"] = 0
+    cfg["model"]["decoder_ff_dim"] = 128
+    cfg["model"]["structured_query"] = {
+        "enabled": True,
+        "num_instances": 16,
+        "num_groups": 4,
+        "num_layers": 1,
+        "num_heads": 4,
+        "ff_dim": 128,
+        "dropout": 0.0,
+        "use_intra_attention": False,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    layer = model.structured_query_head.layers[0]
+    assert layer.use_intra_attention is False
+    assert layer.intra_attn is None
+    assert layer.norm_intra is None
+    assert layer.inter_attn is not None
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["exist_logits"].shape == (1, 16, 2)
+    assert out["row_x_logits"].shape == (1, 16, 72, 200)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+
+
 def test_structured_query_debug_config_builds():
     cfg = load_config("dynlaneseq_eg/configs/debug/culane_s0_structured_query_2k.yaml")
     cfg["model"]["pretrained_backbone"] = False

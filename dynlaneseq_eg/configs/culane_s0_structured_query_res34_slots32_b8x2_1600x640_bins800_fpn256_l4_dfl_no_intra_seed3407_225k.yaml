@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+# Explicitly recorded for the AAAI component-ablation runs.  The historical
+# 79.98 run did not record a seed, so a same-seed full control is recommended
+# when an additional GPU is available.
+seed: 3407
+
+output_dir: outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_225k
+
+model:
+  structured_query:
+    use_intra_attention: false
+
+# Stop at the frozen paper checkpoint while inheriting the original 278k
+# cosine horizon.  Therefore the LR at iteration 225k matches the main run.
+training:
+  max_iters: 225000

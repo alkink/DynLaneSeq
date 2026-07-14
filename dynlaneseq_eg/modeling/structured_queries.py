@@ -20,14 +20,20 @@ class RowAwareCrossAttentionLayer(nn.Module):
         ff_dim: int = 1024,
         dropout: float = 0.1,
         num_groups: int = 1,
+        use_intra_attention: bool = True,
     ):
         super().__init__()
         self.num_groups = int(num_groups)
+        self.use_intra_attention = bool(use_intra_attention)
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.inter_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.intra_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.intra_attn = (
+            nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+            if self.use_intra_attention
+            else None
+        )
         self.ffn = nn.Sequential(
             nn.Linear(dim, ff_dim),
             nn.GELU(),
@@ -36,7 +42,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
         )
         self.norm_cross = nn.LayerNorm(dim)
         self.norm_inter = nn.LayerNorm(dim)
-        self.norm_intra = nn.LayerNorm(dim)
+        self.norm_intra = nn.LayerNorm(dim) if self.use_intra_attention else None
         self.norm_ffn = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
 
@@ -78,10 +84,11 @@ class RowAwareCrossAttentionLayer(nn.Module):
 
         # Vertical interaction lets rows of the same lane share continuity and curvature context.
         lane_rows = q.reshape(b * n, r, c)
-        lane_rows_norm = self.norm_intra(lane_rows)
-        lane_rows = lane_rows + self.drop(
-            self.intra_attn(lane_rows_norm, lane_rows_norm, lane_rows_norm, need_weights=False)[0]
-        )
+        if self.intra_attn is not None and self.norm_intra is not None:
+            lane_rows_norm = self.norm_intra(lane_rows)
+            lane_rows = lane_rows + self.drop(
+                self.intra_attn(lane_rows_norm, lane_rows_norm, lane_rows_norm, need_weights=False)[0]
+            )
         lane_rows_norm = self.norm_ffn(lane_rows)
         lane_rows = lane_rows + self.drop(self.ffn(lane_rows_norm))
         return lane_rows.view(b, n, r, c).contiguous()
@@ -109,6 +116,7 @@ class StructuredLaneQueryHead(nn.Module):
         evidence_x_bins: int | None = None,
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
+        use_intra_attention: bool = True,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -152,6 +160,7 @@ class StructuredLaneQueryHead(nn.Module):
                     ff_dim=int(ff_dim),
                     dropout=float(dropout),
                     num_groups=self.num_groups,
+                    use_intra_attention=bool(use_intra_attention),
                 )
                 for _ in range(int(num_layers))
             ]
@@ -236,4 +245,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         evidence_x_bins=int(structured_cfg.get("evidence_x_bins", structured_cfg.get("attn_x_bins", model_cfg.get("x_bins", 200)))),
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
+        use_intra_attention=bool(structured_cfg.get("use_intra_attention", True)),
     )

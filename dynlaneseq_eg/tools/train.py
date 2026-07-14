@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import random
 
+import numpy as np
 import torch
 
 from dynlaneseq_eg.config import load_config
@@ -11,6 +13,15 @@ from dynlaneseq_eg.engine.logger import SmoothedLogger
 from dynlaneseq_eg.engine.train_one_epoch import train_one_epoch
 from dynlaneseq_eg.engine.visualizer import save_prediction_visuals
 from dynlaneseq_eg.factory import build_criterion, build_dataloader, build_matcher, build_model, build_optimizer, build_scheduler
+
+
+def seed_everything(seed: int) -> None:
+    """Seed fresh runs without claiming bitwise-deterministic CUDA execution."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main() -> None:
@@ -32,6 +43,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     cfg = load_config(args.config)
+    seed = cfg.get("seed")
+    if seed is not None:
+        seed_everything(int(seed))
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
     if args.batch_size > 0:
@@ -87,6 +101,7 @@ def main() -> None:
             "model": cfg.get("model", {}).get("name", "DynLaneSeq"),
             "output_dir": str(out_dir),
             "device": str(device),
+            "seed": None if seed is None else int(seed),
             "train_images": len(loader.dataset),
             "batch_size": batch_size,
             "gradient_accumulation_steps": accumulation_steps,
