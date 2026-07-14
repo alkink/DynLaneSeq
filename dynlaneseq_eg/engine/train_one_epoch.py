@@ -150,7 +150,7 @@ def train_one_epoch(
                 images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
             else:
                 images = images.to(device, non_blocking=True)
-            targets = nested_to_device(targets, device)
+            targets = nested_to_device(targets, device, non_blocking=True)
             with torch.autocast(device_type=device.type, enabled=amp):
                 outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, iteration)
                 if hasattr(criterion, "set_iteration"):

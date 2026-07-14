@@ -172,7 +172,12 @@ class HungarianMatcherS0:
     def _grouped_assignment(self, cost: torch.Tensor, num_groups: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         n, _ = cost.shape
         num_groups = max(1, min(int(num_groups), n))
-        edges = torch.linspace(0, n, num_groups + 1, dtype=torch.long, device=cost.device)
+        # Hungarian matching is implemented by SciPy on CPU.  Transfer the
+        # complete cost matrix once instead of synchronizing/copying one GPU
+        # slice per group.  Group boundaries also stay on CPU so the loop does
+        # not perform repeated CUDA scalar reads via Tensor.item().
+        cost_cpu = cost.detach().cpu()
+        edges = torch.linspace(0, n, num_groups + 1, dtype=torch.long)
         pred_parts = []
         gt_parts = []
         for group_idx in range(num_groups):
@@ -180,7 +185,7 @@ class HungarianMatcherS0:
             end = int(edges[group_idx + 1].item())
             if end <= start:
                 continue
-            row, col = self._linear_sum_assignment(cost[start:end])
+            row, col = self._linear_sum_assignment(cost_cpu[start:end])
             if row.numel() == 0:
                 continue
             pred_parts.append(row + start)

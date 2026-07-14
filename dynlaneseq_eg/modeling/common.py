@@ -31,12 +31,11 @@ def input_to_grid(x: torch.Tensor, y: torch.Tensor, input_w: int = 800, input_h:
     return torch.stack([x_grid, y_grid], dim=-1)
 
 
-def nested_to_device(obj, device: torch.device):
+def nested_to_device(obj, device: torch.device, non_blocking: bool = False):
     if isinstance(obj, torch.Tensor):
-        return obj.to(device)
+        return obj.to(device, non_blocking=non_blocking)
     if isinstance(obj, dict):
-        return {k: nested_to_device(v, device) for k, v in obj.items()}
+        return {k: nested_to_device(v, device, non_blocking=non_blocking) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [nested_to_device(v, device) for v in obj]
+        return [nested_to_device(v, device, non_blocking=non_blocking) for v in obj]
     return obj
-

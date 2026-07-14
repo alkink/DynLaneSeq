@@ -220,10 +220,9 @@ class StructuredLaneQueryHead(nn.Module):
             "quality_logits": quality_logits,
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
-            "structured_debug": {
-                "structured_row_abs": row_tokens.detach().abs().mean(),
-                "structured_feature_abs": row_value_features.detach().abs().mean(),
-            },
+            # Keep the public debug container without running reductions that
+            # are not consumed by the loss or model outputs.
+            "structured_debug": {},
         }
 
 
