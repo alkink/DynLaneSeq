@@ -41,7 +41,17 @@ CKPT_DIR="$(dirname "${CKPT}")"
 SCORE_TAG="${SCORE_THRESH/./p}"
 QUALITY_TAG="${QUALITY_POWER/./p}"
 NMS_TAG="${NMS_DISTANCE_THRESH_PX/./p}"
-PRED_DIR="${PRED_DIR:-${CKPT_DIR}/test_eval_${CKPT_TAG}_thr${SCORE_TAG}_q${QUALITY_TAG}_nms${NMS_TAG}}"
+MODE_TAG=""
+if [[ "${EVAL_BATCH_SIZE}" != "8" ]]; then
+  MODE_TAG+="_b${EVAL_BATCH_SIZE}"
+fi
+if [[ "${AMP_DTYPE}" != "none" ]]; then
+  MODE_TAG+="_amp${AMP_DTYPE}"
+fi
+if [[ "${COMPILE_MODEL}" == "1" ]]; then
+  MODE_TAG+="_compile"
+fi
+PRED_DIR="${PRED_DIR:-${CKPT_DIR}/test_eval_${CKPT_TAG}_thr${SCORE_TAG}_q${QUALITY_TAG}_nms${NMS_TAG}${MODE_TAG}}"
 LOG_FILE="${LOG_FILE:-${PRED_DIR}/eval.log}"
 RESULT_TXT="${RESULT_TXT:-${PRED_DIR}/metrics.txt}"
 RESULT_JSON="${RESULT_JSON:-${PRED_DIR}/metrics.json}"
