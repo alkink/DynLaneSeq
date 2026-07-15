@@ -61,6 +61,7 @@ Fixed-protocol validation and test:
 ```bash
 bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_278k_val.sh
 bash scripts/eval_culane_s0_structured_res34_l4_no_intra_seed3407_278k_test.sh
+bash scripts/eval_culane_s0_structured_res34_l4_full_seed3407_278k_test.sh
 ```
 
 Do not use intermediate test results to select a checkpoint or threshold.
