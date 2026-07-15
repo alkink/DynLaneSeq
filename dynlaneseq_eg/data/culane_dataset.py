@@ -30,6 +30,9 @@ class CULaneDataset(Dataset):
         self.training = training
         self.input_w = int(cfg.get("input_w", 800))
         self.input_h = int(cfg.get("input_h", 288))
+        self.load_targets = bool(cfg.get("load_targets", True))
+        if self.training and not self.load_targets:
+            raise ValueError("load_targets=False is only valid for inference/evaluation datasets")
         self.infer_seg_labels = bool(cfg.get("infer_seg_labels", False))
         self.list_path = self._resolve_list_path(cfg, split)
         self.records = self._read_records(self.list_path)
@@ -77,10 +80,15 @@ class CULaneDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         rec = self.records[index]
-        image = Image.open(rec.image_path).convert("RGB")
+        with Image.open(rec.image_path) as image_file:
+            image = image_file.convert("RGB")
         orig_w, orig_h = image.size
-        lanes = self._read_lines_txt(rec.anno_path)
-        seg_mask = Image.open(rec.seg_path).convert("L") if rec.seg_path and rec.seg_path.exists() else None
+        lanes = self._read_lines_txt(rec.anno_path) if self.load_targets else []
+        if self.load_targets and rec.seg_path and rec.seg_path.exists():
+            with Image.open(rec.seg_path) as seg_file:
+                seg_mask = seg_file.convert("L")
+        else:
+            seg_mask = None
         seg_valid = seg_mask is not None
         image_tensor, lanes_aug, seg_tensor, aug_meta = self.transforms(
             image,
@@ -90,18 +98,21 @@ class CULaneDataset(Dataset):
         )
         crop_w = int(round(float(aug_meta.get("crop_w", orig_w))))
         crop_h = int(round(float(aug_meta.get("crop_h", orig_h))))
-        target_np = self.target_builder.build(lanes_aug, orig_w=crop_w, orig_h=crop_h)
-        targets = {
-            "x_rows": torch.from_numpy(target_np["x_rows"]).float(),
-            "x_bins": torch.from_numpy(target_np["x_bins"]).long(),
-            "valid_mask": torch.from_numpy(target_np["valid_mask"]).bool(),
-            "range_y": torch.from_numpy(target_np["range_y"]).float(),
-            "exist": torch.from_numpy(target_np["exist"]).long(),
-        }
-        if seg_tensor is None:
-            seg_tensor = torch.zeros((1, self.input_h, self.input_w), dtype=torch.float32)
-        targets["seg_mask"] = seg_tensor.float()
-        targets["seg_valid"] = torch.tensor(seg_valid, dtype=torch.bool)
+        if self.load_targets:
+            target_np = self.target_builder.build(lanes_aug, orig_w=crop_w, orig_h=crop_h)
+            targets = {
+                "x_rows": torch.from_numpy(target_np["x_rows"]).float(),
+                "x_bins": torch.from_numpy(target_np["x_bins"]).long(),
+                "valid_mask": torch.from_numpy(target_np["valid_mask"]).bool(),
+                "range_y": torch.from_numpy(target_np["range_y"]).float(),
+                "exist": torch.from_numpy(target_np["exist"]).long(),
+            }
+            if seg_tensor is None:
+                seg_tensor = torch.zeros((1, self.input_h, self.input_w), dtype=torch.float32)
+            targets["seg_mask"] = seg_tensor.float()
+            targets["seg_valid"] = torch.tensor(seg_valid, dtype=torch.bool)
+        else:
+            targets = {}
         meta = {
             "image_path": str(rec.image_path),
             "anno_path": str(rec.anno_path),
@@ -112,7 +123,7 @@ class CULaneDataset(Dataset):
             "input_w": self.input_w,
             "scale_x": self.input_w / float(crop_w),
             "scale_y": self.input_h / float(crop_h),
-            "num_gt_lanes": int(targets["x_rows"].shape[0]),
+            "num_gt_lanes": int(targets["x_rows"].shape[0]) if self.load_targets else 0,
             "lane_flags": rec.lane_flags,
             **aug_meta,
         }

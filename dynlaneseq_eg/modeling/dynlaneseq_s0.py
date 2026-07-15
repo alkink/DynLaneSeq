@@ -430,7 +430,12 @@ class DynLaneSeqEncoder(nn.Module):
             if isinstance(module, nn.BatchNorm2d):
                 module.eval()
 
-    def forward_features(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward_features(
+        self,
+        images: torch.Tensor,
+        inference_only: bool = False,
+        structured_only: bool = False,
+    ) -> dict[str, torch.Tensor]:
         feats = self.backbone(images)
         if self.multi_scale_enabled:
             pyramid = self.fpn(feats, return_pyramid=True)
@@ -444,6 +449,11 @@ class DynLaneSeqEncoder(nn.Module):
             fpn = self.fpn(feats)
             f_proj = self.proj(fpn)
             multi_scale_features = None
+        # A structured S0 inference pass consumes only the projected P2 map.
+        # Positional memory, the legacy lane-query decoder, and auxiliary
+        # training heads do not contribute to any written CULane prediction.
+        if inference_only and structured_only:
+            return {"features": f_proj}
         pos_embed = self.pos(f_proj)
         f_pos = f_proj + pos_embed
         mem_key = f_pos.flatten(2).transpose(1, 2).contiguous()
@@ -526,15 +536,45 @@ class DynLaneSeqS0(nn.Module):
             else None
         )
 
-    def forward(self, images: torch.Tensor, targets=None, return_features: bool = False) -> dict[str, torch.Tensor]:
-        enc = self.encoder.forward_features(images)
+        self.supports_inference_only = True
+
+    def prepare_for_inference(self) -> None:
+        """Release structured-S0 modules that cannot affect predictions.
+
+        This is intentionally called only after checkpoint loading.  Removing
+        these modules then reduces device transfer and resident VRAM without
+        changing the tensors used by the structured prediction head.
+        """
+        if self.structured_query_head is None:
+            return
+        self.heads = None
+        self.encoder.seg_aux_head = None
+        self.encoder.centerline_aux_head = None
+        self.encoder.seg_aux_extra_heads = nn.ModuleDict()
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        targets=None,
+        return_features: bool = False,
+        inference_only: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        structured_only = self.structured_query_head is not None
+        enc = self.encoder.forward_features(
+            images,
+            inference_only=bool(inference_only),
+            structured_only=structured_only,
+        )
         if self.structured_query_head is not None:
-            out = self.structured_query_head(enc["features"])
-            out["memory"] = enc["memory"]
-            out["memory_key"] = enc["memory_key"]
-            out["q0"] = enc["q0"]
+            out = self.structured_query_head(enc["features"], inference_only=bool(inference_only))
+            if not inference_only:
+                out["memory"] = enc["memory"]
+                out["memory_key"] = enc["memory_key"]
+                out["q0"] = enc["q0"]
         else:
             q = enc["queries"]
+            if self.heads is None:
+                raise RuntimeError("Unstructured inference requires the S0 prediction heads")
             if self.s0_geometry_refiner is not None:
                 draft = self.heads(q)
                 sample_x = draft["pred_x_rows"].detach() if self.s0_geometry_detach_draft else draft["pred_x_rows"]
@@ -549,9 +589,9 @@ class DynLaneSeqS0(nn.Module):
             else:
                 out = self.heads(q)
                 out["queries"] = q
-        if "seg_logits" in enc:
+        if not inference_only and "seg_logits" in enc:
             out["seg_logits"] = enc["seg_logits"]
-        if "centerline_logits" in enc:
+        if not inference_only and "centerline_logits" in enc:
             out["centerline_logits"] = enc["centerline_logits"]
         if "dynamic_evidence" in enc:
             out["dynamic_evidence"] = enc["dynamic_evidence"]

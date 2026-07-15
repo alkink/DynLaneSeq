@@ -10,6 +10,14 @@ SCORE_THRESH="${SCORE_THRESH:-0.30}"
 QUALITY_POWER="${QUALITY_POWER:-0.50}"
 TOP_K="${TOP_K:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
+EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:--1}"
+EVAL_PREFETCH_FACTOR="${EVAL_PREFETCH_FACTOR:--1}"
+METRIC_WORKERS="${METRIC_WORKERS:-0}"
+METRIC_CHUNKSIZE="${METRIC_CHUNKSIZE:-64}"
+AMP_DTYPE="${AMP_DTYPE:-none}"
+COMPILE_MODEL="${COMPILE_MODEL:-0}"
+LEGACY_INFERENCE="${LEGACY_INFERENCE:-0}"
+REUSE_PREDICTIONS="${REUSE_PREDICTIONS:-0}"
 NMS_DISTANCE_THRESH_PX="${NMS_DISTANCE_THRESH_PX:-20.0}"
 NMS_MIN_OVERLAP_POINTS="${NMS_MIN_OVERLAP_POINTS:-5}"
 IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.50 0.55 0.60 0.65 0.70 0.75 0.80 0.85 0.90 0.95}"
@@ -40,6 +48,17 @@ RESULT_JSON="${RESULT_JSON:-${PRED_DIR}/metrics.json}"
 
 mkdir -p "${PRED_DIR}"
 
+EXTRA_ARGS=(--no-pretrained-init --amp-dtype "${AMP_DTYPE}")
+if [[ "${COMPILE_MODEL}" == "1" ]]; then
+  EXTRA_ARGS+=(--compile-model)
+fi
+if [[ "${LEGACY_INFERENCE}" == "1" ]]; then
+  EXTRA_ARGS+=(--legacy-inference)
+fi
+if [[ "${REUSE_PREDICTIONS}" == "1" ]]; then
+  EXTRA_ARGS+=(--skip-write)
+fi
+
 echo "checkpoint iteration: ${CKPT_ITER}"
 echo "use_intra_attention: ${CKPT_INTRA}"
 echo "seed: ${CKPT_SEED}"
@@ -52,6 +71,10 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --score-thresh "${SCORE_THRESH}" \
   --quality-score-power "${QUALITY_POWER}" \
   --eval-batch-size "${EVAL_BATCH_SIZE}" \
+  --eval-num-workers "${EVAL_NUM_WORKERS}" \
+  --eval-prefetch-factor "${EVAL_PREFETCH_FACTOR}" \
+  --metric-workers "${METRIC_WORKERS}" \
+  --metric-chunksize "${METRIC_CHUNKSIZE}" \
   --top-k "${TOP_K}" \
   --nms-distance-thresh-px "${NMS_DISTANCE_THRESH_PX}" \
   --nms-min-overlap-points "${NMS_MIN_OVERLAP_POINTS}" \
@@ -60,4 +83,5 @@ python -m dynlaneseq_eg.tools.evaluate_culane \
   --pred-dir "${PRED_DIR}" \
   --output-txt "${RESULT_TXT}" \
   --output-json "${RESULT_JSON}" \
+  "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_FILE}"
