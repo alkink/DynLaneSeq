@@ -184,9 +184,33 @@ def load_or_collect_cache(
     cache_dir: str | Path = "outputs/diagnostic_cache",
     reuse_cache: bool = False,
     max_batches: int = 0,
+    eval_batch_size: int = 0,
+    cache_num_workers: int | None = None,
+    no_pretrained_init: bool = False,
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
+    if no_pretrained_init:
+        model_cfg = cfg.setdefault("model", {})
+        model_cfg["pretrained_backbone"] = False
+        model_cfg["require_pretrained_backbone"] = False
+
+    # Full-resolution validation caches keep every candidate tensor until the
+    # cache is written.  Pinned-memory prefetch and persistent workers can
+    # therefore exhaust pinned memory/file descriptors on long sweeps.  These
+    # settings affect only data transfer, never predictions or metrics.
+    dl_cfg = cfg.setdefault("dataloader", {})
+    dl_cfg["pin_memory"] = False
+    dl_cfg["persistent_workers"] = False
+    if cache_num_workers is not None:
+        dl_cfg["num_workers"] = int(cache_num_workers)
+    if int(dl_cfg.get("num_workers", 0)) > 0:
+        try:
+            torch.multiprocessing.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass
+    if eval_batch_size > 0:
+        dl_cfg["eval_batch_size"] = int(eval_batch_size)
     project_root, dataset_root = _resolve_dataset_root(cfg, config_path)
     resolved_list = resolve_list_path(cfg, split).resolve()
     if not resolved_list.exists():
@@ -203,7 +227,20 @@ def load_or_collect_cache(
         return cached
 
     torch_device = torch.device(device)
+    train_cfg = cfg.get("training", {})
+    if torch_device.type == "cuda":
+        torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", False))
+        if bool(train_cfg.get("tf32", False)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+    channels_last = bool(train_cfg.get("channels_last", False) and torch_device.type == "cuda")
     model = build_model(cfg).to(torch_device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     load_checkpoint(checkpoint_path, model, strict=False)
     model.eval()
     loader = build_dataloader(cfg, split=split, training=False)
@@ -213,7 +250,10 @@ def load_or_collect_cache(
     for batch_idx, (images, targets, metas) in enumerate(tqdm(loader, ncols=80, desc=desc)):
         if max_batches > 0 and batch_idx >= max_batches:
             break
-        images = images.to(torch_device, non_blocking=True)
+        if channels_last:
+            images = images.to(torch_device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(torch_device, non_blocking=True)
         outputs = model(images, targets=targets) if pass_targets else model(images)
         stages = collect_prediction_stages(outputs)
         cpu_stages = {name: _cpu_stage(stage) for name, stage in stages.items()}
