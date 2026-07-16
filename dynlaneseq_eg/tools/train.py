@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from dynlaneseq_eg.config import load_config
@@ -13,6 +15,15 @@ from dynlaneseq_eg.engine.visualizer import save_prediction_visuals
 from dynlaneseq_eg.factory import build_criterion, build_dataloader, build_matcher, build_model, build_optimizer, build_scheduler
 
 
+def seed_everything(seed: int) -> None:
+    """Seed model initialization and the RNGs used by data augmentation."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -21,6 +32,7 @@ def main() -> None:
     parser.add_argument("--init-from", default="", help="Initialize compatible model weights only; optimizer and iteration stay fresh.")
     parser.add_argument("--max-iters", type=int, default=0)
     parser.add_argument("--output-dir", default="", help="Override cfg.output_dir.")
+    parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
     parser.add_argument(
         "--grad-accum",
@@ -34,12 +46,18 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
+    if args.dataset_root:
+        cfg.setdefault("dataset", {})["root"] = args.dataset_root
     if args.batch_size > 0:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
-    device = torch.device(args.device)
     train_cfg = cfg.get("training", {})
+    seed_value = train_cfg.get("seed")
+    seed = int(seed_value) if seed_value is not None else None
+    if seed is not None:
+        seed_everything(seed)
+    device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", False))
         if bool(train_cfg.get("tf32", False)):
@@ -91,6 +109,7 @@ def main() -> None:
             "batch_size": batch_size,
             "gradient_accumulation_steps": accumulation_steps,
             "effective_batch_size": batch_size * accumulation_steps,
+            "seed": seed,
             "iters": planned_iters,
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),

@@ -1,0 +1,6 @@
+_base_: tusimple_s0_structured_query_base_1600x640_bins800_fpn256_l4_dfl_70ep.yaml
+
+output_dir: outputs/tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep
+
+model:
+  resnet_depth: 34

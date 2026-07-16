@@ -1,6 +1,6 @@
 from .lane_target_builder import LaneTargetBuilder
 
-__all__ = ["CULaneDataset", "LaneTargetBuilder", "lane_collate"]
+__all__ = ["CULaneDataset", "TuSimpleDataset", "LaneTargetBuilder", "lane_collate"]
 
 
 def __getattr__(name):
@@ -8,6 +8,10 @@ def __getattr__(name):
         from .culane_dataset import CULaneDataset
 
         return CULaneDataset
+    if name == "TuSimpleDataset":
+        from .tusimple_dataset import TuSimpleDataset
+
+        return TuSimpleDataset
     if name == "lane_collate":
         from .collate import lane_collate
 

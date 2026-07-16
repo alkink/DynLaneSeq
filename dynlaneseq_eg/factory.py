@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from .data import CULaneDataset, lane_collate
+from .data import CULaneDataset, TuSimpleDataset, lane_collate
 from .losses import HungarianMatcherS0, S0Criterion, S1Criterion, S2Criterion, S3Criterion, S4Criterion
 from .losses.loss_s0 import LossConfig
 from .losses.loss_s1 import S1LossConfig
@@ -145,8 +145,16 @@ def dataset_cfg_for_split(cfg: dict[str, Any], split: str) -> dict[str, Any]:
     return out
 
 
-def build_dataset(cfg: dict[str, Any], split: str = "train", training: bool = False) -> CULaneDataset:
-    return CULaneDataset(dataset_cfg_for_split(cfg, split), split=split, training=training)
+def build_dataset(cfg: dict[str, Any], split: str = "train", training: bool = False):
+    dataset_cfg = dataset_cfg_for_split(cfg, split)
+    name = str(dataset_cfg.get("name", "CULane")).strip().lower()
+    if name == "culane":
+        dataset_cls = CULaneDataset
+    elif name in {"tusimple", "tu_simple"}:
+        dataset_cls = TuSimpleDataset
+    else:
+        raise ValueError(f"Unsupported dataset.name: {dataset_cfg.get('name')!r}")
+    return dataset_cls(dataset_cfg, split=split, training=training)
 
 
 def build_dataloader(cfg: dict[str, Any], split: str = "train", training: bool = False) -> DataLoader:
@@ -165,6 +173,10 @@ def build_dataloader(cfg: dict[str, Any], split: str = "train", training: bool =
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", False))
         kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
+    if "seed" in train_cfg:
+        generator = torch.Generator()
+        generator.manual_seed(int(train_cfg["seed"]) + (0 if training else 100_000))
+        kwargs["generator"] = generator
     return DataLoader(dataset, **kwargs)
 
 
