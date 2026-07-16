@@ -12,6 +12,7 @@ from dynlaneseq_eg.modeling.evidence import (
     DynamicOffsetFusion,
     MultiScaleCurveAlignedSampler,
 )
+from dynlaneseq_eg.modeling.structured_queries import RowAwareCrossAttentionLayer
 
 
 def _cfg(name: str):
@@ -154,6 +155,86 @@ def test_structured_query_can_disable_only_intra_lane_attention():
     assert out["exist_logits"].shape == (1, 16, 2)
     assert out["row_x_logits"].shape == (1, 16, 72, 200)
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+
+
+def test_structured_query_can_disable_only_inter_instance_attention():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"]["dim"] = 64
+    cfg["model"]["fpn_channels"] = 64
+    cfg["model"]["num_slots"] = 16
+    cfg["model"]["num_heads"] = 4
+    cfg["model"]["decoder_layers"] = 0
+    cfg["model"]["decoder_ff_dim"] = 128
+    cfg["model"]["structured_query"] = {
+        "enabled": True,
+        "num_instances": 16,
+        "num_groups": 4,
+        "num_layers": 1,
+        "num_heads": 4,
+        "ff_dim": 128,
+        "dropout": 0.0,
+        "use_intra_attention": True,
+        "use_inter_attention": False,
+    }
+    model = DynLaneSeqS0(cfg).eval()
+    layer = model.structured_query_head.layers[0]
+    assert layer.use_inter_attention is False
+    assert layer.inter_attn is None
+    assert layer.norm_inter is None
+    assert layer.intra_attn is not None
+    assert layer.norm_intra is not None
+    with torch.no_grad():
+        out = model(torch.randn(1, 3, 288, 800))
+    assert out["exist_logits"].shape == (1, 16, 2)
+    assert out["row_x_logits"].shape == (1, 16, 72, 200)
+    assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+
+
+def test_disabled_inter_branch_keeps_shared_initialization_seed_aligned():
+    kwargs = {
+        "dim": 32,
+        "num_heads": 4,
+        "ff_dim": 64,
+        "dropout": 0.0,
+        "num_groups": 4,
+        "use_intra_attention": True,
+    }
+    torch.manual_seed(3407)
+    full = RowAwareCrossAttentionLayer(**kwargs, use_inter_attention=True)
+    torch.manual_seed(3407)
+    no_inter = RowAwareCrossAttentionLayer(**kwargs, use_inter_attention=False)
+
+    full_state = full.state_dict()
+    no_inter_state = no_inter.state_dict()
+    assert not any(name.startswith("inter_attn.") for name in no_inter_state)
+    assert not any(name.startswith("norm_inter.") for name in no_inter_state)
+    for name, value in no_inter_state.items():
+        assert torch.equal(value, full_state[name]), name
+
+
+def test_no_inter_layer_backward_reaches_remaining_branches():
+    layer = RowAwareCrossAttentionLayer(
+        dim=32,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        num_groups=2,
+        use_intra_attention=True,
+        use_inter_attention=False,
+    )
+    row_tokens = torch.randn(2, 4, 6, 32, requires_grad=True)
+    row_values = torch.randn(2, 6, 8, 32, requires_grad=True)
+    row_keys = torch.randn(2, 6, 8, 32, requires_grad=True)
+    output = layer(row_tokens, row_values, row_keys)
+    output.square().mean().backward()
+
+    assert torch.isfinite(row_tokens.grad).all()
+    assert torch.isfinite(row_values.grad).all()
+    assert torch.isfinite(row_keys.grad).all()
+    assert torch.isfinite(layer.cross_attn.in_proj_weight.grad).all()
+    assert layer.intra_attn is not None
+    assert torch.isfinite(layer.intra_attn.in_proj_weight.grad).all()
+    assert torch.isfinite(layer.ffn[0].weight.grad).all()
 
 
 def test_structured_query_debug_config_builds():

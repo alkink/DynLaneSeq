@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 # Every checkpoint is forwarded exactly once; all 21 calibration combinations
 # reuse the same cached candidates and official raster-IoU matrices.
 VARIANT="${VARIANT:-full}"
-CHECKPOINT_ITERS="${CHECKPOINT_ITERS:-175000 200000 225000 250000}"
+CHECKPOINT_ITERS="${CHECKPOINT_ITERS:-175000 200000 225000 250000 278000}"
 SCORE_THRESHOLDS="${SCORE_THRESHOLDS:-0.30 0.35 0.40 0.45 0.50 0.55 0.60}"
 QUALITY_POWERS="${QUALITY_POWERS:-0.25 0.50 0.75}"
 IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.50 0.55 0.60 0.65 0.70 0.75 0.80 0.85 0.90 0.95}"
@@ -24,13 +24,23 @@ case "${VARIANT}" in
   full)
     RUN_NAME="culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_full_seed3407_278k"
     CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_full_seed3407_278k.yaml"
+    EXPECTED_INTRA="True"
+    EXPECTED_INTER="True"
     ;;
   no_intra)
     RUN_NAME="culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_278k"
     CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_intra_seed3407_278k.yaml"
+    EXPECTED_INTRA="False"
+    EXPECTED_INTER="True"
+    ;;
+  no_inter)
+    RUN_NAME="culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_inter_seed3407_278k"
+    CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_inter_seed3407_278k.yaml"
+    EXPECTED_INTRA="True"
+    EXPECTED_INTER="False"
     ;;
   *)
-    echo "Unknown VARIANT=${VARIANT}; expected full or no_intra." >&2
+    echo "Unknown VARIANT=${VARIANT}; expected full, no_intra, or no_inter." >&2
     exit 2
     ;;
 esac
@@ -57,6 +67,14 @@ for iteration in ${CHECKPOINT_ITERS}; do
     fi
     echo "Skipping missing checkpoint: ${ckpt}" >&2
     continue
+  fi
+
+  read -r embedded_iter embedded_intra embedded_inter embedded_seed < <(
+    "${PYTHON_BIN}" -c 'import sys, torch; p=torch.load(sys.argv[1], map_location="cpu"); c=p.get("cfg", {}); s=c.get("model", {}).get("structured_query", {}); print(int(p.get("iteration", 0)), s.get("use_intra_attention", True), s.get("use_inter_attention", True), c.get("seed"))' "${ckpt}"
+  )
+  if [[ "${embedded_iter}" != "${iteration}" || "${embedded_intra}" != "${EXPECTED_INTRA}" || "${embedded_inter}" != "${EXPECTED_INTER}" || "${embedded_seed}" != "3407" ]]; then
+    echo "Refusing checkpoint ${ckpt}: iter=${embedded_iter}, intra=${embedded_intra}, inter=${embedded_inter}, seed=${embedded_seed}; expected ${iteration}/${EXPECTED_INTRA}/${EXPECTED_INTER}/3407." >&2
+    exit 1
   fi
 
   out_json="${SWEEP_DIR}/${VARIANT}_iter_$(printf '%07d' "${iteration}")_val_sweep.json"

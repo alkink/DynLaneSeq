@@ -1,0 +1,8 @@
+_base_: culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_full_seed3407_278k.yaml
+
+output_dir: outputs/culane_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_no_inter_seed3407_278k
+
+model:
+  structured_query:
+    use_intra_attention: true
+    use_inter_attention: false

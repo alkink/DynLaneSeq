@@ -21,19 +21,25 @@ class RowAwareCrossAttentionLayer(nn.Module):
         dropout: float = 0.1,
         num_groups: int = 1,
         use_intra_attention: bool = True,
+        use_inter_attention: bool = True,
     ):
         super().__init__()
         self.num_groups = int(num_groups)
         self.use_intra_attention = bool(use_intra_attention)
+        self.use_inter_attention = bool(use_inter_attention)
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.inter_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.intra_attn = (
-            nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-            if self.use_intra_attention
-            else None
-        )
+
+        # Always construct both candidates in the original order before
+        # discarding a disabled branch.  This consumes the same initialization
+        # RNG stream as the full control, so all shared weights start identically
+        # under the recorded seed while disabled parameters remain absent from
+        # the model and optimizer.
+        inter_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        intra_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.inter_attn = inter_attn if self.use_inter_attention else None
+        self.intra_attn = intra_attn if self.use_intra_attention else None
         self.ffn = nn.Sequential(
             nn.Linear(dim, ff_dim),
             nn.GELU(),
@@ -41,12 +47,14 @@ class RowAwareCrossAttentionLayer(nn.Module):
             nn.Linear(ff_dim, dim),
         )
         self.norm_cross = nn.LayerNorm(dim)
-        self.norm_inter = nn.LayerNorm(dim)
+        self.norm_inter = nn.LayerNorm(dim) if self.use_inter_attention else None
         self.norm_intra = nn.LayerNorm(dim) if self.use_intra_attention else None
         self.norm_ffn = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
 
     def _grouped_inter_attention(self, q: torch.Tensor, batch_rows: int, num_instances: int) -> torch.Tensor:
+        if self.inter_attn is None:
+            raise RuntimeError("inter-instance attention is disabled")
         if self.num_groups == 1:
             return self.inter_attn(q, q, q, need_weights=False)[0]
         if num_instances % self.num_groups != 0:
@@ -78,8 +86,9 @@ class RowAwareCrossAttentionLayer(nn.Module):
         q = q + self.drop(self.cross_attn(q_norm, key, value, need_weights=False)[0])
 
         # Group-isolated interaction avoids letting one-to-many training groups suppress each other.
-        q_norm = self.norm_inter(q)
-        q = q + self.drop(self._grouped_inter_attention(q_norm, batch_rows=b * r, num_instances=n))
+        if self.inter_attn is not None and self.norm_inter is not None:
+            q_norm = self.norm_inter(q)
+            q = q + self.drop(self._grouped_inter_attention(q_norm, batch_rows=b * r, num_instances=n))
         q = q.view(b, r, n, c).permute(0, 2, 1, 3).contiguous()
 
         # Vertical interaction lets rows of the same lane share continuity and curvature context.
@@ -117,6 +126,7 @@ class StructuredLaneQueryHead(nn.Module):
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
         use_intra_attention: bool = True,
+        use_inter_attention: bool = True,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -161,6 +171,7 @@ class StructuredLaneQueryHead(nn.Module):
                     dropout=float(dropout),
                     num_groups=self.num_groups,
                     use_intra_attention=bool(use_intra_attention),
+                    use_inter_attention=bool(use_inter_attention),
                 )
                 for _ in range(int(num_layers))
             ]
@@ -254,4 +265,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
         use_intra_attention=bool(structured_cfg.get("use_intra_attention", True)),
+        use_inter_attention=bool(structured_cfg.get("use_inter_attention", True)),
     )
