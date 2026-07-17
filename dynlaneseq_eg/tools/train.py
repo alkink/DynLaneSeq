@@ -103,6 +103,7 @@ def main() -> None:
     print(
         {
             "model": cfg.get("model", {}).get("name", "DynLaneSeq"),
+            "backbone": getattr(getattr(model, "encoder", None), "backbone_name", None),
             "output_dir": str(out_dir),
             "device": str(device),
             "train_images": len(loader.dataset),

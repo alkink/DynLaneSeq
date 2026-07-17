@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .backbone_dla import DLA34Backbone
 from .backbone_resnet import ResNetBackbone
 from .common import input_to_grid, sort_range_norm
 from .cross_attention_decoder import LaneCrossAttentionDecoder
@@ -335,11 +336,30 @@ class DynLaneSeqEncoder(nn.Module):
         self.dynamic_evidence_enabled = bool(dynamic_evidence_cfg.get("enabled", False))
         self.dynamic_proposal_enabled = bool(dynamic_proposal_cfg.get("enabled", False))
         self.seg_aux_extra_scales = list(seg_aux_cfg.get("extra_scales", []))
-        self.backbone = ResNetBackbone(
-            depth=int(model_cfg.get("resnet_depth", 34)),
-            pretrained=bool(model_cfg.get("pretrained_backbone", True)),
-            require_pretrained=bool(model_cfg.get("require_pretrained_backbone", False)),
-        )
+        backbone_name = str(model_cfg.get("backbone_name", "resnet")).strip().lower().replace("-", "")
+        pretrained_backbone = bool(model_cfg.get("pretrained_backbone", True))
+        require_pretrained_backbone = bool(model_cfg.get("require_pretrained_backbone", False))
+        if backbone_name in {"resnet", "resnet18", "resnet34", "resnet50", "resnet101"}:
+            requested_depth = backbone_name[len("resnet") :] if backbone_name.startswith("resnet") else ""
+            resnet_depth = int(requested_depth or model_cfg.get("resnet_depth", 34))
+            self.backbone = ResNetBackbone(
+                depth=resnet_depth,
+                pretrained=pretrained_backbone,
+                require_pretrained=require_pretrained_backbone,
+            )
+            self.backbone_name = f"resnet{resnet_depth}"
+        elif backbone_name == "dla34":
+            self.backbone = DLA34Backbone(
+                pretrained=pretrained_backbone,
+                require_pretrained=require_pretrained_backbone,
+                weights_path=model_cfg.get("pretrained_backbone_path"),
+            )
+            self.backbone_name = "dla34"
+        else:
+            raise ValueError(
+                f"Unsupported model.backbone_name: {backbone_name!r}. "
+                "Supported: resnet, resnet18, resnet34, resnet50, resnet101, dla34"
+            )
         self.fpn = SimpleFPN(in_channels=self.backbone.out_channels, out_channels=fpn_channels)
         self.proj = nn.Conv2d(fpn_channels, dim, 1)
         self.ms_proj = nn.ModuleDict(

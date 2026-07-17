@@ -82,6 +82,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--split", default="val")
+    parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--pred-dir", default="")
     parser.add_argument("--score-thresh", type=float, default=0.5)
@@ -108,6 +109,8 @@ def main() -> None:
         raise ValueError("--pred-dir is required when --skip-write is set.")
 
     cfg = load_config(args.config)
+    if args.dataset_root:
+        cfg.setdefault("dataset", {})["root"] = args.dataset_root
     device = torch.device(args.device)
     train_cfg = cfg.get("training", {})
     if device.type == "cuda":
@@ -147,6 +150,10 @@ def main() -> None:
     pred_dir = Path(args.pred_dir) if args.pred_dir else Path(cfg.get("output_dir", "outputs")) / f"culane_pred_{args.split}_thr{args.score_thresh:g}"
 
     if not args.skip_write:
+        # Checkpoint evaluation must not download or overwrite a backbone with
+        # ImageNet initialization before loading the trained model state.
+        cfg.setdefault("model", {})["pretrained_backbone"] = False
+        cfg.setdefault("model", {})["require_pretrained_backbone"] = False
         model = build_model(cfg).to(device)
         if channels_last:
             model = model.to(memory_format=torch.channels_last)

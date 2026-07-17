@@ -51,6 +51,7 @@ model:
   input_w: 1600
   fpn_channels: 256
   dim: 256
+  backbone_name: resnet
   resnet_depth: 34
   pretrained_backbone: true
   require_pretrained_backbone: true

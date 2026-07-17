@@ -3,8 +3,10 @@
 ## Purpose
 
 This experiment evaluates the frozen structured DynLaneSeq-S0 architecture with
-ResNet-18, ResNet-34, and ResNet-101. The backbone depth is the only intended
-architectural difference between the three runs.
+ResNet-18, ResNet-34, ResNet-101, and DLA-34. ResNet depth is the only intended
+difference among the three ResNet runs. DLA-34 is a separate backbone-family
+generalization experiment; the FPN, structured decoder, losses, optimizer,
+schedule, seed, and post-processing remain identical to the ResNet-34 control.
 
 ## Dataset
 
@@ -40,7 +42,18 @@ threshold selection in these final backbone runs.
 
 No checkpoint or threshold may be selected using TuSimple test results. The
 final 70-epoch checkpoint and the fixed postprocessing configuration are used
-for all three backbones.
+for all four backbones.
+
+The DLA-34 integration exposes canonical DLA levels 2--5 as C2--C5 with
+strides 4/8/16/32 and channels 64/128/256/512. This is exactly the existing
+ResNet-34-to-FPN interface. DLAUp, IDAUp, deformable convolution, and any
+lane-specific neck changes are intentionally excluded so the experiment tests
+the backbone rather than a different head/neck system.
+
+ImageNet weights are required for the final experiment. They are downloaded as
+`dla34-ba72cf86.pth`; if the legacy host is unavailable, a hash-identical mirror
+is attempted. A local file can be forced with
+`DYNLANESEQ_DLA34_WEIGHTS=/path/to/dla34-ba72cf86.pth`.
 
 ## Official Metrics
 
@@ -67,6 +80,7 @@ Fresh training:
 bash scripts/run_tusimple_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.sh
 bash scripts/run_tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.sh
 bash scripts/run_tusimple_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.sh
+bash scripts/run_tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.sh
 ```
 
 On a server with a different dataset location, prefix a command with, for
@@ -82,4 +96,11 @@ Final test evaluation:
 
 ```bash
 CKPT=outputs/tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0015890.pt bash scripts/eval_tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep_test.sh
+```
+
+DLA-34 uses the same wrappers:
+
+```bash
+RESUME=outputs/tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0006810.pt bash scripts/resume_tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_to70ep.sh
+CKPT=outputs/tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0015890.pt bash scripts/eval_tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep_test.sh
 ```
