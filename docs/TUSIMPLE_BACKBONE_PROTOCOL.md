@@ -38,20 +38,22 @@ threshold selection in these final backbone runs.
 - Schedule: cosine, 70 epochs = 15,890 optimizer iterations
 - Checkpoints: every 2,270 iterations (10 epochs)
 - Final checkpoint: iteration 15,890
-- Postprocess: score threshold 0.30, quality power 0.50, top-k 5, lane NMS 20 input pixels
+- Shared reported postprocess: score threshold 0.20, quality power 0.25,
+  top-k 5, lane NMS 20 input pixels
 
-No checkpoint or threshold may be selected using TuSimple test results. The
-final 70-epoch checkpoint and the fixed postprocessing configuration are used
-for all four backbones.
+The completed backbone comparison uses the final 70-epoch checkpoint and one
+shared post-processing configuration for every backbone. That configuration
+(`score_thresh=0.20`, `quality_power=0.25`) was selected by the exploratory
+ResNet-34 test-set sweep described below. It is therefore a test-selected
+protocol, not an unbiased validation-selected estimate. The setting must not be
+retuned separately for ResNet-18, ResNet-101, DLA-34, or the holistic baseline.
 
-The fixed values above are the initial control protocol. Dataset-specific
-selection, when used, is performed in a separate ResNet-34 run trained only on
-`label_data_0313.json` and `label_data_0601.json`. The 358 examples from
-`label_data_0531.json` remain held out for selecting the epoch, score threshold,
-and quality power. The selected values are then frozen and applied uniformly to
-the final trainval backbone runs. A validation sweep must never be run directly
-on the final trainval checkpoints because those models have already seen the
-0531 annotations.
+For a future unbiased protocol, train a separate ResNet-34 selection run using
+only `label_data_0313.json` and `label_data_0601.json`, reserve the 358 examples
+from `label_data_0531.json` for checkpoint and post-processing selection, then
+freeze the selected values for all final trainval runs. A validation sweep must
+not be run directly on a final trainval checkpoint because that model has
+already seen the 0531 annotations.
 
 The DLA-34 integration exposes canonical DLA levels 2--5 as C2--C5 with
 strides 4/8/16/32 and channels 64/128/256/512. This is exactly the existing
@@ -144,3 +146,41 @@ DLA-34 uses the same wrappers:
 RESUME=outputs/tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0006810.pt bash scripts/resume_tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_to70ep.sh
 CKPT=outputs/tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0015890.pt bash scripts/eval_tusimple_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep_test.sh
 ```
+
+## Matched Structured-vs-Holistic Experiment
+
+The ResNet-34 holistic/unstructured run changes only the query representation:
+
+- structured control: four structured instance-to-row decoder layers;
+- holistic baseline: four standard lane-query decoder layers.
+
+Dataset, input resolution, backbone, FPN, DFL, auxiliary heads, matcher, losses,
+optimizer, seed, effective batch size, 70-epoch schedule, and checkpoint cadence
+are inherited unchanged from the structured ResNet-34 configuration. The
+holistic run must not receive a separate test-set threshold sweep. It uses the
+same frozen `score_thresh=0.20` and `quality_power=0.25` setting applied to the
+completed structured backbone runs.
+
+Fresh training:
+
+```bash
+DATA_ROOT=/workspace/TUSimple BATCH_SIZE=8 GRAD_ACCUM=2 bash scripts/run_tusimple_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.sh
+```
+
+Resume:
+
+```bash
+DATA_ROOT=/workspace/TUSimple RESUME=outputs/tusimple_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/last.pt bash scripts/resume_tusimple_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_to70ep.sh
+```
+
+Final test with the shared fixed protocol:
+
+```bash
+DATA_ROOT=/workspace/TUSimple CKPT=outputs/tusimple_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0015890.pt bash scripts/eval_tusimple_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep_test.sh
+```
+
+The existing structured test-selected sweep remains a methodological
+limitation and must be labelled as such in any report. Sharing its frozen
+setting with the holistic baseline prevents additional baseline-specific test
+tuning; it does not turn the original test-selected protocol into an unbiased
+validation-selected benchmark.
