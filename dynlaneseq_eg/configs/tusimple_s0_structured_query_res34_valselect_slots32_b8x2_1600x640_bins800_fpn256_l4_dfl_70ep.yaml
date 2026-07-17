@@ -1,0 +1,28 @@
+_base_: tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep.yaml
+
+# This run is only for selecting the TuSimple epoch and post-processing
+# parameters. Unlike the final trainval run, label_data_0531 is held out.
+output_dir: outputs/tusimple_s0_structured_query_res34_valselect_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep
+
+dataset:
+  splits:
+    train:
+      image_root: train_set
+      annotations:
+        - train_set/label_data_0313.json
+        - train_set/label_data_0601.json
+    val:
+      image_root: train_set
+      annotations:
+        - train_set/label_data_0531.json
+
+# 3,268 training samples, batch 8 and accumulation 2 give exactly 2,045
+# optimizer steps per 10 epochs (409 micro-batches per epoch).
+scheduler:
+  total_iters: 14315
+  warmup_iters: 60
+  min_lr_ratio: 0.01
+
+training:
+  max_iters: 14315
+  checkpoint_interval: 2045

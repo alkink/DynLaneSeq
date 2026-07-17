@@ -44,6 +44,15 @@ No checkpoint or threshold may be selected using TuSimple test results. The
 final 70-epoch checkpoint and the fixed postprocessing configuration are used
 for all four backbones.
 
+The fixed values above are the initial control protocol. Dataset-specific
+selection, when used, is performed in a separate ResNet-34 run trained only on
+`label_data_0313.json` and `label_data_0601.json`. The 358 examples from
+`label_data_0531.json` remain held out for selecting the epoch, score threshold,
+and quality power. The selected values are then frozen and applied uniformly to
+the final trainval backbone runs. A validation sweep must never be run directly
+on the final trainval checkpoints because those models have already seen the
+0531 annotations.
+
 The DLA-34 integration exposes canonical DLA levels 2--5 as C2--C5 with
 strides 4/8/16/32 and channels 64/128/256/512. This is exactly the existing
 ResNet-34-to-FPN interface. DLAUp, IDAUp, deformable convolution, and any
@@ -97,6 +106,25 @@ Final test evaluation:
 ```bash
 CKPT=outputs/tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0015890.pt bash scripts/eval_tusimple_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep_test.sh
 ```
+
+Held-out ResNet-34 selection run and cached 30--70 epoch sweep:
+
+```bash
+bash scripts/run_tusimple_s0_structured_query_res34_valselect_70ep.sh
+bash scripts/sweep_tusimple_s0_structured_query_res34_valselect_30to70ep.sh
+```
+
+Resume the held-out selection run if interrupted:
+
+```bash
+RESUME=outputs/tusimple_s0_structured_query_res34_valselect_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_70ep/iter_0008180.pt bash scripts/resume_tusimple_s0_structured_query_res34_valselect_to70ep.sh
+```
+
+The default grid is score threshold 0.20--0.60 in steps of 0.05 and quality
+power `{0.25, 0.50, 0.75, 1.00}`. Model inference is performed once per
+checkpoint and cached; the post-processing grid does not repeat GPU inference.
+Official TuSimple Accuracy is the selection metric, followed by deterministic
+F1/FP/FN tie breakers.
 
 DLA-34 uses the same wrappers:
 
