@@ -126,6 +126,18 @@ checkpoint and cached; the post-processing grid does not repeat GPU inference.
 Official TuSimple Accuracy is the selection metric, followed by deterministic
 F1/FP/FN tie breakers.
 
+For exploratory analysis only, the full-trainval ResNet-34 checkpoints can be
+swept directly on the test set:
+
+```bash
+bash scripts/sweep_tusimple_s0_structured_query_res34_test_selected_30to70ep.sh
+```
+
+This path deliberately labels its output `test_selected`. Its best value is not
+an unbiased official benchmark estimate because checkpoint and post-processing
+parameters are selected using test annotations. Any use in a report must state
+that selection protocol explicitly.
+
 DLA-34 uses the same wrappers:
 
 ```bash

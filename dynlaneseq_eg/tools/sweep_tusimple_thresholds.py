@@ -365,6 +365,11 @@ def main() -> None:
         "best": best,
         "results": ranked,
     }
+    if args.split == "test":
+        payload["protocol_warning"] = (
+            "Checkpoint and post-processing parameters were selected on the TuSimple test set. "
+            "This is a test-selected diagnostic result, not an unbiased single-evaluation benchmark result."
+        )
 
     output_json = Path(args.output_json)
     output_csv = Path(args.output_csv)
@@ -376,7 +381,10 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(ranked)
 
-    print("best validation setting:")
+    if args.split == "test":
+        print("WARNING: selecting checkpoint/post-processing on the TuSimple test set")
+        print("This result must be reported as test-selected, not as an unbiased official test result.")
+    print(f"best {args.split} setting:")
     print(json.dumps(best, indent=2))
     print(f"json: {output_json}")
     print(f"csv: {output_csv}")
