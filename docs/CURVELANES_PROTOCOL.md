@@ -11,12 +11,14 @@ The configured root must contain this original structure:
 Curvelanes/
   train/{train.txt,images/,labels/}
   valid/{valid.txt,images/,labels/}
-  test/{test.txt,images/}
+  test/images/
 ```
 
 The local default is `/mnt/d/Datasets/CurveLanes/Curvelanes`. On a remote
 machine, point `DATA_ROOT` to the extracted root, for example
-`/workspace/CurveLanes/Curvelanes`.
+`/workspace/Curvelanes`. The distributed test split does not include a
+`test/test.txt`; the dataset reader enumerates `test/images/` recursively in
+deterministic path order. No generated list file is required.
 
 ## Preprocessing and evaluation
 
@@ -36,7 +38,7 @@ CondLSTR's public CurveLanes transform; it preserves the same crop policy and
 aspect transformation while retaining the project’s standard 800 x-bin head.
 
 The reported public score is measured on `valid/valid.txt` (20,000 labelled
-images), not `test/test.txt`, because the distributed test split has no labels.
+images), not the unlabelled `test/images/` split.
 The evaluator follows the public CurveLanes/CondLSTR protocol: native
 polylines are scaled to 224 x 224, rasterized with width 5, Hungarian matched,
 and counted as a hit only at IoU > 0.50.

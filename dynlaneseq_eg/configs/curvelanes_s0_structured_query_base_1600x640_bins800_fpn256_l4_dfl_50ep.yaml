@@ -20,7 +20,6 @@ dataset:
       image_root: valid
       labels: true
     test:
-      list: test/test.txt
       image_root: test
       labels: false
 

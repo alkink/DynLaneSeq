@@ -90,3 +90,30 @@ def test_curvelanes_reader_orders_non_monotonic_annotation_points(tmp_path: Path
 
     assert len(lanes) == 1
     assert [point[1] for point in lanes[0]] == sorted(point[1] for point in lanes[0])
+
+
+def test_curvelanes_official_unlabelled_test_layout_needs_no_list(tmp_path: Path) -> None:
+    first = tmp_path / "test" / "images" / "nested" / "b.jpg"
+    second = tmp_path / "test" / "images" / "a.png"
+    first.parent.mkdir(parents=True)
+    Image.new("RGB", (1280, 720), color=(20, 20, 20)).save(first)
+    Image.new("RGB", (1280, 720), color=(30, 30, 30)).save(second)
+    cfg = {
+        "root": str(tmp_path),
+        "input_w": 160,
+        "input_h": 64,
+        "num_rows": 16,
+        "x_bins": 80,
+    }
+
+    dataset = CurveLanesDataset(cfg, split="test", training=False)
+
+    assert len(dataset) == 2
+    assert [record.raw_file for record in dataset.records] == [
+        "images/a.png",
+        "images/nested/b.jpg",
+    ]
+    item = dataset[0]
+    assert item["meta"]["raw_file"] == "images/a.png"
+    assert item["meta"]["anno_path"] == ""
+    assert not bool(item["targets"]["seg_valid"])

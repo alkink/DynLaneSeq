@@ -34,7 +34,10 @@ class CurveLanesDataset(Dataset):
     _DEFAULT_SPLITS: dict[str, dict[str, str | bool]] = {
         "train": {"list": "train/train.txt", "image_root": "train", "labels": True},
         "val": {"list": "valid/valid.txt", "image_root": "valid", "labels": True},
-        "test": {"list": "test/test.txt", "image_root": "test", "labels": False},
+        # The distributed CurveLanes test split contains test/images but no
+        # test.txt.  Enumerate those images deterministically when no list is
+        # supplied instead of requiring a generated, non-official file.
+        "test": {"image_root": "test", "labels": False},
     }
     # (width, height) -> number of source rows removed from the top.
     _CROP_Y_BY_SIZE: dict[tuple[int, int], int] = {
@@ -55,7 +58,8 @@ class CurveLanesDataset(Dataset):
         self.strict_image_shapes = bool(cfg.get("strict_image_shapes", True))
 
         split_cfg = self._resolve_split_cfg(cfg, self.split)
-        self.list_path = self._resolve_path(str(split_cfg["list"]))
+        list_value = split_cfg.get("list")
+        self.list_path = self._resolve_path(str(list_value)) if list_value is not None else None
         self.image_root = self._resolve_path(str(split_cfg["image_root"]))
         self.labels_required = bool(split_cfg.get("labels", self.split != "test"))
         self.records = self._read_records()
@@ -167,8 +171,11 @@ class CurveLanesDataset(Dataset):
         split_cfg = cfg.get("splits", {}).get(split, self._DEFAULT_SPLITS.get(split))
         if split_cfg is None:
             raise KeyError(f"No CurveLanes split configuration for split={split!r}")
-        if "list" not in split_cfg or "image_root" not in split_cfg:
-            raise KeyError(f"CurveLanes split {split!r} requires list and image_root")
+        if "image_root" not in split_cfg:
+            raise KeyError(f"CurveLanes split {split!r} requires image_root")
+        labels_required = bool(split_cfg.get("labels", split != "test"))
+        if labels_required and "list" not in split_cfg:
+            raise KeyError(f"Labelled CurveLanes split {split!r} requires list")
         return dict(split_cfg)
 
     def _resolve_path(self, value: str | Path) -> Path:
@@ -176,6 +183,10 @@ class CurveLanesDataset(Dataset):
         return path if path.is_absolute() else self.root / path
 
     def _read_records(self) -> list[CurveLanesRecord]:
+        if self.list_path is None:
+            if self.labels_required:
+                raise ValueError(f"Labelled CurveLanes split {self.split!r} requires a split list")
+            return self._enumerate_unlabelled_images()
         if not self.list_path.is_file():
             raise FileNotFoundError(f"CurveLanes split list not found: {self.list_path}")
         records: list[CurveLanesRecord] = []
@@ -196,6 +207,26 @@ class CurveLanesDataset(Dataset):
         if not records:
             raise ValueError(f"CurveLanes split list is empty: {self.list_path}")
         return records
+
+    def _enumerate_unlabelled_images(self) -> list[CurveLanesRecord]:
+        if not self.image_root.is_dir():
+            raise FileNotFoundError(f"CurveLanes image root not found: {self.image_root}")
+        supported_suffixes = {".jpg", ".jpeg", ".png"}
+        image_paths = sorted(
+            path
+            for path in self.image_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in supported_suffixes
+        )
+        if not image_paths:
+            raise ValueError(f"CurveLanes image root contains no supported images: {self.image_root}")
+        return [
+            CurveLanesRecord(
+                image_path=image_path,
+                annotation_path=None,
+                raw_file=image_path.relative_to(self.image_root).as_posix(),
+            )
+            for image_path in image_paths
+        ]
 
     def _crop_y(self, width: int, height: int, image_path: Path) -> int:
         crop_y = self._CROP_Y_BY_SIZE.get((width, height))
