@@ -62,10 +62,13 @@ DATA_ROOT=/mnt/d/Datasets/CurveLanes/Curvelanes \
   bash scripts/run_curvelanes_s0_unstructured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
 ```
 
-To resume without resetting the optimizer, scheduler, scaler, RNG state, or
-global iteration, set `RESUME` to a checkpoint and use the corresponding
-resume script. The script derives the remaining iterations from the checkpoint
-and the 312,500-step target.
+To resume without resetting the optimizer, scheduler, scaler, or global
+iteration, set `RESUME` to a checkpoint and use the corresponding resume
+script. The script derives the remaining iterations from the checkpoint and
+the 312,500-step target. The current generic checkpoint format does not store
+the exact data-loader/augmentation RNG position; therefore a resumed run is
+state-continuous but is not guaranteed to be bitwise identical to an
+uninterrupted run.
 
 ```bash
 RESUME=outputs/curvelanes_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0100000.pt \
@@ -102,7 +105,9 @@ CKPT=outputs/curvelanes_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_
 ```
 
 Here `top_k=0` means no global output cap. The script writes ranked F1 results
-to `sweep.csv` and `sweep.json` beside the checkpoint. If this isolated test
-shows that the cap matters, expand `SCORE_THRESHOLDS` and `QUALITY_POWERS` in a
-second validation-only sweep; do not choose those settings on the unlabeled
-`test/` split.
+to `sweep.csv` and `sweep.json` beside the checkpoint. Raw-output caches are
+tied to the checkpoint, config, dataset root, split, and project source
+fingerprint, so a cache from different model or preprocessing code is not
+silently reused. If this isolated test shows that the cap matters, expand
+`SCORE_THRESHOLDS` and `QUALITY_POWERS` in a second validation-only sweep; do
+not choose those settings on the unlabeled `test/` split.

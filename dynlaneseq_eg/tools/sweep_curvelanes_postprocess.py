@@ -18,7 +18,7 @@ from dynlaneseq_eg.evaluation.curvelanes_writer import outputs_to_curvelanes_rec
 from dynlaneseq_eg.factory import build_dataloader, build_model
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 PREDICTION_FIELDS = (
     "pred_x_rows",
     "exist_logits",
@@ -26,6 +26,28 @@ PREDICTION_FIELDS = (
     "range_norm",
     "row_visibility_logits",
 )
+
+
+def _source_fingerprint() -> str:
+    """Fingerprint inference-relevant project code to reject stale caches.
+
+    A checkpoint and config can stay unchanged while preprocessing or model
+    forward code changes between branches.  Reusing raw outputs across that
+    change would make a sweep silently evaluate the old implementation.
+    Hashing the package sources is intentionally conservative and cheap
+    compared with one full validation inference pass.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted(package_root.rglob("*.py")):
+        relative = path.relative_to(package_root)
+        if "__pycache__" in relative.parts or "tests" in relative.parts:
+            continue
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _plain_value(value: Any) -> Any:
@@ -79,6 +101,7 @@ def _cache_path(
             str(checkpoint_stat.st_mtime_ns),
             str(dataset_root.resolve()),
             str(split),
+            _source_fingerprint(),
         )
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -105,9 +128,15 @@ def collect_checkpoint_cache(
     cache_dir: Path,
     reuse_cache: bool,
 ) -> dict[str, Any]:
+    source_fingerprint = _source_fingerprint()
     cache_path = _cache_path(cache_dir, config_path, checkpoint_path, dataset_root, split)
     if reuse_cache and cache_path.exists():
         cache = _load_cache(cache_path)
+        if int(cache.get("cache_version", -1)) != CACHE_VERSION:
+            raise ValueError(f"Unsupported CurveLanes cache version in {cache_path}")
+        cached_fingerprint = str(cache.get("metadata", {}).get("source_fingerprint", ""))
+        if cached_fingerprint != source_fingerprint:
+            raise ValueError(f"CurveLanes cache was produced by different project code: {cache_path}")
         cache.setdefault("metadata", {})["cache_path"] = str(cache_path)
         return cache
 
@@ -137,7 +166,9 @@ def collect_checkpoint_cache(
     model = build_model(cfg).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
-    load_checkpoint(checkpoint_path, model, strict=False)
+    # A sweep must never partially load a checkpoint into the wrong
+    # architecture and continue with randomly initialized missing weights.
+    load_checkpoint(checkpoint_path, model, strict=True)
     model.eval()
     loader = build_dataloader(cfg, split=split, training=False)
 
@@ -162,12 +193,16 @@ def collect_checkpoint_cache(
             "dataset_root": str(dataset_root),
             "split": str(split),
             "num_samples": sum(len(batch["metas"]) for batch in batches),
+            "source_fingerprint": source_fingerprint,
             "cache_path": str(cache_path),
         },
         "batches": batches,
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, cache_path)
+    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    torch.save(payload, temporary_path)
+    temporary_path.replace(cache_path)
     return payload
 
 
@@ -175,7 +210,28 @@ def _split_dir(split: str) -> str:
     return {"val": "valid", "train": "train", "test": "test"}.get(str(split), str(split))
 
 
-def load_ground_truth(dataset_root: Path, split: str) -> list[dict[str, Any]]:
+def _image_sizes_from_cache(cache: dict[str, Any]) -> dict[str, tuple[int, int]]:
+    image_sizes: dict[str, tuple[int, int]] = {}
+    for batch in cache.get("batches", []):
+        for meta in batch.get("metas", []):
+            raw_file = str(meta["raw_file"])
+            if raw_file in image_sizes:
+                raise ValueError(f"Duplicate CurveLanes metadata for {raw_file!r}")
+            width = int(meta["orig_w"])
+            height = int(meta["orig_h"])
+            if width <= 0 or height <= 0:
+                raise ValueError(f"Invalid CurveLanes image size for {raw_file!r}: {width}x{height}")
+            image_sizes[raw_file] = (width, height)
+    if not image_sizes:
+        raise ValueError("CurveLanes cache contains no image metadata")
+    return image_sizes
+
+
+def load_ground_truth(
+    dataset_root: Path,
+    split: str,
+    image_sizes: dict[str, tuple[int, int]] | None = None,
+) -> list[dict[str, Any]]:
     split_dir = _split_dir(split)
     if split_dir == "test":
         raise ValueError("CurveLanes test/images is unlabeled; use split=val for post-process selection")
@@ -185,6 +241,15 @@ def load_ground_truth(dataset_root: Path, split: str) -> list[dict[str, Any]]:
     raw_files = [line.strip().lstrip("/") for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not raw_files:
         raise ValueError(f"CurveLanes split list is empty: {list_path}")
+    if image_sizes is not None:
+        expected = set(raw_files)
+        missing = expected - set(image_sizes)
+        unexpected = set(image_sizes) - expected
+        if missing or unexpected:
+            raise ValueError(
+                "Cached CurveLanes metadata does not exactly match the selected split: "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
 
     ground_truth: list[dict[str, Any]] = []
     for raw_file in tqdm(raw_files, ncols=88, desc=f"load CurveLanes {split_dir} ground truth"):
@@ -194,8 +259,11 @@ def load_ground_truth(dataset_root: Path, split: str) -> list[dict[str, Any]]:
             raise FileNotFoundError(f"CurveLanes annotation not found: {annotation_path}")
         with annotation_path.open("r", encoding="utf-8") as handle:
             gt_data = json.load(handle)
-        with Image.open(image_path) as image:
-            image_size = image.size
+        if image_sizes is None:
+            with Image.open(image_path) as image:
+                image_size = image.size
+        else:
+            image_size = image_sizes[raw_file]
         ground_truth.append({"raw_file": raw_file, "gt_data": gt_data, "image_size": image_size})
     return ground_truth
 
@@ -354,8 +422,7 @@ def main() -> None:
 
     if _split_dir(str(args.split)) == "test":
         raise ValueError("CurveLanes post-process selection must use the labelled validation split, not test")
-    ground_truth = load_ground_truth(dataset_root, str(args.split))
-
+    ground_truth: list[dict[str, Any]] | None = None
     all_rows: list[dict[str, Any]] = []
     for checkpoint_path in checkpoint_paths:
         cache = collect_checkpoint_cache(
@@ -370,6 +437,12 @@ def main() -> None:
             cache_dir=Path(args.cache_dir),
             reuse_cache=bool(args.reuse_cache),
         )
+        if ground_truth is None:
+            ground_truth = load_ground_truth(
+                dataset_root,
+                str(args.split),
+                image_sizes=_image_sizes_from_cache(cache),
+            )
         all_rows.extend(
             evaluate_grid(
                 cache=cache,

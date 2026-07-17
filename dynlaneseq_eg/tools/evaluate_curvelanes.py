@@ -144,7 +144,10 @@ def main() -> None:
         model = build_model(cfg).to(device)
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
-        load_checkpoint(args.checkpoint, model, strict=False)
+        # Evaluation must fail loudly when the config does not exactly match
+        # the checkpoint.  Partial loading could otherwise produce a plausible
+        # but invalid score with randomly initialized missing modules.
+        load_checkpoint(args.checkpoint, model, strict=True)
         loader = build_dataloader(cfg, split=args.split, training=False)
         records = collect_predictions(
             model,

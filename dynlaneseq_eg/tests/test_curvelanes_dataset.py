@@ -72,3 +72,21 @@ def test_curvelanes_dataset_rejects_unknown_native_geometry(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="Unsupported CurveLanes image geometry"):
         _ = dataset[0]
+
+
+def test_curvelanes_reader_orders_non_monotonic_annotation_points(tmp_path: Path) -> None:
+    annotation = tmp_path / "sample.lines.json"
+    _write_label(
+        annotation,
+        [(40.0, 900.0), (20.0, 600.0), (35.0, 800.0), (30.0, 700.0)],
+    )
+
+    lanes = CurveLanesDataset._read_and_crop_lanes(
+        annotation,
+        crop_y=640,
+        crop_w=2560,
+        crop_h=800,
+    )
+
+    assert len(lanes) == 1
+    assert [point[1] for point in lanes[0]] == sorted(point[1] for point in lanes[0])

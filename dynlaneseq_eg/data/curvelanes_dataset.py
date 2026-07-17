@@ -240,6 +240,11 @@ class CurveLanesDataset(Dataset):
                 if not (math.isfinite(x) and math.isfinite(y)):
                     continue
                 source_points.append((x, y))
+            # CurveLanes is represented row-wise.  A small number of public
+            # annotations contain locally non-monotonic point order; sorting
+            # prevents those points from drawing a zig-zag segmentation target
+            # while leaving the fixed-row geometry target unchanged.
+            source_points.sort(key=lambda point: point[1])
             cropped = CurveLanesDataset._clip_lane_to_crop(
                 source_points,
                 crop_y=float(crop_y),
