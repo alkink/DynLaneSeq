@@ -30,10 +30,10 @@ implementation:
 | 1570 x 660 | 180 px | 1570 x 480 |
 | 1280 x 720 | 368 px | 1280 x 352 |
 
-The road crop is resized to 1600 x 640. This is the exact 2x counterpart of
-the common 800 x 320 CurveLanes input setting; it preserves the same crop
-policy and aspect transformation while retaining the project’s standard 800
-x-bin head.
+The road crop is resized to 1600 x 640. This is both the exact 2x counterpart
+of the common 800 x 320 CurveLanes input setting and the resolution used by
+CondLSTR's public CurveLanes transform; it preserves the same crop policy and
+aspect transformation while retaining the project’s standard 800 x-bin head.
 
 The reported public score is measured on `valid/valid.txt` (20,000 labelled
 images), not `test/test.txt`, because the distributed test split has no labels.
@@ -85,3 +85,24 @@ CKPT=outputs/curvelanes_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_
 The evaluator writes one prediction JSON under the result directory for every
 entry in `valid/valid.txt`; it refuses to score an incomplete prediction set.
 That prevents a partial write from silently inflating F1.
+
+## Post-process selection
+
+`top_k: 5` is a CULane-oriented default and should not be assumed optimal for
+CurveLanes. The following cached validation sweep changes only the global lane
+cap while keeping the initial score threshold (`0.30`), quality power (`0.50`),
+and NMS policy fixed. Model inference runs once; all three post-process cases
+reuse the saved raw outputs.
+
+```bash
+CKPT=outputs/curvelanes_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep/iter_0250000.pt \
+  DATA_ROOT=/mnt/d/Datasets/CurveLanes/Curvelanes \
+  TOP_KS="5 8 0" \
+  bash scripts/sweep_curvelanes_postprocess.sh
+```
+
+Here `top_k=0` means no global output cap. The script writes ranked F1 results
+to `sweep.csv` and `sweep.json` beside the checkpoint. If this isolated test
+shows that the cap matters, expand `SCORE_THRESHOLDS` and `QUALITY_POWERS` in a
+second validation-only sweep; do not choose those settings on the unlabeled
+`test/` split.
