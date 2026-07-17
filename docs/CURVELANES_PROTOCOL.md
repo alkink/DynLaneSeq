@@ -57,6 +57,24 @@ DATA_ROOT=/mnt/d/Datasets/CurveLanes/Curvelanes \
   bash scripts/run_curvelanes_s0_structured_query_res34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
 ```
 
+Matched backbone-scaling runs use the identical dataset, seed, optimizer,
+scheduler, iteration budget, structured head, input resolution, batch size,
+and accumulation. Only the backbone identity and output directory differ:
+
+```bash
+# ResNet-18
+DATA_ROOT=/workspace/Curvelanes \
+  bash scripts/run_curvelanes_s0_structured_query_res18_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
+
+# ResNet-101
+DATA_ROOT=/workspace/Curvelanes \
+  bash scripts/run_curvelanes_s0_structured_query_res101_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
+
+# DLA-34
+DATA_ROOT=/workspace/Curvelanes \
+  bash scripts/run_curvelanes_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.sh
+```
+
 Matched unstructured ResNet-34 ablation:
 
 ```bash
