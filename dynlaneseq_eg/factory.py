@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from .data import CULaneDataset, TuSimpleDataset, lane_collate
+from .data import CULaneDataset, CurveLanesDataset, TuSimpleDataset, lane_collate
 from .losses import HungarianMatcherS0, S0Criterion, S1Criterion, S2Criterion, S3Criterion, S4Criterion
 from .losses.loss_s0 import LossConfig
 from .losses.loss_s1 import S1LossConfig
@@ -152,6 +152,8 @@ def build_dataset(cfg: dict[str, Any], split: str = "train", training: bool = Fa
         dataset_cls = CULaneDataset
     elif name in {"tusimple", "tu_simple"}:
         dataset_cls = TuSimpleDataset
+    elif name in {"curvelanes", "curve_lanes"}:
+        dataset_cls = CurveLanesDataset
     else:
         raise ValueError(f"Unsupported dataset.name: {dataset_cfg.get('name')!r}")
     return dataset_cls(dataset_cfg, split=split, training=training)
