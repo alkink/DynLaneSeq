@@ -104,12 +104,19 @@ def test_culane_dla34_config_is_res34_control_except_backbone_metadata() -> None
     )
     assert dla34["model"]["backbone_name"] == "dla34"
     assert dla34["model"]["require_pretrained_backbone"] is True
+    assert dla34["training"]["seed"] == 3407
+    assert dla34["training"]["vis_interval"] == 25000
 
     for cfg in (res34, dla34):
         cfg.pop("_config_path", None)
         cfg.pop("output_dir", None)
         cfg["model"].pop("backbone_name", None)
         cfg["model"].pop("require_pretrained_backbone", None)
+        # Seed and visualization cadence are run bookkeeping rather than model,
+        # optimization, or data-pipeline differences.  The historical control
+        # did not record a seed, while the new DLA run deliberately does.
+        cfg["training"].pop("seed", None)
+        cfg["training"].pop("vis_interval", None)
     assert dla34 == res34
 
 

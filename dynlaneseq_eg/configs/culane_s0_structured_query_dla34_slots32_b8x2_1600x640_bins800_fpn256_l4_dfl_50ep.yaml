@@ -5,3 +5,10 @@ output_dir: outputs/culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins8
 model:
   backbone_name: dla34
   require_pretrained_backbone: true
+
+# The historical 79.98 ResNet-34 run did not record a seed.  This backbone
+# experiment is reproducible and must be compared against the independently
+# trained seed-3407 ResNet-34 full control for a paired scaling analysis.
+training:
+  seed: 3407
+  vis_interval: 25000
