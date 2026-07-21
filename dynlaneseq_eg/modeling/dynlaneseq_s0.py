@@ -375,6 +375,7 @@ class DynLaneSeqEncoder(nn.Module):
                 input_h=input_h,
                 input_w=input_w,
                 dropout=float(seg_aux_cfg.get("dropout", 0.1)),
+                amp_dtype=str(seg_aux_cfg.get("amp_dtype", "inherit")),
             )
             if self.seg_aux_enabled
             else None
@@ -386,6 +387,7 @@ class DynLaneSeqEncoder(nn.Module):
                     input_h=input_h,
                     input_w=input_w,
                     dropout=float(seg_aux_cfg.get("dropout", 0.1)),
+                    amp_dtype=str(seg_aux_cfg.get("amp_dtype", "inherit")),
                 )
                 for name in self.seg_aux_extra_scales
             }

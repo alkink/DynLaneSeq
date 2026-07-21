@@ -129,3 +129,22 @@ def test_unknown_backbone_name_fails_clearly() -> None:
     }
     with pytest.raises(ValueError, match="Unsupported model.backbone_name"):
         DynLaneSeqEncoder(cfg)
+
+
+def test_seg_aux_precision_override_is_isolated_to_segmentation_head() -> None:
+    cfg = {
+        "model": {
+            "backbone_name": "dla34",
+            "pretrained_backbone": False,
+            "fpn_channels": 64,
+            "dim": 64,
+            "input_h": 64,
+            "input_w": 128,
+            "seg_aux": {"enabled": True, "amp_dtype": "bfloat16"},
+            "centerline_aux": {"enabled": True},
+        }
+    }
+    encoder = DynLaneSeqEncoder(cfg)
+    assert encoder.seg_aux_head is not None
+    assert encoder.seg_aux_head.amp_dtype == "bfloat16"
+    assert not hasattr(encoder.centerline_aux_head, "amp_dtype")

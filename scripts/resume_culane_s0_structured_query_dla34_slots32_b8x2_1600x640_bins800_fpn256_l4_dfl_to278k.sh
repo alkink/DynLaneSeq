@@ -11,6 +11,7 @@ DATA_ROOT="${DATA_ROOT:-dataset}"
 TARGET_ITERS="${TARGET_ITERS:-278000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
+SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
 
 if [[ ! -f "${RESUME}" ]]; then
   echo "Missing resume checkpoint: ${RESUME}" >&2
@@ -29,6 +30,7 @@ echo "resume: ${RESUME}"
 echo "start_iter: ${START_ITER}"
 echo "target_iters_total: ${TARGET_ITERS}"
 echo "remaining_iters_this_run: ${REMAINING_ITERS}"
+echo "seg_aux_amp_dtype: ${SEG_AUX_AMP_DTYPE}"
 
 python -u -m dynlaneseq_eg.tools.train \
   --config "${CONFIG}" \
@@ -38,4 +40,5 @@ python -u -m dynlaneseq_eg.tools.train \
   --max-iters "${REMAINING_ITERS}" \
   --output-dir "${OUT_DIR}" \
   --batch-size "${BATCH_SIZE}" \
+  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
   --grad-accum "${GRAD_ACCUM}"

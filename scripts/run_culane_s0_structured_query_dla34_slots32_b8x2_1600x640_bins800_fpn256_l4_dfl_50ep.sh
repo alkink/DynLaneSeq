@@ -8,10 +8,12 @@ DEVICE="${DEVICE:-cuda}"
 DATA_ROOT="${DATA_ROOT:-dataset}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
+SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
 
 python -u -m dynlaneseq_eg.tools.train \
   --config "${CONFIG}" \
   --device "${DEVICE}" \
   --dataset-root "${DATA_ROOT}" \
   --batch-size "${BATCH_SIZE}" \
+  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
   --grad-accum "${GRAD_ACCUM}"

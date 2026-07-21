@@ -35,6 +35,12 @@ def main() -> None:
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
     parser.add_argument(
+        "--seg-aux-amp-dtype",
+        choices=("inherit", "float16", "bfloat16"),
+        default="",
+        help="Override model.seg_aux.amp_dtype without changing the main model AMP dtype.",
+    )
+    parser.add_argument(
         "--grad-accum",
         "--gradient-accumulation-steps",
         dest="grad_accum",
@@ -50,6 +56,8 @@ def main() -> None:
         cfg.setdefault("dataset", {})["root"] = args.dataset_root
     if args.batch_size > 0:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
+    if args.seg_aux_amp_dtype:
+        cfg.setdefault("model", {}).setdefault("seg_aux", {})["amp_dtype"] = args.seg_aux_amp_dtype
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
     train_cfg = cfg.get("training", {})
@@ -115,6 +123,7 @@ def main() -> None:
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),
             "amp": bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda"),
+            "seg_aux_amp_dtype": str(cfg.get("model", {}).get("seg_aux", {}).get("amp_dtype", "inherit")),
             "channels_last": channels_last,
             "compile_model": bool(train_cfg.get("compile_model", False)),
             "clip_grad_norm": float(train_cfg.get("clip_grad_norm", 1.0)),

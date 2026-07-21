@@ -79,10 +79,20 @@ class S0Heads(nn.Module):
 class SegAuxHead(nn.Module):
     """Dense lane-mask supervision head used only as an auxiliary training signal."""
 
-    def __init__(self, dim: int = 256, input_h: int = 288, input_w: int = 800, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int = 256,
+        input_h: int = 288,
+        input_w: int = 800,
+        dropout: float = 0.1,
+        amp_dtype: str = "inherit",
+    ):
         super().__init__()
         self.input_h = input_h
         self.input_w = input_w
+        self.amp_dtype = str(amp_dtype).strip().lower()
+        if self.amp_dtype not in {"inherit", "float16", "bfloat16"}:
+            raise ValueError("seg_aux.amp_dtype must be 'inherit', 'float16', or 'bfloat16'")
         self.net = nn.Sequential(
             nn.Dropout2d(dropout),
             nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1),
@@ -92,7 +102,17 @@ class SegAuxHead(nn.Module):
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        logits = self.net(features)
+        if self.amp_dtype == "inherit" or features.device.type != "cuda":
+            logits = self.net(features)
+        else:
+            if self.amp_dtype == "bfloat16" and not torch.cuda.is_bf16_supported():
+                raise RuntimeError("seg_aux.amp_dtype=bfloat16 requires a CUDA device with BF16 support")
+            dtype = torch.float16 if self.amp_dtype == "float16" else torch.bfloat16
+            # A nested autocast changes only the auxiliary mask branch.  The
+            # backbone, structured decoder, and paper-facing predictions keep
+            # the outer training precision unchanged.
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                logits = self.net(features)
         return F.interpolate(logits, size=(self.input_h, self.input_w), mode="bilinear", align_corners=False)
 
 
