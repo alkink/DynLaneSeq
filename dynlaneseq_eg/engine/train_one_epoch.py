@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 import time
 
@@ -109,6 +110,32 @@ def output_debug_stats(outputs) -> dict[str, torch.Tensor]:
     return stats
 
 
+def format_loss_diagnostics(loss_dict: dict[str, Any], metas: list[dict[str, Any]] | None = None) -> str:
+    """Format scalar losses only when a non-finite total is encountered.
+
+    Copying scalar values to CPU is deliberately confined to the failure path,
+    so normal training has no synchronization or throughput penalty.
+    """
+    terms = []
+    for name, value in loss_dict.items():
+        if not isinstance(value, torch.Tensor) or value.numel() != 1:
+            continue
+        scalar = float(value.detach().float().cpu().item())
+        marker = "*" if not math.isfinite(scalar) else ""
+        terms.append(f"{name}={scalar:.7g}{marker}")
+    sample_paths = []
+    for meta in metas or []:
+        if not isinstance(meta, dict):
+            continue
+        path = meta.get("image_path")
+        if path:
+            sample_paths.append(str(path))
+    parts = ["losses[" + ", ".join(terms) + "]"]
+    if sample_paths:
+        parts.append("samples[" + ", ".join(sample_paths) + "]")
+    return " | ".join(parts)
+
+
 def train_one_epoch(
     model,
     dataloader,
@@ -159,6 +186,7 @@ def train_one_epoch(
                 loss = loss_dict["loss_total"]
             if not torch.isfinite(loss):
                 print(f"iter {iteration + 1:07d} | non-finite loss; skipping optimizer step")
+                print(f"iter {iteration + 1:07d} | {format_loss_diagnostics(loss_dict, metas)}")
                 optimizer.zero_grad(set_to_none=True)
                 micro_in_step = 0
                 iteration += 1
