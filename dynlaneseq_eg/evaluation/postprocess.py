@@ -69,13 +69,19 @@ def predictions_to_lanes(
         row_visibility = torch.sigmoid(outputs["row_visibility_logits"]) >= float(row_visibility_thresh)
     ranges = sort_range_norm(outputs["range_norm"])
     y_rows = fixed_y_rows(pred_x.shape[-1], input_h, device=pred_x.device, dtype=pred_x.dtype)
+    # Transfer each result tensor once per batch.  The previous per-sample
+    # .cpu() calls introduced four CUDA synchronizations for every image.
+    p_lane_cpu = p_lane.detach().cpu()
+    pred_x_cpu = pred_x.detach().cpu()
+    ranges_cpu = ranges.detach().cpu()
+    y_rows_cpu = y_rows.detach().cpu()
+    row_visibility_cpu = row_visibility.detach().cpu() if row_visibility is not None else None
     batch_lanes: list[list[list[tuple[float, float]]]] = []
     for b in range(pred_x.shape[0]):
-        p_lane_b = p_lane[b].detach().cpu()
-        pred_x_b = pred_x[b].detach().cpu()
-        ranges_b = ranges[b].detach().cpu()
-        y_rows_cpu = y_rows.detach().cpu()
-        row_visibility_b = row_visibility[b].detach().cpu() if row_visibility is not None else None
+        p_lane_b = p_lane_cpu[b]
+        pred_x_b = pred_x_cpu[b]
+        ranges_b = ranges_cpu[b]
+        row_visibility_b = row_visibility_cpu[b] if row_visibility_cpu is not None else None
         candidates: list[tuple[float, list[tuple[float, float]]]] = []
         for n in range(pred_x.shape[1]):
             score = float(p_lane_b[n])

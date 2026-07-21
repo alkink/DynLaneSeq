@@ -181,7 +181,11 @@ class StructuredLaneQueryHead(nn.Module):
             feat_key = feat_key + x_pos
         return feat_value, feat_key
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        features: torch.Tensor,
+        inference_only: bool = False,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         b = int(features.shape[0])
         dtype = features.dtype
         device = features.device
@@ -202,20 +206,26 @@ class StructuredLaneQueryHead(nn.Module):
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
         quality_logits = self.quality(lane_query).squeeze(-1)
-        return {
+        outputs: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
             "exist_logits": self.exist(lane_query),
-            "row_x_logits": row_x_logits,
             "pred_x_rows": pred_x_rows,
-            "range_raw": range_raw,
             "range_norm": range_norm,
             "quality_logits": quality_logits,
+        }
+        if inference_only:
+            return outputs
+        outputs.update({
+            "row_x_logits": row_x_logits,
+            "range_raw": range_raw,
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
-            "structured_debug": {
-                "structured_row_abs": row_tokens.detach().abs().mean(),
-                "structured_feature_abs": row_value_features.detach().abs().mean(),
-            },
-        }
+            # Keep the public debug container without running reductions that
+            # are not consumed by training, evaluation, or model outputs.  In
+            # particular, abs() on the full row-evidence tensor otherwise
+            # materializes a roughly 500 MiB temporary at the paper batch size.
+            "structured_debug": {},
+        })
+        return outputs
 
 
 def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQueryHead | None:

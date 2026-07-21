@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 
@@ -9,7 +10,12 @@ from tqdm import tqdm
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import load_checkpoint
-from dynlaneseq_eg.evaluation.culane_metric import eval_predictions, format_category_results, format_results
+from dynlaneseq_eg.evaluation.culane_metric import (
+    eval_predictions,
+    eval_predictions_with_categories,
+    format_category_results,
+    format_results,
+)
 from dynlaneseq_eg.evaluation.culane_writer import write_culane_predictions
 from dynlaneseq_eg.factory import build_dataloader, build_model
 
@@ -28,16 +34,30 @@ def write_predictions(
     row_visibility_thresh: float,
     quality_score_power: float,
     channels_last: bool = False,
+    pass_targets: bool = False,
+    inference_only: bool = False,
+    amp_dtype: str = "none",
 ) -> None:
     model.eval()
     pred_dir.mkdir(parents=True, exist_ok=True)
-    pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
     for images, targets, metas in tqdm(loader, ncols=80, desc="writing predictions"):
         if channels_last:
             images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
         else:
             images = images.to(device, non_blocking=True)
-        outputs = model(images, targets=targets) if pass_targets else model(images)
+        if amp_dtype == "float16" and device.type == "cuda":
+            amp_context = torch.autocast(device_type="cuda", dtype=torch.float16)
+        elif amp_dtype == "bfloat16" and device.type == "cuda":
+            amp_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            amp_context = nullcontext()
+        with amp_context:
+            if pass_targets:
+                outputs = model(images, targets=targets)
+            elif inference_only:
+                outputs = model(images, inference_only=True)
+            else:
+                outputs = model(images)
         write_culane_predictions(
             outputs,
             metas,
@@ -93,14 +113,41 @@ def main() -> None:
     parser.add_argument("--row-visibility-thresh", type=float, default=None)
     parser.add_argument("--quality-score-power", type=float, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=0)
+    parser.add_argument("--eval-num-workers", type=int, default=-1, help="Override dataloader workers; -1 keeps config.")
+    parser.add_argument(
+        "--eval-prefetch-factor",
+        type=int,
+        default=-1,
+        help="Override dataloader prefetch factor; -1 keeps config.",
+    )
     parser.add_argument("--width", type=int, default=30)
     parser.add_argument("--iou-thresholds", type=float, nargs="+", default=[0.5])
     parser.add_argument("--continuous", action="store_true", help="Use shapely continuous IoU instead of CULane-style raster IoU.")
     parser.add_argument("--sequential", action="store_true")
+    parser.add_argument("--metric-workers", type=int, default=0, help="Raster metric workers; 0 uses all CPU cores.")
+    parser.add_argument("--metric-chunksize", type=int, default=64)
     parser.add_argument("--skip-write", action="store_true", help="Evaluate existing files in --pred-dir.")
     parser.add_argument("--categories", action="store_true", help="Also evaluate CULane official test_split categories.")
     parser.add_argument("--output-txt", default="", help="Write a compact evaluation report to this text file.")
     parser.add_argument("--output-json", default="", help="Write metrics and metadata to this JSON file.")
+    parser.add_argument(
+        "--no-pretrained-init",
+        action="store_true",
+        help="Do not initialize pretrained backbone weights before loading the complete checkpoint.",
+    )
+    parser.add_argument(
+        "--legacy-inference",
+        action="store_true",
+        help="Disable the exact-output fast path for parity/debugging.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("none", "float16", "bfloat16"),
+        default="none",
+        help="Optional CUDA autocast. 'none' preserves the original FP32 numerical path.",
+    )
+    parser.add_argument("--compile-model", action="store_true", help="Optionally run inference through torch.compile.")
+    parser.add_argument("--compile-mode", default="reduce-overhead")
     args = parser.parse_args()
 
     if not args.skip_write and not args.checkpoint:
@@ -111,7 +158,15 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.dataset_root:
         cfg.setdefault("dataset", {})["root"] = args.dataset_root
+    if args.no_pretrained_init and not args.skip_write:
+        model_cfg = cfg.setdefault("model", {})
+        model_cfg["pretrained_backbone"] = False
+        model_cfg["require_pretrained_backbone"] = False
     device = torch.device(args.device)
+    if args.amp_dtype != "none" and device.type != "cuda":
+        raise ValueError("--amp-dtype currently requires a CUDA device")
+    if args.compile_model and not hasattr(torch, "compile"):
+        raise RuntimeError("--compile-model requires a PyTorch build with torch.compile")
     train_cfg = cfg.get("training", {})
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", False))
@@ -124,6 +179,10 @@ def main() -> None:
                 pass
     if args.eval_batch_size > 0:
         cfg.setdefault("dataloader", {})["eval_batch_size"] = int(args.eval_batch_size)
+    if args.eval_num_workers >= 0:
+        cfg.setdefault("dataloader", {})["num_workers"] = int(args.eval_num_workers)
+    if args.eval_prefetch_factor > 0:
+        cfg.setdefault("dataloader", {})["prefetch_factor"] = int(args.eval_prefetch_factor)
     channels_last = bool(train_cfg.get("channels_last", False) and device.type == "cuda")
     post_cfg = cfg.get("postprocess", {})
     nms_distance_thresh_px = (
@@ -149,16 +208,28 @@ def main() -> None:
     )
     pred_dir = Path(args.pred_dir) if args.pred_dir else Path(cfg.get("output_dir", "outputs")) / f"culane_pred_{args.split}_thr{args.score_thresh:g}"
 
+    inference_only = False
+    pass_targets = False
     if not args.skip_write:
         # Checkpoint evaluation must not download or overwrite a backbone with
         # ImageNet initialization before loading the trained model state.
         cfg.setdefault("model", {})["pretrained_backbone"] = False
         cfg.setdefault("model", {})["require_pretrained_backbone"] = False
-        model = build_model(cfg).to(device)
+        model = build_model(cfg)
+        load_checkpoint(args.checkpoint, model, strict=False)
+        pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
+        inference_only = bool(getattr(model, "supports_inference_only", False) and not args.legacy_inference)
+        if inference_only and not pass_targets:
+            cfg.setdefault("dataset", {})["load_targets"] = False
+            cfg.setdefault("dataset", {})["infer_seg_labels"] = False
+        loader = build_dataloader(cfg, split=args.split, training=False)
+        if inference_only and hasattr(model, "prepare_for_inference"):
+            model.prepare_for_inference()
+        model = model.to(device)
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
-        load_checkpoint(args.checkpoint, model, strict=False)
-        loader = build_dataloader(cfg, split=args.split, training=False)
+        if args.compile_model:
+            model = torch.compile(model, mode=args.compile_mode)
         write_predictions(
             model,
             loader,
@@ -172,19 +243,39 @@ def main() -> None:
             row_visibility_thresh,
             quality_score_power,
             channels_last=channels_last,
+            pass_targets=pass_targets,
+            inference_only=inference_only,
+            amp_dtype=args.amp_dtype,
         )
 
     list_path = resolve_list_path(cfg, args.split)
     anno_dir = Path(cfg.get("dataset", {}).get("root", "dataset"))
-    results = eval_predictions(
-        pred_dir=pred_dir,
-        anno_dir=anno_dir,
-        list_path=list_path,
-        iou_thresholds=args.iou_thresholds,
-        width=args.width,
-        official=not args.continuous,
-        sequential=args.sequential,
-    )
+    if args.categories:
+        results, cat_results = eval_predictions_with_categories(
+            pred_dir=pred_dir,
+            anno_dir=anno_dir,
+            list_path=list_path,
+            category_lists=category_lists(anno_dir),
+            iou_thresholds=args.iou_thresholds,
+            width=args.width,
+            official=not args.continuous,
+            sequential=args.sequential,
+            num_workers=args.metric_workers,
+            chunksize=args.metric_chunksize,
+        )
+    else:
+        results = eval_predictions(
+            pred_dir=pred_dir,
+            anno_dir=anno_dir,
+            list_path=list_path,
+            iou_thresholds=args.iou_thresholds,
+            width=args.width,
+            official=not args.continuous,
+            sequential=args.sequential,
+            num_workers=args.metric_workers,
+            chunksize=args.metric_chunksize,
+        )
+        cat_results = {}
     report_lines = [
         f"config: {args.config}",
         f"checkpoint: {args.checkpoint}" if args.checkpoint else "checkpoint: <skip-write>",
@@ -199,25 +290,17 @@ def main() -> None:
         f"score_thresh: {args.score_thresh}",
         f"eval_batch_size: {cfg.get('dataloader', {}).get('eval_batch_size', 1)}",
         f"channels_last: {channels_last}",
+        f"inference_only: {inference_only}",
+        f"amp_dtype: {args.amp_dtype}",
+        f"compile_model: {args.compile_model}",
+        f"no_pretrained_init: {args.no_pretrained_init}",
+        f"metric_workers: {args.metric_workers}",
+        f"metric_chunksize: {args.metric_chunksize}",
         format_results(results),
     ]
     category_report = ""
 
     if args.categories:
-        cat_results = {}
-        for name, cat_list in category_lists(anno_dir).items():
-            if not cat_list.exists():
-                continue
-            print(f"category {name}: {cat_list}")
-            cat_results[name] = eval_predictions(
-                pred_dir=pred_dir,
-                anno_dir=anno_dir,
-                list_path=cat_list,
-                iou_thresholds=args.iou_thresholds,
-                width=args.width,
-                official=not args.continuous,
-                sequential=args.sequential,
-            )
         if cat_results:
             category_report = format_category_results(cat_results)
             report_lines.extend(["categories:", category_report])
@@ -250,6 +333,13 @@ def main() -> None:
             "quality_score_power": quality_score_power,
             "eval_batch_size": cfg.get("dataloader", {}).get("eval_batch_size", 1),
             "channels_last": channels_last,
+            "inference_only": inference_only,
+            "amp_dtype": args.amp_dtype,
+            "compile_model": args.compile_model,
+            "compile_mode": args.compile_mode,
+            "no_pretrained_init": args.no_pretrained_init,
+            "metric_workers": args.metric_workers,
+            "metric_chunksize": args.metric_chunksize,
             "results": results,
             "categories": cat_results,
         }

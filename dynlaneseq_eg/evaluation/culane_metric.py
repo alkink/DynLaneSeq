@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from functools import partial
 from itertools import repeat
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Mapping, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -17,11 +16,15 @@ from tqdm import tqdm
 Lane = List[Tuple[float, float]]
 
 
-def draw_lane(lane: np.ndarray, img_shape: tuple[int, int, int] = (590, 1640, 3), width: int = 30) -> np.ndarray:
+ImageShape = Union[Tuple[int, int], Tuple[int, int, int]]
+
+
+def draw_lane(lane: np.ndarray, img_shape: ImageShape = (590, 1640), width: int = 30) -> np.ndarray:
     img = np.zeros(img_shape, dtype=np.uint8)
     lane = lane.astype(np.int32)
+    color = (255, 255, 255) if len(img_shape) == 3 else 255
     for p1, p2 in zip(lane[:-1], lane[1:]):
-        cv2.line(img, tuple(p1), tuple(p2), color=(255, 255, 255), thickness=width)
+        cv2.line(img, tuple(p1), tuple(p2), color=color, thickness=width)
     return img > 0
 
 
@@ -29,15 +32,23 @@ def discrete_cross_iou(
     xs: Iterable[np.ndarray],
     ys: Iterable[np.ndarray],
     width: int = 30,
-    img_shape: tuple[int, int, int] = (590, 1640, 3),
+    img_shape: ImageShape = (590, 1640),
 ) -> np.ndarray:
     xs_masks = [draw_lane(lane, img_shape=img_shape, width=width) for lane in xs]
     ys_masks = [draw_lane(lane, img_shape=img_shape, width=width) for lane in ys]
     ious = np.zeros((len(xs_masks), len(ys_masks)), dtype=np.float32)
     for i, x in enumerate(xs_masks):
         for j, y in enumerate(ys_masks):
-            union = (x | y).sum()
-            ious[i, j] = 0.0 if union == 0 else float((x & y).sum()) / float(union)
+            union = int((x | y).sum())
+            if union == 0:
+                ious[i, j] = 0.0
+            else:
+                intersection = int((x & y).sum())
+                # The previous implementation rasterized three identical RGB
+                # channels.  Preserve its exact floating-point ratio while
+                # storing and combining only one channel.
+                channel_factor = 3 if len(img_shape) == 2 else 1
+                ious[i, j] = float(intersection * channel_factor) / float(union * channel_factor)
     return ious
 
 
@@ -45,9 +56,9 @@ def continuous_cross_iou(
     xs: Iterable[np.ndarray],
     ys: Iterable[np.ndarray],
     width: int = 30,
-    img_shape: tuple[int, int, int] = (590, 1640, 3),
+    img_shape: ImageShape = (590, 1640),
 ) -> np.ndarray:
-    h, w, _ = img_shape
+    h, w = img_shape[:2]
     image = Polygon([(0, 0), (0, h - 1), (w - 1, h - 1), (w - 1, 0)])
     xs_poly = [LineString(lane).buffer(width / 2.0, cap_style=1, join_style=2).intersection(image) for lane in xs]
     ys_poly = [LineString(lane).buffer(width / 2.0, cap_style=1, join_style=2).intersection(image) for lane in ys]
@@ -79,7 +90,7 @@ def culane_metric(
     width: int = 30,
     iou_thresholds: list[float] | tuple[float, ...] = (0.5,),
     official: bool = True,
-    img_shape: tuple[int, int, int] = (590, 1640, 3),
+    img_shape: ImageShape = (590, 1640),
 ) -> dict[float, list[int]]:
     if len(pred) == 0 or len(anno) == 0:
         return {float(thr): [0, len(pred), len(anno)] for thr in iou_thresholds}
@@ -146,36 +157,43 @@ def _metric_one(args) -> dict[float, list[int]]:
     return culane_metric(pred, anno, width=width, iou_thresholds=iou_thresholds, official=official, img_shape=img_shape)
 
 
-def eval_predictions(
-    pred_dir: str | Path,
-    anno_dir: str | Path,
-    list_path: str | Path,
-    iou_thresholds: list[float] | tuple[float, ...] = (0.5,),
-    width: int = 30,
-    official: bool = True,
-    sequential: bool = False,
-    img_shape: tuple[int, int, int] = (590, 1640, 3),
-) -> dict[float | str, dict[str, float | int]]:
-    predictions = load_culane_data(pred_dir, list_path)
-    annotations = load_culane_data(anno_dir, list_path)
-    tasks = list(zip(predictions, annotations, repeat(width), repeat(tuple(iou_thresholds)), repeat(official), repeat(img_shape)))
-    desc = f"evaluating {Path(list_path).name}"
-    if sequential:
-        results = [_metric_one(task) for task in tqdm(tasks, desc=desc, ncols=80)]
-    else:
-        with Pool(cpu_count()) as pool:
-            results = list(tqdm(pool.imap(_metric_one, tasks), total=len(tasks), desc=desc, ncols=80))
+def _run_metric_tasks(
+    tasks: Sequence[tuple],
+    desc: str,
+    sequential: bool,
+    num_workers: int,
+    chunksize: int,
+) -> list[dict[float, list[int]]]:
+    if sequential or len(tasks) == 0:
+        return [_metric_one(task) for task in tqdm(tasks, desc=desc, ncols=80)]
+    workers = int(num_workers) if int(num_workers) > 0 else cpu_count()
+    with Pool(workers) as pool:
+        return list(
+            tqdm(
+                pool.imap(_metric_one, tasks, chunksize=max(1, int(chunksize))),
+                total=len(tasks),
+                desc=desc,
+                ncols=80,
+            )
+        )
 
+
+def _aggregate_results(
+    results: Sequence[dict[float, list[int]]],
+    iou_thresholds: Sequence[float],
+    indices: Sequence[int] | None = None,
+) -> dict[float | str, dict[str, float | int]]:
+    selected = results if indices is None else [results[index] for index in indices]
     ret: dict[float | str, dict[str, float | int]] = {}
     mean_f1 = 0.0
     mean_precision = 0.0
     mean_recall = 0.0
     total_tp = total_fp = total_fn = 0
-    for thr in iou_thresholds:
-        thr = float(thr)
-        tp = sum(m[thr][0] for m in results)
-        fp = sum(m[thr][1] for m in results)
-        fn = sum(m[thr][2] for m in results)
+    for threshold in iou_thresholds:
+        thr = float(threshold)
+        tp = sum(metric[thr][0] for metric in selected)
+        fp = sum(metric[thr][1] for metric in selected)
+        fn = sum(metric[thr][2] for metric in selected)
         precision = float(tp) / float(tp + fp) if tp + fp > 0 else 0.0
         recall = float(tp) / float(tp + fn) if tp + fn > 0 else 0.0
         f1 = 2.0 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
@@ -197,6 +215,83 @@ def eval_predictions(
             "F1": mean_f1,
         }
     return ret
+
+
+def eval_predictions(
+    pred_dir: str | Path,
+    anno_dir: str | Path,
+    list_path: str | Path,
+    iou_thresholds: list[float] | tuple[float, ...] = (0.5,),
+    width: int = 30,
+    official: bool = True,
+    sequential: bool = False,
+    img_shape: ImageShape = (590, 1640),
+    num_workers: int = 0,
+    chunksize: int = 64,
+) -> dict[float | str, dict[str, float | int]]:
+    predictions = load_culane_data(pred_dir, list_path)
+    annotations = load_culane_data(anno_dir, list_path)
+    tasks = list(zip(predictions, annotations, repeat(width), repeat(tuple(iou_thresholds)), repeat(official), repeat(img_shape)))
+    desc = f"evaluating {Path(list_path).name}"
+    results = _run_metric_tasks(tasks, desc, sequential, num_workers, chunksize)
+    return _aggregate_results(results, tuple(iou_thresholds))
+
+
+def eval_predictions_with_categories(
+    pred_dir: str | Path,
+    anno_dir: str | Path,
+    list_path: str | Path,
+    category_lists: Mapping[str, str | Path],
+    iou_thresholds: list[float] | tuple[float, ...] = (0.5,),
+    width: int = 30,
+    official: bool = True,
+    sequential: bool = False,
+    img_shape: ImageShape = (590, 1640),
+    num_workers: int = 0,
+    chunksize: int = 64,
+) -> tuple[
+    dict[float | str, dict[str, float | int]],
+    dict[str, dict[float | str, dict[str, float | int]]],
+]:
+    """Evaluate the full split and all category subsets in one raster pass."""
+    rels = list_image_rel_paths(list_path)
+    predictions = [load_culane_img_data(Path(pred_dir) / rel.replace(".jpg", ".lines.txt")) for rel in rels]
+    annotations = [load_culane_img_data(Path(anno_dir) / rel.replace(".jpg", ".lines.txt")) for rel in rels]
+    thresholds = tuple(iou_thresholds)
+    tasks = list(zip(predictions, annotations, repeat(width), repeat(thresholds), repeat(official), repeat(img_shape)))
+    results = _run_metric_tasks(
+        tasks,
+        f"evaluating {Path(list_path).name}",
+        sequential,
+        num_workers,
+        chunksize,
+    )
+
+    rel_to_indices: dict[str, list[int]] = {}
+    for index, rel in enumerate(rels):
+        rel_to_indices.setdefault(rel, []).append(index)
+
+    category_results: dict[str, dict[float | str, dict[str, float | int]]] = {}
+    for name, category_list in category_lists.items():
+        category_path = Path(category_list)
+        if not category_path.exists():
+            continue
+        category_indices: list[int] = []
+        missing: list[str] = []
+        for rel in list_image_rel_paths(category_path):
+            matched = rel_to_indices.get(rel)
+            if matched is None:
+                missing.append(rel)
+            else:
+                category_indices.extend(matched)
+        if missing:
+            raise ValueError(
+                f"Category {name!r} contains {len(missing)} entries absent from {list_path}; "
+                f"first missing entry: {missing[0]}"
+            )
+        category_results[name] = _aggregate_results(results, thresholds, category_indices)
+
+    return _aggregate_results(results, thresholds), category_results
 
 
 def format_results(results: dict[float | str, dict[str, float | int]]) -> str:
