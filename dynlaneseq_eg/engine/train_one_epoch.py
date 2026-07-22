@@ -154,6 +154,13 @@ def train_one_epoch(
 ) -> int:
     model.train()
     amp = bool(cfg.get("training", {}).get("amp", False))
+    amp_dtype_name = str(cfg.get("training", {}).get("amp_dtype", "")).lower()
+    amp_dtype = None
+    if device.type == "cuda":
+        if amp_dtype_name in {"bf16", "bfloat16"}:
+            amp_dtype = torch.bfloat16
+        elif amp_dtype_name in {"fp16", "float16", "half"}:
+            amp_dtype = torch.float16
     channels_last = bool(cfg.get("training", {}).get("channels_last", False) and device.type == "cuda")
     clip_norm = float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
     clip_mode = str(cfg.get("training", {}).get("clip_grad_norm_mode", "global"))
@@ -178,7 +185,10 @@ def train_one_epoch(
             else:
                 images = images.to(device, non_blocking=True)
             targets = nested_to_device(targets, device)
-            with torch.autocast(device_type=device.type, enabled=amp):
+            autocast_kwargs = {"device_type": device.type, "enabled": amp}
+            if amp_dtype is not None:
+                autocast_kwargs["dtype"] = amp_dtype
+            with torch.autocast(**autocast_kwargs):
                 outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, iteration)
                 if hasattr(criterion, "set_iteration"):
                     criterion.set_iteration(iteration)

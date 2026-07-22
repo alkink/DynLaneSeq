@@ -6,6 +6,7 @@ from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.factory import build_criterion, build_matcher, build_model
 from dynlaneseq_eg.losses.loss_s2 import S2Criterion, S2LossConfig
 from dynlaneseq_eg.modeling import DynLaneSeqS0, DynLaneSeqS1, DynLaneSeqS2, DynLaneSeqS3
+from dynlaneseq_eg.modeling.structured_queries import StructuredLaneQueryHead
 from dynlaneseq_eg.modeling.evidence import (
     AsymmetricContextModulationBridge,
     DynamicDepthwiseBridge,
@@ -123,6 +124,41 @@ def test_structured_query_s0_forward_shapes():
     assert out["range_norm"].shape == (1, 16, 2)
     assert out["queries"].shape == (1, 16, 64)
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
+    assert "aux_outputs" not in out
+
+
+def test_structured_query_intermediate_supervision_uses_shared_heads() -> None:
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=4,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=4,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=2,
+        intermediate_supervision=True,
+    ).eval()
+    features = torch.randn(2, 32, 8, 12)
+    outputs = head(features)
+
+    assert len(outputs["aux_outputs"]) == 3
+    assert outputs["row_x_logits"].shape == (2, 4, 8, 16)
+    for auxiliary in outputs["aux_outputs"]:
+        assert auxiliary["exist_logits"].shape == (2, 4, 2)
+        assert auxiliary["row_x_logits"].shape == (2, 4, 8, 16)
+        assert auxiliary["pred_x_rows"].shape == (2, 4, 8)
+        assert auxiliary["range_norm"].shape == (2, 4, 2)
+        assert "quality_logits" not in auxiliary
+
+    # Inference remains final-layer-only, so deep supervision has no test-time
+    # output or compute beyond the existing four decoder layers.
+    inference = head(features, inference_only=True)
+    assert set(inference) == {"exist_logits", "pred_x_rows", "range_norm", "quality_logits"}
+    assert "aux_outputs" not in inference
 
 
 def test_structured_query_debug_config_builds():

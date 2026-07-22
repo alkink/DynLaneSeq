@@ -61,6 +61,8 @@ def main() -> None:
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
     train_cfg = cfg.get("training", {})
+    amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
+    amp_dtype_is_bf16 = amp_dtype_name in {"bf16", "bfloat16"}
     seed_value = train_cfg.get("seed")
     seed = int(seed_value) if seed_value is not None else None
     if seed is not None:
@@ -84,7 +86,12 @@ def main() -> None:
     matcher = build_matcher(cfg)
     criterion = build_criterion(cfg)
     optimizer = build_optimizer(cfg, model)
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda"))
+    use_grad_scaler = bool(
+        cfg.get("training", {}).get("amp", False)
+        and device.type == "cuda"
+        and not amp_dtype_is_bf16
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler) if use_grad_scaler else None
     loader = build_dataloader(cfg, split="train", training=True)
     out_dir = Path(cfg.get("output_dir", "outputs/train"))
     vis_interval = int(cfg.get("training", {}).get("vis_interval", 100))
@@ -123,6 +130,7 @@ def main() -> None:
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),
             "amp": bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda"),
+            "amp_dtype": amp_dtype_name or "default",
             "seg_aux_amp_dtype": str(cfg.get("model", {}).get("seg_aux", {}).get("amp_dtype", "inherit")),
             "channels_last": channels_last,
             "compile_model": bool(train_cfg.get("compile_model", False)),

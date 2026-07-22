@@ -109,6 +109,7 @@ class StructuredLaneQueryHead(nn.Module):
         evidence_x_bins: int | None = None,
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
+        intermediate_supervision: bool = False,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -120,6 +121,7 @@ class StructuredLaneQueryHead(nn.Module):
         self.use_x_pos = bool(use_x_pos)
         self.num_groups = int(num_groups)
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
+        self.intermediate_supervision = bool(intermediate_supervision)
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -185,7 +187,7 @@ class StructuredLaneQueryHead(nn.Module):
         self,
         features: torch.Tensor,
         inference_only: bool = False,
-    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    ) -> dict[str, Any]:
         b = int(features.shape[0])
         dtype = features.dtype
         device = features.device
@@ -195,9 +197,53 @@ class StructuredLaneQueryHead(nn.Module):
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
         row_value_features, row_key_features = self._row_features(features)
 
-        for layer in self.layers:
+        intermediate_row_tokens = []
+        for layer_index, layer in enumerate(self.layers):
             row_tokens = layer(row_tokens, row_value_features, row_key_features)
+            if (
+                self.intermediate_supervision
+                and not inference_only
+                and layer_index < len(self.layers) - 1
+            ):
+                intermediate_row_tokens.append(row_tokens)
 
+        outputs = self._predict_from_row_tokens(row_tokens, instance, include_quality=True)
+        row_tokens = outputs["structured_row_tokens"]
+        if not isinstance(row_tokens, torch.Tensor):
+            raise TypeError("structured_row_tokens must be a tensor")
+        if self.intermediate_supervision and not inference_only:
+            outputs["aux_outputs"] = [
+                self._predict_from_row_tokens(tokens, instance, include_quality=False)
+                for tokens in intermediate_row_tokens
+            ]
+        if inference_only:
+            return {
+                "exist_logits": outputs["exist_logits"],
+                "pred_x_rows": outputs["pred_x_rows"],
+                "range_norm": outputs["range_norm"],
+                "quality_logits": outputs["quality_logits"],
+            }
+        # Keep the public debug container without running reductions that are
+        # not consumed by training, evaluation, or model outputs.  In
+        # particular, abs() on the full row-evidence tensor otherwise
+        # materializes a roughly 500 MiB temporary at the paper batch size.
+        outputs["structured_debug"] = {}
+        return outputs
+
+    def _predict_from_row_tokens(
+        self,
+        row_tokens: torch.Tensor,
+        instance: torch.Tensor,
+        *,
+        include_quality: bool,
+    ) -> dict[str, torch.Tensor]:
+        """Apply the shared lane heads to one decoder-layer state.
+
+        Sharing these heads across layers isolates deep supervision from an
+        increase in prediction-head capacity.  Auxiliary layers intentionally
+        omit quality calibration; quality remains a final-layer decision.
+        """
+        b = int(row_tokens.shape[0])
         row_tokens = self.row_norm(row_tokens)
         instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
         lane_query = self.lane_norm(row_tokens.mean(dim=2) + row_tokens.amax(dim=2) + instance_residual)
@@ -205,26 +251,17 @@ class StructuredLaneQueryHead(nn.Module):
         pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
-        quality_logits = self.quality(lane_query).squeeze(-1)
-        outputs: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {
+        outputs = {
             "exist_logits": self.exist(lane_query),
             "pred_x_rows": pred_x_rows,
             "range_norm": range_norm,
-            "quality_logits": quality_logits,
-        }
-        if inference_only:
-            return outputs
-        outputs.update({
             "row_x_logits": row_x_logits,
             "range_raw": range_raw,
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
-            # Keep the public debug container without running reductions that
-            # are not consumed by training, evaluation, or model outputs.  In
-            # particular, abs() on the full row-evidence tensor otherwise
-            # materializes a roughly 500 MiB temporary at the paper batch size.
-            "structured_debug": {},
-        })
+        }
+        if include_quality:
+            outputs["quality_logits"] = self.quality(lane_query).squeeze(-1)
         return outputs
 
 
@@ -246,4 +283,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         evidence_x_bins=int(structured_cfg.get("evidence_x_bins", structured_cfg.get("attn_x_bins", model_cfg.get("x_bins", 200)))),
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
+        intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
     )

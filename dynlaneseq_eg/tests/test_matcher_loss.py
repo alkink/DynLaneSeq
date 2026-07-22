@@ -260,6 +260,59 @@ def test_s0_lambda_coarse_adds_draft_supervision():
     assert final["pred_x_rows"].grad is not None
 
 
+def test_s0_intermediate_supervision_matches_each_layer_and_backpropagates():
+    target = _target()
+
+    def prediction(offset: float):
+        return {
+            "exist_logits": torch.tensor([[[5.0, -5.0], [-5.0, 5.0]]], requires_grad=True),
+            "pred_x_rows": torch.full((1, 2, 72), 100.0 + offset, requires_grad=True),
+            "range_norm": torch.tensor([[[0.13, 0.27], [0.0, 1.0]]], requires_grad=True),
+            "row_x_logits": torch.randn(1, 2, 72, 200, requires_grad=True),
+        }
+
+    final = prediction(1.0)
+    auxiliaries = [prediction(12.0), prediction(8.0), prediction(4.0)]
+    outputs = dict(final)
+    outputs["aux_outputs"] = auxiliaries
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            lambda_obj=2.0,
+            lambda_point=5.0,
+            lambda_range=1.0,
+            lambda_line_iou=1.0,
+            line_iou_radius=15.0,
+        )
+    )
+    matches = matcher(final, [target])
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=800,
+            input_h=288,
+            w_exist=2.0,
+            w_point=5.0,
+            w_range=1.0,
+            w_line_iou=2.0,
+            line_iou_radius=15.0,
+            w_row_dfl=0.5,
+            lambda_intermediate=0.5,
+            intermediate_layer_weights=(1.0, 2.0, 3.0),
+        ),
+        matcher=matcher,
+    )
+    losses = criterion(outputs, [target], matches)
+
+    assert torch.isfinite(losses["loss_total"])
+    assert torch.isfinite(losses["loss_intermediate_total"])
+    assert losses["weight_intermediate"].item() == 0.5
+    losses["loss_total"].backward()
+    for auxiliary in auxiliaries:
+        assert auxiliary["pred_x_rows"].grad is not None
+        assert auxiliary["pred_x_rows"].grad.abs().sum() > 0
+        assert auxiliary["row_x_logits"].grad is not None
+        assert auxiliary["row_x_logits"].grad.abs().sum() > 0
+
+
 def test_geometry_draft_supervision_backprops_to_sampler_draft():
     target = _target()
     geometry_draft = {

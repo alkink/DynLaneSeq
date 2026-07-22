@@ -1,0 +1,27 @@
+_base_: culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep
+
+model:
+  structured_query:
+    intermediate_supervision: true
+  # DLA's segmentation auxiliary produced FP16 NaNs in the historical run.
+  # The full run is BF16 below; keeping this explicit documents the contract.
+  seg_aux:
+    amp_dtype: bfloat16
+
+matcher:
+  line_iou_radius: 15.0
+
+loss:
+  line_iou_radius: 15.0
+  # L1/L2/L3 are normalized with relative weights 1:2:3, then the complete
+  # intermediate stack contributes half as much as the final-layer objective.
+  lambda_intermediate: 0.5
+  intermediate_layer_weights: [1.0, 2.0, 3.0]
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  amp_dtype: bfloat16
+  check_finite_grad: true

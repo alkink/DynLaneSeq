@@ -82,12 +82,16 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         dynamic_proposal_seed_radius_bins=int(loss.get("dynamic_proposal_seed_radius_bins", 2)),
         dynamic_proposal_heatmap_pos_weight=float(loss.get("dynamic_proposal_heatmap_pos_weight", 1.0)),
         lambda_geometry_draft=float(loss.get("lambda_geometry_draft", 0.0)),
+        lambda_intermediate=float(loss.get("lambda_intermediate", 0.0)),
+        intermediate_layer_weights=tuple(float(v) for v in loss.get("intermediate_layer_weights", [])),
     )
     if "smoothness_contiguous" in getattr(LossConfig, "__dataclass_fields__", {}):
         base_kwargs["smoothness_contiguous"] = bool(loss.get("smoothness_contiguous", True))
     name = model.get("name", "DynLaneSeqS0")
     if name == "DynLaneSeqS0":
-        return S0Criterion(LossConfig(**base_kwargs, lambda_coarse=float(loss.get("lambda_coarse", 0.0))))
+        loss_cfg = LossConfig(**base_kwargs, lambda_coarse=float(loss.get("lambda_coarse", 0.0)))
+        aux_matcher = build_matcher(cfg) if loss_cfg.lambda_intermediate > 0.0 else None
+        return S0Criterion(loss_cfg, matcher=aux_matcher)
     if name == "DynLaneSeqS1":
         return S1Criterion(
             S1LossConfig(

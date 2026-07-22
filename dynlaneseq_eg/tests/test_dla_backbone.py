@@ -120,6 +120,25 @@ def test_culane_dla34_config_is_res34_control_except_backbone_metadata() -> None
     assert dla34 == res34
 
 
+def test_culane_dla34_radius15_deep_supervision_config_contract() -> None:
+    cfg = load_config(
+        "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_slots32_b4x4_"
+        "1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep.yaml"
+    )
+    assert cfg["model"]["backbone_name"] == "dla34"
+    assert cfg["model"]["structured_query"]["num_layers"] == 4
+    assert cfg["model"]["structured_query"]["intermediate_supervision"] is True
+    assert cfg["matcher"]["line_iou_radius"] == 15.0
+    assert cfg["loss"]["line_iou_radius"] == 15.0
+    assert cfg["loss"]["lambda_intermediate"] == 0.5
+    assert cfg["loss"]["intermediate_layer_weights"] == [1.0, 2.0, 3.0]
+    assert cfg["training"]["seed"] == 3407
+    assert cfg["training"]["amp_dtype"] == "bfloat16"
+    assert cfg["training"]["batch_size"] == 4
+    assert cfg["training"]["gradient_accumulation_steps"] == 4
+    assert cfg["training"]["batch_size"] * cfg["training"]["gradient_accumulation_steps"] == 16
+
+
 def test_unknown_backbone_name_fails_clearly() -> None:
     cfg = {
         "model": {

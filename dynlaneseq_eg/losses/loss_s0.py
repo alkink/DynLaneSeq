@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dynlaneseq_eg.modeling.common import sort_range_norm
+from .matcher_s0 import HungarianMatcherS0
 
 
 @dataclass
@@ -42,12 +43,15 @@ class LossConfig:
     dynamic_proposal_heatmap_pos_weight: float = 1.0
     lambda_coarse: float = 0.0
     lambda_geometry_draft: float = 0.0
+    lambda_intermediate: float = 0.0
+    intermediate_layer_weights: tuple[float, ...] = ()
 
 
 class S0Criterion(nn.Module):
-    def __init__(self, cfg: LossConfig | None = None):
+    def __init__(self, cfg: LossConfig | None = None, matcher: HungarianMatcherS0 | None = None):
         super().__init__()
         self.cfg = cfg or LossConfig()
+        self.matcher = matcher
         self._iteration = 0
 
     def set_iteration(self, iteration: int) -> None:
@@ -153,6 +157,97 @@ class S0Criterion(nn.Module):
                 }
             )
         out = self.add_geometry_draft_loss(out, raw_outputs, targets, matches)
+        out = self.add_intermediate_losses(out, raw_outputs, targets)
+        return out
+
+    def add_intermediate_losses(
+        self,
+        losses: dict[str, torch.Tensor],
+        outputs: dict[str, object],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Deeply supervise intermediate structured decoder states.
+
+        Each layer receives its own assignment, matching CondLSTR's training
+        principle while retaining the final layer as the only quality-calibrated
+        output.  Encoder auxiliary objectives, smoothness, and quality are not
+        duplicated here.
+        """
+        strength = float(self.cfg.lambda_intermediate)
+        if strength <= 0.0:
+            return losses
+        aux_outputs = outputs.get("aux_outputs")
+        if not isinstance(aux_outputs, (list, tuple)) or not aux_outputs:
+            raise ValueError("lambda_intermediate > 0 requires non-empty model aux_outputs")
+        if self.matcher is None:
+            raise ValueError("lambda_intermediate > 0 requires an auxiliary matcher")
+
+        configured_weights = tuple(float(v) for v in self.cfg.intermediate_layer_weights)
+        if configured_weights:
+            if len(configured_weights) != len(aux_outputs):
+                raise ValueError(
+                    "intermediate_layer_weights must match the number of auxiliary decoder layers: "
+                    f"got {len(configured_weights)} weights for {len(aux_outputs)} outputs"
+                )
+            layer_weights = configured_weights
+        else:
+            layer_weights = tuple(1.0 for _ in aux_outputs)
+        if any(weight < 0.0 for weight in layer_weights) or sum(layer_weights) <= 0.0:
+            raise ValueError("intermediate_layer_weights must be non-negative with a positive sum")
+
+        normalizer = float(sum(layer_weights))
+        row_dfl_weight = self.row_dfl_weight()
+        aggregate = losses["loss_total"].new_zeros(())
+        component_sums = {
+            "exist": aggregate.clone(),
+            "point": aggregate.clone(),
+            "range": aggregate.clone(),
+            "line_iou": aggregate.clone(),
+            "row_dfl": aggregate.clone(),
+        }
+        out = dict(losses)
+        for layer_index, (aux, layer_weight) in enumerate(zip(aux_outputs, layer_weights), start=1):
+            if not isinstance(aux, dict):
+                raise TypeError("every auxiliary decoder output must be a dictionary")
+            aux_matches = self.matcher(aux, targets)
+            zero = self._zero_anchor(aux).sum() * 0.0
+            aux_exist = self.compute_exist_loss(aux, aux_matches) if self.cfg.w_exist != 0 else zero
+            aux_point = self.compute_point_loss(aux, targets, aux_matches) if self.cfg.w_point != 0 else zero
+            aux_range = self.compute_range_loss(aux, targets, aux_matches) if self.cfg.w_range != 0 else zero
+            aux_line_iou = (
+                self.compute_line_iou_loss(aux, targets, aux_matches)
+                if self.cfg.w_line_iou != 0
+                else zero
+            )
+            aux_row_dfl = (
+                self.compute_row_dfl_loss(aux, targets, aux_matches)
+                if row_dfl_weight != 0
+                else zero
+            )
+            aux_total = (
+                self.cfg.w_exist * aux_exist
+                + self.cfg.w_point * aux_point
+                + self.cfg.w_range * aux_range
+                + self.cfg.w_line_iou * aux_line_iou
+                + row_dfl_weight * aux_row_dfl
+            )
+            normalized_weight = float(layer_weight) / normalizer
+            aggregate = aggregate + normalized_weight * aux_total
+            component_sums["exist"] = component_sums["exist"] + normalized_weight * aux_exist
+            component_sums["point"] = component_sums["point"] + normalized_weight * aux_point
+            component_sums["range"] = component_sums["range"] + normalized_weight * aux_range
+            component_sums["line_iou"] = component_sums["line_iou"] + normalized_weight * aux_line_iou
+            component_sums["row_dfl"] = component_sums["row_dfl"] + normalized_weight * aux_row_dfl
+            out[f"loss_intermediate_l{layer_index}_total"] = aux_total
+
+        out["loss_total"] = out["loss_total"] + strength * aggregate
+        out["loss_intermediate_total"] = aggregate
+        out["loss_intermediate_exist"] = component_sums["exist"]
+        out["loss_intermediate_point"] = component_sums["point"]
+        out["loss_intermediate_range"] = component_sums["range"]
+        out["loss_intermediate_line_iou"] = component_sums["line_iou"]
+        out["loss_intermediate_row_dfl"] = component_sums["row_dfl"]
+        out["weight_intermediate"] = aggregate.new_tensor(strength)
         return out
 
     def add_geometry_draft_loss(
