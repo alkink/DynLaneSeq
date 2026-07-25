@@ -8,7 +8,7 @@ import torch
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.modeling.backbone_dla import DLA34Backbone
 from dynlaneseq_eg.modeling.dynlaneseq_s0 import DynLaneSeqEncoder
-from dynlaneseq_eg.modeling.fpn import SimpleFPN
+from dynlaneseq_eg.modeling.fpn import BalancedDetailFPN, SimpleFPN
 
 
 def test_dla34_backbone_feature_contract() -> None:
@@ -43,6 +43,68 @@ def test_dla34_fpn_path_backpropagates_finite_gradients() -> None:
     assert grad is not None
     assert torch.isfinite(grad).all()
     assert float(grad.abs().sum()) > 0.0
+
+
+def test_balanced_detail_fpn_preserves_shapes_and_initial_detail_prior() -> None:
+    backbone = DLA34Backbone(pretrained=False).eval()
+    fpn = BalancedDetailFPN(
+        in_channels=backbone.out_channels,
+        out_channels=32,
+        num_groups=8,
+        detail_init=2.0,
+        context_init=0.0,
+    ).eval()
+    with torch.inference_mode():
+        pyramid = fpn(backbone(torch.randn(1, 3, 64, 96)), return_pyramid=True)
+    assert {name: tuple(value.shape) for name, value in pyramid.items()} == {
+        "p2": (1, 32, 16, 24),
+        "p3": (1, 32, 8, 12),
+        "p4": (1, 32, 4, 6),
+        "p5": (1, 32, 2, 3),
+    }
+    p2_weights = fpn.fusion_weights()["p2"]
+    assert torch.isclose(p2_weights.sum(), torch.tensor(1.0))
+    assert float(p2_weights[0]) > 0.70
+    assert float(p2_weights[1]) < 0.30
+
+
+def test_balanced_detail_fpn_backpropagates_to_every_backbone_level() -> None:
+    in_channels = {"c2": 8, "c3": 12, "c4": 16, "c5": 24}
+    fpn = BalancedDetailFPN(in_channels=in_channels, out_channels=16, num_groups=4).train()
+    features = {
+        "c2": torch.randn(2, 8, 16, 24, requires_grad=True),
+        "c3": torch.randn(2, 12, 8, 12, requires_grad=True),
+        "c4": torch.randn(2, 16, 4, 6, requires_grad=True),
+        "c5": torch.randn(2, 24, 2, 3, requires_grad=True),
+    }
+    fpn(features).square().mean().backward()
+    for name, feature in features.items():
+        assert feature.grad is not None, name
+        assert torch.isfinite(feature.grad).all(), name
+        assert float(feature.grad.abs().sum()) > 0.0, name
+
+
+def test_culane_dla34_balanced_detail_config_changes_only_neck_and_output() -> None:
+    config_dir = Path("dynlaneseq_eg/configs")
+    control = load_config(
+        config_dir / "culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml"
+    )
+    balanced = load_config(
+        config_dir
+        / "culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_balanced_detail_fpn256_l4_dfl_50ep.yaml"
+    )
+    assert balanced["model"]["neck"]["type"] == "balanced_detail_fpn"
+    assert balanced["matcher"]["line_iou_radius"] == 7.5
+    assert balanced["loss"]["line_iou_radius"] == 7.5
+    assert balanced["model"]["structured_query"].get("intermediate_supervision", False) is False
+    assert balanced["training"]["batch_size"] == 8
+    assert balanced["training"]["gradient_accumulation_steps"] == 2
+
+    for cfg in (control, balanced):
+        cfg.pop("_config_path", None)
+        cfg.pop("output_dir", None)
+    balanced["model"].pop("neck")
+    assert balanced == control
 
 
 def test_dla34_encoder_selection_and_frozen_bn() -> None:

@@ -11,7 +11,7 @@ from .backbone_resnet import ResNetBackbone
 from .common import input_to_grid, sort_range_norm
 from .cross_attention_decoder import LaneCrossAttentionDecoder
 from .evidence import CurveAlignedSampler
-from .fpn import SimpleFPN
+from .fpn import BalancedDetailFPN, SimpleFPN
 from .heads_s0 import CenterlineAuxHead, S0Heads, SegAuxHead
 from .lane_queries import LaneQueries
 from .position_encoding import SinePositionEncoding2D
@@ -360,7 +360,25 @@ class DynLaneSeqEncoder(nn.Module):
                 f"Unsupported model.backbone_name: {backbone_name!r}. "
                 "Supported: resnet, resnet18, resnet34, resnet50, resnet101, dla34"
             )
-        self.fpn = SimpleFPN(in_channels=self.backbone.out_channels, out_channels=fpn_channels)
+        neck_cfg = model_cfg.get("neck", {})
+        neck_type = str(neck_cfg.get("type", "simple_fpn")).strip().lower()
+        if neck_type in {"simple", "simple_fpn", "fpn"}:
+            self.fpn = SimpleFPN(in_channels=self.backbone.out_channels, out_channels=fpn_channels)
+        elif neck_type in {"balanced_detail", "balanced_detail_fpn"}:
+            self.fpn = BalancedDetailFPN(
+                in_channels=self.backbone.out_channels,
+                out_channels=fpn_channels,
+                num_groups=int(neck_cfg.get("num_groups", 8)),
+                upsample_mode=str(neck_cfg.get("upsample_mode", "bilinear")),
+                detail_init=float(neck_cfg.get("detail_init", 2.0)),
+                context_init=float(neck_cfg.get("context_init", 0.0)),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model.neck.type: {neck_type!r}. "
+                "Supported: simple_fpn, balanced_detail_fpn"
+            )
+        self.neck_type = neck_type
         self.proj = nn.Conv2d(fpn_channels, dim, 1)
         self.ms_proj = nn.ModuleDict(
             {
