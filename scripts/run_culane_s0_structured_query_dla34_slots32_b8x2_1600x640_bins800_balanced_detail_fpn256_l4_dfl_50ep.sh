@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_balanced_detail_fpn256_l4_dfl_50ep.yaml}"
 DEVICE="${DEVICE:-cuda}"
 DATA_ROOT="${DATA_ROOT:-dataset}"
+OUT_DIR="${OUT_DIR:-}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
@@ -23,6 +24,10 @@ TRAIN_ARGS=(
   --compile-mode "${COMPILE_MODE}"
   --attention-backend "${ATTENTION_BACKEND}"
 )
+
+if [[ -n "${OUT_DIR}" ]]; then
+  TRAIN_ARGS+=(--output-dir "${OUT_DIR}")
+fi
 
 if [[ "${COMPILE_MODEL}" == "1" || "${COMPILE_MODEL}" == "true" ]]; then
   TRAIN_ARGS+=(--compile-model)
