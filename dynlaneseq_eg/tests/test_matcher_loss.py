@@ -7,6 +7,7 @@ from dynlaneseq_eg.losses.loss_s0 import LossConfig
 from dynlaneseq_eg.losses.loss_s2 import S2LossConfig
 from dynlaneseq_eg.losses.loss_s3 import S3Criterion
 from dynlaneseq_eg.losses.matcher_s0 import MatcherConfig
+from dynlaneseq_eg.modeling.common import soft_expected_x, soft_expected_x_with_log_probs
 
 
 def _target():
@@ -106,6 +107,44 @@ def test_row_dfl_loss_backprops_to_row_logits_with_soft_bin_target():
     loss.backward()
     assert row_x_logits.grad is not None
     assert row_x_logits.grad.abs().sum() > 0
+
+
+def test_shared_log_distribution_matches_separate_expected_x_and_dfl():
+    torch.manual_seed(7)
+    logits_reference = torch.randn(1, 2, 4, 8, requires_grad=True)
+    logits_shared = logits_reference.detach().clone().requires_grad_(True)
+    target = {
+        "x_rows": torch.tensor([[0.0, 10.0, 15.0, -1.0]]),
+        "valid_mask": torch.tensor([[True, True, True, False]]),
+        "range_y": torch.zeros((1, 2)),
+    }
+    matches = [{"pred_indices": torch.tensor([0]), "gt_indices": torch.tensor([0])}]
+    criterion = S0Criterion(LossConfig(input_w=80, w_row_dfl=1.0))
+
+    reference_x = soft_expected_x(logits_reference, input_w=80, x_bins=8)
+    reference_outputs = {
+        "row_x_logits": logits_reference,
+        "pred_x_rows": reference_x,
+    }
+    reference_loss = criterion.compute_row_dfl_loss(reference_outputs, [target], matches)
+    (reference_x.sum() + reference_loss).backward()
+
+    shared_x, shared_log_probs = soft_expected_x_with_log_probs(
+        logits_shared,
+        input_w=80,
+        x_bins=8,
+    )
+    shared_outputs = {
+        "row_x_logits": logits_shared,
+        "row_x_log_probs": shared_log_probs,
+        "pred_x_rows": shared_x,
+    }
+    shared_loss = criterion.compute_row_dfl_loss(shared_outputs, [target], matches)
+    (shared_x.sum() + shared_loss).backward()
+
+    assert torch.allclose(shared_x, reference_x, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(shared_loss, reference_loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(logits_shared.grad, logits_reference.grad, atol=2e-5, rtol=2e-5)
 
 
 def test_matcher_line_iou_cost_is_finite_for_non_overlapping_lanes():

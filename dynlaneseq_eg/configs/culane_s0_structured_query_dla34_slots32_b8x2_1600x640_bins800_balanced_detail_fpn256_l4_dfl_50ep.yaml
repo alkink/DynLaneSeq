@@ -12,4 +12,3 @@ model:
     upsample_mode: bilinear
     detail_init: 2.0
     context_init: 0.0
-

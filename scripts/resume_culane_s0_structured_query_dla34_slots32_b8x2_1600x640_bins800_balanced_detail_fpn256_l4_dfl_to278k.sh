@@ -12,6 +12,9 @@ TARGET_ITERS="${TARGET_ITERS:-278000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
+COMPILE_MODEL="${COMPILE_MODEL:-0}"
+COMPILE_MODE="${COMPILE_MODE:-default}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-default}"
 
 if [[ ! -f "${RESUME}" ]]; then
   echo "Missing resume checkpoint: ${RESUME}" >&2
@@ -31,14 +34,24 @@ echo "start_iter: ${START_ITER}"
 echo "target_iters_total: ${TARGET_ITERS}"
 echo "remaining_iters_this_run: ${REMAINING_ITERS}"
 
-python -u -m dynlaneseq_eg.tools.train \
-  --config "${CONFIG}" \
-  --device "${DEVICE}" \
-  --dataset-root "${DATA_ROOT}" \
-  --resume "${RESUME}" \
-  --max-iters "${REMAINING_ITERS}" \
-  --output-dir "${OUT_DIR}" \
-  --batch-size "${BATCH_SIZE}" \
-  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
+TRAIN_ARGS=(
+  --config "${CONFIG}"
+  --device "${DEVICE}"
+  --dataset-root "${DATA_ROOT}"
+  --resume "${RESUME}"
+  --max-iters "${REMAINING_ITERS}"
+  --output-dir "${OUT_DIR}"
+  --batch-size "${BATCH_SIZE}"
+  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}"
   --grad-accum "${GRAD_ACCUM}"
+  --compile-mode "${COMPILE_MODE}"
+  --attention-backend "${ATTENTION_BACKEND}"
+)
 
+if [[ "${COMPILE_MODEL}" == "1" || "${COMPILE_MODEL}" == "true" ]]; then
+  TRAIN_ARGS+=(--compile-model)
+else
+  TRAIN_ARGS+=(--no-compile-model)
+fi
+
+python -u -m dynlaneseq_eg.tools.train "${TRAIN_ARGS[@]}"

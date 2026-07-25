@@ -27,19 +27,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         default="all",
-        choices=["all", "synthetic-model", "synthetic-train", "dataloader", "loader-h2d", "real-train"],
+        choices=[
+            "all",
+            "synthetic-model",
+            "synthetic-train",
+            "dataloader",
+            "loader-h2d",
+            "real-train",
+            "phase-train",
+            "operator-profile",
+        ],
     )
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=0)
+    parser.add_argument("--data-root", default="")
     parser.add_argument("--num-workers", type=int, default=-1)
     parser.add_argument("--prefetch-factor", type=int, default=0)
     parser.add_argument("--persistent-workers", type=int, choices=[0, 1], default=-1)
+    parser.add_argument(
+        "--channels-last",
+        type=int,
+        choices=(0, 1),
+        default=-1,
+        help="Override training.channels_last for an exact A/B timing check.",
+    )
     parser.add_argument("--synthetic-lanes", type=int, default=4)
     parser.add_argument("--synthetic-seg", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("float16", "bfloat16"),
+        default="",
+        help="Override the main autocast dtype.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--clip-grad-norm", type=float, default=-1.0)
+    parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--seg-aux-amp-dtype",
+        choices=("inherit", "float16", "bfloat16"),
+        default="",
+        help="Match the segmentation auxiliary precision used by the training launcher.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("default", "flash_preferred"),
+        default="",
+        help="Override structured_query.attention_backend.",
+    )
     return parser.parse_args()
 
 
@@ -59,6 +100,11 @@ def configure_runtime(cfg: dict[str, Any], device: torch.device, no_amp: bool) -
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
+        amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
+        if amp_dtype_name in {"bf16", "bfloat16"}:
+            torch.set_autocast_gpu_dtype(torch.bfloat16)
+        elif amp_dtype_name in {"fp16", "float16", "half"}:
+            torch.set_autocast_gpu_dtype(torch.float16)
     return bool(train_cfg.get("amp", False) and device.type == "cuda" and not no_amp)
 
 
@@ -66,15 +112,41 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, 
     cfg = copy.deepcopy(cfg)
     cfg.setdefault("training", {})
     cfg.setdefault("dataloader", {})
+    cfg.setdefault("dataset", {})
+    cfg.setdefault("model", {})
     if args.batch_size > 0:
         cfg["training"]["batch_size"] = int(args.batch_size)
+    if args.data_root:
+        cfg["dataset"]["root"] = str(args.data_root)
     if args.num_workers >= 0:
         cfg["dataloader"]["num_workers"] = int(args.num_workers)
     if args.prefetch_factor > 0:
         cfg["dataloader"]["prefetch_factor"] = int(args.prefetch_factor)
     if args.persistent_workers >= 0:
         cfg["dataloader"]["persistent_workers"] = bool(args.persistent_workers)
+    if args.channels_last >= 0:
+        cfg["training"]["channels_last"] = bool(args.channels_last)
+    if args.amp_dtype:
+        cfg["training"]["amp_dtype"] = str(args.amp_dtype)
+    if args.seg_aux_amp_dtype:
+        cfg["model"].setdefault("seg_aux", {})["amp_dtype"] = str(args.seg_aux_amp_dtype)
+    if args.attention_backend:
+        cfg["model"].setdefault("structured_query", {})["attention_backend"] = str(args.attention_backend)
     return cfg
+
+
+def channels_last_enabled(cfg: dict[str, Any], device: torch.device) -> bool:
+    return bool(cfg.get("training", {}).get("channels_last", False) and device.type == "cuda")
+
+
+def move_images(
+    images: torch.Tensor,
+    device: torch.device,
+    channels_last: bool,
+) -> torch.Tensor:
+    if channels_last:
+        return images.to(device, non_blocking=True, memory_format=torch.channels_last)
+    return images.to(device, non_blocking=True)
 
 
 def make_synthetic_targets(
@@ -220,6 +292,8 @@ def run_synthetic_model(
         int(model_cfg.get("input_w", 800)),
         device=device,
     )
+    if channels_last_enabled(cfg, device):
+        images = images.contiguous(memory_format=torch.channels_last)
     clip_norm = args.clip_grad_norm if args.clip_grad_norm >= 0 else float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
     sync(device)
@@ -270,12 +344,18 @@ def run_synthetic_train(
     )
     if h2d:
         targets = clone_targets_to_cpu(targets)
+    elif channels_last_enabled(cfg, device):
+        images = images.contiguous(memory_format=torch.channels_last)
     clip_norm = args.clip_grad_norm if args.clip_grad_norm >= 0 else float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
     sync(device)
     start = None
     for step in range(args.warmup + args.steps):
-        step_images = images.to(device, non_blocking=True) if h2d else images
+        step_images = (
+            move_images(images, device, channels_last_enabled(cfg, device))
+            if h2d
+            else images
+        )
         step_targets = nested_to_device(targets, device) if h2d else targets
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -300,7 +380,7 @@ def run_dataloader(cfg: dict[str, Any], device: torch.device, args: argparse.Nam
     for step in range(args.warmup + args.steps):
         images, targets, _ = next(iterator)
         if h2d:
-            images = images.to(device, non_blocking=True)
+            images = move_images(images, device, channels_last_enabled(cfg, device))
             targets = nested_to_device(targets, device)
             sync(device)
         if step == args.warmup - 1:
@@ -322,25 +402,230 @@ def run_real_train(
     loader = build_dataloader(cfg, split="train", training=True)
     iterator = infinite_loader(loader)
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
+    accumulation_steps = max(int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)), 1)
     clip_norm = args.clip_grad_norm if args.clip_grad_norm >= 0 else float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
     sync(device)
     start = None
+    micro_in_step = 0
+    optimizer.zero_grad(set_to_none=True)
     for step in range(args.warmup + args.steps):
         images, targets, _ = next(iterator)
-        images = images.to(device, non_blocking=True)
+        images = move_images(images, device, channels_last_enabled(cfg, device))
         targets = nested_to_device(targets, device)
-        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, step)
             loss_dict = criterion(outputs, targets, matches)
-            loss = loss_dict["loss_total"]
-        optimizer_step(loss, model, optimizer, scaler, amp_enabled, clip_norm)
+            loss = loss_dict["loss_total"] / float(accumulation_steps)
+        if amp_enabled:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        micro_in_step += 1
+        if micro_in_step >= accumulation_steps:
+            if amp_enabled:
+                scaler.unscale_(optimizer)
+            if clip_norm > 0:
+                clip_grad_norm_(model.parameters(), clip_norm)
+            if amp_enabled:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            micro_in_step = 0
         if step == args.warmup - 1:
             sync(device)
             start = time.perf_counter()
     sync(device)
     report("real-train", args.steps, batch_size, time.perf_counter() - (start or time.perf_counter()), device)
+
+
+def run_phase_train(
+    cfg: dict[str, Any],
+    model: torch.nn.Module,
+    matcher,
+    criterion,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    device: torch.device,
+    amp_enabled: bool,
+    args: argparse.Namespace,
+) -> None:
+    """Synchronize every training phase to expose hidden CPU/GPU stalls.
+
+    This deliberately sacrifices absolute throughput accuracy.  The regular
+    ``real-train`` mode measures end-to-end speed; this mode explains where the
+    time goes.
+    """
+
+    loader = build_dataloader(cfg, split="train", training=True)
+    iterator = infinite_loader(loader)
+    batch_size = int(cfg.get("training", {}).get("batch_size", 1))
+    accumulation_steps = max(int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)), 1)
+    clip_norm = args.clip_grad_norm if args.clip_grad_norm >= 0 else float(
+        cfg.get("training", {}).get("clip_grad_norm", 1.0)
+    )
+    phase_totals = {
+        "data": 0.0,
+        "h2d": 0.0,
+        "forward": 0.0,
+        "matcher": 0.0,
+        "criterion": 0.0,
+        "backward": 0.0,
+        "optimizer": 0.0,
+    }
+    optimizer.zero_grad(set_to_none=True)
+    micro_in_step = 0
+    measured_steps = 0
+    total_steps = int(args.warmup + args.steps)
+    for step in range(total_steps):
+        record = step >= args.warmup
+
+        sync(device)
+        phase_start = time.perf_counter()
+        images, targets, _ = next(iterator)
+        elapsed = time.perf_counter() - phase_start
+        if record:
+            phase_totals["data"] += elapsed
+
+        sync(device)
+        phase_start = time.perf_counter()
+        images = move_images(images, device, channels_last_enabled(cfg, device))
+        targets = nested_to_device(targets, device)
+        sync(device)
+        if record:
+            phase_totals["h2d"] += time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model_forward_no_match(model, images, cfg)
+        sync(device)
+        if record:
+            phase_totals["forward"] += time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
+        matches = matcher(outputs, targets)
+        sync(device)
+        if record:
+            phase_totals["matcher"] += time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            if hasattr(criterion, "set_iteration"):
+                criterion.set_iteration(step)
+            loss_dict = criterion(outputs, targets, matches)
+            loss = loss_dict["loss_total"] / float(accumulation_steps)
+        sync(device)
+        if record:
+            phase_totals["criterion"] += time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
+        if amp_enabled:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        sync(device)
+        if record:
+            phase_totals["backward"] += time.perf_counter() - phase_start
+
+        micro_in_step += 1
+        phase_start = time.perf_counter()
+        if micro_in_step >= accumulation_steps:
+            if amp_enabled:
+                scaler.unscale_(optimizer)
+            if clip_norm > 0:
+                clip_grad_norm_(model.parameters(), clip_norm)
+            if amp_enabled:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            micro_in_step = 0
+        sync(device)
+        if record:
+            phase_totals["optimizer"] += time.perf_counter() - phase_start
+            measured_steps += 1
+
+    denom = max(measured_steps, 1)
+    total = sum(phase_totals.values())
+    print("phase-train synchronized breakdown:")
+    for name, elapsed in phase_totals.items():
+        per_step_ms = 1000.0 * elapsed / denom
+        share = 100.0 * elapsed / max(total, 1e-9)
+        print(f"  {name:>9s}: {per_step_ms:8.2f} ms/micro-step | {share:5.1f}%")
+    print(
+        f"  {'total':>9s}: {1000.0 * total / denom:8.2f} ms/micro-step"
+        f" | {batch_size * denom / max(total, 1e-9):.1f} img/s (synchronized diagnostic)"
+    )
+
+
+def run_operator_profile(
+    cfg: dict[str, Any],
+    model: torch.nn.Module,
+    matcher,
+    criterion,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    device: torch.device,
+    amp_enabled: bool,
+    args: argparse.Namespace,
+) -> None:
+    if device.type != "cuda":
+        raise RuntimeError("operator-profile requires CUDA")
+    loader = build_dataloader(cfg, split="train", training=True)
+    iterator = infinite_loader(loader)
+    clip_norm = args.clip_grad_norm if args.clip_grad_norm >= 0 else float(
+        cfg.get("training", {}).get("clip_grad_norm", 1.0)
+    )
+
+    def one_step(profile: bool = False) -> None:
+        images, targets, _ = next(iterator)
+        images = move_images(images, device, channels_last_enabled(cfg, device))
+        targets = nested_to_device(targets, device)
+        optimizer.zero_grad(set_to_none=True)
+        record = torch.profiler.record_function
+        with record("train::forward"):
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                outputs = model_forward_no_match(model, images, cfg)
+        with record("train::matcher"):
+            matches = matcher(outputs, targets)
+        with record("train::criterion"):
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                loss_dict = criterion(outputs, targets, matches)
+                loss = loss_dict["loss_total"]
+        with record("train::backward"):
+            if amp_enabled:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+        with record("train::optimizer"):
+            if amp_enabled:
+                scaler.unscale_(optimizer)
+            if clip_norm > 0:
+                clip_grad_norm_(model.parameters(), clip_norm)
+            if amp_enabled:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+        sync(device)
+
+    for _ in range(max(int(args.warmup), 1)):
+        one_step()
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(
+        activities=activities,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        one_step(profile=True)
+    print("operator-profile sorted by self CUDA time:")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=40))
+    print("operator-profile sorted by total CPU time:")
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
 
 
 def main() -> None:
@@ -350,9 +635,13 @@ def main() -> None:
     device = torch.device(args.device)
     amp_enabled = configure_runtime(cfg, device, args.no_amp)
     model = build_model(cfg).to(device).train()
+    if channels_last_enabled(cfg, device):
+        model = model.to(memory_format=torch.channels_last)
     matcher = build_matcher(cfg)
     criterion = build_criterion(cfg)
     optimizer = build_optimizer(cfg, model)
+    if args.compile_model:
+        model = torch.compile(model, mode=str(args.compile_mode))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     print(
         {
@@ -361,14 +650,22 @@ def main() -> None:
             "device": str(device),
             "batch_size": int(cfg.get("training", {}).get("batch_size", 1)),
             "amp": amp_enabled,
+            "channels_last": channels_last_enabled(cfg, device),
+            "data_root": cfg.get("dataset", {}).get("root"),
             "num_workers": int(cfg.get("dataloader", {}).get("num_workers", 0)),
             "prefetch_factor": cfg.get("dataloader", {}).get("prefetch_factor"),
             "persistent_workers": cfg.get("dataloader", {}).get("persistent_workers"),
             "steps": args.steps,
             "warmup": args.warmup,
+            "compile_model": bool(args.compile_model),
+            "compile_mode": str(args.compile_mode) if args.compile_model else None,
         }
     )
-    modes = [args.mode] if args.mode != "all" else ["synthetic-model", "synthetic-train", "loader-h2d", "real-train"]
+    modes = (
+        [args.mode]
+        if args.mode != "all"
+        else ["synthetic-model", "synthetic-train", "loader-h2d", "real-train", "phase-train"]
+    )
     for mode in modes:
         if mode == "synthetic-model":
             run_synthetic_model(cfg, model, optimizer, scaler, device, amp_enabled, args)
@@ -380,6 +677,10 @@ def main() -> None:
             run_dataloader(cfg, device, args, h2d=True)
         elif mode == "real-train":
             run_real_train(cfg, model, matcher, criterion, optimizer, scaler, device, amp_enabled, args)
+        elif mode == "phase-train":
+            run_phase_train(cfg, model, matcher, criterion, optimizer, scaler, device, amp_enabled, args)
+        elif mode == "operator-profile":
+            run_operator_profile(cfg, model, matcher, criterion, optimizer, scaler, device, amp_enabled, args)
         else:
             raise ValueError(f"Unhandled mode: {mode}")
 

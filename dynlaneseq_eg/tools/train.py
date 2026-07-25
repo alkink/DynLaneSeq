@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,37 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def report_cuda_runtime(device: torch.device) -> None:
+    """Print enough runtime metadata to diagnose silently incompatible wheels."""
+
+    if device.type != "cuda":
+        return
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(index)
+    native_arch = f"sm_{major}{minor}"
+    compiled_arches = list(torch.cuda.get_arch_list())
+    runtime = {
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "gpu": torch.cuda.get_device_name(index),
+        "compute_capability": f"{major}.{minor}",
+        "compiled_cuda_arches": compiled_arches,
+        "native_arch_available": native_arch in compiled_arches,
+    }
+    print({"cuda_runtime_audit": runtime})
+    if compiled_arches and native_arch not in compiled_arches:
+        message = (
+            f"This PyTorch build has no native {native_arch} kernels for "
+            f"{runtime['gpu']} (compiled arches: {compiled_arches}). "
+            "PTX/JIT fallback or unsupported kernels can make training "
+            "dramatically slower or fail."
+        )
+        if major >= 12:
+            message += " Blackwell GPUs require a CUDA 12.8-era PyTorch build (PyTorch 2.7+ cu128 or newer)."
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 def main() -> None:
@@ -48,6 +80,31 @@ def main() -> None:
         default=0,
         help="Override training.gradient_accumulation_steps.",
     )
+    parser.set_defaults(compile_model=None)
+    parser.add_argument(
+        "--compile-model",
+        dest="compile_model",
+        action="store_true",
+        help="Compile the model even when training.compile_model is false.",
+    )
+    parser.add_argument(
+        "--no-compile-model",
+        dest="compile_model",
+        action="store_false",
+        help="Disable compilation even when training.compile_model is true.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="",
+        help="Override training.compile_mode.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("default", "flash_preferred"),
+        default="",
+        help="Override model.structured_query.attention_backend.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.output_dir:
@@ -60,6 +117,14 @@ def main() -> None:
         cfg.setdefault("model", {}).setdefault("seg_aux", {})["amp_dtype"] = args.seg_aux_amp_dtype
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
+    if args.compile_model is not None:
+        cfg.setdefault("training", {})["compile_model"] = bool(args.compile_model)
+    if args.compile_mode:
+        cfg.setdefault("training", {})["compile_mode"] = str(args.compile_mode)
+    if args.attention_backend:
+        cfg.setdefault("model", {}).setdefault("structured_query", {})[
+            "attention_backend"
+        ] = str(args.attention_backend)
     train_cfg = cfg.get("training", {})
     amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
     amp_dtype_is_bf16 = amp_dtype_name in {"bf16", "bfloat16"}
@@ -69,6 +134,7 @@ def main() -> None:
         seed_everything(seed)
     device = torch.device(args.device)
     if device.type == "cuda":
+        report_cuda_runtime(device)
         torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", False))
         if bool(train_cfg.get("tf32", False)):
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -111,6 +177,10 @@ def main() -> None:
             compile_kwargs["backend"] = str(train_cfg.get("compile_backend"))
         if train_cfg.get("compile_mode") is not None:
             compile_kwargs["mode"] = str(train_cfg.get("compile_mode"))
+        print(
+            "torch.compile enabled: the first real optimizer step performs a "
+            "one-time compilation and is excluded from steady-state speed/ETA."
+        )
         train_model = torch.compile(model, **compile_kwargs)
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
     accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
@@ -134,6 +204,10 @@ def main() -> None:
             "seg_aux_amp_dtype": str(cfg.get("model", {}).get("seg_aux", {}).get("amp_dtype", "inherit")),
             "channels_last": channels_last,
             "compile_model": bool(train_cfg.get("compile_model", False)),
+            "compile_mode": str(train_cfg.get("compile_mode", "default")),
+            "attention_backend": str(
+                cfg.get("model", {}).get("structured_query", {}).get("attention_backend", "default")
+            ),
             "clip_grad_norm": float(train_cfg.get("clip_grad_norm", 1.0)),
             "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),

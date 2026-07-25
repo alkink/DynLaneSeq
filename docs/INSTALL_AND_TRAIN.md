@@ -19,8 +19,9 @@ conda activate clrernet
 python -m pip install --upgrade pip
 ```
 
-Install PyTorch. Pick the CUDA wheel/channel that matches your machine. This is
-the common CUDA 12.1 conda install:
+Install PyTorch. Pick a current CUDA wheel from the official PyTorch selector.
+The following CUDA 12.8 wheel supports both Ampere/Ada cards and RTX 50-series
+Blackwell cards:
 
 ```bash
 python -m pip uninstall -y torch torchvision torchaudio
@@ -28,6 +29,12 @@ python -m pip cache purge
 
 python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
+
+For RTX 5070/5080/5090, do not reuse an old PyTorch 2.1 + CUDA 12.1
+environment.  Native Blackwell support starts with PyTorch 2.7 CUDA 12.8;
+use that combination or a newer official CUDA wheel.  A wheel without native
+`sm_120` kernels may fall back, fail on unsupported kernels, or be dramatically
+slower than an older GPU.
 
 Install the project dependencies and editable package:
 
@@ -44,8 +51,15 @@ import torch
 print("torch:", torch.__version__)
 print("cuda:", torch.cuda.is_available())
 print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
+print("capability:", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)
+print("compiled arches:", torch.cuda.get_arch_list() if torch.cuda.is_available() else None)
 PY
 ```
+
+The device capability should appear in the compiled architecture list
+(`(8, 6)` → `sm_86` for RTX 3090 and `(12, 0)` → `sm_120` for RTX 50-series).
+The training entry point also prints this audit and warns when the installed
+wheel lacks the native GPU architecture.
 
 ## 3. Link CULane
 
@@ -303,4 +317,26 @@ gh release create s0-strong-b16-75k \
   outputs/culane_s0_res34_strong_b16_giou/iter_0075000.pt \
   --title "S0 Strong B16 75k Checkpoint" \
   --notes "Strong S0 checkpoint used to initialize full CULane S1 residual training."
+```
+
+## 10. Fast Path For The Balanced DLA-34 Experiment
+
+The method configuration remains the neck-only A/B configuration.  Runtime
+switches are kept in a separate launcher:
+
+```bash
+DATA_ROOT=/home/alki/projects/CULane \
+bash scripts/run_culane_s0_structured_query_dla34_balanced_detail_fpn_fast.sh
+```
+
+This launcher preserves the original 8x2 batch schedule (effective batch size
+16) and uses `torch.compile(mode="default")`.  On the audited RTX 3090 stack,
+the compiled default attention backend is faster and uses less memory than
+explicitly forcing Flash SDPA.
+The first step includes a one-time compilation pause.  To resume:
+
+```bash
+DATA_ROOT=/home/alki/projects/CULane \
+RESUME=outputs/culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_balanced_detail_fpn256_l4_dfl_50ep/last.pt \
+bash scripts/resume_culane_s0_structured_query_dla34_balanced_detail_fpn_fast.sh
 ```

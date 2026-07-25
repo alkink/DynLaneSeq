@@ -171,6 +171,8 @@ def train_one_epoch(
     max_iters = max_iters or int(cfg.get("training", {}).get("max_iters", len(dataloader)))
     end_iter = start_iter + max_iters
     wall_start = time.perf_counter()
+    timing_start_iter = start_iter
+    reset_timing_after_first_step = bool(cfg.get("training", {}).get("compile_model", False))
     loader_len = max(len(dataloader), 1) if hasattr(dataloader, "__len__") else 1
     processed_images = 0
     micro_in_step = 0
@@ -237,6 +239,15 @@ def train_one_epoch(
                     scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             micro_in_step = 0
+            # torch.compile performs its one-time graph compilation on the
+            # first real forward/backward.  Excluding that startup pause keeps
+            # the reported img/s and ETA representative of steady-state
+            # training instead of depressing the cumulative average for hours.
+            if reset_timing_after_first_step:
+                wall_start = time.perf_counter()
+                timing_start_iter = iteration + 1
+                processed_images = 0
+                reset_timing_after_first_step = False
             if logger is not None:
                 stats = {k: v for k, v in loss_dict.items()}
                 stats.update(match_stats(outputs, matches))
@@ -246,9 +257,10 @@ def train_one_epoch(
                 logger.update(**stats)
                 if (iteration + 1) % log_interval == 0:
                     done = max(iteration + 1 - start_iter, 1)
+                    timed_done = max(iteration + 1 - timing_start_iter, 1)
                     total = max(max_iters, 1)
                     elapsed = time.perf_counter() - wall_start
-                    sec_per_iter = elapsed / done
+                    sec_per_iter = elapsed / timed_done
                     img_per_sec = processed_images / max(elapsed, 1e-6)
                     eta = sec_per_iter * max(total - done, 0)
                     pct = 100.0 * done / total

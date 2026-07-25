@@ -380,10 +380,9 @@ class S0Criterion(nn.Module):
             gt_x = gt_x[:, :row_count]
             mask = mask[:, :row_count]
             valid = mask & torch.isfinite(gt_x) & (gt_x >= 0.0) & (gt_x <= float(self.cfg.input_w))
-            if not valid.any():
-                continue
 
-            target_bin = (gt_x / bin_width).clamp(0.0, float(x_bins - 1))
+            safe_gt_x = torch.where(valid, gt_x, torch.zeros_like(gt_x))
+            target_bin = (safe_gt_x / bin_width).clamp(0.0, float(x_bins - 1))
             left = target_bin.floor().long()
             right = (left + 1).clamp(max=x_bins - 1)
             right_w = target_bin - left.to(dtype=target_bin.dtype)
@@ -392,7 +391,16 @@ class S0Criterion(nn.Module):
             left_w = torch.where(same, torch.ones_like(left_w), left_w)
             right_w = torch.where(same, torch.zeros_like(right_w), right_w)
 
-            log_probs = F.log_softmax(pred_logits, dim=-1)
+            cached_log_probs = outputs.get("row_x_log_probs")
+            if cached_log_probs is None:
+                log_probs = F.log_softmax(pred_logits, dim=-1)
+            else:
+                if cached_log_probs.shape != logits.shape:
+                    raise ValueError(
+                        "row_x_log_probs must match row_x_logits, got "
+                        f"{tuple(cached_log_probs.shape)} vs {tuple(logits.shape)}"
+                    )
+                log_probs = cached_log_probs.float()[bi, pred_idx, :row_count]
             left_lp = log_probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)
             right_lp = log_probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
             loss = -(left_w * left_lp + right_w * right_lp)
@@ -564,9 +572,8 @@ class S0Criterion(nn.Module):
             valid_mask = valid_mask[:, :row_count]
             centers = (x_rows / bin_width).clamp(min=0.0, max=float(x_bins - 1))
             valid = valid_mask & torch.isfinite(centers) & (x_rows >= 0.0) & (x_rows <= float(self.cfg.input_w))
-            if not valid.any():
-                continue
-            diff = grid - centers.unsqueeze(-1)
+            safe_centers = torch.where(valid, centers, torch.zeros_like(centers))
+            diff = grid - safe_centers.unsqueeze(-1)
             gauss = torch.exp(-0.5 * (diff / sigma).pow(2))
             gauss = gauss * valid.unsqueeze(-1).to(dtype=dtype)
             target_map[bi, 0, :row_count] = gauss.amax(dim=0)
@@ -705,23 +712,31 @@ class S0Criterion(nn.Module):
     ) -> torch.Tensor:
         pred_x = outputs["pred_x_rows"]
         total = pred_x.sum() * 0.0
-        count = 0
+        count = pred_x.new_zeros(())
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_x.device)
             gt_idx = match["gt_indices"].to(pred_x.device)
-            for pidx, gidx in zip(pred_idx.tolist(), gt_idx.tolist()):
-                mask = targets[bi]["valid_mask"].to(pred_x.device)[gidx].bool()
-                if not self.cfg.smoothness_contiguous:
-                    if int(mask.sum().item()) >= 3:
-                        lane_x = pred_x[bi, pidx][mask]
+            if pred_idx.numel() == 0:
+                continue
+            mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
+            lanes = pred_x[bi, pred_idx]
+            if not self.cfg.smoothness_contiguous:
+                # Retain the legacy compressed-row definition for old configs.
+                for lane_x, lane_mask in zip(lanes, mask):
+                    if int(lane_mask.sum().item()) >= 3:
+                        lane_x = lane_x[lane_mask]
                         d2 = lane_x[2:] - 2.0 * lane_x[1:-1] + lane_x[:-2]
                         total = total + (d2 / float(self.cfg.input_w)).abs().mean()
-                        count += 1
-                    continue
-                triplet_mask = mask[2:] & mask[1:-1] & mask[:-2]
-                if triplet_mask.any():
-                    lane_x = pred_x[bi, pidx]
-                    d2 = lane_x[2:] - 2.0 * lane_x[1:-1] + lane_x[:-2]
-                    total = total + (d2[triplet_mask] / float(self.cfg.input_w)).abs().sum()
-                    count += int(triplet_mask.sum().item())
-        return total / max(count, 1)
+                        count = count + 1.0
+                continue
+            # The paper configuration uses contiguous triplets.  Compute all
+            # matched lanes at once and keep the denominator on device; the
+            # previous per-lane ``any`` and ``sum().item()`` calls serialized
+            # the CUDA stream dozens of times per image.
+            triplet_mask = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
+            d2 = lanes[:, 2:] - 2.0 * lanes[:, 1:-1] + lanes[:, :-2]
+            total = total + (
+                d2.abs() * triplet_mask.to(dtype=d2.dtype) / float(self.cfg.input_w)
+            ).sum()
+            count = count + triplet_mask.to(dtype=count.dtype).sum()
+        return total / count.clamp_min(1.0)

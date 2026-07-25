@@ -9,12 +9,25 @@ DATA_ROOT="${DATA_ROOT:-dataset}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
+COMPILE_MODEL="${COMPILE_MODEL:-0}"
+COMPILE_MODE="${COMPILE_MODE:-default}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-default}"
 
-python -u -m dynlaneseq_eg.tools.train \
-  --config "${CONFIG}" \
-  --device "${DEVICE}" \
-  --dataset-root "${DATA_ROOT}" \
-  --batch-size "${BATCH_SIZE}" \
-  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
+TRAIN_ARGS=(
+  --config "${CONFIG}"
+  --device "${DEVICE}"
+  --dataset-root "${DATA_ROOT}"
+  --batch-size "${BATCH_SIZE}"
+  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}"
   --grad-accum "${GRAD_ACCUM}"
+  --compile-mode "${COMPILE_MODE}"
+  --attention-backend "${ATTENTION_BACKEND}"
+)
 
+if [[ "${COMPILE_MODEL}" == "1" || "${COMPILE_MODEL}" == "true" ]]; then
+  TRAIN_ARGS+=(--compile-model)
+else
+  TRAIN_ARGS+=(--no-compile-model)
+fi
+
+python -u -m dynlaneseq_eg.tools.train "${TRAIN_ARGS[@]}"

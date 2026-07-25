@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .common import soft_expected_x, sort_range_norm
+from .common import soft_expected_x, soft_expected_x_with_log_probs, sort_range_norm
 
 
 class RowAwareCrossAttentionLayer(nn.Module):
@@ -20,11 +21,15 @@ class RowAwareCrossAttentionLayer(nn.Module):
         ff_dim: int = 1024,
         dropout: float = 0.1,
         num_groups: int = 1,
+        attention_backend: str = "default",
     ):
         super().__init__()
         self.num_groups = int(num_groups)
+        self.attention_backend = str(attention_backend).strip().lower()
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
+        if self.attention_backend not in {"default", "flash_preferred"}:
+            raise ValueError("structured_query.attention_backend must be 'default' or 'flash_preferred'")
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.inter_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.intra_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
@@ -40,9 +45,38 @@ class RowAwareCrossAttentionLayer(nn.Module):
         self.norm_ffn = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
 
+    def _attention(
+        self,
+        module: nn.MultiheadAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        context = nullcontext()
+        if self.attention_backend == "flash_preferred" and query.is_cuda:
+            # PyTorch 2.1 frequently selects memory-efficient SDPA for the
+            # LaneRowNet row-local shape on Ampere, although Flash SDPA is
+            # materially faster.  Disable only that slower candidate and retain
+            # the math backend as a safe fallback for unsupported devices.
+            if hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
+                context = torch.nn.attention.sdpa_kernel(
+                    [
+                        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                        torch.nn.attention.SDPBackend.MATH,
+                    ]
+                )
+            else:
+                context = torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_mem_efficient=False,
+                    enable_math=True,
+                )
+        with context:
+            return module(query, key, value, need_weights=False)[0]
+
     def _grouped_inter_attention(self, q: torch.Tensor, batch_rows: int, num_instances: int) -> torch.Tensor:
         if self.num_groups == 1:
-            return self.inter_attn(q, q, q, need_weights=False)[0]
+            return self._attention(self.inter_attn, q, q, q)
         if num_instances % self.num_groups != 0:
             raise ValueError(
                 f"num_instances={num_instances} must be divisible by structured_query.num_groups={self.num_groups}"
@@ -50,7 +84,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
         group_size = num_instances // self.num_groups
         grouped = q.view(batch_rows, self.num_groups, group_size, q.shape[-1])
         grouped = grouped.reshape(batch_rows * self.num_groups, group_size, q.shape[-1])
-        delta = self.inter_attn(grouped, grouped, grouped, need_weights=False)[0]
+        delta = self._attention(self.inter_attn, grouped, grouped, grouped)
         return delta.view(batch_rows, self.num_groups, group_size, q.shape[-1]).reshape(
             batch_rows, num_instances, q.shape[-1]
         )
@@ -69,7 +103,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
         q_norm = self.norm_cross(q)
         key = row_key_features.reshape(b * r, x_bins, c)
         value = row_value_features.reshape(b * r, x_bins, c)
-        q = q + self.drop(self.cross_attn(q_norm, key, value, need_weights=False)[0])
+        q = q + self.drop(self._attention(self.cross_attn, q_norm, key, value))
 
         # Group-isolated interaction avoids letting one-to-many training groups suppress each other.
         q_norm = self.norm_inter(q)
@@ -80,7 +114,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
         lane_rows = q.reshape(b * n, r, c)
         lane_rows_norm = self.norm_intra(lane_rows)
         lane_rows = lane_rows + self.drop(
-            self.intra_attn(lane_rows_norm, lane_rows_norm, lane_rows_norm, need_weights=False)[0]
+            self._attention(self.intra_attn, lane_rows_norm, lane_rows_norm, lane_rows_norm)
         )
         lane_rows_norm = self.norm_ffn(lane_rows)
         lane_rows = lane_rows + self.drop(self.ffn(lane_rows_norm))
@@ -110,6 +144,7 @@ class StructuredLaneQueryHead(nn.Module):
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
         intermediate_supervision: bool = False,
+        attention_backend: str = "default",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -154,6 +189,7 @@ class StructuredLaneQueryHead(nn.Module):
                     ff_dim=int(ff_dim),
                     dropout=float(dropout),
                     num_groups=self.num_groups,
+                    attention_backend=str(attention_backend),
                 )
                 for _ in range(int(num_layers))
             ]
@@ -207,13 +243,23 @@ class StructuredLaneQueryHead(nn.Module):
             ):
                 intermediate_row_tokens.append(row_tokens)
 
-        outputs = self._predict_from_row_tokens(row_tokens, instance, include_quality=True)
+        outputs = self._predict_from_row_tokens(
+            row_tokens,
+            instance,
+            include_quality=True,
+            include_log_probs=self.training and not inference_only,
+        )
         row_tokens = outputs["structured_row_tokens"]
         if not isinstance(row_tokens, torch.Tensor):
             raise TypeError("structured_row_tokens must be a tensor")
         if self.intermediate_supervision and not inference_only:
             outputs["aux_outputs"] = [
-                self._predict_from_row_tokens(tokens, instance, include_quality=False)
+                self._predict_from_row_tokens(
+                    tokens,
+                    instance,
+                    include_quality=False,
+                    include_log_probs=self.training,
+                )
                 for tokens in intermediate_row_tokens
             ]
         if inference_only:
@@ -236,6 +282,7 @@ class StructuredLaneQueryHead(nn.Module):
         instance: torch.Tensor,
         *,
         include_quality: bool,
+        include_log_probs: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Apply the shared lane heads to one decoder-layer state.
 
@@ -248,7 +295,19 @@ class StructuredLaneQueryHead(nn.Module):
         instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
         lane_query = self.lane_norm(row_tokens.mean(dim=2) + row_tokens.amax(dim=2) + instance_residual)
         row_x_logits = self.row_x(row_tokens)
-        pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
+        if include_log_probs:
+            pred_x_rows, row_x_log_probs = soft_expected_x_with_log_probs(
+                row_x_logits,
+                input_w=self.input_w,
+                x_bins=self.x_bins,
+            )
+        else:
+            pred_x_rows = soft_expected_x(
+                row_x_logits,
+                input_w=self.input_w,
+                x_bins=self.x_bins,
+            )
+            row_x_log_probs = None
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
         outputs = {
@@ -260,6 +319,8 @@ class StructuredLaneQueryHead(nn.Module):
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
         }
+        if row_x_log_probs is not None:
+            outputs["row_x_log_probs"] = row_x_log_probs
         if include_quality:
             outputs["quality_logits"] = self.quality(lane_query).squeeze(-1)
         return outputs
@@ -284,4 +345,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
         intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
+        attention_backend=str(structured_cfg.get("attention_backend", "default")),
     )

@@ -474,6 +474,22 @@ class DynLaneSeqEncoder(nn.Module):
             if isinstance(module, nn.BatchNorm2d):
                 module.eval()
 
+    def _add_auxiliary_outputs(
+        self,
+        out: dict[str, torch.Tensor],
+        f_proj: torch.Tensor,
+        multi_scale_features: dict[str, torch.Tensor] | None,
+    ) -> None:
+        if self.seg_aux_head is not None:
+            out["seg_logits"] = self.seg_aux_head(f_proj)
+        if self.centerline_aux_head is not None:
+            out["centerline_logits"] = self.centerline_aux_head(f_proj)
+        if multi_scale_features is not None:
+            for name, head in self.seg_aux_extra_heads.items():
+                if name not in multi_scale_features:
+                    raise KeyError(f"seg_aux extra scale {name!r} is not in multi_scale_features")
+                out[f"seg_logits_{name}"] = head(multi_scale_features[name])
+
     def forward_features(
         self,
         images: torch.Tensor,
@@ -493,11 +509,19 @@ class DynLaneSeqEncoder(nn.Module):
             fpn = self.fpn(feats)
             f_proj = self.proj(fpn)
             multi_scale_features = None
-        # A structured S0 inference pass consumes only the projected P2 map.
-        # Positional memory, the legacy lane-query decoder, and auxiliary
-        # training heads do not contribute to any written CULane prediction.
-        if inference_only and structured_only:
-            return {"features": f_proj}
+        # Structured S0 consumes the projected feature map directly.  The
+        # legacy holistic-query memory/decoder below cannot affect structured
+        # predictions or losses (decoder_layers is normally zero), yet building
+        # its 160x400 positional memory costs a large allocation and extra
+        # kernels on every training step.  Keep only the auxiliary supervision
+        # heads during training and skip the dead legacy path exactly.
+        if structured_only:
+            out = {"features": f_proj}
+            if multi_scale_features is not None:
+                out["multi_scale_features"] = multi_scale_features
+            if not inference_only:
+                self._add_auxiliary_outputs(out, f_proj, multi_scale_features)
+            return out
         pos_embed = self.pos(f_proj)
         f_pos = f_proj + pos_embed
         mem_key = f_pos.flatten(2).transpose(1, 2).contiguous()
@@ -528,15 +552,7 @@ class DynLaneSeqEncoder(nn.Module):
             out["dynamic_evidence"] = dynamic_debug
         if multi_scale_features is not None:
             out["multi_scale_features"] = multi_scale_features
-        if self.seg_aux_head is not None:
-            out["seg_logits"] = self.seg_aux_head(f_proj)
-        if self.centerline_aux_head is not None:
-            out["centerline_logits"] = self.centerline_aux_head(f_proj)
-        if multi_scale_features is not None:
-            for name, head in self.seg_aux_extra_heads.items():
-                if name not in multi_scale_features:
-                    raise KeyError(f"seg_aux extra scale {name!r} is not in multi_scale_features")
-                out[f"seg_logits_{name}"] = head(multi_scale_features[name])
+        self._add_auxiliary_outputs(out, f_proj, multi_scale_features)
         return out
 
 
@@ -611,10 +627,6 @@ class DynLaneSeqS0(nn.Module):
         )
         if self.structured_query_head is not None:
             out = self.structured_query_head(enc["features"], inference_only=bool(inference_only))
-            if not inference_only:
-                out["memory"] = enc["memory"]
-                out["memory_key"] = enc["memory_key"]
-                out["q0"] = enc["q0"]
         else:
             q = enc["queries"]
             if self.heads is None:

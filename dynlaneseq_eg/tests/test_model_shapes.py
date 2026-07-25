@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.factory import build_criterion, build_matcher, build_model
@@ -13,6 +14,11 @@ from dynlaneseq_eg.modeling.evidence import (
     DynamicOffsetFusion,
     MultiScaleCurveAlignedSampler,
 )
+
+
+class _FailIfCalled(nn.Module):
+    def forward(self, *args, **kwargs):
+        raise AssertionError("legacy holistic-query path must not run for structured S0")
 
 
 def _cfg(name: str):
@@ -125,6 +131,42 @@ def test_structured_query_s0_forward_shapes():
     assert out["queries"].shape == (1, 16, 64)
     assert out["structured_row_tokens"].shape == (1, 16, 72, 64)
     assert "aux_outputs" not in out
+
+
+def test_structured_query_training_skips_unused_holistic_memory_path():
+    cfg = _cfg("DynLaneSeqS0")
+    cfg["model"].update(
+        {
+            "dim": 32,
+            "fpn_channels": 32,
+            "num_slots": 4,
+            "num_rows": 8,
+            "x_bins": 16,
+            "num_heads": 4,
+            "decoder_layers": 0,
+            "structured_query": {
+                "enabled": True,
+                "num_instances": 4,
+                "num_groups": 2,
+                "num_layers": 1,
+                "num_heads": 4,
+                "ff_dim": 64,
+                "dropout": 0.0,
+                "evidence_x_bins": 12,
+            },
+            "seg_aux": {"enabled": True, "dropout": 0.0},
+            "centerline_aux": {"enabled": True, "dropout": 0.0},
+        }
+    )
+    model = DynLaneSeqS0(cfg).train()
+    model.encoder.pos = _FailIfCalled()
+    out = model(torch.randn(1, 3, 288, 800))
+
+    assert "memory" not in out
+    assert "memory_key" not in out
+    assert "q0" not in out
+    assert out["seg_logits"].shape == (1, 1, 288, 800)
+    assert out["centerline_logits"].shape == (1, 1, 8, 16)
 
 
 def test_structured_query_intermediate_supervision_uses_shared_heads() -> None:
