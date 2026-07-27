@@ -33,6 +33,7 @@ def write_predictions(
     top_k: int,
     row_visibility_thresh: float,
     quality_score_power: float,
+    score_mode: str,
     channels_last: bool = False,
     pass_targets: bool = False,
     inference_only: bool = False,
@@ -69,6 +70,7 @@ def write_predictions(
             top_k=top_k,
             row_visibility_thresh=row_visibility_thresh,
             quality_score_power=quality_score_power,
+            score_mode=score_mode,
         )
 
 
@@ -112,6 +114,12 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--row-visibility-thresh", type=float, default=None)
     parser.add_argument("--quality-score-power", type=float, default=None)
+    parser.add_argument(
+        "--score-mode",
+        choices=("exist", "quality", "exist_quality"),
+        default=None,
+        help="Candidate score source; default comes from postprocess.score_mode.",
+    )
     parser.add_argument("--eval-batch-size", type=int, default=0)
     parser.add_argument("--eval-num-workers", type=int, default=-1, help="Override dataloader workers; -1 keeps config.")
     parser.add_argument(
@@ -206,6 +214,7 @@ def main() -> None:
         if args.quality_score_power is not None
         else float(post_cfg.get("quality_score_power", 0.0))
     )
+    score_mode = str(args.score_mode or post_cfg.get("score_mode", "exist_quality"))
     pred_dir = Path(args.pred_dir) if args.pred_dir else Path(cfg.get("output_dir", "outputs")) / f"culane_pred_{args.split}_thr{args.score_thresh:g}"
 
     inference_only = False
@@ -242,6 +251,7 @@ def main() -> None:
             top_k,
             row_visibility_thresh,
             quality_score_power,
+            score_mode,
             channels_last=channels_last,
             pass_targets=pass_targets,
             inference_only=inference_only,
@@ -287,6 +297,7 @@ def main() -> None:
         f"top_k: {top_k}",
         f"row_visibility_thresh: {row_visibility_thresh}",
         f"quality_score_power: {quality_score_power}",
+        f"score_mode: {score_mode}",
         f"score_thresh: {args.score_thresh}",
         f"eval_batch_size: {cfg.get('dataloader', {}).get('eval_batch_size', 1)}",
         f"channels_last: {channels_last}",
@@ -331,6 +342,7 @@ def main() -> None:
             "top_k": top_k,
             "row_visibility_thresh": row_visibility_thresh,
             "quality_score_power": quality_score_power,
+            "score_mode": score_mode,
             "eval_batch_size": cfg.get("dataloader", {}).get("eval_batch_size", 1),
             "channels_last": channels_last,
             "inference_only": inference_only,

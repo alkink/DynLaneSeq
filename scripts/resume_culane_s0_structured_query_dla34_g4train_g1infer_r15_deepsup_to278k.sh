@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_slots32_g4train_g1infer_b4x4_1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep.yaml}"
+OUT_DIR="${OUT_DIR:-outputs/culane_s0_structured_query_dla34_slots32_g4train_g1infer_b4x4_1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep}"
+DEVICE="${DEVICE:-cuda}"
+DATA_ROOT="${DATA_ROOT:-dataset}"
+TARGET_ITERS="${TARGET_ITERS:-278000}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
+
+if [[ -z "${RESUME:-}" ]]; then
+  RESUME="$(find "${OUT_DIR}" -maxdepth 1 -type f -name 'iter_*.pt' | sort -V | tail -n 1)"
+fi
+if [[ -z "${RESUME}" || ! -f "${RESUME}" ]]; then
+  echo "Missing resume checkpoint in: ${OUT_DIR}" >&2
+  exit 1
+fi
+
+START_ITER="$(python -c 'import sys, torch; print(int(torch.load(sys.argv[1], map_location="cpu").get("iteration", 0)))' "${RESUME}")"
+REMAINING_ITERS=$((TARGET_ITERS - START_ITER))
+if (( REMAINING_ITERS <= 0 )); then
+  echo "checkpoint already reached target: start_iter=${START_ITER}, target_iters=${TARGET_ITERS}"
+  exit 0
+fi
+
+echo "config: ${CONFIG}"
+echo "resume: ${RESUME}"
+echo "start_iter: ${START_ITER}"
+echo "target_iters_total: ${TARGET_ITERS}"
+echo "remaining_iters_this_run: ${REMAINING_ITERS}"
+echo "effective_batch_size: $((BATCH_SIZE * GRAD_ACCUM))"
+
+python -u -m dynlaneseq_eg.tools.train \
+  --config "${CONFIG}" \
+  --device "${DEVICE}" \
+  --dataset-root "${DATA_ROOT}" \
+  --resume "${RESUME}" \
+  --max-iters "${REMAINING_ITERS}" \
+  --output-dir "${OUT_DIR}" \
+  --batch-size "${BATCH_SIZE}" \
+  --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
+  --grad-accum "${GRAD_ACCUM}"

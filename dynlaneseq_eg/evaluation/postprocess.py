@@ -54,15 +54,32 @@ def predictions_to_lanes(
     top_k: int = 0,
     row_visibility_thresh: float = 0.0,
     quality_score_power: float = 0.0,
+    score_mode: str = "exist_quality",
 ) -> list[list[list[tuple[float, float]]]]:
     if "stage2" in outputs:
         outputs = outputs["stage2"]
     elif "final" in outputs:
         outputs = outputs["final"]
-    p_lane = torch.softmax(outputs["exist_logits"], dim=-1)[..., 0]
-    if quality_score_power > 0 and "quality_logits" in outputs:
-        quality = torch.sigmoid(outputs["quality_logits"]).clamp(min=1e-6)
-        p_lane = p_lane * quality.pow(float(quality_score_power))
+    exist_score = torch.softmax(outputs["exist_logits"], dim=-1)[..., 0]
+    quality = (
+        torch.sigmoid(outputs["quality_logits"]).clamp(min=1e-6)
+        if "quality_logits" in outputs
+        else None
+    )
+    score_mode = str(score_mode).strip().lower()
+    if score_mode in {"exist", "existence"}:
+        p_lane = exist_score
+    elif score_mode in {"quality", "iou"}:
+        if quality is None:
+            raise ValueError("postprocess score_mode='quality' requires quality_logits")
+        quality_power = float(quality_score_power) if quality_score_power > 0 else 1.0
+        p_lane = quality.pow(quality_power)
+    elif score_mode in {"exist_quality", "product"}:
+        p_lane = exist_score
+        if quality_score_power > 0 and quality is not None:
+            p_lane = p_lane * quality.pow(float(quality_score_power))
+    else:
+        raise ValueError(f"Unsupported postprocess score_mode: {score_mode!r}")
     pred_x = outputs["pred_x_rows"].clamp(0, input_w - 1)
     row_visibility = None
     if row_visibility_thresh > 0 and "row_visibility_logits" in outputs:

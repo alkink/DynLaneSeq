@@ -161,6 +161,34 @@ def test_structured_query_intermediate_supervision_uses_shared_heads() -> None:
     assert "aux_outputs" not in inference
 
 
+def test_structured_query_can_train_many_and_infer_one_group() -> None:
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=8,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=2,
+        inference_group_index=1,
+    ).eval()
+    features = torch.randn(2, 32, 8, 12)
+    with torch.inference_mode():
+        full = head(features)
+        inference = head(features, inference_only=True)
+
+    assert inference["exist_logits"].shape == (2, 4, 2)
+    assert inference["pred_x_rows"].shape == (2, 4, 8)
+    assert inference["range_norm"].shape == (2, 4, 2)
+    assert inference["quality_logits"].shape == (2, 4)
+    for key in ("exist_logits", "pred_x_rows", "range_norm", "quality_logits"):
+        assert torch.allclose(inference[key], full[key][:, 4:], atol=1e-6, rtol=1e-6)
+
+
 def test_structured_query_debug_config_builds():
     cfg = load_config("dynlaneseq_eg/configs/debug/culane_s0_structured_query_2k.yaml")
     cfg["model"]["pretrained_backbone"] = False

@@ -57,3 +57,47 @@ def test_quality_score_can_rerank_lanes():
     assert len(lanes) == 1
     mean_x = sum(x for x, _ in lanes[0]) / len(lanes[0])
     assert mean_x > 150.0
+
+
+def test_quality_only_score_does_not_inherit_existence_ranking():
+    pred_x = torch.stack(
+        [torch.full((72,), 80.0), torch.full((72,), 220.0)],
+        dim=0,
+    ).unsqueeze(0)
+    outputs = {
+        "exist_logits": torch.tensor([[[5.0, -5.0], [-5.0, 5.0]]]),
+        "quality_logits": torch.tensor([[-5.0, 5.0]]),
+        "pred_x_rows": pred_x,
+        "range_norm": torch.tensor([[[0.1, 0.9], [0.1, 0.9]]]),
+    }
+    lanes = predictions_to_lanes(
+        outputs,
+        score_thresh=0.0,
+        top_k=1,
+        score_mode="quality",
+    )[0]
+    mean_x = sum(x for x, _ in lanes[0]) / len(lanes[0])
+    assert mean_x > 150.0
+
+
+def test_quality_only_score_respects_quality_power_for_thresholding():
+    outputs = {
+        "exist_logits": torch.tensor([[[5.0, -5.0]]]),
+        "quality_logits": torch.tensor([[0.0]]),
+        "pred_x_rows": torch.full((1, 1, 72), 80.0),
+        "range_norm": torch.tensor([[[0.1, 0.9]]]),
+    }
+    kept = predictions_to_lanes(
+        outputs,
+        score_thresh=0.4,
+        score_mode="quality",
+        quality_score_power=1.0,
+    )[0]
+    removed = predictions_to_lanes(
+        outputs,
+        score_thresh=0.4,
+        score_mode="quality",
+        quality_score_power=2.0,
+    )[0]
+    assert len(kept) == 1
+    assert len(removed) == 0

@@ -20,6 +20,7 @@ def write_culane_predictions(
     top_k: int = 0,
     row_visibility_thresh: float = 0.0,
     quality_score_power: float = 0.0,
+    score_mode: str = "exist_quality",
 ) -> list[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -36,6 +37,7 @@ def write_culane_predictions(
         top_k=top_k,
         row_visibility_thresh=row_visibility_thresh,
         quality_score_power=quality_score_power,
+        score_mode=score_mode,
     )
     written: list[Path] = []
     for lanes, meta in zip(lanes_batch, metas):

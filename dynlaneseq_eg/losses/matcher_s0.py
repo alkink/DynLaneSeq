@@ -20,6 +20,7 @@ class MatcherConfig:
     eps: float = 1e-6
     assignment: str = "hungarian"
     num_groups: int = 1
+    object_cost_type: str = "neg_log_probability"
 
 
 class HungarianMatcherS0:
@@ -80,7 +81,16 @@ class HungarianMatcherS0:
             }
 
         p_lane = torch.softmax(exist_logits, dim=-1)[:, 0]
-        cost_obj = -torch.log(p_lane.clamp_min(self.cfg.eps)).view(n, 1).expand(n, m)
+        object_cost_type = str(self.cfg.object_cost_type).strip().lower()
+        if object_cost_type in {"neg_probability", "negative_probability", "minus_p"}:
+            # Bounded classification cost, matching DETR-style assignment.
+            # Unlike -log(p), this cannot overwhelm geometry merely because a
+            # still-learning query has low confidence.
+            cost_obj = -p_lane.view(n, 1).expand(n, m)
+        elif object_cost_type in {"neg_log_probability", "negative_log_probability", "nll"}:
+            cost_obj = -torch.log(p_lane.clamp_min(self.cfg.eps)).view(n, 1).expand(n, m)
+        else:
+            raise ValueError(f"Unsupported matcher.object_cost_type: {self.cfg.object_cost_type!r}")
 
         diff = (pred_x_rows[:, None, :] - gt_x[None, :, :]).abs() / float(self.cfg.input_w)
         mask = gt_mask[None, :, :].expand(n, m, -1)

@@ -1,0 +1,24 @@
+_base_: culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_slots32_g4train_g1infer_b4x4_1600x640_bins800_fpn256_l4_dfl_r15_deepsup_50ep
+
+model:
+  structured_query:
+    # Four isolated groups provide one-to-many supervision during training.
+    # Only group zero (8 unique candidates) is evaluated at inference.
+    inference_group_index: 0
+
+matcher:
+  # Keep confidence useful for assignment without allowing -log(p) to dwarf
+  # the geometry terms while queries are still poorly calibrated.
+  object_cost_type: neg_probability
+
+postprocess:
+  # Within the retained group, Hungarian assignment makes the quality target
+  # assignment-aware: matched queries regress line IoU and unmatched queries
+  # regress zero. It therefore acts as the single ranking/classification score.
+  score_mode: quality
+  quality_score_power: 1.0
+  lane_nms_distance_thresh_px: 0.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4

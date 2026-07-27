@@ -45,6 +45,7 @@ def build_matcher(cfg: dict[str, Any]) -> HungarianMatcherS0:
             input_h=int(model.get("input_h", 288)),
             assignment=str(m.get("assignment", "hungarian")),
             num_groups=int(m.get("num_groups", 1)),
+            object_cost_type=str(m.get("object_cost_type", "neg_log_probability")),
         )
     )
 

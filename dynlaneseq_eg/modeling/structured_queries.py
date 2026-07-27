@@ -40,22 +40,38 @@ class RowAwareCrossAttentionLayer(nn.Module):
         self.norm_ffn = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
 
-    def _grouped_inter_attention(self, q: torch.Tensor, batch_rows: int, num_instances: int) -> torch.Tensor:
-        if self.num_groups == 1:
+    def _grouped_inter_attention(
+        self,
+        q: torch.Tensor,
+        batch_rows: int,
+        num_instances: int,
+        num_groups: int | None = None,
+    ) -> torch.Tensor:
+        active_num_groups = self.num_groups if num_groups is None else int(num_groups)
+        if active_num_groups < 1:
+            raise ValueError("active num_groups must be >= 1")
+        if active_num_groups == 1:
             return self.inter_attn(q, q, q, need_weights=False)[0]
-        if num_instances % self.num_groups != 0:
+        if num_instances % active_num_groups != 0:
             raise ValueError(
-                f"num_instances={num_instances} must be divisible by structured_query.num_groups={self.num_groups}"
+                f"num_instances={num_instances} must be divisible by active num_groups={active_num_groups}"
             )
-        group_size = num_instances // self.num_groups
-        grouped = q.view(batch_rows, self.num_groups, group_size, q.shape[-1])
-        grouped = grouped.reshape(batch_rows * self.num_groups, group_size, q.shape[-1])
+        group_size = num_instances // active_num_groups
+        grouped = q.view(batch_rows, active_num_groups, group_size, q.shape[-1])
+        grouped = grouped.reshape(batch_rows * active_num_groups, group_size, q.shape[-1])
         delta = self.inter_attn(grouped, grouped, grouped, need_weights=False)[0]
-        return delta.view(batch_rows, self.num_groups, group_size, q.shape[-1]).reshape(
+        return delta.view(batch_rows, active_num_groups, group_size, q.shape[-1]).reshape(
             batch_rows, num_instances, q.shape[-1]
         )
 
-    def forward(self, row_tokens: torch.Tensor, row_value_features: torch.Tensor, row_key_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        row_tokens: torch.Tensor,
+        row_value_features: torch.Tensor,
+        row_key_features: torch.Tensor,
+        *,
+        num_groups: int | None = None,
+    ) -> torch.Tensor:
         b, n, r, c = row_tokens.shape
         _, rv, x_bins, _ = row_value_features.shape
         _, rk, key_x_bins, _ = row_key_features.shape
@@ -73,7 +89,14 @@ class RowAwareCrossAttentionLayer(nn.Module):
 
         # Group-isolated interaction avoids letting one-to-many training groups suppress each other.
         q_norm = self.norm_inter(q)
-        q = q + self.drop(self._grouped_inter_attention(q_norm, batch_rows=b * r, num_instances=n))
+        q = q + self.drop(
+            self._grouped_inter_attention(
+                q_norm,
+                batch_rows=b * r,
+                num_instances=n,
+                num_groups=num_groups,
+            )
+        )
         q = q.view(b, r, n, c).permute(0, 2, 1, 3).contiguous()
 
         # Vertical interaction lets rows of the same lane share continuity and curvature context.
@@ -110,6 +133,7 @@ class StructuredLaneQueryHead(nn.Module):
         num_groups: int = 1,
         exist_prior_prob: float | None = None,
         intermediate_supervision: bool = False,
+        inference_group_index: int | None = None,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -122,6 +146,7 @@ class StructuredLaneQueryHead(nn.Module):
         self.num_groups = int(num_groups)
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
         self.intermediate_supervision = bool(intermediate_supervision)
+        self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -129,6 +154,11 @@ class StructuredLaneQueryHead(nn.Module):
         if self.num_instances % self.num_groups != 0:
             raise ValueError(
                 f"structured_query.num_instances={self.num_instances} must be divisible by num_groups={self.num_groups}"
+            )
+        if self.inference_group_index is not None and not 0 <= self.inference_group_index < self.num_groups:
+            raise ValueError(
+                "structured_query.inference_group_index must be in "
+                f"[0, {self.num_groups - 1}], got {self.inference_group_index}"
             )
         if self.exist_prior_prob is not None and not 0.0 < self.exist_prior_prob < 1.0:
             raise ValueError("structured_query.exist_prior_prob must be between 0 and 1")
@@ -192,6 +222,15 @@ class StructuredLaneQueryHead(nn.Module):
         dtype = features.dtype
         device = features.device
         instance = self.instance_tokens.weight.to(device=device, dtype=dtype)
+        active_num_groups = self.num_groups
+        if inference_only and self.inference_group_index is not None:
+            group_size = self.num_instances // self.num_groups
+            group_start = self.inference_group_index * group_size
+            instance = instance[group_start : group_start + group_size]
+            # The retained group must interact as one complete candidate set.
+            # This is mathematically the same group-isolated attention it saw
+            # during training, without evaluating the three train-only groups.
+            active_num_groups = 1
         row = self.row_tokens.weight.to(device=device, dtype=dtype)
         row_tokens = instance[:, None, :] + row[None, :, :]
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
@@ -199,7 +238,12 @@ class StructuredLaneQueryHead(nn.Module):
 
         intermediate_row_tokens = []
         for layer_index, layer in enumerate(self.layers):
-            row_tokens = layer(row_tokens, row_value_features, row_key_features)
+            row_tokens = layer(
+                row_tokens,
+                row_value_features,
+                row_key_features,
+                num_groups=active_num_groups,
+            )
             if (
                 self.intermediate_supervision
                 and not inference_only
@@ -284,4 +328,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         num_groups=int(structured_cfg.get("num_groups", 1)),
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
         intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
+        inference_group_index=structured_cfg.get("inference_group_index"),
     )

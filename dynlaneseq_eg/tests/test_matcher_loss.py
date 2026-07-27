@@ -148,6 +148,27 @@ def test_grouped_one_to_many_matcher_assigns_gt_once_per_group():
     assert matches[0]["gt_indices"].tolist() == [0, 0]
 
 
+def test_negative_probability_matcher_cost_is_bounded():
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            object_cost_type="neg_probability",
+            lambda_point=0.0,
+            lambda_range=0.0,
+            lambda_line_iou=0.0,
+        )
+    )
+    logits = torch.tensor([[-4.595, 0.0], [4.595, 0.0]])
+    cost, stats = matcher.compute_cost_for_image(
+        logits,
+        torch.full((2, 72), 100.0),
+        torch.zeros((2, 2)),
+        _target(),
+    )
+    assert torch.all(cost <= 0.0)
+    assert torch.all(cost >= -matcher.cfg.lambda_obj)
+    assert -1.0 <= float(stats["mean_cost_obj"]) <= 0.0
+
+
 def test_focal_exist_loss_backprops_with_grouped_matches():
     logits = torch.zeros((1, 8, 2), requires_grad=True)
     outputs = {
