@@ -5,6 +5,17 @@ decoder-layer measurements below use a short, fixed subset of 64 CULane
 validation images (195 valid GT lanes) and a row-wise line-IoU proxy. They are
 diagnostics, not official benchmark results.
 
+> **Sampling correction.** The original 64-image subset used in Sections 1--16
+> was the first sequential slice of the ordered CULane validation list. Those
+> frames come from one video sequence and are therefore correlated. The
+> intervention results remain useful for falsifying the narrow mechanisms they
+> directly test, but their exact recall percentages must not be generalized to
+> the full validation distribution. Sections 17 onward repeat the principal
+> audits with uniformly spaced images spanning indices `0--9674` of the complete
+> validation list. These uniform diagnostics supersede the earlier subset for
+> cross-backbone rates, query utilization, decoder-stage recall, and loss
+> analysis.
+
 ## 1. Decoder-layer progression
 
 Each cell reports raw proposal recall as `R@0.50 / R@0.70`; scores, thresholding,
@@ -615,3 +626,211 @@ rather than another local geometry-refinement branch.
 
 The reproducible diagnostic entry point is
 `scripts/probe_culane_r34_reference_guided_p2_update.sh`.
+
+## 17. Uniform P2 interventions reject decoder image blindness
+
+The first distribution-spanning audit asks whether the row decoder actually
+uses P2, rather than reproducing learned query priors. Thirty-two validation
+images were sampled uniformly across the full ordered validation list. P2 was
+then zeroed, replaced by its horizontal mean, exchanged between images, or
+shifted horizontally by 64 input pixels while keeping decoder weights frozen.
+
+Zeroing P2 or removing its horizontal structure reduces raw proposal
+`R@0.50` to zero for both backbones. Exchanging P2 between images makes the
+decoder outputs follow the donor image, and shifting P2 produces a same-direction
+coordinate response at every layer. At L4, the mean response to a 64-pixel P2
+shift is approximately `98%` of the injected displacement for ResNet-34 and
+`98%` for DLA-34. DLA is already strongly image-responsive at L2
+(`93%`), as is ResNet-34 (`87%`).
+
+This causally rejects a broad but tempting explanation: the structured decoder
+is not globally blind to its image input, and the backbone-to-P2-to-decoder
+wiring is not silently bypassed. The remaining failure must be selective--which
+lane evidence is bound to which query--rather than absence of visual grounding
+in general.
+
+The exact outputs are:
+
+- `/tmp/decoder_image_grounding_uniform32/r34_225k.json`;
+- `/tmp/decoder_image_grounding_uniform32/dla34_225k.json`.
+
+## 18. R34 and DLA miss overwhelmingly the same lanes
+
+A second audit sampled 64 images uniformly over the full validation split,
+containing 221 valid GT lanes. It compared raw group-0 proposals before scores,
+Top-K, or NMS:
+
+| Uniform-64 diagnostic | ResNet-34 | DLA-34 | Backbone oracle union |
+|---|---:|---:|---:|
+| R@0.50 | 63.80 | 61.09 | 68.33 |
+| R@0.70 | 45.70 | 43.44 | 50.23 |
+
+The per-lane best-IoU correlation between backbones is `0.876`. At IoU 0.50,
+125 lanes are hit by both, 16 only by ResNet-34, 10 only by DLA-34, and 70 are
+missed by both. Thus `87.5%` of ResNet-34 misses and `81.4%` of DLA-34 misses
+are shared. Evaluating all 32 queries does not improve the cross-backbone union
+over the eight-query deployment group.
+
+The large shared-error fraction is strong evidence against backbone capacity or
+a DLA-specific FPN bug as the primary ceiling. Two materially different
+backbones reach nearly the same hard-instance boundary after passing through
+the same query acquisition and supervision interface.
+
+The exact output is
+`/tmp/cross_backbone_error_overlap_uniform64_r34_dla34_225k.json`.
+
+## 19. Each eight-query group collapses to four ordinal lane roles
+
+The same uniform-64 audit traces every group-0 query. In ResNet-34, queries
+`0, 2, 4, 7` are never assigned and never achieve IoU 0.30 with any GT lane;
+queries `1, 3, 5, 6` specialize mostly to the four left-to-right lane ranks.
+For DLA-34, the dead queries are `0, 3, 6, 7`, while `1, 2, 4, 5` occupy the
+same four ordinal roles. No useful unassigned query was observed at IoU 0.30
+or 0.50.
+
+This has two distinct interpretations:
+
+1. four active candidates are sufficient for the CULane annotation limit of
+   four lanes, so “four dead queries” alone is not proof of missing capacity;
+2. the model has no reserve candidate that discovers a lane when its
+   corresponding ordinal specialist fails. The other four queries remain
+   background rather than becoming alternate hypotheses.
+
+The replicated four-group training contract magnifies this behavior: it trains
+four copies of the same ordinal solution, explaining the severe no-NMS ranking
+collapse without explaining away the common misses.
+
+The exact output is
+`/tmp/cross_backbone_query_specialization_uniform64_r34_dla34_225k.json`.
+
+## 20. Radius-15 deep supervision improves early DLA geometry but not coverage
+
+The original DLA-34 run and the radius-15, deeply supervised DLA-34 run were
+compared at 225k on the same uniform 64 images:
+
+| DLA-34 checkpoint | L1 R@0.50 | L2 | L3 | L4 |
+|---|---:|---:|---:|---:|
+| Original | 0.00 | 47.06 | 59.73 | 61.09 |
+| Radius-15 + deep supervision | 59.28 | 64.25 | 64.25 | 63.35 |
+
+Deep supervision plainly works as supervision: valid lane geometry appears at
+L1 instead of only after multiple blocks, and final R@0.50 rises by 2.26
+points on this diagnostic. It does not solve the ceiling:
+
+- the exact same four queries remain dead;
+- final L4 loses two IoU-0.50 lanes that were present at L3;
+- 73 of 221 lanes remain common misses between the two DLA variants;
+- their per-lane best-IoU correlation is `0.902`;
+- the completed official test run peaks around the existing 80 band rather
+  than establishing a new backbone-scaling regime.
+
+The result rules out “the final layer simply lacked any direct loss” as a
+complete explanation. Deep supervision strengthens the already chosen ordinal
+hypotheses but does not teach unused hypotheses to bind to missing full curves.
+
+The exact output is
+`/tmp/dla_old_vs_r15_deepsup_query_uniform64_225k.json`.
+
+## 21. Expected-x decoding is a symptom, not the ceiling
+
+Frozen final row distributions were decoded with argmax, soft expectations at
+temperatures `0.25--1.5`, and local-mode expectations over radii
+`2--16` bins. ResNet-34's normal temperature-1 expectation gives
+`63.80 / 45.70` raw recall at IoU `0.50 / 0.70`. The best alternative,
+temperature `0.5`, changes this to `64.25 / 46.15`: one lane at each
+threshold, while assigned-row MAE becomes `0.26` pixels worse. Argmax lowers
+IoU-0.70 recall and worsens MAE by `0.78` pixels. Neither original nor
+deeply-supervised DLA receives a meaningful gain from an alternative decoder.
+
+Missed lanes do have much more diffuse distributions. ResNet-34 normalized
+entropy rises from `0.357` on IoU-0.50 hits to `0.514` on misses, and
+expected-to-mode distance rises from `1.11` to `6.07` pixels. But switching
+to the mode does not recover them. Diffuseness is therefore evidence of
+uncertainty or failed association, not proof that soft expectation is averaging
+away otherwise correct modes.
+
+The exact outputs are:
+
+- `/tmp/row_decode_r34_uniform64.json`;
+- `/tmp/row_decode_dla_old_uniform64.json`;
+- `/tmp/row_decode_dla_r15_deepsup_uniform64.json`.
+
+## 22. Geometry losses do not fight, but short lanes are underweighted
+
+For frozen final logits, each weighted geometry loss was differentiated with
+respect to the row logits. On uniformly sampled images, ResNet-34 has mean
+gradient norms of:
+
+| Weighted component | Gradient norm |
+|---|---:|
+| Point | 0.000091 |
+| LineIoU | 0.00527 |
+| DFL | 0.00893 |
+| Smoothness | 0.0000036 |
+
+The LineIoU--DFL cosine is `+0.172`, not negative. Point--LineIoU is
+`+0.371`. DLA gives the same qualitative result. Hence there is no evidence
+for a destructive DFL-versus-LineIoU “loss war”; DFL is simply the dominant
+row-logit objective, while point and smoothness are negligible at maturity.
+
+There is a verified reduction defect. Point and DFL currently sum all valid
+rows globally before division, whereas LineIoU normalizes each lane. Lanes
+shorter than 80 rows therefore receive only about half the per-lane weight they
+would receive under lane-balanced reduction. Replacing point/DFL reductions
+with per-lane means increases rank-3 lane gradient by `33%` for ResNet-34 and
+`40%` for DLA-34. However, the complete old and lane-balanced gradients retain
+cosine `0.976` and differ in norm by only about `3.3%`.
+
+Lane-balanced reduction is a justified correction, especially for short outer
+lanes. Its measured magnitude is not sufficient to claim that it alone caused
+the global 80-F1 ceiling.
+
+The exact outputs are:
+
+- `/tmp/geometry_loss_gradients_r34_uniform8.json`;
+- `/tmp/geometry_loss_gradients_dla_old_uniform8.json`.
+
+## 23. Current root-cause boundary and next falsification gate
+
+The distribution-spanning evidence now classifies the system as follows:
+
+| Component | Current status | Evidence |
+|---|---|---|
+| Backbone / P2 wiring | Functioning | Shift, zero, and image-swap interventions |
+| Fused P2 task signal | Present but weaker on hard lanes | Curve-conditioned feature probes |
+| Decoder image grounding | Strong | Near-proportional output response to shifted P2 |
+| Final expected-x decoder | Not the ceiling | Temperature, argmax, and local-mode sweep |
+| DFL versus LineIoU | No destructive conflict | Positive gradient cosine |
+| Short-lane reduction | Real secondary defect | 1.6--2.0x analytical underweighting |
+| Deep supervision | Improves early geometry only | Same dead queries and common misses |
+| Query-to-full-curve association | Primary remaining suspect | Shared misses and rigid ordinal roles |
+
+The highest-value remaining experiment is therefore not another neck, local
+sampler, or decoding sweep. It is a frozen-base query-conditioned dense curve
+probe. For every frozen lane-row state, the probe generates a dynamic vector
+and scores every horizontal P2 position on the corresponding row. Only this
+small head is trained, with per-lane-balanced curve supervision under the
+existing group-0 assignment.
+
+The probe includes two anti-shortcut controls:
+
+- P2 is exchanged between validation images while the query states stay fixed;
+- query states are exchanged while P2 stays fixed.
+
+A positive gate requires both:
+
+1. at least `+5.0` raw union-recall points over the frozen decoder at IoU 0.50;
+2. correct-image dense recall at least `3.0` points above the wrong-image
+   control.
+
+Passing that gate would support an end-to-end training-time
+query-conditioned dense association auxiliary, while keeping the final
+LaneRowNet row-distribution head. Failing it would reject the strongest
+remaining decoder-interface hypothesis and imply that the common misses are
+limited more fundamentally by representation/data ambiguity.
+
+The implemented entry point is:
+
+```bash
+bash scripts/probe_culane_query_conditioned_dense_curve_short.sh
+```
