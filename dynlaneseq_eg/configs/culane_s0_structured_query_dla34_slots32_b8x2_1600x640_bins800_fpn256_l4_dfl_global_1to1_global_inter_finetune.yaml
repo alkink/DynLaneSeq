@@ -1,0 +1,10 @@
+_base_: culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_global_1to1_finetune.yaml
+
+# Second causal arm: remove both repeated positive assignment and the
+# same-row isolation between the four historical query groups. Parameter
+# shapes are unchanged, so this remains load-compatible with the 225k model.
+output_dir: outputs/diagnostics/culane_dla34_225k_global_1to1_global_inter_finetune
+
+model:
+  structured_query:
+    num_groups: 1

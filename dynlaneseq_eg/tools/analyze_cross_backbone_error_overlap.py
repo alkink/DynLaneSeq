@@ -14,7 +14,10 @@ from tqdm import tqdm
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import load_checkpoint
-from dynlaneseq_eg.evaluation.proposal_recall import line_iou_against_gt
+from dynlaneseq_eg.evaluation.proposal_recall import (
+    line_iou_against_gt,
+    select_candidates,
+)
 from dynlaneseq_eg.factory import build_dataloader, build_matcher, build_model
 from dynlaneseq_eg.modeling.common import nested_to_device
 from dynlaneseq_eg.tools.analyze_decoder_image_grounding import (
@@ -407,6 +410,22 @@ def summarize_records(
                 )
                 / lane_count
             ),
+            "r34_all32_recall": (
+                sum(float(row["r34_l4_all32_iou"]) >= threshold for row in records)
+                / lane_count
+            ),
+            "dla34_all32_recall": (
+                sum(float(row["dla34_l4_all32_iou"]) >= threshold for row in records)
+                / lane_count
+            ),
+            "r34_model_top4_recall": (
+                sum(float(row["r34_l4_model_top4_iou"]) >= threshold for row in records)
+                / lane_count
+            ),
+            "dla34_model_top4_recall": (
+                sum(float(row["dla34_l4_model_top4_iou"]) >= threshold for row in records)
+                / lane_count
+            ),
         }
     return result
 
@@ -499,6 +518,24 @@ def main() -> None:
         d_stage_names = sorted(d_stages, key=lambda name: int(name[1:]))
         r_final = r_stages[r_stage_names[-1]]["pred_x_rows"]
         d_final = d_stages[d_stage_names[-1]]["pred_x_rows"]
+        r_top4 = [
+            select_candidates(
+                r_stages[r_stage_names[-1]],
+                image_index,
+                top_k=4,
+                rank_by="score_quality",
+            )
+            for image_index in range(int(images.shape[0]))
+        ]
+        d_top4 = [
+            select_candidates(
+                d_stages[d_stage_names[-1]],
+                image_index,
+                top_k=4,
+                rank_by="score_quality",
+            )
+            for image_index in range(int(images.shape[0]))
+        ]
         r_matches = r_matcher(r_stages[r_stage_names[-1]], targets)
         d_matches = d_matcher(d_stages[d_stage_names[-1]], targets)
 
@@ -615,6 +652,18 @@ def main() -> None:
                 )
                 row["dla34_l4_all32_iou"] = _best_iou(
                     d_final[image_index],
+                    gt_x,
+                    valid,
+                    line_width=args.line_width,
+                )
+                row["r34_l4_model_top4_iou"] = _best_iou(
+                    r_top4[image_index],
+                    gt_x,
+                    valid,
+                    line_width=args.line_width,
+                )
+                row["dla34_l4_model_top4_iou"] = _best_iou(
+                    d_top4[image_index],
                     gt_x,
                     valid,
                     line_width=args.line_width,

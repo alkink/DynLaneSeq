@@ -1034,3 +1034,129 @@ Exact outputs:
 
 - `outputs/diagnostics/position_transport/dla34_225k_uniform32_full.json`;
 - `outputs/diagnostics/position_transport/dla34_225k_uniform64_fine_fusion.json`.
+
+## 28. Lane-balanced geometry reduction is a cleanup, not the ceiling
+
+The final verified loss-level defect from Section 26 was trained causally. Two
+otherwise matched DLA-34 continuations started from the same 225k checkpoint:
+
+- the historical global-row reduction;
+- per-lane row normalization for point and DFL losses.
+
+Both were continued for 5000 iterations and compared on the same uniformly
+spaced 64-image/221-lane validation subset.
+
+| Reduction at 230k | Raw R@0.50 | Raw R@0.70 |
+|---|---:|---:|
+| Historical global rows | 61.09 | 43.44 |
+| Lane-balanced rows | 61.54 | 42.53 |
+
+Lane balancing recovers one additional lane at IoU 0.50 but loses two at IoU
+0.70. Per-lane best IoU is almost unchanged
+(`Pearson r = 0.9964`), and 84 IoU-0.50 misses remain common to both models.
+This rejects global-row reduction as the primary capacity ceiling. Per-lane
+normalization remains the cleaner objective for future training, but its
+observed effect is too small and does not explain why stronger backbones fail
+to create new lane hypotheses.
+
+Exact output:
+
+`outputs/diagnostics/dla34_global_vs_lane_balanced_230k_uniform64.json`.
+
+## 29. Error arbitration is learnable, but the available correction is weak
+
+The next diagnostic separated two questions that were previously conflated:
+
+1. can the model recognize a bad lane hypothesis?
+2. does its current attention provide a safe replacement for that hypothesis?
+
+The answer to the first question is yes. On the 64-image subset, low row-peak
+confidence predicts an IoU-0.50 miss with AUC `0.882` and an IoU-0.70 miss
+with AUC `0.860`. Low quality and row entropy each reach approximately
+`0.85--0.88` AUC. The model therefore contains a useful error/uncertainty
+signal.
+
+The second answer is no. Those uncertainty signals do not predict whether an
+attention-coordinate correction will help; benefit AUC is generally near
+chance. The best deployable one-lane gate changes no IoU-0.50 decisions and
+recovers only one lane (`+0.45` point) at IoU 0.70, while slightly reducing
+mean IoU. Even a GT-defined miss gate with the natural correction recovers
+only one IoU-0.50 lane.
+
+This moves quality/gating out of the primary-suspect position. The detector can
+often identify a poor hypothesis, but it does not possess a sufficiently
+reliable alternative curve to substitute for it.
+
+Exact output:
+
+`outputs/diagnostics/refinement_arbitration/dla34_225k_uniform64.json`.
+
+## 30. Alternative proposals expose a small natural signal and a false oracle
+
+Attention-derived curves were next added as extra proposals instead of
+overwriting the baseline lane. This removes the no-harm requirement from the
+correction itself and tests whether the four dead group-0 slots could carry
+useful alternatives.
+
+The strongest natural fixed-eight bank combines the top four baseline lanes
+with four weakly fused attention alternatives. It raises raw R@0.50 by
+`1.81` points (four recovered, zero lost). A smaller `0.05` fusion recovers
+six lanes at IoU 0.70 (`+2.71` points) but only one at IoU 0.50. Pure natural
+attention-peak and attention-expectation curves recover no missing lane.
+Even a 56-candidate bank assembled from every natural alternative gains only
+`2.71` points at each threshold. Thus there is a small refinement signal, not
+a strong missing-lane proposal source.
+
+A GT-corridor-biased attention peak appeared to provide a much larger
+`+24.89` R@0.50 gain. A counterfactual audit invalidates that interpretation:
+the same gain remains when the P2 values are replaced by zeros. Wrong-image
+and horizontal-mean controls also retain large gains. The oracle is copying
+the injected GT coordinate through the attention distribution; it is not
+recovering visual evidence. Its image-derived increment over the strongest
+image-removed control is zero.
+
+This oracle result must not be used to motivate or quantify a final
+architecture. The supported natural opportunity is at most the small
+fusion-bank gain above.
+
+Exact outputs:
+
+- `outputs/diagnostics/attention_alternative_proposals/dla34_225k_uniform64.json`;
+- `outputs/diagnostics/oracle_attention_counterfactual/dla34_225k_uniform64.json`.
+
+## 31. CondLSTR narrows the next causal question to assignment and acquisition
+
+A source-level audit of the local CondLSTR implementation identifies four
+material differences from the historical LaneRowNet run:
+
+1. CondLSTR performs one global Hungarian assignment over 20 queries; every GT
+   has one positive query and all unmatched queries receive the no-object
+   target. LaneRowNet repeats each GT once in each of four isolated groups.
+2. CondLSTR uses the bounded DETR matcher term `-p`, rather than `-log(p)`.
+3. Every query generates dynamic parameters that correlate against the full
+   spatial encoder map and produce a query-specific dense HxW localization
+   field before row decoding.
+4. Location is normalized within each lane and every decoder layer is
+   supervised.
+
+Items 2 and 4 have already been isolated in LaneRowNet. Bounded matching is a
+valid stability correction, while lane-balanced normalization and deep
+supervision did not break the coverage ceiling. A frozen post-hoc
+query-conditioned dense readout also recovered zero misses, so copying a
+CondLSTR-style output head onto a mature checkpoint is not supported.
+
+The remaining clean assignment test is therefore:
+
+- global one-to-one matching while retaining the grouped decoder;
+- global one-to-one matching plus global inter-query interaction.
+
+If the first improves unique all-query recall, duplicate positive supervision
+is causal. If only the second improves, group isolation also prevents query
+diversity. If neither improves after a short paired continuation, NMS/grouping
+is a cleanup issue rather than the ceiling, and the remaining architectural
+difference is jointly learned query-to-image curve acquisition.
+
+The position conclusion remains deliberately narrower than “position cannot
+be involved.” Static absolute x position is present, ordered, and essential.
+What is still unverified is a **lane-specific, image-derived reference curve**
+or equivalent dense query-image correlation before row refinement.

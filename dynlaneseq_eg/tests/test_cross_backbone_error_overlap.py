@@ -24,6 +24,10 @@ def _record(r_iou: float, d_iou: float) -> dict[str, float | int]:
         "r34_layer_union_group0_iou": min(r_iou + 0.1, 1.0),
         "dla34_layer_union_group0_iou": min(d_iou + 0.1, 1.0),
         "cross_backbone_l4_all32_union_iou": max(r_iou, d_iou),
+        "r34_l4_all32_iou": r_iou,
+        "dla34_l4_all32_iou": d_iou,
+        "r34_l4_model_top4_iou": r_iou,
+        "dla34_l4_model_top4_iou": d_iou,
     }
 
 
