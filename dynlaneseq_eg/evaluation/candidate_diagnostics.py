@@ -21,7 +21,7 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 STAGE_TENSOR_FIELDS = (
     "pred_x_rows",
     "exist_logits",
@@ -68,6 +68,7 @@ def _cache_path(
     list_path: str | Path,
     split: str,
     max_batches: int,
+    eval_batch_size: int | None,
 ) -> Path:
     checkpoint = Path(checkpoint_path)
     stat = checkpoint.stat()
@@ -81,6 +82,7 @@ def _cache_path(
             sha256_file(list_path),
             str(split),
             str(max_batches),
+            str(eval_batch_size),
             str(CACHE_VERSION),
         ]
     )
@@ -185,16 +187,34 @@ def load_or_collect_cache(
     cache_dir: str | Path = "outputs/diagnostic_cache",
     reuse_cache: bool = False,
     max_batches: int = 0,
+    eval_batch_size: int | None = None,
+    num_workers: int | None = None,
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
     if dataset_root:
         cfg.setdefault("dataset", {})["root"] = str(Path(dataset_root).expanduser())
+    dataloader_cfg = cfg.setdefault("dataloader", {})
+    if eval_batch_size is not None:
+        dataloader_cfg["eval_batch_size"] = int(eval_batch_size)
+    if num_workers is not None:
+        dataloader_cfg["num_workers"] = int(num_workers)
+        if int(num_workers) == 0:
+            dataloader_cfg["persistent_workers"] = False
     project_root, dataset_root = _resolve_dataset_root(cfg, config_path)
     resolved_list = resolve_list_path(cfg, split).resolve()
     if not resolved_list.exists():
         raise FileNotFoundError(f"Evaluation list does not exist: {resolved_list}")
-    cache_path = _cache_path(cache_dir, config_path, checkpoint_path, resolved_list, split, max_batches)
+    effective_eval_batch_size = int(dataloader_cfg.get("eval_batch_size", 1))
+    cache_path = _cache_path(
+        cache_dir,
+        config_path,
+        checkpoint_path,
+        resolved_list,
+        split,
+        max_batches,
+        effective_eval_batch_size,
+    )
     if reuse_cache and cache_path.exists():
         try:
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -208,6 +228,9 @@ def load_or_collect_cache(
     torch_device = torch.device(device)
     model = build_model(cfg).to(torch_device)
     load_checkpoint(checkpoint_path, model, strict=False)
+    supports_inference_only = bool(getattr(model, "supports_inference_only", False))
+    if supports_inference_only and hasattr(model, "prepare_for_inference"):
+        model.prepare_for_inference()
     model.eval()
     loader = build_dataloader(cfg, split=split, training=False)
     pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
@@ -217,7 +240,12 @@ def load_or_collect_cache(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         images = images.to(torch_device, non_blocking=True)
-        outputs = model(images, targets=targets) if pass_targets else model(images)
+        if pass_targets:
+            outputs = model(images, targets=targets)
+        elif supports_inference_only:
+            outputs = model(images, inference_only=True)
+        else:
+            outputs = model(images)
         stages = collect_prediction_stages(outputs)
         cpu_stages = {name: _cpu_stage(stage) for name, stage in stages.items()}
         for bi, (target, meta) in enumerate(zip(targets, metas)):
@@ -248,6 +276,8 @@ def load_or_collect_cache(
             "list_path": str(resolved_list),
             "list_sha256": sha256_file(resolved_list),
             "max_batches": int(max_batches),
+            "eval_batch_size": effective_eval_batch_size,
+            "num_workers": int(dataloader_cfg.get("num_workers", 0)),
             "input_w": int(model_cfg.get("input_w", 800)),
             "input_h": int(model_cfg.get("input_h", 288)),
             "postprocess": deepcopy(cfg.get("postprocess", {})),
