@@ -180,6 +180,7 @@ def load_or_collect_cache(
     checkpoint_path: str | Path,
     split: str = "val",
     list_path: str | Path | None = None,
+    dataset_root: str | Path | None = None,
     device: str | torch.device = "cuda",
     cache_dir: str | Path = "outputs/diagnostic_cache",
     reuse_cache: bool = False,
@@ -187,6 +188,8 @@ def load_or_collect_cache(
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
+    if dataset_root:
+        cfg.setdefault("dataset", {})["root"] = str(Path(dataset_root).expanduser())
     project_root, dataset_root = _resolve_dataset_root(cfg, config_path)
     resolved_list = resolve_list_path(cfg, split).resolve()
     if not resolved_list.exists():

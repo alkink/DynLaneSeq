@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", default="val")
     parser.add_argument("--list-path", default="")
+    parser.add_argument("--dataset-root", default="")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--top-k-values", type=int, nargs="+", default=[4, 6, 8])
     parser.add_argument("--top-k", type=int, default=None, help="Compatibility alias for a single Top-K value.")
@@ -91,6 +92,7 @@ def main() -> None:
         args.checkpoint,
         split=args.split,
         list_path=args.list_path or None,
+        dataset_root=args.dataset_root or None,
         device=args.device,
         cache_dir=args.cache_dir,
         reuse_cache=args.reuse_cache,
