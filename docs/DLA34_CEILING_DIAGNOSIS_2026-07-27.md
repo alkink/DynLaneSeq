@@ -883,3 +883,68 @@ OUTPUT_JSON=/tmp/dla34_initial_state_dense_probe.json \
 SAVE_PROBE=/tmp/dla34_initial_state_dense_probe.pt \
 bash scripts/probe_culane_query_conditioned_dense_curve_short.sh
 ```
+
+## 25. Initial-state dense association also fails the coverage gate
+
+The same probe was retrained from scratch with the frozen image-blind
+`instance_token + row_token` states before the first decoder block. This removes
+the possibility that only an already-misdirected final state prevents the
+dense head from finding a missed lane.
+
+| Probe input / output | Raw R@0.50 | Raw R@0.70 | Paired mean IoU |
+|---|---:|---:|---:|
+| Frozen base decoder | 61.09 | 43.44 | 0.550 |
+| Dense head, correct P2 and initial state | 15.38 | 1.36 | 0.243 |
+| Dense head, wrong-image P2 | 0.90 | 0.00 | 0.091 |
+| Dense head, zero P2 | 0.00 | 0.00 | 0.003 |
+| 50/50 base--dense coordinate blend | 24.89 | 6.33 | 0.317 |
+
+The wrong-state result is intentionally identical to the correct-state result:
+initial token states are image-independent and therefore unchanged by a batch
+roll. Correct-versus-wrong P2 still shows a real image-specific signal, but the
+probe again recovers `0/86` base misses at IoU 0.50 and `0/125` at IoU 0.70.
+It improves 20 paired lanes by more than 0.02 IoU and worsens 186.
+
+Together, Sections 24--25 reject both forms of the frozen dense-readout
+hypothesis:
+
+- a mature row state cannot use an added dense P2 readout to recover a missing
+  lane;
+- a static ordinal query identity cannot use that readout to form a new missing
+  full-curve hypothesis either.
+
+This is not evidence that P2 contains no lane information--both probes collapse
+under wrong or zero P2, and the GT-corridor probe in Section 13 established a
+conditional signal. It is evidence that the missing conditional variable is a
+coherent **curve hypothesis**, not another pointwise output head.
+
+Matcher instability is also too small to explain the result. In the uniform
+DLA audit, the dominant query--rank assignments are approximately
+`q2 -> rank0` in 53/55 cases, `q4 -> rank1` in 53/60, `q5 -> rank2` in
+51/60, and `q1 -> rank3` in 38/46. ResNet-34 is more stable still. Assignment
+identity is not randomly permuted from image to image.
+
+The exact output is `/tmp/dla34_initial_state_dense_probe.json`.
+
+## 26. Last supported loss-level test: lane-balanced short fine-tune
+
+The only verified supervision defect not yet causally trained is the global-row
+reduction in point and DFL losses (Section 22). A diagnostic option now averages
+rows within each matched lane before averaging lanes, leaving the architecture,
+matcher, heads, nominal loss weights, optimizer state, and checkpoint unchanged.
+Historical behavior remains the default.
+
+This test is deliberately a 5000-iteration continuation from the exact DLA
+225k checkpoint, with checkpoints at 227.5k and 230k. It is not intended as a
+new benchmark run. Its question is narrower: does restoring equal lane weight
+begin to recover short/rank-3 lanes under a paired checkpoint comparison?
+
+```bash
+bash scripts/finetune_culane_dla34_lane_balanced_225k_short.sh
+```
+
+If neither 2.5k nor 5k continuation improves uniform raw miss recovery, loss
+reduction is only a cleanup and the remaining ceiling is the absence of a
+sequence-level curve proposal/initialization mechanism. If it selectively
+improves rank-3 and short-lane recovery without damaging central lanes, it
+becomes the lowest-risk supervision change for a later full run.

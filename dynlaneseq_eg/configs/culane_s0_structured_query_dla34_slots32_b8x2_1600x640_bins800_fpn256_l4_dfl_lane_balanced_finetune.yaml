@@ -1,0 +1,14 @@
+_base_: culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+output_dir: outputs/diagnostics/culane_dla34_225k_lane_balanced_finetune
+
+# Diagnostic fine-tune only.  The old reduction averages all valid rows in the
+# batch, so short lanes receive less total supervision.  This option averages
+# rows within each matched lane before averaging lanes.  All model parameters,
+# heads, assignments, and nominal loss weights stay unchanged.
+loss:
+  geometry_reduction: lane_mean
+
+training:
+  checkpoint_interval: 2500
+  vis_interval: 1000000

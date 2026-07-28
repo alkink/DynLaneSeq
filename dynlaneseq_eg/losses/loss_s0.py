@@ -45,6 +45,7 @@ class LossConfig:
     lambda_geometry_draft: float = 0.0
     lambda_intermediate: float = 0.0
     intermediate_layer_weights: tuple[float, ...] = ()
+    geometry_reduction: str = "global_rows"
 
 
 class S0Criterion(nn.Module):
@@ -53,6 +54,26 @@ class S0Criterion(nn.Module):
         self.cfg = cfg or LossConfig()
         self.matcher = matcher
         self._iteration = 0
+        reduction = str(self.cfg.geometry_reduction).strip().lower()
+        if reduction not in {
+            "global",
+            "global_rows",
+            "row",
+            "rows",
+            "lane",
+            "lane_mean",
+            "per_lane",
+        }:
+            raise ValueError(
+                f"Unsupported loss.geometry_reduction: {self.cfg.geometry_reduction!r}"
+            )
+
+    def lane_balanced_geometry(self) -> bool:
+        return str(self.cfg.geometry_reduction).strip().lower() in {
+            "lane",
+            "lane_mean",
+            "per_lane",
+        }
 
     def set_iteration(self, iteration: int) -> None:
         self._iteration = int(iteration)
@@ -336,6 +357,7 @@ class S0Criterion(nn.Module):
         pred_x = outputs["pred_x_rows"]
         total = pred_x.sum() * 0.0
         count = pred_x.new_tensor(0.0)
+        lane_balanced = self.lane_balanced_geometry()
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(pred_x.device)
             gt_idx = match["gt_indices"].to(pred_x.device)
@@ -347,8 +369,17 @@ class S0Criterion(nn.Module):
             gt = gt_x / float(self.cfg.input_w)
             valid = mask.to(dtype=pred.dtype)
             loss = F.smooth_l1_loss(pred, gt, beta=self.cfg.smooth_l1_beta, reduction="none")
-            total = total + (loss * valid).sum()
-            count = count + valid.sum()
+            if lane_balanced:
+                valid_count = valid.sum(dim=-1)
+                lane_loss = (loss * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+                valid_lane = valid_count > 0
+                total = total + (
+                    lane_loss * valid_lane.to(dtype=lane_loss.dtype)
+                ).sum()
+                count = count + valid_lane.to(dtype=count.dtype).sum()
+            else:
+                total = total + (loss * valid).sum()
+                count = count + valid.sum()
         return total / count.clamp_min(1.0)
 
     def compute_row_dfl_loss(
@@ -365,6 +396,7 @@ class S0Criterion(nn.Module):
         logits_f = logits.float()
         total = logits_f.sum() * 0.0
         count = logits_f.new_tensor(0.0)
+        lane_balanced = self.lane_balanced_geometry()
         bin_width = float(self.cfg.input_w) / float(x_bins)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(logits.device)
@@ -397,8 +429,17 @@ class S0Criterion(nn.Module):
             right_lp = log_probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
             loss = -(left_w * left_lp + right_w * right_lp)
             valid_f = valid.to(dtype=loss.dtype)
-            total = total + (loss * valid_f).sum()
-            count = count + valid_f.sum()
+            if lane_balanced:
+                valid_count = valid_f.sum(dim=-1)
+                lane_loss = (loss * valid_f).sum(dim=-1) / valid_count.clamp_min(1.0)
+                valid_lane = valid_count > 0
+                total = total + (
+                    lane_loss * valid_lane.to(dtype=lane_loss.dtype)
+                ).sum()
+                count = count + valid_lane.to(dtype=count.dtype).sum()
+            else:
+                total = total + (loss * valid_f).sum()
+                count = count + valid_f.sum()
         return total / count.clamp_min(1.0)
 
     def compute_line_iou_loss(
