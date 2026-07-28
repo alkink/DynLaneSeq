@@ -162,6 +162,8 @@ def _layer_forward_with_attention(
     *,
     num_groups: int,
     cross_bias: torch.Tensor | None,
+    coordinate_codebook: torch.Tensor | None = None,
+    coordinate_feedback_scale: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mirror one production decoder block and expose per-head cross attention."""
 
@@ -203,6 +205,22 @@ def _layer_forward_with_attention(
         average_attn_weights=False,
     )
     query = query + layer.drop(cross_delta)
+    if coordinate_codebook is not None and float(coordinate_feedback_scale) != 0.0:
+        if tuple(coordinate_codebook.shape) != (x_bins, channels):
+            raise ValueError(
+                "coordinate codebook shape mismatch: "
+                f"{tuple(coordinate_codebook.shape)} vs {(x_bins, channels)}"
+            )
+        # MultiheadAttention returns [B*R, H, N, X].  The ordinary decoder
+        # uses these weights only to average appearance values.  This
+        # diagnostic additionally transports the selected x identity through
+        # a coordinate code that the frozen row classifier already knows.
+        # It is an oracle/mechanistic intervention, not a deployable model.
+        coordinate_delta = torch.matmul(
+            attention.mean(dim=1),
+            coordinate_codebook.to(device=query.device, dtype=query.dtype),
+        )
+        query = query + float(coordinate_feedback_scale) * coordinate_delta
 
     query_norm = layer.norm_inter(query)
     query = query + layer.drop(
@@ -242,6 +260,9 @@ def _structured_forward_with_attention(
     features: torch.Tensor,
     *,
     cross_bias_by_layer: dict[int, torch.Tensor] | None = None,
+    coordinate_feedback_by_layer: (
+        dict[int, tuple[torch.Tensor, float]] | None
+    ) = None,
 ) -> tuple[
     dict[str, torch.Tensor],
     list[dict[str, torch.Tensor]],
@@ -262,6 +283,11 @@ def _structured_forward_with_attention(
     stages: list[dict[str, torch.Tensor]] = []
     attention_by_layer: list[torch.Tensor] = []
     for layer_index, layer in enumerate(head.layers):
+        coordinate_feedback = (
+            None
+            if coordinate_feedback_by_layer is None
+            else coordinate_feedback_by_layer.get(layer_index)
+        )
         row_tokens, attention = _layer_forward_with_attention(
             layer,
             row_tokens,
@@ -272,6 +298,12 @@ def _structured_forward_with_attention(
                 None
                 if cross_bias_by_layer is None
                 else cross_bias_by_layer.get(layer_index)
+            ),
+            coordinate_codebook=(
+                None if coordinate_feedback is None else coordinate_feedback[0]
+            ),
+            coordinate_feedback_scale=(
+                0.0 if coordinate_feedback is None else coordinate_feedback[1]
             ),
         )
         attention_by_layer.append(attention)

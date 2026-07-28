@@ -948,3 +948,89 @@ reduction is only a cleanup and the remaining ceiling is the absence of a
 sequence-level curve proposal/initialization mechanism. If it selectively
 improves rank-3 and short-lane recovery without damaging central lanes, it
 becomes the lowest-risk supervision change for a later full run.
+
+## 27. Position is essential, but missing position alone is not the ceiling
+
+The remaining position-path ambiguity was decomposed with three frozen DLA-34
+interventions. These use the same uniformly spaced validation protocol as the
+previous diagnostics and must not be reported as benchmark results.
+
+### 27.1 The learned x embedding is functional, not ignored
+
+The 400 learned horizontal embeddings are applied to cross-attention keys but
+not values. On 32 uniformly sampled images (98 GT lanes), the baseline group-0
+raw recall was `62.24%` at IoU 0.50. Perturbing the positional correspondence
+caused:
+
+| Key-position intervention | Raw R@0.50 | Mean query-row movement |
+|---|---:|---:|
+| Baseline | 62.24 | -- |
+| Zero x embedding | 2.04 | 74.52 px |
+| Reverse x order | 2.04 | 133.38 px |
+| Shuffle x order | 3.06 | 68.71 px |
+| Roll x order by -/+ 50 P2 columns | 0.00 / 0.00 | 145.15 / 151.32 px |
+
+The positional component RMS is `0.187`, versus `0.250` for projected P2
+features. Adjacent learned embeddings have mean cosine `0.938`, while
+half-width-separated embeddings have mean cosine `-0.193`. Thus the decoder
+learned an ordered, spatially meaningful key-position system and depends on
+it strongly. The hypothesis that the ceiling is caused by absent or ignored
+horizontal position is rejected.
+
+### 27.2 Explicit coordinate-state feedback has only a small strict-IoU effect
+
+A second oracle intervention converted each attention distribution into a
+classifier-recognizable x code and added that code to the row state. Aligned
+and horizontally reversed codes used identical norms and the same GT-corridor
+attention bias.
+
+On the 32-image subset, aligned feedback at scales 1 and 2 retained
+`43.88%` R@0.70, versus `41.84%` for the reversed control. Neither aligned
+setting recovered a single IoU-0.50 miss. The aligned effect is directionally
+consistent but small: it changes one strict-IoU lane and does not unlock
+coverage. Natural-attention feedback produces no recall gain.
+
+### 27.3 Direct attention-to-coordinate fusion fails the no-harm test
+
+The final test bypassed row-state encoding completely. It interpolated the
+attention-x distribution to the 800 output bins and mixed it directly with the
+row-coordinate probability distribution. The attention was first moved toward
+the assigned GT corridor with the same moderate `+2` oracle logit bias used in
+Section 14. A fine sweep was evaluated on 64 uniformly sampled images and 221
+lanes:
+
+| Attention mixture | R@0.50 before -> after | Recovered / lost @0.50 | R@0.70 before -> after | Miss assigned-IoU change | Hit assigned-IoU change |
+|---:|---:|---:|---:|---:|---:|
+| 0 (bias only) | 61.09 -> 61.09 | 3 / 3 | 43.44 -> 42.53 | +0.011 | -0.003 |
+| 0.01 | 61.09 -> 61.09 | 3 / 3 | 43.44 -> 41.18 | +0.009 | -0.016 |
+| 0.025 | 61.09 -> 60.63 | 2 / 3 | 43.44 -> 41.18 | +0.008 | -0.018 |
+| 0.05 | 61.09 -> 60.63 | 2 / 3 | 43.44 -> 41.18 | +0.006 | -0.024 |
+| 0.10 | 61.09 -> 58.82 | 3 / 8 | 43.44 -> 38.46 | +0.003 | -0.049 |
+
+Correctly directed x evidence can improve a few baseline misses, so the
+position-transport concern is not fictitious. It is not a safe global
+correction: even a one-percent mixture loses as many IoU-0.50 hits as it
+recovers and damages strict localization. Larger mixtures increasingly damage
+already-correct lanes. Natural, non-oracle attention fusion is worse.
+
+The supported boundary is therefore:
+
+- **solid:** horizontal position is represented, ordered, and heavily used;
+- **secondary weakness:** hard-lane attention/position can sometimes improve a
+  miss when externally corrected;
+- **not supported as the primary ceiling:** merely putting position in values,
+  exposing an attention centroid, or globally mixing attention coordinates;
+- **primary remaining issue:** producing a reliable missing-lane curve
+  hypothesis and deciding when a candidate should be redirected without
+  damaging established lanes.
+
+The next experiment should target query acquisition and refinement arbitration,
+not another unconditional positional encoding. A jointly trained explicit
+reference-x decoder remains a possible architecture, but it must include a
+learned no-harm/uncertainty decision and must pass a short paired gate before a
+full run.
+
+Exact outputs:
+
+- `outputs/diagnostics/position_transport/dla34_225k_uniform32_full.json`;
+- `outputs/diagnostics/position_transport/dla34_225k_uniform64_fine_fusion.json`.
