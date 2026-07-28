@@ -320,3 +320,72 @@ Consequently:
    supervision and a short subset gate before a full run;
 5. for the current budget, prefer the already prepared conservative
    supervision experiment over introducing an unvalidated proposal branch.
+
+## 13. GT-curve-aligned feature probe separates representation from acquisition
+
+The endpoint probe in Section 10 could not distinguish two explanations:
+
+1. the frozen features do not contain usable evidence for hard lanes; or
+2. a point seed is an insufficient interface for accessing curve-level
+   evidence that is already present.
+
+We therefore trained three equal-capacity (`156,226` trainable parameters)
+sequence probes while keeping the complete lane detector frozen. During probe
+training and held-out evaluation, GT geometry defines a controlled
+curve-aligned corridor with four synthetic perturbations: two global
+translations of 32 pixels and two opposite linear tilts spanning -32 to +32
+pixels. Each probe sees the complete offset profile along the curve and
+predicts a smooth row sequence. The three sources are raw backbone C2, the
+projected fused P2 consumed by LaneRowNet, and the trained top-down P2/P3/P4
+pyramid states. All probes use the same initialization, architecture,
+optimization steps, examples, offsets, and parameter count.
+
+This is deliberately an oracle-assisted diagnostic: GT provides the
+approximate curve corridor, and the best-of-four figure selects the best
+corrected perturbation for each lane. It measures conditional information
+availability, not deployable detector recall.
+
+| Backbone / source, current group-0 misses | Row MAE gain | Mean IoU after correction | Pattern R@0.50 | Direction accuracy | Best-of-four R@0.50 |
+|---|---:|---:|---:|---:|---:|
+| ResNet-34 C2 (37 lanes) | +0.98 px | 0.233 | 10.1% | 56.0% | 35.1% |
+| ResNet-34 P2 (37 lanes) | +5.55 px | 0.335 | 21.6% | 72.3% | 70.3% |
+| ResNet-34 P2/P3/P4 (37 lanes) | +5.54 px | 0.335 | 21.6% | 72.0% | 67.6% |
+| DLA-34 C2 (38 lanes) | +1.29 px | 0.243 | 5.9% | 56.9% | 18.4% |
+| DLA-34 P2 (38 lanes) | +5.84 px | 0.339 | 19.7% | 71.5% | 60.5% |
+| DLA-34 P2/P3/P4 (38 lanes) | +5.84 px | 0.339 | 20.4% | 71.8% | 63.2% |
+
+The main result is that fused P2 is substantially more informative than raw
+C2 on the lanes missed by the current decoder. For DLA-34, P2 raises
+best-of-four R@0.50 from `18.4%` to `60.5%`; for ResNet-34 it rises from
+`35.1%` to `70.3%`. Thus the FPN is not destroying the relevant lane signal.
+Conditioned on an approximate complete curve, a small frozen-feature decoder
+can recover a substantial fraction of current misses.
+
+The result also rules out a simple multiscale-neck explanation. Adding P3 and
+P4 changes DLA-34 best-of-four recovery by only one of 38 missed lanes and
+slightly reduces it for ResNet-34. The learned DLA-34 scale weights assign
+`94.1%` to P2. A generic larger FPN is therefore unlikely to be the highest
+leverage intervention.
+
+The diagnosis is not purely architectural. Hard misses remain much less
+decodable than already acquired lanes. With DLA-34 P2, best-of-four R@0.50 is
+`60.5%` for misses versus `96.2%` for hits, and direction accuracy is `71.5%`
+versus `86.2%`. ResNet-34 is stronger on the corresponding miss upper bound
+(`70.3%`), which provides a plausible secondary explanation for why the
+current ResNet-34 run scales better than DLA-34.
+
+The combined evidence supports the following conclusion:
+
+- the primary bottleneck is the **curve acquisition/interface and its
+  supervision**: the current lane queries do not reliably reach coherent P2
+  evidence that becomes useful once the full curve neighborhood is supplied;
+- hard-lane representation quality is a secondary bottleneck, particularly for
+  DLA-34;
+- raw C2 bypasses, endpoint-only routing, and a generic P3/P4 neck are not
+  supported as the next full-run fix;
+- a future intervention should be curve-aware and sequence-level, use P2 as
+  its main evidence, and receive intermediate discovery/coverage supervision
+  before final row-distribution refinement.
+
+The exact diagnostic outputs are stored in
+`outputs/diagnostics/gt_curve_feature_probe/{r34,dla34}_225k.json`.
