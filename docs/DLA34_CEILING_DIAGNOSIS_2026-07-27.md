@@ -545,3 +545,73 @@ mechanistic gate before committing to a full run.
 
 The complete output is
 `outputs/diagnostics/attention_coordinate_adapter/r34_225k.json`.
+
+## 16. Reference-guided local P2 probe rejects curve-aligned refinement as the ceiling fix
+
+The remaining coordinate-path hypothesis was tested more directly before
+committing to a full detector run. The ResNet-34 225k detector was frozen and
+four identically initialized, equal-capacity (`199,233` parameters) probes
+were fitted for 300 steps:
+
+1. explicit anchor x and row index only;
+2. anchor plus the intermediate row state;
+3. anchor plus P2 profiles sampled at nine offsets from -64 to +64 pixels;
+4. anchor plus both row state and local P2 profiles.
+
+All variants shared exactly the same architecture, optimizer, training
+assignments, coordinate inputs, and losses. Inputs disabled by an ablation
+were replaced with zeros. The probes predicted bounded row-wise residuals and
+were evaluated on the same held-out 64-image/195-lane subset. Evaluation
+applied each probe to all deployment-group candidates without GT association
+and compared them with the mature L4 raw proposals.
+
+### 16.1 L2 reference
+
+| Frozen R34 L2 probe | Raw R@0.50 | Raw R@0.70 | Recovered / lost @0.50 | Assigned-row MAE |
+|---|---:|---:|---:|---:|
+| Mature L4 output | **81.03** | **66.15** | -- | **10.10 px** |
+| Anchor only | 32.31 | 0.00 | 2 / 97 | 20.41 px |
+| State only | 35.38 | 0.51 | 2 / 91 | 19.62 px |
+| Local P2 | 70.77 | 34.87 | 1 / 21 | 15.52 px |
+| State + local P2 | 71.79 | 39.49 | 1 / 19 | 15.02 px |
+
+Local P2 is genuinely informative at L2: relative to the state-only control,
+it reduces assigned-row MAE by `4.60` pixels. It nevertheless remains `4.92`
+pixels worse than the mature L4 output, loses 19 existing R@0.50 hits, and
+recovers only one of 37 mature-output misses. Thus the detector does not
+appear ceiling-limited by an inability to make an early curve-aligned local
+correction.
+
+### 16.2 L3 reference
+
+| Frozen R34 L3 probe | Raw R@0.50 | Raw R@0.70 | Recovered / lost @0.50 | Assigned-row MAE |
+|---|---:|---:|---:|---:|
+| Mature L4 output | **81.03** | **66.15** | -- | **10.10 px** |
+| Anchor only | 80.51 | 59.49 | 3 / 4 | 12.05 px |
+| State only | 80.51 | 59.49 | 3 / 4 | 12.03 px |
+| Local P2 | 80.00 | 62.05 | 1 / 3 | 11.92 px |
+| State + local P2 | 79.49 | 62.56 | 1 / 4 | 11.84 px |
+
+At L3 the explicit local visual path adds only `0.19` pixels of MAE
+improvement over the state-only control. More importantly, it recovers fewer
+mature-output misses (`1/37`) than state alone (`3/37`) and lowers total
+R@0.50. The predefined positive gate therefore fails at both viable update
+locations.
+
+### 16.3 Consequence
+
+These results reject **curve-aligned local P2 residual refinement as the
+supported one-shot ceiling intervention**. They do not say that local P2 is
+useless: it substantially improves an immature L2 curve. They show that the
+existing L3/L4 decoder already extracts the useful part of that signal and
+that the remaining mature-output misses are not recovered by searching a
+local corridor around the current curve.
+
+Accordingly, a CLRNet-style ROI gather, deformable sampling layer, or
+post-hoc dynamic reference updater should not be selected as the next full
+training run on the present evidence. The remaining ceiling diagnosis should
+focus on proposal formation, assignment, query diversity, and supervision
+rather than another local geometry-refinement branch.
+
+The reproducible diagnostic entry point is
+`scripts/probe_culane_r34_reference_guided_p2_update.sh`.
