@@ -389,3 +389,105 @@ The combined evidence supports the following conclusion:
 
 The exact diagnostic outputs are stored in
 `outputs/diagnostics/gt_curve_feature_probe/{r34,dla34}_225k.json`.
+
+## 14. Soft attention intervention locates the post-attention bottleneck
+
+Section 13 showed that P2 contains useful curve evidence once an approximate
+curve corridor is supplied, but it did not distinguish two mechanisms:
+
+1. a query never attends to the missing lane; or
+2. attention reaches the lane but its selected position is not converted into
+   row geometry.
+
+We therefore exposed the per-head row-local cross-attention maps of the frozen
+four-layer decoder. Final Hungarian group-0 assignments preserve query
+identity, while raw proposal geometry--before scores, thresholding, Top-K, or
+NMS--defines hit and miss buckets. Attention is measured inside a 16-pixel GT
+corridor. We then add small positive biases (`+0.5`, `+1`, `+2`, and `+4`) to
+the L3 attention logits inside that corridor. Unlike the earlier hard mask,
+all locations remain accessible and the intervention can be swept from weak
+to strong.
+
+Natural attention is correlated with successful acquisition:
+
+| Backbone, L3 bucket | Corridor mass | Top-1 inside | Centroid error |
+|---|---:|---:|---:|
+| ResNet-34, L2 miss recovered at L3 | 15.2% | 40.4% | 83.3 px |
+| ResNet-34, L2 miss unresolved at L3 | 12.6% | 27.7% | 143.0 px |
+| DLA-34, L2 miss recovered at L3 | 15.9% | 42.6% | 87.0 px |
+| DLA-34, L2 miss unresolved at L3 | 13.9% | 30.0% | 130.0 px |
+
+Thus missing lanes receive weaker and less spatially accurate attention.
+However, the causal intervention shows that this is not the complete
+bottleneck:
+
+| Backbone, final misses | Natural L3 top-1 inside | Top-1 inside with `+2` | Attention-peak R@0.50 with `+2` | Normal output recovered, L3 only / L3--L4 | Mean row-output move, L3 only / L3--L4 |
+|---|---:|---:|---:|---:|---:|
+| ResNet-34 (37 misses) | 28.3% | 88.2% | 37.8% | 0 / 0 | 1.64 / 2.08 px |
+| DLA-34 (38 misses) | 30.7% | 92.6% | 34.2% | 1 / 2 | 1.02 / 1.60 px |
+
+The `attention-peak` diagnostic directly converts the most-attended x-bin at
+each row into a lane after oracle association. It is not a deployable
+prediction, but it proves that under a moderate bias the attention maps
+contain substantially more correct row location than the ordinary output
+uses. The regular row prediction moves by only one to two pixels. For final
+misses, the mean assigned-lane IoU gain is only `+0.005` for ResNet-34 and
+`+0.011` for DLA-34 with an L3-only `+2` bias.
+
+Increasing the bias does not solve the interface. At `+4`, L3-only bias
+recovers two IoU-0.50 misses but also loses two existing hits for each
+backbone. Applying `+4` at both L3 and L4 loses four ResNet-34 hits and six
+DLA-34 hits while recovering only one miss. The failure is therefore not a
+matter of choosing a stronger attention gate.
+
+### 14.1 The code path explains the measured insensitivity
+
+The current row-feature construction is:
+
+```python
+feat_value = feat
+feat_key = feat_value + x_pos
+```
+
+Cross-attention then returns a weighted sum of `feat_value`, and only that sum
+is added to the row token. The x-position embedding affects **where** attention
+looks through the key, but neither the attention centroid nor x-position is
+included in the value passed to the row state. The final absolute coordinate
+distribution is predicted later from that state:
+
+```python
+q = q + cross_attn(q, feat_key, feat_value)
+row_x_logits = row_x(q)
+```
+
+Consequently, moving attention from one visually similar lane marking to
+another can change the attention weights without explicitly telling the row
+state where the selected evidence was located. Instance-token spatial priors
+can still make the trained model work, but unused or duplicate queries cannot
+be reliably redirected toward a missing curve. This also explains why a
+stronger backbone improves early/easy-lane evidence without consistently
+raising final coverage.
+
+### 14.2 Updated diagnosis and required architectural property
+
+The evidence now locates the primary ceiling **after visual selection and
+before row-coordinate prediction**. Natural acquisition is weaker on hard
+lanes, but forcing attention to the correct corridor does not make the current
+state/output path follow it. A loss-only change may improve existing query
+priors, but it cannot add the missing coordinate-carrying interface.
+
+A supported next design should therefore:
+
+1. keep fused P2 as the primary visual source;
+2. maintain an explicit per-lane, per-row reference x-coordinate;
+3. feed the attended x-coordinate or a positional encoding of it back into the
+   row state, rather than returning appearance values alone;
+4. update the reference coordinate across decoder layers and supervise those
+   intermediate coordinates/coverage;
+5. preserve a bounded residual update so precise existing lanes are not
+   destroyed.
+
+This is materially different from adding P3/P4, increasing attention bias, or
+adding only another final loss. The complete intervention outputs are in
+`outputs/diagnostics/attention_acquisition/`, and the coordinate-response
+audit is in `outputs/diagnostics/attention_acquisition_response/`.
