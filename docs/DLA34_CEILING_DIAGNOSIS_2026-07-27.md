@@ -247,3 +247,76 @@ If that probe recovers a large fraction of final misses, the information is in
 P2 and the current centerline supervision/readout is inadequate. If it does
 not, the bottleneck includes the backbone/FPN representation of hard lanes and
 a proposal-only full run is a poor use of the training budget.
+
+## 10. Frozen-P2 discovery probe rejects the endpoint-only proposal
+
+We implemented the proposed train/validation-disjoint diagnostic. The base
+DLA-34 checkpoint and its P2 tensor remain frozen. A `121,673`-parameter probe
+predicts a dense bottom-endpoint heatmap, uses the resulting spatially distinct
+seeds to initialize an 80-row structured decoder, and reads frozen P2 with one
+row-aware decoder block. It was trained for 250 short steps on CULane train and
+evaluated on the same fixed 64-image CULane validation subset.
+
+| DLA-34 frozen-P2 diagnostic | Result |
+|---|---:|
+| Endpoint seed recall within 16 / 32 / 64 px | 23.1 / 39.0 / 52.3% |
+| Endpoint recall within 32 px on current group-0 misses | 28.9% |
+| Probe proposal recall at IoU 0.50 / 0.70 | 0.5 / 0.0% |
+| Current group-0 misses recovered at IoU 0.50 | 0 / 38 |
+| Union recall gain over the frozen decoder | 0.0 points |
+| GT-endpoint-seeded proposal recall at IoU 0.50 / 0.70 | 0.0 / 0.0% |
+
+The endpoint heatmap contains a weak but real localization signal. It is not
+enough to initialize a valid full-lane hypothesis: even replacing predicted
+endpoints with exact GT endpoints does not produce one valid proposal. The
+newly initialized row decoder had only 250 optimization steps, so this result
+alone cannot prove that all trainable proposal mechanisms will fail. It does,
+however, reject the claim that an endpoint router is a cheap, already-supported
+ceiling fix.
+
+## 11. Oracle intervention on the mature decoder also fails
+
+To remove the ambiguity caused by the newly initialized probe decoder, we ran
+a second zero-training intervention on the checkpoint's mature four-layer
+structured decoder. Final group-0 assignments identify the query associated
+with each GT lane. We then constrain that query's visual cross-attention to a
+16-pixel GT corridor while leaving all weights frozen.
+
+| GT-informed intervention | R@0.50 change | Recovered / lost @0.50 | R@0.70 change | Mean best-IoU change |
+|---|---:|---:|---:|---:|
+| Correct bottom endpoint, first block | 0.0 points | 0 / 0 | 0.0 points | -0.0002 |
+| Correct bottom endpoint, every block | 0.0 points | 0 / 0 | 0.0 points | -0.0027 |
+| Correct full curve, first block | -24.6 points | 1 / 49 | -23.1 points | -0.1840 |
+
+These are causal diagnostics, not deployable results: the corridors use GT and
+a hard attention mask is not equivalent to a learned additive proposal prior.
+Nevertheless, the result is decisive for the narrow hypothesis. Giving the
+mature decoder the correct endpoint does not recover any missing lane, and
+hard-constraining attention around the complete GT curve causes severe
+distribution shift and destroys many existing hits.
+
+## 12. Updated go/no-go decision
+
+The evidence now gives a **red light to an endpoint-only query router** as the
+next full training run. Its required precondition was that a spatially correct
+seed should let either a small P2 decoder or the mature decoder acquire missing
+lanes. Neither test satisfies that condition.
+
+This does not show that lane discovery is irrelevant. The measured symptom
+remains: DLA refines acquired lanes well but recovers fewer hard missing lanes.
+It shows that the cause is deeper than assigning duplicate queries to different
+bottom endpoints. The hard lanes often lack a sufficiently coherent
+curve-level representation in the current P2/dense outputs, and the existing
+decoder cannot turn a single local cue into a new lane.
+
+Consequently:
+
+1. do not spend the only full run on the tested endpoint heatmap/router;
+2. do not interpret a larger generic FPN as a supported fix;
+3. retain the bounded matcher and train-many/infer-one changes as cleanup, not
+   as claimed ceiling solutions;
+4. if a new discovery architecture is pursued later, require a
+   **curve-aware, sequence-level proposal** with its own intermediate
+   supervision and a short subset gate before a full run;
+5. for the current budget, prefer the already prepared conservative
+   supervision experiment over introducing an unvalidated proposal branch.
