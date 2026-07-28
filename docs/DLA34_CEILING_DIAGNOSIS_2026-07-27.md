@@ -491,3 +491,57 @@ This is materially different from adding P3/P4, increasing attention bias, or
 adding only another final loss. The complete intervention outputs are in
 `outputs/diagnostics/attention_acquisition/`, and the coordinate-response
 audit is in `outputs/diagnostics/attention_acquisition_response/`.
+
+## 15. Frozen coordinate-adapter probe does not support a post-hoc fix
+
+Section 14 identified a real coordinate-response problem under a causal
+attention intervention, but that result used a GT-defined soft corridor. We
+therefore tested whether the **natural** L3/L4 attention coordinates in the
+frozen ResNet-34 model contain deployable correction information.
+
+The detector was frozen at 225k. Four identically initialized, equal-capacity
+(`77,185` parameters) bounded residual adapters were fitted for 300 steps on
+the CULane training split:
+
+1. anchor x and row index only;
+2. anchor plus final row state;
+3. anchor plus per-head L3/L4 attention expected-x, peak-x, entropy, and peak
+   probability;
+4. anchor plus both row state and attention coordinates.
+
+All adapters used the same sequence mixer, loss, optimizer, and training
+examples. Evaluation used the same held-out 64-image/195-lane validation
+subset as the previous diagnosis and raw group-0 geometry before scoring,
+Top-K, or NMS.
+
+| Frozen R34 probe | Raw R@0.50 | Recovered / lost @0.50 | Raw R@0.70 | Assigned-row MAE change |
+|---|---:|---:|---:|---:|
+| Baseline | 81.03 | -- | 65.64 | -- |
+| Anchor only | 81.03 | 1 / 1 | 63.08 | **-0.22 px** |
+| State only | 80.51 | 1 / 2 | 63.59 | **-0.28 px** |
+| Attention only | 81.03 | 1 / 1 | 63.08 | **-0.21 px** |
+| State + attention | 81.03 | 1 / 1 | 62.56 | **-0.23 px** |
+
+Here a negative MAE change means that the correction made row error worse.
+All four variants recovered only one of the 37 baseline misses. The combined
+adapter improved miss recall by exactly `0.0` points over the equal-capacity
+state-only control. It therefore fails the predefined positive gate.
+
+This falsifies the **simple post-hoc version** of the hypothesis: natural
+attention centroids from the already-trained decoder cannot merely be exposed
+to a small frozen-model adapter and expected to unlock the ceiling. It also
+shows that adding another residual head is not automatically a no-harm
+operation.
+
+The result does not erase Section 14's causal finding. The old attention maps
+were themselves learned in a system whose values carry appearance but not
+position; they were never optimized to serve as coordinate measurements.
+Consequently, this probe cannot determine whether an explicit reference-x
+path learned jointly from initialization would make attention and coordinate
+updates co-adapt. It does, however, remove the justification for treating a
+plug-in coordinate adapter as a likely improvement. Any remaining test of the
+architectural hypothesis must be end-to-end and should first use a short
+mechanistic gate before committing to a full run.
+
+The complete output is
+`outputs/diagnostics/attention_coordinate_adapter/r34_225k.json`.
