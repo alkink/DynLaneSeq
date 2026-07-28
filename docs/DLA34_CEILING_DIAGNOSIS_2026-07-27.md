@@ -208,3 +208,42 @@ This is closer to the useful part of CondLSTR's design--query-conditioned dense
 prediction and supervision at every decoder layer--than copying its neck. It
 targets the measured missing-lane recovery bottleneck while leaving the
 already-strong row geometry intact.
+
+## 9. Dense centerline evidence does not yet validate a pure routing fix
+
+We subsequently asked a stricter zero-training question: when a group-0
+structured candidate misses a GT lane, is that lane nevertheless visible in the
+checkpoint's independently supervised dense centerline output?
+
+For every valid GT row, the diagnostic extracts the nearest of eight
+NMS-filtered centerline peaks. Selecting the nearest peak separately at each GT
+row uses GT association and is therefore an oracle diagnostic, not a detector
+result. On the same 64-image subset:
+
+| Backbone / lane bucket | Peak rows within 15 px | Dense-peak oracle R@0.50 |
+|---|---:|---:|
+| ResNet-34, structured hit @0.50 | 87.8% | 87.3% |
+| ResNet-34, structured miss @0.50 | 57.7% | 10.8% |
+| DLA-34, structured hit @0.50 | 82.2% | 73.9% |
+| DLA-34, structured miss @0.50 | 57.3% | 5.3% |
+
+The centerline probability sampled at GT coordinates also falls from `0.501`
+to `0.165` for ResNet-34 hits versus misses and from `0.456` to `0.166` for
+DLA-34. Thus most final misses are not clean lane traces waiting in the current
+dense auxiliary map for a query router to select. DLA's missed lanes are no
+more recoverable from this output than ResNet-34's.
+
+This result narrows, rather than reverses, the conclusion in Section 7:
+
+- instance-level hard-lane recovery remains the observed decoder symptom;
+- four-group duplication remains real;
+- but a **pure query-assignment/router change is not yet causally supported**;
+- the current task-aligned dense readout also lacks sufficient evidence on
+  most missed lanes.
+
+The next cheap falsification test should therefore train a small discovery
+probe on **frozen P2 features**, using image-disjoint train/validation subsets.
+If that probe recovers a large fraction of final misses, the information is in
+P2 and the current centerline supervision/readout is inadequate. If it does
+not, the bottleneck includes the backbone/FPN representation of hard lanes and
+a proposal-only full run is a poor use of the training budget.
