@@ -6,6 +6,7 @@ from dynlaneseq_eg.tools.probe_query_conditioned_dense_curve import (
     QueryConditionedDenseCurveProbe,
     _group_zero_matches,
     matched_dense_curve_loss,
+    probe_row_states,
 )
 
 
@@ -74,3 +75,32 @@ def test_dense_curve_loss_is_lane_balanced_and_differentiable() -> None:
     assert logits.grad is not None
     assert float(logits.grad[0, :2].abs().sum()) > 0.0
     assert float(logits.grad[0, 2:].abs().sum()) == 0.0
+
+
+def test_initial_probe_states_are_image_blind_but_query_specific() -> None:
+    class Head(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.instance_tokens = torch.nn.Embedding(4, 6)
+            self.row_tokens = torch.nn.Embedding(5, 6)
+
+    head = Head()
+    outputs = {"structured_row_tokens": torch.randn(2, 4, 5, 6)}
+    initial = probe_row_states(
+        head,
+        outputs,
+        source="initial",
+        group_size=3,
+        batch_size=2,
+    )
+    final = probe_row_states(
+        head,
+        outputs,
+        source="final",
+        group_size=3,
+        batch_size=2,
+    )
+    assert initial.shape == (2, 3, 5, 6)
+    assert torch.equal(initial[0], initial[1])
+    assert not torch.equal(initial[0, 0], initial[0, 1])
+    assert torch.equal(final, outputs["structured_row_tokens"][:, :3])

@@ -47,6 +47,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--evidence-width", type=int, default=400)
+    parser.add_argument(
+        "--state-source",
+        choices=("final", "initial"),
+        default="final",
+        help=(
+            "Use the frozen final decoder row states, or the image-blind "
+            "instance+row states before the first decoder block."
+        ),
+    )
     parser.add_argument("--line-width", type=float, default=30.0)
     parser.add_argument("--eval-max-batches", type=int, default=16)
     parser.add_argument(
@@ -396,6 +405,30 @@ def _roll_batch(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.roll(shifts=1, dims=0)
 
 
+def probe_row_states(
+    structured_head: nn.Module,
+    outputs: dict[str, Any],
+    *,
+    source: str,
+    group_size: int,
+    batch_size: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    source = str(source).strip().lower()
+    if source == "final":
+        return outputs["structured_row_tokens"][:, :group_size].to(dtype=dtype)
+    if source != "initial":
+        raise ValueError(f"Unsupported state source: {source!r}")
+    instance_tokens = getattr(structured_head, "instance_tokens").weight[:group_size]
+    row_tokens = getattr(structured_head, "row_tokens").weight
+    initial = instance_tokens[:, None, :] + row_tokens[None, :, :]
+    return (
+        initial.unsqueeze(0)
+        .expand(int(batch_size), -1, -1, -1)
+        .to(dtype=dtype)
+    )
+
+
 @torch.no_grad()
 def evaluate_probe(
     model: nn.Module,
@@ -407,6 +440,7 @@ def evaluate_probe(
     amp_dtype: torch.dtype | None,
     group_size: int,
     line_width: float,
+    state_source: str,
 ) -> tuple[dict[str, Any], int]:
     model.eval()
     probe.eval()
@@ -438,7 +472,13 @@ def evaluate_probe(
             )
         matches = matcher(outputs, targets)
         p2 = encoded["features"].float()
-        row_states = outputs["structured_row_tokens"][:, :group_size].float()
+        row_states = probe_row_states(
+            model.structured_query_head,
+            outputs,
+            source=state_source,
+            group_size=group_size,
+            batch_size=int(images.shape[0]),
+        )
         encoded_correct = probe.encode_features(p2)
         correct_logits = probe.score_encoded(encoded_correct, row_states)
         wrong_image_logits = probe.score_encoded(
@@ -598,8 +638,12 @@ def main() -> None:
                 )
                 matches = matcher(outputs, targets)
                 p2 = encoded["features"].float()
-                row_states = (
-                    outputs["structured_row_tokens"][:, :group_size].float()
+                row_states = probe_row_states(
+                    model.structured_query_head,
+                    outputs,
+                    source=args.state_source,
+                    group_size=group_size,
+                    batch_size=int(images.shape[0]),
                 )
             logits = probe(p2, row_states)
             loss, lane_count, row_count = matched_dense_curve_loss(
@@ -647,6 +691,7 @@ def main() -> None:
         amp_dtype=amp_dtype,
         group_size=group_size,
         line_width=float(args.line_width),
+        state_source=args.state_source,
     )
     dense = metrics["modes"]["dense_correct"]
     wrong_image = metrics["modes"]["dense_wrong_image"]
@@ -668,6 +713,7 @@ def main() -> None:
         "split": args.split,
         "seed": int(args.seed),
         "train_steps": int(args.train_steps),
+        "state_source": args.state_source,
         "images": int(images_seen),
         "sample_strategy": args.sample_strategy,
         "sampled_dataset_indices": sampled_indices,

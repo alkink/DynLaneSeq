@@ -13,6 +13,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
+STATE_SOURCE="${STATE_SOURCE:-final}"
 
 python -m dynlaneseq_eg.tools.probe_query_conditioned_dense_curve \
   --config "$CONFIG" \
@@ -27,6 +28,7 @@ python -m dynlaneseq_eg.tools.probe_query_conditioned_dense_curve \
   --num-workers "$NUM_WORKERS" \
   --hidden-dim 64 \
   --evidence-width 400 \
+  --state-source "$STATE_SOURCE" \
   --learning-rate 1e-3 \
   --line-width 30.0 \
   --amp-dtype "$AMP_DTYPE" \

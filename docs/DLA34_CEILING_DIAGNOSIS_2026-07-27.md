@@ -834,3 +834,52 @@ The implemented entry point is:
 ```bash
 bash scripts/probe_culane_query_conditioned_dense_curve_short.sh
 ```
+
+## 24. Final-state dense association is image-specific but recovers no misses
+
+The DLA-34 225k checkpoint was frozen and the query-conditioned dense curve
+probe was trained for 1000 steps. Evaluation used the same uniformly spaced
+64-image/221-lane validation subset as Sections 18--21.
+
+| Probe input / output | Raw R@0.50 | Raw R@0.70 | Paired mean IoU |
+|---|---:|---:|---:|
+| Frozen base decoder | 61.09 | 43.44 | 0.550 |
+| Dense head, correct P2 and final row state | 21.72 | 2.71 | 0.308 |
+| Dense head, wrong-image P2 | 1.36 | 0.00 | 0.097 |
+| Dense head, wrong-image row state | 9.05 | 0.45 | 0.189 |
+| Dense head, zero P2 | 0.00 | 0.00 | 0.006 |
+| 50/50 base--dense coordinate blend | 33.94 | 6.33 | 0.373 |
+
+The controls establish that the probe learned a real image- and state-dependent
+signal: correct-image recall is 20.36 points above the wrong-image control and
+zeroing P2 eliminates all valid proposals. The negative result is nevertheless
+decisive for the proposed use. Of the 86 base misses at IoU 0.50 and 125 at
+IoU 0.70, the dense head recovers **zero**. Every dense-head hit is already a
+base hit. On paired assignments it improves 29 lanes by more than 0.02 IoU but
+worsens 180; blending does not provide a no-harm correction.
+
+The predefined positive gate therefore fails by its primary criterion:
+union-recall gain is `0.0`, not the required `+5.0` points. A dense output head
+attached to the mature final row state should not be promoted to a full
+training run on this evidence.
+
+The result localizes the remaining ambiguity one step earlier. A missed lane's
+final row state may already be committed to the wrong curve, in which case a
+correctly functioning dense readout cannot rediscover it. The next and final
+cheap decomposition reuses the same dense head but replaces the final row
+state with the frozen image-blind `instance_token + row_token` state before
+the first decoder block. A positive result would implicate decoder state
+formation; another zero-recovery result would show that neither mature states
+nor static ordinal query identities can extract missing full curves from the
+frozen P2 representation with this supervision.
+
+The exact final-state output is
+`/tmp/dla34_query_conditioned_dense_probe.json`. The state-source control is
+selected with:
+
+```bash
+STATE_SOURCE=initial \
+OUTPUT_JSON=/tmp/dla34_initial_state_dense_probe.json \
+SAVE_PROBE=/tmp/dla34_initial_state_dense_probe.pt \
+bash scripts/probe_culane_query_conditioned_dense_curve_short.sh
+```
