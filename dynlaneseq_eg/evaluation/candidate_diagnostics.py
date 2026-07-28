@@ -21,7 +21,7 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 STAGE_TENSOR_FIELDS = (
     "pred_x_rows",
     "exist_logits",
@@ -69,6 +69,7 @@ def _cache_path(
     split: str,
     max_batches: int,
     eval_batch_size: int | None,
+    sample_strategy: str,
 ) -> Path:
     checkpoint = Path(checkpoint_path)
     stat = checkpoint.stat()
@@ -83,6 +84,7 @@ def _cache_path(
             str(split),
             str(max_batches),
             str(eval_batch_size),
+            str(sample_strategy),
             str(CACHE_VERSION),
         ]
     )
@@ -189,6 +191,7 @@ def load_or_collect_cache(
     max_batches: int = 0,
     eval_batch_size: int | None = None,
     num_workers: int | None = None,
+    sample_strategy: str = "sequential",
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
@@ -214,6 +217,7 @@ def load_or_collect_cache(
         split,
         max_batches,
         effective_eval_batch_size,
+        sample_strategy,
     )
     if reuse_cache and cache_path.exists():
         try:
@@ -233,6 +237,14 @@ def load_or_collect_cache(
         model.prepare_for_inference()
     model.eval()
     loader = build_dataloader(cfg, split=split, training=False)
+    from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
+
+    loader, sampled_indices = select_diagnostic_loader(
+        loader,
+        strategy=sample_strategy,
+        max_batches=max_batches,
+        num_workers=int(dataloader_cfg.get("num_workers", 0)),
+    )
     pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
     records: list[dict[str, Any]] = []
 
@@ -278,6 +290,8 @@ def load_or_collect_cache(
             "max_batches": int(max_batches),
             "eval_batch_size": effective_eval_batch_size,
             "num_workers": int(dataloader_cfg.get("num_workers", 0)),
+            "sample_strategy": str(sample_strategy),
+            "sampled_dataset_indices": sampled_indices,
             "input_w": int(model_cfg.get("input_w", 800)),
             "input_h": int(model_cfg.get("input_h", 288)),
             "postprocess": deepcopy(cfg.get("postprocess", {})),

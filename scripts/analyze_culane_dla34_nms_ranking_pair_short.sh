@@ -13,6 +13,7 @@ CACHE_DIR="${CACHE_DIR:-${OUTPUT_DIR}/cache}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 MAX_BATCHES="${MAX_BATCHES:-16}"
+SAMPLE_STRATEGY="${SAMPLE_STRATEGY:-uniform}"
 DEVICE="${DEVICE:-cuda}"
 TOP_K="${TOP_K:-4}"
 IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.5 0.7}"
@@ -53,6 +54,7 @@ run_arm() {
     --max-batches "$MAX_BATCHES" \
     --eval-batch-size "$EVAL_BATCH_SIZE" \
     --num-workers "$NUM_WORKERS" \
+    --sample-strategy "$SAMPLE_STRATEGY" \
     --top-k-values "$TOP_K" \
     --iou-thresholds ${IOU_THRESHOLDS} \
     --quality-powers ${QUALITY_POWERS} \

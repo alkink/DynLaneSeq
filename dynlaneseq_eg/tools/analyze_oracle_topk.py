@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--sample-strategy",
+        choices=("sequential", "uniform"),
+        default="sequential",
+    )
     parser.add_argument("--output-json", default="")
     parser.add_argument("--cache-dir", default="outputs/diagnostic_cache")
     parser.add_argument("--reuse-cache", action="store_true")
@@ -101,6 +106,7 @@ def main() -> None:
         max_batches=args.max_batches,
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
+        sample_strategy=args.sample_strategy,
         desc="oracle cache",
     )
     metadata = cache["metadata"]

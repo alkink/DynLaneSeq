@@ -38,6 +38,8 @@ def _report(offset: float = 0.0) -> dict:
             "max_batches": 4,
             "num_records": 4,
             "iou_space": "row_space",
+            "sample_strategy": "uniform",
+            "sampled_dataset_indices": [0, 3, 6, 9],
         },
         "rows": [
             _row("all_raw", recall=0.8 + offset, top_k=0),

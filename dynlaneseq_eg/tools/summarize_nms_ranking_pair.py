@@ -85,6 +85,10 @@ def _comparability(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str,
         "num_records": base_meta.get("num_records")
         == candidate_meta.get("num_records"),
         "iou_space": base_meta.get("iou_space") == candidate_meta.get("iou_space"),
+        "sample_strategy": base_meta.get("sample_strategy")
+        == candidate_meta.get("sample_strategy"),
+        "sampled_dataset_indices": base_meta.get("sampled_dataset_indices")
+        == candidate_meta.get("sampled_dataset_indices"),
     }
     return {
         "all_checks_pass": all(checks.values()),
