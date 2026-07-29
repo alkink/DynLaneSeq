@@ -310,14 +310,20 @@ def _training_residuals(
     return residual.clamp(-float(max_shift), float(max_shift))
 
 
-def _evaluation_residuals(num_rows: int, *, device: torch.device) -> torch.Tensor:
+def _evaluation_residuals(
+    num_rows: int,
+    *,
+    device: torch.device,
+    shift_px: float = 32.0,
+) -> torch.Tensor:
     t = torch.linspace(-1.0, 1.0, num_rows, device=device)
+    shift = float(shift_px)
     return torch.stack(
         (
-            torch.full_like(t, -32.0),
-            torch.full_like(t, 32.0),
-            32.0 * t,
-            -32.0 * t,
+            torch.full_like(t, -shift),
+            torch.full_like(t, shift),
+            shift * t,
+            -shift * t,
         ),
         dim=0,
     )
@@ -331,6 +337,7 @@ def _build_lane_examples(
     max_offset: float,
     training: bool,
     max_train_shift: float,
+    eval_shift_px: float = 32.0,
 ) -> LaneExamples | None:
     image_parts: list[torch.Tensor] = []
     gt_parts: list[torch.Tensor] = []
@@ -364,7 +371,11 @@ def _build_lane_examples(
             )
             patterns = torch.zeros(gt.shape[0], device=gt.device, dtype=torch.long)
         else:
-            templates = _evaluation_residuals(probe_rows, device=gt.device)
+            templates = _evaluation_residuals(
+                probe_rows,
+                device=gt.device,
+                shift_px=float(eval_shift_px),
+            )
             pattern_count = int(templates.shape[0])
             gt = gt.repeat_interleave(pattern_count, dim=0)
             valid = valid.repeat_interleave(pattern_count, dim=0)
