@@ -29,62 +29,95 @@ class HungarianMatcherS0:
 
     @torch.no_grad()
     def __call__(self, outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
-        if "coarse" in outputs:
-            outputs = outputs["coarse"]
-        pending = []
-        for b, target in enumerate(targets):
-            cost, stats = self.compute_cost_for_image(
-                outputs["exist_logits"][b],
-                outputs["pred_x_rows"][b],
-                outputs["range_norm"][b],
-                target,
-            )
-            num_gt = int(target["x_rows"].shape[0])
-            pending.append((cost, stats, num_gt))
+        return self.match_many((outputs,), targets)[0]
+
+    @torch.no_grad()
+    def match_many(
+        self,
+        output_sequence: list[dict[str, torch.Tensor]] | tuple[dict[str, torch.Tensor], ...],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> list[list[dict[str, torch.Tensor]]]:
+        """Match several decoder outputs with one device round trip.
+
+        Deep supervision needs an independent assignment for every decoder
+        layer.  Computing those assignments one matcher call at a time forced
+        one D2H synchronization and one H2D index transfer per layer.  Cost
+        construction and SciPy's per-image Hungarian solve remain identical;
+        only the transport of the already-computed cost matrices and integer
+        pairs is batched across layers.
+        """
+
+        normalized_outputs = []
+        pending_by_output = []
+        for outputs in output_sequence:
+            if "coarse" in outputs:
+                outputs = outputs["coarse"]
+            normalized_outputs.append(outputs)
+            pending = []
+            for b, target in enumerate(targets):
+                cost, stats = self.compute_cost_for_image(
+                    outputs["exist_logits"][b],
+                    outputs["pred_x_rows"][b],
+                    outputs["range_norm"][b],
+                    target,
+                )
+                num_gt = int(target["x_rows"].shape[0])
+                pending.append((cost, stats, num_gt))
+            pending_by_output.append(pending)
+
+        if not normalized_outputs:
+            return []
 
         # Deep supervision calls the matcher once for every decoder output.
-        # Moving each image cost to CPU inside the loop serializes the CUDA
-        # stream B times per call (and B * decoder_layers times per training
-        # micro-batch).  The matrices are tiny, so concatenate them and pay for
-        # exactly one device synchronization while preserving the identical
-        # per-image SciPy assignment below.
-        nonempty_costs = [cost.reshape(-1) for cost, _, num_gt in pending if num_gt > 0]
+        # The matrices are tiny, so concatenate every layer and image and pay
+        # for exactly one device synchronization while preserving the
+        # identical per-image SciPy assignment below.
+        nonempty_costs = [
+            cost.reshape(-1)
+            for pending in pending_by_output
+            for cost, _, num_gt in pending
+            if num_gt > 0
+        ]
         flat_cost_cpu = (
             torch.cat(nonempty_costs, dim=0).detach().cpu()
             if nonempty_costs
             else torch.empty(0)
         )
 
-        solved = []
+        solved_by_output = []
         flat_offset = 0
-        for cost, stats, num_gt in pending:
-            if num_gt == 0:
-                pred_idx = torch.empty(0, dtype=torch.long)
-                gt_idx = torch.empty(0, dtype=torch.long)
-            else:
-                numel = int(cost.numel())
-                cost_cpu = flat_cost_cpu[flat_offset : flat_offset + numel].view(
-                    int(cost.shape[0]),
-                    int(cost.shape[1]),
-                )
-                flat_offset += numel
-                if self.cfg.assignment == "grouped_one_to_many":
-                    pred_idx, gt_idx = self._grouped_assignment(
-                        cost_cpu,
-                        num_groups=max(1, int(self.cfg.num_groups)),
-                    )
+        for pending in pending_by_output:
+            solved = []
+            for cost, stats, num_gt in pending:
+                if num_gt == 0:
+                    pred_idx = torch.empty(0, dtype=torch.long)
+                    gt_idx = torch.empty(0, dtype=torch.long)
                 else:
-                    pred_idx, gt_idx = self._linear_sum_assignment(cost_cpu)
-            solved.append((pred_idx, gt_idx, stats, num_gt))
+                    numel = int(cost.numel())
+                    cost_cpu = flat_cost_cpu[flat_offset : flat_offset + numel].view(
+                        int(cost.shape[0]),
+                        int(cost.shape[1]),
+                    )
+                    flat_offset += numel
+                    if self.cfg.assignment == "grouped_one_to_many":
+                        pred_idx, gt_idx = self._grouped_assignment(
+                            cost_cpu,
+                            num_groups=max(1, int(self.cfg.num_groups)),
+                        )
+                    else:
+                        pred_idx, gt_idx = self._linear_sum_assignment(cost_cpu)
+                solved.append((pred_idx, gt_idx, stats, num_gt))
+            solved_by_output.append(solved)
 
         # Losses consume the same assignment repeatedly (existence, point,
         # range, LineIoU, DFL, and quality).  Returning CPU indices makes every
-        # one of those losses launch its own tiny H2D copy.  Pack all pairs for
-        # this decoder output into one transfer and keep them on the output
-        # device.  SciPy still decides the exact same integer assignment.
-        output_device = outputs["exist_logits"].device
+        # one of those losses launch its own tiny H2D copy.  Pack every layer's
+        # pairs into one transfer and keep them on the output device.  SciPy
+        # still decides the exact same integer assignment.
+        output_device = normalized_outputs[0]["exist_logits"].device
         pair_parts = [
             torch.stack((pred_idx, gt_idx), dim=-1)
+            for solved in solved_by_output
             for pred_idx, gt_idx, _, _ in solved
             if pred_idx.numel() > 0
         ]
@@ -93,24 +126,27 @@ class HungarianMatcherS0:
         else:
             flat_pairs = torch.empty((0, 2), dtype=torch.long, device=output_device)
 
-        matches = []
+        matches_by_output = []
         pair_offset = 0
-        for pred_idx_cpu, _, stats, num_gt in solved:
-            num_matched = int(pred_idx_cpu.numel())
-            pairs = flat_pairs[pair_offset : pair_offset + num_matched]
-            pair_offset += num_matched
-            pred_idx = pairs[:, 0]
-            gt_idx = pairs[:, 1]
-            matches.append(
-                {
-                    "pred_indices": pred_idx,
-                    "gt_indices": gt_idx,
-                    "num_gt": torch.tensor(num_gt, dtype=torch.long),
-                    "num_matched": torch.tensor(num_matched, dtype=torch.long),
-                    **stats,
-                }
-            )
-        return matches
+        for solved in solved_by_output:
+            matches = []
+            for pred_idx_cpu, _, stats, num_gt in solved:
+                num_matched = int(pred_idx_cpu.numel())
+                pairs = flat_pairs[pair_offset : pair_offset + num_matched]
+                pair_offset += num_matched
+                pred_idx = pairs[:, 0]
+                gt_idx = pairs[:, 1]
+                matches.append(
+                    {
+                        "pred_indices": pred_idx,
+                        "gt_indices": gt_idx,
+                        "num_gt": torch.tensor(num_gt, dtype=torch.long),
+                        "num_matched": torch.tensor(num_matched, dtype=torch.long),
+                        **stats,
+                    }
+                )
+            matches_by_output.append(matches)
+        return matches_by_output
 
     def compute_cost_for_image(
         self,

@@ -88,7 +88,19 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
         )
         return outputs, matches
     outputs = model(images)
-    matches = matcher(outputs, targets)
+    aux_outputs = outputs.get("aux_outputs") if isinstance(outputs, dict) else None
+    if (
+        isinstance(aux_outputs, (list, tuple))
+        and aux_outputs
+        and hasattr(matcher, "match_many")
+    ):
+        all_matches = matcher.match_many((outputs, *aux_outputs), targets)
+        matches = all_matches[0]
+        # Private training-only transport: the criterion consumes these exact
+        # per-layer assignments instead of repeating GPU/CPU matcher traffic.
+        outputs["_aux_matches"] = all_matches[1:]
+    else:
+        matches = matcher(outputs, targets)
     return outputs, matches
 
 

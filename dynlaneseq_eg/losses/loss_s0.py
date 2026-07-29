@@ -227,10 +227,25 @@ class S0Criterion(nn.Module):
             "row_dfl": aggregate.clone(),
         }
         out = dict(losses)
-        for layer_index, (aux, layer_weight) in enumerate(zip(aux_outputs, layer_weights), start=1):
+        precomputed_matches = outputs.get("_aux_matches")
+        if isinstance(precomputed_matches, (list, tuple)):
+            if len(precomputed_matches) != len(aux_outputs):
+                raise ValueError(
+                    "_aux_matches must match the number of auxiliary decoder layers: "
+                    f"got {len(precomputed_matches)} matches for {len(aux_outputs)} outputs"
+                )
+            aux_matches_by_layer = precomputed_matches
+        elif hasattr(self.matcher, "match_many"):
+            aux_matches_by_layer = self.matcher.match_many(tuple(aux_outputs), targets)
+        else:
+            aux_matches_by_layer = [self.matcher(aux, targets) for aux in aux_outputs]
+
+        for layer_index, (aux, layer_weight, aux_matches) in enumerate(
+            zip(aux_outputs, layer_weights, aux_matches_by_layer),
+            start=1,
+        ):
             if not isinstance(aux, dict):
                 raise TypeError("every auxiliary decoder output must be a dictionary")
-            aux_matches = self.matcher(aux, targets)
             zero = self._zero_anchor(aux).sum() * 0.0
             aux_exist = self.compute_exist_loss(aux, aux_matches) if self.cfg.w_exist != 0 else zero
             aux_point = self.compute_point_loss(aux, targets, aux_matches) if self.cfg.w_point != 0 else zero

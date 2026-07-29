@@ -148,6 +148,38 @@ def test_grouped_one_to_many_matcher_assigns_gt_once_per_group():
     assert matches[0]["gt_indices"].tolist() == [0, 0]
 
 
+def test_match_many_preserves_independent_layer_assignments():
+    target = _target()
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            assignment="hungarian",
+            lambda_obj=0.0,
+            lambda_point=1.0,
+            lambda_range=0.0,
+            lambda_line_iou=0.0,
+        )
+    )
+
+    def prediction(first_x: float, second_x: float):
+        pred = torch.full((2, 72), 400.0)
+        pred[0, 10:20] = first_x
+        pred[1, 10:20] = second_x
+        return {
+            "exist_logits": torch.zeros((1, 2, 2)),
+            "pred_x_rows": pred.unsqueeze(0),
+            "range_norm": torch.zeros((1, 2, 2)),
+        }
+
+    outputs = [prediction(100.0, 300.0), prediction(300.0, 100.0)]
+    repeated = [matcher(output, [target]) for output in outputs]
+    batched = matcher.match_many(outputs, [target])
+
+    assert len(batched) == len(repeated)
+    for actual, expected in zip(batched, repeated):
+        assert actual[0]["pred_indices"].tolist() == expected[0]["pred_indices"].tolist()
+        assert actual[0]["gt_indices"].tolist() == expected[0]["gt_indices"].tolist()
+
+
 def test_negative_probability_matcher_cost_is_bounded():
     matcher = HungarianMatcherS0(
         MatcherConfig(

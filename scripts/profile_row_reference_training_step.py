@@ -51,6 +51,14 @@ def parse_args() -> argparse.Namespace:
         default="default",
         choices=("default", "reduce-overhead", "max-autotune"),
     )
+    parser.add_argument(
+        "--disable-intermediate-supervision",
+        action="store_true",
+        help=(
+            "Diagnostic only: retain the row-reference decoder but suppress "
+            "auxiliary decoder-layer outputs and losses to isolate their cost."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -250,6 +258,11 @@ def main() -> None:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
+    if args.disable_intermediate_supervision:
+        cfg.setdefault("model", {}).setdefault("structured_query", {})[
+            "intermediate_supervision"
+        ] = False
+        cfg.setdefault("loss", {})["lambda_intermediate"] = 0.0
 
     training = cfg.get("training", {})
     seed_everything(int(training.get("seed", 3407)))
@@ -306,6 +319,11 @@ def main() -> None:
             "attention_backend": row_reference.get("attention_backend", "materialized"),
             "compile_model": bool(args.compile_model),
             "compile_mode": str(args.compile_mode) if args.compile_model else None,
+            "intermediate_supervision": bool(
+                cfg.get("model", {})
+                .get("structured_query", {})
+                .get("intermediate_supervision", False)
+            ),
             "warmup_steps": args.warmup_steps,
             "breakdown_steps": args.breakdown_steps,
             "profiler_steps": args.profiler_steps,
