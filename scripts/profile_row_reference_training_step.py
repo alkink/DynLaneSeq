@@ -41,6 +41,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-steps", type=int, default=1)
     parser.add_argument("--row-limit", type=int, default=25)
     parser.add_argument("--trace", default="")
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Benchmark torch.compile on the model only; the criterion and matcher stay eager.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        default="default",
+        choices=("default", "reduce-overhead", "max-autotune"),
+    )
     return parser.parse_args()
 
 
@@ -259,6 +269,8 @@ def main() -> None:
     matcher = build_matcher(cfg)
     criterion = build_criterion(cfg)
     optimizer = build_optimizer(cfg, model)
+    if args.compile_model:
+        model = torch.compile(model, mode=str(args.compile_mode))
     amp_enabled, amp_dtype, use_scaler = amp_settings(cfg, device)
     scaler = torch.cuda.amp.GradScaler(enabled=True) if use_scaler else None
     accumulation_steps = max(
@@ -292,6 +304,8 @@ def main() -> None:
             "sampling_backend": row_reference.get("sampling_backend", "grid_sample"),
             "projection_backend": row_reference.get("projection_backend", "separate"),
             "attention_backend": row_reference.get("attention_backend", "materialized"),
+            "compile_model": bool(args.compile_model),
+            "compile_mode": str(args.compile_mode) if args.compile_model else None,
             "warmup_steps": args.warmup_steps,
             "breakdown_steps": args.breakdown_steps,
             "profiler_steps": args.profiler_steps,
@@ -369,6 +383,7 @@ def main() -> None:
         record_shapes=False,
         profile_memory=True,
         with_stack=False,
+        acc_events=True,
     ) as profiler:
         run_optimizer_steps(
             count=args.profiler_steps,
