@@ -25,10 +25,11 @@ from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train an independent ordered-curve proposal head directly on frozen P2. "
-            "The probe never consumes the model's lane queries, row states, decoder "
-            "outputs, or assignments. It tests whether P2 alone can acquire coarse "
-            "references for GT lanes missed by the structured decoder."
+            "Train an independent ordered-curve proposal head on one frozen visual "
+            "source. The probe never consumes the model's lane queries, row states, "
+            "decoder outputs, or assignments. It tests whether that feature source "
+            "alone can acquire coarse references for GT lanes missed by the "
+            "structured decoder."
         )
     )
     parser.add_argument("--config", required=True)
@@ -42,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-proposals", type=int, default=4)
+    parser.add_argument(
+        "--feature-source",
+        choices=("p2", "c2", "c3"),
+        default="p2",
+        help=(
+            "Frozen visual source consumed by the independent head. Raw C2/C3 "
+            "are zero-padded to the model dimension so every source uses the "
+            "same trainable probe architecture and parameter count."
+        ),
+    )
     parser.add_argument("--feature-dim", type=int, default=16)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--probe-width", type=int, default=100)
@@ -173,6 +184,45 @@ class IndependentP2CurveProposalProbe(nn.Module):
             indices = logits.argmax(dim=-1).to(dtype=logits.dtype)
             return (indices + 0.5) * (float(self.input_w) / float(self.x_bins))
         raise ValueError(f"Unsupported decode method: {method!r}")
+
+
+def canonicalize_feature_channels(
+    feature: torch.Tensor,
+    *,
+    output_channels: int,
+) -> torch.Tensor:
+    """Losslessly pad a frozen feature map to a common channel count."""
+    input_channels = int(feature.shape[1])
+    output_channels = int(output_channels)
+    if input_channels > output_channels:
+        raise ValueError(
+            f"Cannot losslessly canonicalize {input_channels} channels to "
+            f"{output_channels}; increase the common channel count."
+        )
+    if input_channels == output_channels:
+        return feature
+    return F.pad(feature, (0, 0, 0, 0, 0, output_channels - input_channels))
+
+
+def extract_frozen_feature_source(
+    base_model: nn.Module,
+    images: torch.Tensor,
+    *,
+    feature_source: str,
+    canonical_channels: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the selected frozen source and the projected P2 used by the base."""
+    if feature_source not in {"p2", "c2", "c3"}:
+        raise ValueError(f"Unsupported feature source: {feature_source!r}")
+    encoder = base_model.encoder
+    backbone_features = encoder.backbone(images)
+    p2 = encoder.proj(encoder.fpn(backbone_features))
+    selected = p2 if feature_source == "p2" else backbone_features[feature_source]
+    selected = canonicalize_feature_channels(
+        selected,
+        output_channels=int(canonical_channels),
+    )
+    return selected, p2
 
 
 def _lane_reference_x(x_rows: torch.Tensor, valid: torch.Tensor) -> float:
@@ -406,6 +456,8 @@ def evaluate_probe(
     amp_dtype: torch.dtype | None,
     group_size: int,
     line_width: float,
+    feature_source: str = "p2",
+    canonical_channels: int | None = None,
 ) -> dict[str, Any]:
     mode_names = (
         "correct_expected",
@@ -422,7 +474,11 @@ def evaluate_probe(
     base_model.eval()
     probe.eval()
     autocast_enabled = amp_dtype is not None and device.type == "cuda"
-    for images, targets, _metas in tqdm(loader, ncols=96, desc="independent P2 proposal eval"):
+    for images, targets, _metas in tqdm(
+        loader,
+        ncols=96,
+        desc=f"independent {str(feature_source).upper()} proposal eval",
+    ):
         images = images.to(
             device,
             non_blocking=True,
@@ -434,20 +490,30 @@ def evaluate_probe(
             else nullcontext()
         )
         with amp_context:
-            p2 = base_model.encoder.forward_features(
+            selected_feature, p2 = extract_frozen_feature_source(
+                base_model,
                 images,
-                inference_only=True,
-                structured_only=True,
-            )["features"]
+                feature_source=str(feature_source),
+                canonical_channels=int(
+                    canonical_channels
+                    if canonical_channels is not None
+                    else base_model.encoder.proj.out_channels
+                ),
+            )
             base_outputs = base_model.structured_query_head(p2)
-        p2_float = p2.float()
-        wrong_indices = torch.roll(torch.arange(int(p2.shape[0]), device=device), shifts=1)
+        selected_float = selected_feature.float()
+        wrong_indices = torch.roll(
+            torch.arange(int(selected_feature.shape[0]), device=device),
+            shifts=1,
+        )
         conditions = {
-            "correct_expected": p2_float,
-            "correct_argmax": p2_float,
-            "wrong_image": p2_float[wrong_indices],
-            "zero_image": torch.zeros_like(p2_float),
-            "horizontal_mean": p2_float.mean(dim=-1, keepdim=True).expand_as(p2_float),
+            "correct_expected": selected_float,
+            "correct_argmax": selected_float,
+            "wrong_image": selected_float[wrong_indices],
+            "zero_image": torch.zeros_like(selected_float),
+            "horizontal_mean": selected_float.mean(dim=-1, keepdim=True).expand_as(
+                selected_float
+            ),
         }
         condition_outputs: dict[str, torch.Tensor] = {}
         for mode_name, condition_p2 in conditions.items():
@@ -528,6 +594,7 @@ def main() -> None:
 
     num_rows = int(model_cfg.get("num_rows", 72))
     input_w = int(model_cfg.get("input_w", 800))
+    canonical_channels = int(model_cfg.get("dim", 256))
     structured_cfg = model_cfg.get("structured_query", {})
     num_instances = int(structured_cfg.get("num_instances", model_cfg.get("num_slots", 0)))
     num_groups = int(structured_cfg.get("num_groups", 1))
@@ -536,7 +603,7 @@ def main() -> None:
     group_size = num_instances // num_groups
 
     probe = IndependentP2CurveProposalProbe(
-        in_dim=int(model_cfg.get("dim", 256)),
+        in_dim=canonical_channels,
         feature_dim=int(args.feature_dim),
         hidden_dim=int(args.hidden_dim),
         num_rows=num_rows,
@@ -606,12 +673,13 @@ def main() -> None:
                 else nullcontext()
             )
             with amp_context:
-                p2 = base_model.encoder.forward_features(
+                selected_feature, _p2 = extract_frozen_feature_source(
+                    base_model,
                     images,
-                    inference_only=True,
-                    structured_only=True,
-                )["features"]
-        outputs = probe(p2.float())
+                    feature_source=str(args.feature_source),
+                    canonical_channels=canonical_channels,
+                )
+        outputs = probe(selected_feature.float())
         loss, components, dropped_lanes = compute_probe_loss(probe, outputs, targets)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -625,7 +693,8 @@ def main() -> None:
             if step == int(args.train_steps) and step % int(args.log_interval) != 0:
                 window = step % int(args.log_interval)
             print(
-                f"independent P2 proposal step {step:05d}/{int(args.train_steps):05d} | "
+                f"independent {str(args.feature_source).upper()} proposal step "
+                f"{step:05d}/{int(args.train_steps):05d} | "
                 + " | ".join(
                     f"{name} {running[name] / max(window, 1):.4f}"
                     for name in running
@@ -643,14 +712,17 @@ def main() -> None:
         amp_dtype=amp_dtype,
         group_size=group_size,
         line_width=float(args.line_width),
+        feature_source=str(args.feature_source),
+        canonical_channels=canonical_channels,
     )
     parameter_count = sum(parameter.numel() for parameter in probe.parameters())
     payload = {
         "diagnostic_only": True,
         "warning": (
-            "The base model and P2 are frozen. A positive result proves that an "
-            "independent supervised P2-only head can acquire missed lane references; "
-            "it is not a benchmark result or a jointly trained final architecture."
+            f"The base model and {str(args.feature_source).upper()} source are frozen. "
+            "A positive result proves that an independent supervised head can acquire "
+            "missed lane references from that source; it is not a benchmark result "
+            "or a jointly trained final architecture."
         ),
         "config": args.config,
         "checkpoint": args.checkpoint,
@@ -679,7 +751,16 @@ def main() -> None:
         "images": len(sampled_indices),
         "probe_parameters": int(parameter_count),
         "probe_design": {
-            "inputs": "frozen P2 plus absolute x/y coordinate channels",
+            "inputs": (
+                f"frozen {str(args.feature_source).upper()} plus absolute x/y "
+                "coordinate channels"
+            ),
+            "feature_source": str(args.feature_source),
+            "canonical_channels": canonical_channels,
+            "channel_equalization": (
+                "raw C2/C3 channels are losslessly zero-padded to the model "
+                "dimension; all sources therefore use an identical trainable head"
+            ),
             "excluded_inputs": (
                 "lane queries, row tokens/states, decoder outputs, matcher assignments, "
                 "base predicted curves"

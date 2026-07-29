@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from dynlaneseq_eg.tools.probe_independent_p2_curve_proposals import (
     IndependentP2CurveProposalProbe,
+    canonicalize_feature_channels,
     compute_probe_loss,
+    extract_frozen_feature_source,
     ordered_target_tensors,
 )
 
@@ -89,3 +92,53 @@ def test_zero_p2_still_has_valid_coordinate_control_output() -> None:
     decoded = probe.decode(outputs, method="expected")
     assert decoded.shape == (1, 4, 6)
     assert torch.isfinite(decoded).all()
+
+
+def test_feature_channel_canonicalization_is_lossless_and_equal_size() -> None:
+    c2 = torch.randn((2, 4, 3, 5))
+    padded = canonicalize_feature_channels(c2, output_channels=8)
+    assert padded.shape == (2, 8, 3, 5)
+    torch.testing.assert_close(padded[:, :4], c2)
+    assert int(torch.count_nonzero(padded[:, 4:])) == 0
+    same = canonicalize_feature_channels(padded, output_channels=8)
+    assert same.data_ptr() == padded.data_ptr()
+
+
+def test_feature_channel_canonicalization_refuses_lossy_truncation() -> None:
+    with pytest.raises(ValueError, match="Cannot losslessly"):
+        canonicalize_feature_channels(torch.randn((1, 9, 2, 2)), output_channels=8)
+
+
+class _TinyEncoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = lambda images: {
+            "c2": images[:, :2],
+            "c3": images[:, :3, ::2, ::2],
+        }
+        self.fpn = lambda features: torch.cat(
+            (features["c2"], features["c2"]),
+            dim=1,
+        )
+        self.proj = torch.nn.Conv2d(4, 4, 1, bias=False)
+
+
+class _TinyBase(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = _TinyEncoder()
+
+
+def test_extract_frozen_source_returns_equal_channels_and_base_p2() -> None:
+    model = _TinyBase()
+    images = torch.randn((2, 3, 6, 8))
+    c2, p2 = extract_frozen_feature_source(
+        model,
+        images,
+        feature_source="c2",
+        canonical_channels=4,
+    )
+    assert c2.shape == (2, 4, 6, 8)
+    assert p2.shape == (2, 4, 6, 8)
+    torch.testing.assert_close(c2[:, :2], images[:, :2])
+    assert int(torch.count_nonzero(c2[:, 2:])) == 0

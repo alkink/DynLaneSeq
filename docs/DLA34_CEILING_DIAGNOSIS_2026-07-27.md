@@ -1160,3 +1160,47 @@ The position conclusion remains deliberately narrower than “position cannot
 be involved.” Static absolute x position is present, ordered, and essential.
 What is still unverified is a **lane-specific, image-derived reference curve**
 or equivalent dense query-image correlation before row refinement.
+
+## 32. Independent C2/C3/P2 acquisition does not expose hidden raw-backbone coverage
+
+The previous C2/P2/pyramid probes were conditional refinement tests: every
+probe received a curve already placed near the GT. They established that P2
+preserves useful local lane evidence, but they could not distinguish a
+decoder-acquisition failure from an FPN representation failure.
+
+The missing control was therefore run with an independent ordered-curve head.
+It consumes only one frozen visual source plus absolute x/y coordinate
+channels and explicitly excludes LaneRowNet's lane queries, row states,
+decoder outputs, matcher assignments, and predicted curves. C2 and C3 are
+losslessly zero-padded to 256 channels, so all three sources use the same
+`552,712`-parameter head, initialization, 1500-step training schedule, and
+uniform 64-image/221-lane validation subset.
+
+| Frozen source | Independent R@0.50 (expected / argmax) | Paired mean IoU | Correct minus wrong-image paired IoU | Base misses recovered @0.50 |
+|---|---:|---:|---:|---:|
+| Raw C2 | 0.00 / 2.71 | 0.114 | +0.037 | 0 / 86 |
+| Raw C3 | 0.90 / 6.33 | 0.137 | +0.062 | 0 / 86 |
+| Fused P2 | 20.81 / 36.65 | 0.292 | +0.195 | 1 / 86 |
+
+P2 is substantially more usable than raw C2 or C3 for independent curve
+acquisition. Thus the simple FPN is not merely destroying a rich,
+independently decodable lane signal that already exists in C2/C3. Extending
+the P2 probe to 5000 total steps raises its standalone R@0.50 to `32.58`, but
+it still recovers only two base misses; one of those is also recovered by the
+wrong-image control. The correct-image-specific incremental coverage is
+therefore approximately one lane (`+0.45` point).
+
+This result does **not** prove that the decoder is innocent. It narrows the
+failure to image-to-lane-reference acquisition: GT-near P2 sampling can refine
+many misses, while neither the production decoder nor an independent
+fixed-order P2 head discovers those lanes without a useful reference. The
+evidence rules out raw C2/C3 replacement and another unconditional positional
+encoding as likely fixes. A jointly learned, image-grounded reference
+acquisition mechanism remains the unresolved causal intervention.
+
+Exact outputs:
+
+- `outputs/diagnostics/independent_feature_curve_proposals/dla34_225k_c2_uniform64_1500steps.json`;
+- `outputs/diagnostics/independent_feature_curve_proposals/dla34_225k_c3_uniform64_1500steps.json`;
+- `outputs/diagnostics/independent_p2_curve_proposals/dla34_225k_uniform64.json`;
+- `outputs/diagnostics/independent_p2_curve_proposals/dla34_225k_uniform64_5000steps.json`.
