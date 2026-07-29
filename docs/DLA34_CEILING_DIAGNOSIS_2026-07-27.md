@@ -1204,3 +1204,69 @@ Exact outputs:
 - `outputs/diagnostics/independent_feature_curve_proposals/dla34_225k_c3_uniform64_1500steps.json`;
 - `outputs/diagnostics/independent_p2_curve_proposals/dla34_225k_uniform64.json`;
 - `outputs/diagnostics/independent_p2_curve_proposals/dla34_225k_uniform64_5000steps.json`.
+
+## 33. A frozen-P2 dense separability test rejects a decoder-only diagnosis
+
+The independent curve head still mixed two questions: detecting lane evidence
+and associating row peaks into a fixed ordered curve. A smaller bypass was
+therefore run directly on frozen P2. Two identically initialized
+`295,297`-parameter dense heads were trained for 1000 steps in one run:
+
+- a production-objective control using the checkpoint's Gaussian centerline
+  target and BCE with `pos_weight=2`;
+- a discovery control that additionally applies a direct row-wise
+  log-softmax loss at every visible GT lane center.
+
+Neither head consumes lane queries, row states, predicted curves, references,
+matcher assignments, or decoder outputs. Evaluation uses the same uniform
+64-image/221-lane subset and partitions lanes by whether the production
+group-0 decoder already reaches IoU 0.50.
+
+| Dense P2 reader | 15px row-peak recall on 86 base misses | Dense-peak oracle R@0.50 on base misses | Mean dense-peak oracle IoU |
+|---|---:|---:|---:|
+| Checkpoint head, correct image | 47.44 | 3 / 86 (3.49) | 0.279 |
+| Checkpoint head, wrong image | 27.37 | 3 / 86 (3.49) | 0.157 |
+| Fresh production-BCE, correct image | 46.55 | 1 / 86 (1.16) | 0.273 |
+| Fresh production-BCE, wrong image | 26.31 | 3 / 86 (3.49) | 0.151 |
+| Fresh discovery loss, correct image | 46.05 | 3 / 86 (3.49) | 0.272 |
+| Fresh discovery loss, wrong image | 27.11 | 3 / 86 (3.49) | 0.156 |
+| Fresh discovery, horizontal mean | 1.02 | 0 / 86 (0.00) | 0.005 |
+
+The probe itself is not generally broken: over all 221 lanes, the fresh
+discovery head reaches `49.32%` dense-peak oracle recall at IoU 0.50 versus
+`4.98%` with wrong-image P2, and on the 135 production hits it reaches
+`78.52%`. The failure is concentrated on the exact lanes already missed by
+the decoder.
+
+Correct-image P2 clearly contains **local** image-grounded evidence on the
+misses: it improves 15px row-peak recall by approximately 19 points over the
+wrong-image control. However, those peaks do not form a coherent lane with
+IoU 0.50. A stronger, directly supervised discovery loss does not improve
+miss recovery over the long-trained checkpoint head. All three predeclared
+gates therefore fail:
+
+- frozen P2 is not globally readable for the missed lanes by this modest
+  dense reader;
+- the production centerline objective is not isolated as the primary cause;
+- joint optimization of the checkpoint centerline head is not isolated as
+  the primary cause.
+
+This rejects the strong claim that the ceiling is located **only** in the
+structured decoder, matching, NMS, or positional transport. It also does not
+prove that every decoder choice is optimal. The narrower causal conclusion
+is:
+
+> hard-lane failures are already shared by the frozen visual representation
+> before lane-query acquisition; the decoder cannot recover coherent curves
+> from evidence that remains local and fragmented.
+
+Combined with Section 32, raw C2/C3 substitution is not a supported fix
+because those sources are even less independently decodable than fused P2.
+The remaining intervention should therefore alter how lane-coherent visual
+features are learned or acquired **jointly**, rather than adding another
+post-hoc decoder, positional embedding, quality sweep, or centerline-head
+loss to the frozen checkpoint.
+
+Exact output:
+
+- `outputs/diagnostics/frozen_p2_centerline_separability/dla34_225k_uniform64_1000steps.json`.
