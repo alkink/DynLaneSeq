@@ -55,7 +55,7 @@ class HungarianMatcherS0:
             else torch.empty(0)
         )
 
-        matches = []
+        solved = []
         flat_offset = 0
         for cost, stats, num_gt in pending:
             if num_gt == 0:
@@ -75,12 +75,38 @@ class HungarianMatcherS0:
                     )
                 else:
                     pred_idx, gt_idx = self._linear_sum_assignment(cost_cpu)
+            solved.append((pred_idx, gt_idx, stats, num_gt))
+
+        # Losses consume the same assignment repeatedly (existence, point,
+        # range, LineIoU, DFL, and quality).  Returning CPU indices makes every
+        # one of those losses launch its own tiny H2D copy.  Pack all pairs for
+        # this decoder output into one transfer and keep them on the output
+        # device.  SciPy still decides the exact same integer assignment.
+        output_device = outputs["exist_logits"].device
+        pair_parts = [
+            torch.stack((pred_idx, gt_idx), dim=-1)
+            for pred_idx, gt_idx, _, _ in solved
+            if pred_idx.numel() > 0
+        ]
+        if pair_parts:
+            flat_pairs = torch.cat(pair_parts, dim=0).to(output_device)
+        else:
+            flat_pairs = torch.empty((0, 2), dtype=torch.long, device=output_device)
+
+        matches = []
+        pair_offset = 0
+        for pred_idx_cpu, _, stats, num_gt in solved:
+            num_matched = int(pred_idx_cpu.numel())
+            pairs = flat_pairs[pair_offset : pair_offset + num_matched]
+            pair_offset += num_matched
+            pred_idx = pairs[:, 0]
+            gt_idx = pairs[:, 1]
             matches.append(
                 {
                     "pred_indices": pred_idx,
                     "gt_indices": gt_idx,
                     "num_gt": torch.tensor(num_gt, dtype=torch.long),
-                    "num_matched": torch.tensor(int(pred_idx.numel()), dtype=torch.long),
+                    "num_matched": torch.tensor(num_matched, dtype=torch.long),
                     **stats,
                 }
             )

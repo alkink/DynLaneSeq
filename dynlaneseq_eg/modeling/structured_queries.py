@@ -129,6 +129,8 @@ class ReferenceGuidedRowLayer(nn.Module):
         num_groups: int = 1,
         offsets_px: tuple[float, ...] = (-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0),
         sampling_backend: str = "grid_sample",
+        projection_backend: str = "separate",
+        attention_backend: str = "materialized",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -151,6 +153,18 @@ class ReferenceGuidedRowLayer(nn.Module):
             raise ValueError(
                 "row_reference.sampling_backend must be grid_sample or "
                 f"linear_gather, got {sampling_backend!r}"
+            )
+        self.projection_backend = str(projection_backend).strip().lower()
+        if self.projection_backend not in {"separate", "fused"}:
+            raise ValueError(
+                "row_reference.projection_backend must be separate or "
+                f"fused, got {projection_backend!r}"
+            )
+        self.attention_backend = str(attention_backend).strip().lower()
+        if self.attention_backend not in {"materialized", "einsum"}:
+            raise ValueError(
+                "row_reference.attention_backend must be materialized or "
+                f"einsum, got {attention_backend!r}"
             )
 
         self.local_query = nn.Linear(self.dim, self.dim, bias=False)
@@ -408,16 +422,18 @@ class ReferenceGuidedRowLayer(nn.Module):
             self.num_heads,
             head_dim,
         )
-        # Key and value consume the same very large sampled-profile matrix.
-        # A single GEMM with concatenated (parameter-compatible) weights
-        # avoids launching and reading that matrix twice.  The two original
-        # Linear modules remain intact, so old checkpoints and optimizer state
-        # load without conversion.
-        key_value = F.linear(
-            profiles,
-            torch.cat((self.local_key.weight, self.local_value.weight), dim=0),
-        )
-        key, value = key_value.split(self.dim, dim=-1)
+        if self.projection_backend == "fused":
+            # Optional kernel experiment: retain original parameter names and
+            # checkpoint layout while issuing one concatenated GEMM.
+            key_value = F.linear(
+                profiles,
+                torch.cat((self.local_key.weight, self.local_value.weight), dim=0),
+            )
+            key, value = key_value.split(self.dim, dim=-1)
+        else:
+            # Numerically identical path used by the validated 10k gate.
+            key = self.local_key(profiles)
+            value = self.local_value(profiles)
         key = key.view(
             b,
             n,
@@ -434,14 +450,16 @@ class ReferenceGuidedRowLayer(nn.Module):
             self.num_heads,
             head_dim,
         ).permute(0, 1, 2, 4, 3, 5)
-        # Contract directly instead of materializing [B,N,R,H,K,D] products.
-        # At the paper resolution the two legacy multiply-then-reduce
-        # expressions each create a large temporary once per decoder block.
-        attention = torch.einsum(
-            "bnrhd,bnrhkd->bnrhk",
-            query,
-            key,
-        ) / math.sqrt(float(head_dim))
+        if self.attention_backend == "einsum":
+            attention = torch.einsum(
+                "bnrhd,bnrhkd->bnrhk",
+                query,
+                key,
+            ) / math.sqrt(float(head_dim))
+        else:
+            attention = (query.unsqueeze(-2) * key).sum(dim=-1) / math.sqrt(
+                float(head_dim)
+            )
         attention = attention + self.relative_offset_bias.view(
             1,
             1,
@@ -450,11 +468,19 @@ class ReferenceGuidedRowLayer(nn.Module):
             offsets,
         )
         attention = torch.softmax(attention, dim=-1)
-        context = torch.einsum(
-            "bnrhk,bnrhkd->bnrhd",
-            attention,
-            value,
-        ).reshape(b, n, r, c)
+        if self.attention_backend == "einsum":
+            context = torch.einsum(
+                "bnrhk,bnrhkd->bnrhd",
+                attention,
+                value,
+            ).reshape(b, n, r, c)
+        else:
+            context = (attention.unsqueeze(-1) * value).sum(dim=-2).reshape(
+                b,
+                n,
+                r,
+                c,
+            )
 
         x_norm = 2.0 * reference_x_rows.to(dtype=row_tokens.dtype) / float(
             max(int(input_w) - 1, 1)
@@ -587,6 +613,18 @@ class StructuredLaneQueryHead(nn.Module):
                             self.row_reference_cfg.get(
                                 "sampling_backend",
                                 "grid_sample",
+                            )
+                        ),
+                        projection_backend=str(
+                            self.row_reference_cfg.get(
+                                "projection_backend",
+                                "separate",
+                            )
+                        ),
+                        attention_backend=str(
+                            self.row_reference_cfg.get(
+                                "attention_backend",
+                                "materialized",
                             )
                         ),
                     )

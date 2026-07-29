@@ -225,13 +225,7 @@ def test_full_reference_config_preserves_validated_candidate_contract() -> None:
         "fpn256_l4_dfl_rowref_r15_deepsup_50ep.yaml"
     )
 
-    full_structured = dict(full["model"]["structured_query"])
-    short_structured = dict(short["model"]["structured_query"])
-    full_reference = dict(full_structured.pop("row_reference"))
-    short_reference = dict(short_structured.pop("row_reference"))
-    assert full_structured == short_structured
-    assert full_reference.pop("sampling_backend") == "linear_gather"
-    assert full_reference == short_reference
+    assert full["model"]["structured_query"] == short["model"]["structured_query"]
     assert full["matcher"] == short["matcher"]
     assert full["loss"] == short["loss"]
     assert full["optimizer"] == short["optimizer"]

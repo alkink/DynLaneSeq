@@ -144,6 +144,16 @@ def main() -> None:
                 if bool(row_reference_cfg.get("enabled", False))
                 else None
             ),
+            "row_reference_projection_backend": (
+                str(row_reference_cfg.get("projection_backend", "separate"))
+                if bool(row_reference_cfg.get("enabled", False))
+                else None
+            ),
+            "row_reference_attention_backend": (
+                str(row_reference_cfg.get("attention_backend", "materialized"))
+                if bool(row_reference_cfg.get("enabled", False))
+                else None
+            ),
             "clip_grad_norm": float(train_cfg.get("clip_grad_norm", 1.0)),
             "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),

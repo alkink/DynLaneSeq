@@ -290,6 +290,8 @@ def main() -> None:
             "amp_dtype": str(amp_dtype),
             "channels_last": channels_last,
             "sampling_backend": row_reference.get("sampling_backend", "grid_sample"),
+            "projection_backend": row_reference.get("projection_backend", "separate"),
+            "attention_backend": row_reference.get("attention_backend", "materialized"),
             "warmup_steps": args.warmup_steps,
             "breakdown_steps": args.breakdown_steps,
             "profiler_steps": args.profiler_steps,

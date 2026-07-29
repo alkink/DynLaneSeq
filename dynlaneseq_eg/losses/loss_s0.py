@@ -393,9 +393,11 @@ class S0Criterion(nn.Module):
             return outputs["pred_x_rows"].sum() * 0.0
         b, n, num_rows, x_bins = logits.shape
         del b, n
-        logits_f = logits.float()
-        total = logits_f.sum() * 0.0
-        count = logits_f.new_tensor(0.0)
+        # Preserve a differentiable zero without materializing an FP32 copy of
+        # every slot/row/bin.  Only matched lane logits contribute to DFL and
+        # are converted below after indexing.
+        total = logits.sum(dtype=torch.float32) * 0.0
+        count = total.new_tensor(0.0)
         lane_balanced = self.lane_balanced_geometry()
         bin_width = float(self.cfg.input_w) / float(x_bins)
         for bi, match in enumerate(matches):
@@ -403,19 +405,23 @@ class S0Criterion(nn.Module):
             gt_idx = match["gt_indices"].to(logits.device)
             if pred_idx.numel() == 0:
                 continue
-            gt_x = targets[bi]["x_rows"].to(logits.device, dtype=logits_f.dtype)[gt_idx]
+            gt_x = targets[bi]["x_rows"].to(logits.device, dtype=torch.float32)[gt_idx]
             mask = targets[bi]["valid_mask"].to(logits.device)[gt_idx].bool()
             row_count = min(int(gt_x.shape[-1]), int(num_rows))
             if row_count <= 0:
                 continue
-            pred_logits = logits_f[bi, pred_idx, :row_count]
+            pred_logits = logits[bi, pred_idx, :row_count].float()
             gt_x = gt_x[:, :row_count]
             mask = mask[:, :row_count]
             valid = mask & torch.isfinite(gt_x) & (gt_x >= 0.0) & (gt_x <= float(self.cfg.input_w))
-            if not valid.any():
-                continue
 
-            target_bin = (gt_x / bin_width).clamp(0.0, float(x_bins - 1))
+            # Avoid a Python boolean conversion of a CUDA tensor here.  Deep
+            # supervision reaches this path once per image and decoder output;
+            # the old ``if not valid.any()`` therefore serialized the stream
+            # many times per optimizer step.  Invalid values are made safe
+            # before indexing and remain exactly zero-weighted below.
+            safe_gt_x = torch.where(valid, gt_x, torch.zeros_like(gt_x))
+            target_bin = (safe_gt_x / bin_width).clamp(0.0, float(x_bins - 1))
             left = target_bin.floor().long()
             right = (left + 1).clamp(max=x_bins - 1)
             right_w = target_bin - left.to(dtype=target_bin.dtype)
@@ -605,9 +611,10 @@ class S0Criterion(nn.Module):
             valid_mask = valid_mask[:, :row_count]
             centers = (x_rows / bin_width).clamp(min=0.0, max=float(x_bins - 1))
             valid = valid_mask & torch.isfinite(centers) & (x_rows >= 0.0) & (x_rows <= float(self.cfg.input_w))
-            if not valid.any():
-                continue
-            diff = grid - centers.unsqueeze(-1)
+            # Keep empty/invalid images on the tensor path instead of forcing
+            # a device synchronization through ``Tensor.__bool__``.
+            safe_centers = torch.where(valid, centers, torch.zeros_like(centers))
+            diff = grid - safe_centers.unsqueeze(-1)
             gauss = torch.exp(-0.5 * (diff / sigma).pow(2))
             gauss = gauss * valid.unsqueeze(-1).to(dtype=dtype)
             target_map[bi, 0, :row_count] = gauss.amax(dim=0)

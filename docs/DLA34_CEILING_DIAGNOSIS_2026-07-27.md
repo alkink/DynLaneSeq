@@ -1538,21 +1538,23 @@ unchanged to a fresh 278k full schedule:
 - the 10k checkpoint is not resumed because its cosine schedule terminated at
   10k and is a diagnostic model, not a prefix of the full schedule.
 
-The full config uses the `linear_gather` sampler backend.  Because P2 already
-has exactly one feature row per decoder row and the legacy grid uses
-`align_corners=True`, its two-dimensional bilinear sampling reduces
-analytically to one-dimensional interpolation between adjacent horizontal
-cells.  The specialized backend preserves the sampling coordinates,
-interpolation rule, and coordinate gradients while avoiding four full-P2 FP32
-copies, NCHW materializations, and general `grid_sample` calls per forward
-pass.  FP32 value/gradient equivalence is covered by regression tests; native
-BF16 interpolation can differ from the legacy FP32 island by one BF16
-quantization step.
+An optional `linear_gather` sampler was implemented and verified against the
+legacy row-aligned `grid_sample`.  Although it accelerates an isolated CPU
+layer benchmark, a real CUDA training profile showed no material end-to-end
+gain.  The full paper run therefore deliberately retains the numerically
+identical 10k-gate path: FP32 `grid_sample`, separate local key/value
+projections, and materialized attention reductions.
 
-Attention dot products and weighted-value reductions use direct tensor
-contractions rather than materializing `[B,N,R,H,K,D]` multiply
-intermediates.  Local key/value projections share one concatenated GEMM while
-retaining the original parameter names and checkpoint layout.  Finally,
-per-image matcher costs are transferred to CPU together, reducing deep
-supervision from one CUDA synchronization per image and layer to one per
-layer.
+The retained throughput changes are arithmetic-preserving:
+
+- per-image matcher costs are transferred to CPU together;
+- solved assignment indices are returned to the GPU once per decoder output
+  instead of being copied again by every loss;
+- DFL selects matched lane logits before converting them to FP32, avoiding an
+  FP32 copy of all 32 candidates at every supervised decoder layer; and
+- tensor-valued validity checks stay on-device rather than synchronizing
+  Python with CUDA.
+
+The DFL reordering is bitwise value/gradient equivalent in BF16 regression
+tests.  These changes preserve the validated model path while targeting the
+copy and synchronization traffic identified by the CUDA profile.
