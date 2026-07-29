@@ -39,7 +39,7 @@ PROBE_MODES: dict[str, tuple[bool, bool]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Freeze a trained LaneRowNet detector at an intermediate decoder "
+            "Freeze a trained LaneRowNet detector at a selected decoder "
             "layer and fit equal-capacity reference-update probes. Each probe "
             "sees the same explicit row reference; controlled variants add the "
             "intermediate row state, local P2 samples, or both. The held-out "
@@ -739,9 +739,9 @@ def main() -> None:
     if head is None:
         raise ValueError("reference probe requires structured_query")
     layer_count = len(head.layers)
-    if not 1 <= int(args.anchor_layer) < layer_count:
+    if not 1 <= int(args.anchor_layer) <= layer_count:
         raise ValueError(
-            f"--anchor-layer must be before final layer in [1,{layer_count - 1}]"
+            f"--anchor-layer must be in [1,{layer_count}]"
         )
     channels_last = (
         bool(cfg.get("training", {}).get("channels_last", False))
