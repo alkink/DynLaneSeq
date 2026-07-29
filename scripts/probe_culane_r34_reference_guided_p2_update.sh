@@ -14,6 +14,7 @@ BATCH_SIZE="${BATCH_SIZE:-2}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-32}"
+EVAL_SAMPLE_STRATEGY="${EVAL_SAMPLE_STRATEGY:-uniform}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 ANCHOR_LAYER="${ANCHOR_LAYER:-2}"
 TRAIN_GROUP_MODE="${TRAIN_GROUP_MODE:-all}"
@@ -53,6 +54,7 @@ python -u -m dynlaneseq_eg.tools.probe_reference_guided_p2_update \
   --line-width 30.0 \
   --train-group-mode "${TRAIN_GROUP_MODE}" \
   --eval-max-batches "${EVAL_MAX_BATCHES}" \
+  --eval-sample-strategy "${EVAL_SAMPLE_STRATEGY}" \
   --amp-dtype "${AMP_DTYPE}" \
   --log-interval 25 \
   --save-probes "${SAVE_PROBES}" \

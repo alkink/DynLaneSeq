@@ -20,6 +20,7 @@ from dynlaneseq_eg.modeling.common import fixed_y_rows, input_to_grid, nested_to
 from dynlaneseq_eg.tools.analyze_attention_acquisition import (
     _group_zero_assignments,
 )
+from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
 from dynlaneseq_eg.tools.probe_attention_coordinate_adapter import (
     GeometryStats,
     _best_iou,
@@ -76,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         help="Use all train-time group assignments or only deployment group zero.",
     )
     parser.add_argument("--eval-max-batches", type=int, default=32)
+    parser.add_argument(
+        "--eval-sample-strategy",
+        choices=("uniform", "sequential"),
+        default="uniform",
+    )
     parser.add_argument(
         "--amp-dtype",
         choices=("none", "float16", "bfloat16"),
@@ -915,6 +921,12 @@ def main() -> None:
         )
 
     eval_loader = build_dataloader(cfg, split="val", training=False)
+    eval_loader, sampled_indices = select_diagnostic_loader(
+        eval_loader,
+        strategy=str(args.eval_sample_strategy),
+        max_batches=int(args.eval_max_batches),
+        num_workers=int(args.num_workers),
+    )
     evaluation = _evaluate(
         model=model,
         probes=probes,
@@ -950,6 +962,8 @@ def main() -> None:
         "anchor_layer": int(args.anchor_layer),
         "train_steps": trained_steps,
         "train_group_mode": str(args.train_group_mode),
+        "eval_sample_strategy": str(args.eval_sample_strategy),
+        "sampled_dataset_indices": sampled_indices,
         "offsets_px": [float(value) for value in args.offsets_px],
         "probe_parameter_counts": parameter_counts,
         "history": history,
