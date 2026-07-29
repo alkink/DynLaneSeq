@@ -208,6 +208,15 @@ class DistributionStats:
     top2_total: float = 0.0
     top1_top2_distance_total: float = 0.0
     expected_mode_distance_total: float = 0.0
+    gt_count: int = 0
+    gt_nearest_probability_total: float = 0.0
+    gt_dfl_probability_total: float = 0.0
+    gt_mode_error_total: float = 0.0
+    gt_expected_error_total: float = 0.0
+    gt_rank_histogram: list[int] = field(default_factory=list)
+    gt_window_mass_totals: dict[int, float] = field(
+        default_factory=lambda: {1: 0.0, 2: 0.0, 4: 0.0, 8: 0.0}
+    )
 
     def update(
         self,
@@ -216,6 +225,7 @@ class DistributionStats:
         valid_rows: torch.Tensor,
         input_w: int,
         x_bins: int,
+        gt_x: torch.Tensor | None = None,
     ) -> None:
         selected = logits[valid_rows].float()
         if selected.numel() == 0:
@@ -240,10 +250,77 @@ class DistributionStats:
             * (float(input_w) / float(x_bins))
         )
         self.expected_mode_distance_total += float((expected - mode).abs().sum())
+        if gt_x is None:
+            return
+
+        selected_gt = gt_x[valid_rows].float()
+        finite = torch.isfinite(selected_gt)
+        if not bool(finite.any()):
+            return
+        selected_gt = selected_gt[finite]
+        probs = probs[finite]
+        expected = expected[finite]
+        top_indices = top_indices[finite]
+        bin_width = float(input_w) / float(x_bins)
+        target_bin = (selected_gt / bin_width).clamp(0.0, float(x_bins - 1))
+        nearest = target_bin.round().long()
+        nearest_probability = probs.gather(-1, nearest.unsqueeze(-1)).squeeze(-1)
+        rank = (probs > nearest_probability.unsqueeze(-1)).sum(dim=-1) + 1
+
+        if not self.gt_rank_histogram:
+            self.gt_rank_histogram = [0] * (x_bins + 1)
+        rank_counts = torch.bincount(rank, minlength=x_bins + 1).cpu().tolist()
+        for index, value in enumerate(rank_counts[: x_bins + 1]):
+            self.gt_rank_histogram[index] += int(value)
+
+        left = target_bin.floor().long()
+        right = (left + 1).clamp(max=x_bins - 1)
+        right_weight = target_bin - left.to(dtype=target_bin.dtype)
+        left_weight = 1.0 - right_weight
+        same = right == left
+        left_weight = torch.where(same, torch.ones_like(left_weight), left_weight)
+        right_weight = torch.where(same, torch.zeros_like(right_weight), right_weight)
+        left_probability = probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)
+        right_probability = probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
+        dfl_probability = (
+            left_weight * left_probability + right_weight * right_probability
+        )
+
+        bins = torch.arange(
+            x_bins,
+            device=probs.device,
+            dtype=target_bin.dtype,
+        ).view(1, -1)
+        for radius_bins in self.gt_window_mass_totals:
+            inside = (bins - target_bin.unsqueeze(-1)).abs() <= float(radius_bins)
+            self.gt_window_mass_totals[radius_bins] += float(
+                (probs * inside.to(dtype=probs.dtype)).sum()
+            )
+
+        mode = top_indices[:, 0].float() * bin_width
+        self.gt_count += int(selected_gt.numel())
+        self.gt_nearest_probability_total += float(nearest_probability.sum())
+        self.gt_dfl_probability_total += float(dfl_probability.sum())
+        self.gt_mode_error_total += float((mode - selected_gt).abs().sum())
+        self.gt_expected_error_total += float((expected - selected_gt).abs().sum())
+
+    def _rank_quantile(self, quantile: float) -> int:
+        if self.gt_count <= 0 or not self.gt_rank_histogram:
+            return 0
+        target = max(1, int(math.ceil(float(quantile) * self.gt_count)))
+        running = 0
+        for rank, count in enumerate(self.gt_rank_histogram):
+            running += int(count)
+            if running >= target:
+                return int(rank)
+        return len(self.gt_rank_histogram) - 1
 
     def summary(self) -> dict[str, float | int]:
         count = max(self.count, 1)
+        gt_count = max(self.gt_count, 1)
         return {
+            "valid_rows": self.count,
+            # Backward-compatible name from the first version of this audit.
             "valid_assigned_rows": self.count,
             "mean_normalized_entropy": self.entropy_total / count,
             "mean_top1_probability": self.top1_total / count,
@@ -254,6 +331,38 @@ class DistributionStats:
             "mean_expected_to_mode_distance_px": (
                 self.expected_mode_distance_total / count
             ),
+            "valid_gt_rows": self.gt_count,
+            "mean_probability_at_nearest_gt_bin": (
+                self.gt_nearest_probability_total / gt_count
+            ),
+            "mean_probability_at_dfl_target": (
+                self.gt_dfl_probability_total / gt_count
+            ),
+            "mean_mode_abs_error_px": self.gt_mode_error_total / gt_count,
+            "mean_expected_abs_error_px": self.gt_expected_error_total / gt_count,
+            "mean_gt_bin_rank": (
+                sum(
+                    rank * count
+                    for rank, count in enumerate(self.gt_rank_histogram)
+                )
+                / gt_count
+            ),
+            "median_gt_bin_rank": self._rank_quantile(0.5),
+            "p90_gt_bin_rank": self._rank_quantile(0.9),
+            **{
+                f"fraction_gt_bin_in_top{k}": (
+                    sum(self.gt_rank_histogram[1 : k + 1]) / gt_count
+                    if self.gt_rank_histogram
+                    else 0.0
+                )
+                for k in (1, 5, 10, 20)
+            },
+            **{
+                f"mean_gt_probability_mass_within_{radius}_bins": (
+                    total / gt_count
+                )
+                for radius, total in self.gt_window_mass_totals.items()
+            },
         }
 
 
@@ -292,6 +401,29 @@ def _make_decoders(
     return decoders
 
 
+def _prediction_stages(
+    outputs: dict[str, Any],
+) -> list[tuple[str, dict[str, torch.Tensor]]]:
+    stages: list[tuple[str, dict[str, torch.Tensor]]] = []
+    auxiliary = outputs.get("aux_outputs")
+    if isinstance(auxiliary, (list, tuple)):
+        for index, stage in enumerate(auxiliary, start=1):
+            if isinstance(stage, dict) and "row_x_logits" in stage:
+                stages.append((f"L{index}", stage))
+    stages.append((f"L{len(stages) + 1}", outputs))
+    return stages
+
+
+def _new_distribution_buckets() -> dict[str, DistributionStats]:
+    buckets: dict[str, DistributionStats] = {}
+    for source in ("matched_candidate", "best_candidate"):
+        buckets[f"{source}/all"] = DistributionStats()
+        for threshold in (0.5, 0.7):
+            buckets[f"{source}/baseline_hit@{threshold:.2f}"] = DistributionStats()
+            buckets[f"{source}/baseline_miss@{threshold:.2f}"] = DistributionStats()
+    return buckets
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -322,14 +454,8 @@ def main() -> None:
         input_w=input_w,
         x_bins=x_bins,
     )
-    stats = {
-        name: DecodeStats(thresholds=thresholds) for name in decoders
-    }
-    distribution_stats = {
-        "all_assigned": DistributionStats(),
-        "baseline_hit@0.50": DistributionStats(),
-        "baseline_miss@0.50": DistributionStats(),
-    }
+    stats_by_stage: dict[str, dict[str, DecodeStats]] = {}
+    distribution_by_stage: dict[str, dict[str, DistributionStats]] = {}
     loader = build_dataloader(cfg, split=args.split, training=False)
     loader, sampled_indices = select_diagnostic_loader(
         loader,
@@ -352,96 +478,146 @@ def main() -> None:
                 inference_only=True,
                 structured_only=True,
             )
-            outputs = head(encoded["features"], inference_only=False)
-        logits = outputs["row_x_logits"].detach().float()
-        decoded = {
-            name: decoder(logits) for name, decoder in decoders.items()
-        }
-        matches = matcher(outputs, targets)
-        baseline = decoded["expected_t1"]
-        for image_index, (target, match) in enumerate(zip(targets, matches)):
-            gt_x_all = target["x_rows"].float()
-            valid_all = target["valid_mask"].bool()
-            assignments = _group_zero_assignments(
-                match,
-                group_size=group_size,
+            previous_intermediate_supervision = bool(head.intermediate_supervision)
+            head.intermediate_supervision = True
+            try:
+                outputs = head(encoded["features"], inference_only=False)
+            finally:
+                head.intermediate_supervision = previous_intermediate_supervision
+
+        for stage_name, stage in _prediction_stages(outputs):
+            stage_stats = stats_by_stage.setdefault(
+                stage_name,
+                {
+                    name: DecodeStats(thresholds=thresholds)
+                    for name in decoders
+                },
             )
-            for gt_index in range(int(gt_x_all.shape[0])):
-                valid = valid_all[gt_index]
-                if int(valid.sum()) < 5:
-                    continue
-                assigned_index = assignments.get(gt_index)
-                baseline_iou = 0.0
-                baseline_values = line_iou_against_gt(
-                    baseline[image_index, :group_size],
-                    gt_x_all[gt_index],
-                    valid,
-                    line_width=float(args.line_width),
+            stage_distributions = distribution_by_stage.setdefault(
+                stage_name,
+                _new_distribution_buckets(),
+            )
+            logits = stage["row_x_logits"].detach().float()
+            decoded = {
+                name: decoder(logits) for name, decoder in decoders.items()
+            }
+            matches = matcher(stage, targets)
+            baseline = decoded["expected_t1"]
+            for image_index, (target, match) in enumerate(zip(targets, matches)):
+                gt_x_all = target["x_rows"].float()
+                valid_all = target["valid_mask"].bool()
+                assignments = _group_zero_assignments(
+                    match,
+                    group_size=group_size,
                 )
-                if baseline_values.numel():
-                    baseline_iou = float(baseline_values.max())
-                for name, candidates in decoded.items():
-                    assigned_candidate = (
-                        candidates[image_index, assigned_index]
-                        if assigned_index is not None
-                        else None
-                    )
-                    stats[name].update_lane(
-                        candidates[image_index, :group_size],
-                        gt_x=gt_x_all[gt_index],
-                        valid=valid,
-                        assigned_candidate=assigned_candidate,
+                for gt_index in range(int(gt_x_all.shape[0])):
+                    valid = valid_all[gt_index]
+                    if int(valid.sum()) < 5:
+                        continue
+                    gt_x = gt_x_all[gt_index]
+                    assigned_index = assignments.get(gt_index)
+                    baseline_iou = 0.0
+                    best_index: int | None = None
+                    baseline_values = line_iou_against_gt(
+                        baseline[image_index, :group_size],
+                        gt_x,
+                        valid,
                         line_width=float(args.line_width),
                     )
-                if assigned_index is not None:
-                    assigned_logits = logits[image_index, assigned_index]
-                    distribution_stats["all_assigned"].update(
-                        assigned_logits,
-                        valid_rows=valid,
-                        input_w=input_w,
-                        x_bins=x_bins,
-                    )
-                    bucket = (
-                        "baseline_hit@0.50"
-                        if baseline_iou >= 0.5
-                        else "baseline_miss@0.50"
-                    )
-                    distribution_stats[bucket].update(
-                        assigned_logits,
-                        valid_rows=valid,
-                        input_w=input_w,
-                        x_bins=x_bins,
-                    )
+                    if baseline_values.numel():
+                        baseline_iou = float(baseline_values.max())
+                        best_index = int(baseline_values.argmax())
+                    for name, candidates in decoded.items():
+                        assigned_candidate = (
+                            candidates[image_index, assigned_index]
+                            if assigned_index is not None
+                            else None
+                        )
+                        stage_stats[name].update_lane(
+                            candidates[image_index, :group_size],
+                            gt_x=gt_x,
+                            valid=valid,
+                            assigned_candidate=assigned_candidate,
+                            line_width=float(args.line_width),
+                        )
+
+                    distribution_sources = {
+                        "matched_candidate": assigned_index,
+                        "best_candidate": best_index,
+                    }
+                    for source_name, candidate_index in distribution_sources.items():
+                        if candidate_index is None:
+                            continue
+                        candidate_logits = logits[image_index, candidate_index]
+                        base_key = f"{source_name}/all"
+                        stage_distributions[base_key].update(
+                            candidate_logits,
+                            valid_rows=valid,
+                            input_w=input_w,
+                            x_bins=x_bins,
+                            gt_x=gt_x,
+                        )
+                        for threshold in (0.5, 0.7):
+                            status = "hit" if baseline_iou >= threshold else "miss"
+                            bucket = (
+                                f"{source_name}/baseline_{status}@{threshold:.2f}"
+                            )
+                            stage_distributions[bucket].update(
+                                candidate_logits,
+                                valid_rows=valid,
+                                input_w=input_w,
+                                x_bins=x_bins,
+                                gt_x=gt_x,
+                            )
         images_seen += int(images.shape[0])
 
-    summaries = {name: value.summary() for name, value in stats.items()}
-    baseline_summary = summaries["expected_t1"]
-    baseline_recall = {
-        threshold: float(
-            baseline_summary[f"raw_recall@{threshold:.2f}"]
-        )
-        for threshold in thresholds
-    }
-    comparisons: dict[str, dict[str, float]] = {}
-    for name, summary in summaries.items():
-        comparisons[name] = {
-            **{
-                f"recall_gain@{threshold:.2f}": (
-                    float(summary[f"raw_recall@{threshold:.2f}"])
-                    - baseline_recall[threshold]
-                )
-                for threshold in thresholds
-            },
-            "assigned_row_mae_gain_px": (
-                float(baseline_summary["assigned_row_mae_px"])
-                - float(summary["assigned_row_mae_px"])
-            ),
+    stage_payload: dict[str, dict[str, Any]] = {}
+    for stage_name, stage_stats in stats_by_stage.items():
+        summaries = {
+            name: value.summary() for name, value in stage_stats.items()
         }
+        baseline_summary = summaries["expected_t1"]
+        baseline_recall = {
+            threshold: float(
+                baseline_summary[f"raw_recall@{threshold:.2f}"]
+            )
+            for threshold in thresholds
+        }
+        comparisons: dict[str, dict[str, float]] = {}
+        for name, summary in summaries.items():
+            comparisons[name] = {
+                **{
+                    f"recall_gain@{threshold:.2f}": (
+                        float(summary[f"raw_recall@{threshold:.2f}"])
+                        - baseline_recall[threshold]
+                    )
+                    for threshold in thresholds
+                },
+                "assigned_row_mae_gain_px": (
+                    float(baseline_summary["assigned_row_mae_px"])
+                    - float(summary["assigned_row_mae_px"])
+                ),
+            }
+        stage_payload[stage_name] = {
+            "decode_metrics": summaries,
+            "comparisons_to_expected_t1": comparisons,
+            "distribution_shape": {
+                name: value.summary()
+                for name, value in distribution_by_stage[stage_name].items()
+            },
+        }
+
+    if not stage_payload:
+        raise RuntimeError("No decoder stages were produced")
+    final_layer = list(stage_payload)[-1]
+    final_payload = stage_payload[final_layer]
     payload = {
         "diagnostic_only": True,
         "warning": (
-            "Decode variants are frozen-checkpoint raw-proposal diagnostics, "
-            "not validation-selected benchmark results."
+            "Decode variants and GT-bin statistics are frozen-checkpoint "
+            "raw-proposal diagnostics, not validation-selected benchmark "
+            "results. GT-bin metrics inspect existing logits and do not "
+            "inject GT into decoded predictions."
         ),
         "config": args.config,
         "checkpoint": args.checkpoint,
@@ -454,16 +630,81 @@ def main() -> None:
         "input_w": input_w,
         "x_bins": x_bins,
         "line_width": float(args.line_width),
-        "decode_metrics": summaries,
-        "comparisons_to_expected_t1": comparisons,
-        "distribution_shape": {
-            name: value.summary()
-            for name, value in distribution_stats.items()
-        },
+        "decoder_layers": stage_payload,
+        "final_layer": final_layer,
+        # Retain the original top-level keys for scripts that consumed the
+        # first version of this diagnostic.
+        "decode_metrics": final_payload["decode_metrics"],
+        "comparisons_to_expected_t1": (
+            final_payload["comparisons_to_expected_t1"]
+        ),
+        "distribution_shape": final_payload["distribution_shape"],
     }
-    compact = dict(payload)
-    compact.pop("sampled_dataset_indices")
-    print(json.dumps(compact, indent=2))
+    console_layers: dict[str, Any] = {}
+    for stage_name, stage in stage_payload.items():
+        baseline = stage["decode_metrics"]["expected_t1"]
+        best_050_name, best_050 = max(
+            stage["comparisons_to_expected_t1"].items(),
+            key=lambda item: float(item[1]["recall_gain@0.50"]),
+        )
+        best_070_name, best_070 = max(
+            stage["comparisons_to_expected_t1"].items(),
+            key=lambda item: float(item[1]["recall_gain@0.70"]),
+        )
+        miss_050 = stage["distribution_shape"][
+            "best_candidate/baseline_miss@0.50"
+        ]
+        miss_070 = stage["distribution_shape"][
+            "best_candidate/baseline_miss@0.70"
+        ]
+        console_layers[stage_name] = {
+            "expected_t1": {
+                "raw_recall@0.50": baseline["raw_recall@0.50"],
+                "raw_recall@0.70": baseline["raw_recall@0.70"],
+                "assigned_row_mae_px": baseline["assigned_row_mae_px"],
+            },
+            "best_decode_gain@0.50": {
+                "decoder": best_050_name,
+                **best_050,
+            },
+            "best_decode_gain@0.70": {
+                "decoder": best_070_name,
+                **best_070,
+            },
+            "best_candidate_baseline_miss@0.50": {
+                key: miss_050[key]
+                for key in (
+                    "valid_gt_rows",
+                    "mean_expected_abs_error_px",
+                    "mean_mode_abs_error_px",
+                    "median_gt_bin_rank",
+                    "fraction_gt_bin_in_top5",
+                    "mean_gt_probability_mass_within_4_bins",
+                )
+            },
+            "best_candidate_baseline_miss@0.70": {
+                key: miss_070[key]
+                for key in (
+                    "valid_gt_rows",
+                    "mean_expected_abs_error_px",
+                    "mean_mode_abs_error_px",
+                    "median_gt_bin_rank",
+                    "fraction_gt_bin_in_top5",
+                    "mean_gt_probability_mass_within_4_bins",
+                )
+            },
+        }
+    print(
+        json.dumps(
+            {
+                "checkpoint_iteration": iteration,
+                "images": images_seen,
+                "group_size": group_size,
+                "decoder_layers": console_layers,
+            },
+            indent=2,
+        )
+    )
     output_path = Path(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

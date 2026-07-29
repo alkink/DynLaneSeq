@@ -4,6 +4,7 @@ import torch
 
 from dynlaneseq_eg.tools.analyze_row_distribution_decoding import (
     DecodeStats,
+    DistributionStats,
     decode_argmax,
     decode_local_mode_expectation,
 )
@@ -44,3 +45,30 @@ def test_decode_stats_reports_recall_and_assigned_mae() -> None:
     summary = stats.summary()
     assert summary["raw_recall@0.50"] == 1.0
     assert summary["assigned_row_mae_px"] == 2.0
+
+
+def test_distribution_stats_locates_gt_bin_and_probability_mass() -> None:
+    stats = DistributionStats()
+    logits = torch.tensor(
+        [
+            [0.0, 1.0, 8.0, 0.0],
+            [0.0, 7.0, 1.0, 0.0],
+        ]
+    )
+    valid = torch.ones(2, dtype=torch.bool)
+    gt_x = torch.tensor([8.0, 4.0])
+    stats.update(
+        logits,
+        valid_rows=valid,
+        input_w=16,
+        x_bins=4,
+        gt_x=gt_x,
+    )
+    summary = stats.summary()
+    assert summary["valid_gt_rows"] == 2
+    assert summary["median_gt_bin_rank"] == 1
+    assert summary["p90_gt_bin_rank"] == 1
+    assert summary["fraction_gt_bin_in_top1"] == 1.0
+    assert summary["mean_mode_abs_error_px"] == 0.0
+    assert summary["mean_probability_at_nearest_gt_bin"] > 0.99
+    assert summary["mean_gt_probability_mass_within_1_bins"] > 0.99
