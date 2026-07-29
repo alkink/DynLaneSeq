@@ -1558,3 +1558,17 @@ The retained throughput changes are arithmetic-preserving:
 The DFL reordering is bitwise value/gradient equivalent in BF16 regression
 tests.  These changes preserve the validated model path while targeting the
 copy and synchronization traffic identified by the CUDA profile.
+
+On PyTorch 2.11.0+cu128 with an RTX 5070 Ti, compiling the model (but leaving
+the matcher and criterion eager) reduced the synchronized optimizer-step time
+from 1.2060 s to 1.0500 s:
+
+- throughput: 13.27 -> 15.24 images/s;
+- model forward plus final matching: 0.3563 -> 0.1939 s/step;
+- backward: 0.7210 -> 0.5703 s/step;
+- profiler kernel launches: 27,493 -> 18,647; and
+- peak allocated memory: 9.91 -> 7.46 GiB.
+
+The full config therefore enables `torch.compile` in `default` mode.  This is
+an execution optimization only; checkpoint parameters, model outputs,
+matcher, losses, optimizer, and schedule retain the same public contract.
