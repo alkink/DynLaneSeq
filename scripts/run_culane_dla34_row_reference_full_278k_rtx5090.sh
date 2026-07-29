@@ -33,13 +33,16 @@ if required not in arches:
     )
 '
 
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_lanerownet_5090}"
+# Each server has its own filesystem, so the shared canonical cache name is
+# safe and lets profiler/training processes reuse the same compiled kernels.
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_lanerownet}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Deliberately retain batch 4 x accumulation 4.  RTX 5090 has enough memory
 # for larger micro-batches, but changing that split also changes auxiliary
 # BatchNorm statistics.  The identical setting is the cleanest one-run
 # scientific comparison and should still exploit the faster GPU.
+echo "Note: the first speed line may include cold compilation; subsequent lines are windowed."
 DATA_ROOT="${DATA_ROOT:-/workspace/CULane}" \
 BATCH_SIZE="${BATCH_SIZE:-4}" \
 GRAD_ACCUM="${GRAD_ACCUM:-4}" \
