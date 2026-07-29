@@ -12,6 +12,8 @@ model:
     intermediate_supervision: true
     row_reference:
       enabled: true
+      # Mathematically equivalent row-aligned specialization of the legacy sampler.
+      sampling_backend: linear_gather
       offsets_px: [-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0]
       visual_logit_scale: 8.0
       initial_prior_sigma_px: 240.0

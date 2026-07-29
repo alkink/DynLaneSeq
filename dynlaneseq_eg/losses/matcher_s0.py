@@ -31,7 +31,7 @@ class HungarianMatcherS0:
     def __call__(self, outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
         if "coarse" in outputs:
             outputs = outputs["coarse"]
-        matches = []
+        pending = []
         for b, target in enumerate(targets):
             cost, stats = self.compute_cost_for_image(
                 outputs["exist_logits"][b],
@@ -40,13 +40,41 @@ class HungarianMatcherS0:
                 target,
             )
             num_gt = int(target["x_rows"].shape[0])
+            pending.append((cost, stats, num_gt))
+
+        # Deep supervision calls the matcher once for every decoder output.
+        # Moving each image cost to CPU inside the loop serializes the CUDA
+        # stream B times per call (and B * decoder_layers times per training
+        # micro-batch).  The matrices are tiny, so concatenate them and pay for
+        # exactly one device synchronization while preserving the identical
+        # per-image SciPy assignment below.
+        nonempty_costs = [cost.reshape(-1) for cost, _, num_gt in pending if num_gt > 0]
+        flat_cost_cpu = (
+            torch.cat(nonempty_costs, dim=0).detach().cpu()
+            if nonempty_costs
+            else torch.empty(0)
+        )
+
+        matches = []
+        flat_offset = 0
+        for cost, stats, num_gt in pending:
             if num_gt == 0:
                 pred_idx = torch.empty(0, dtype=torch.long)
                 gt_idx = torch.empty(0, dtype=torch.long)
-            elif self.cfg.assignment == "grouped_one_to_many":
-                pred_idx, gt_idx = self._grouped_assignment(cost, num_groups=max(1, int(self.cfg.num_groups)))
             else:
-                pred_idx, gt_idx = self._linear_sum_assignment(cost)
+                numel = int(cost.numel())
+                cost_cpu = flat_cost_cpu[flat_offset : flat_offset + numel].view(
+                    int(cost.shape[0]),
+                    int(cost.shape[1]),
+                )
+                flat_offset += numel
+                if self.cfg.assignment == "grouped_one_to_many":
+                    pred_idx, gt_idx = self._grouped_assignment(
+                        cost_cpu,
+                        num_groups=max(1, int(self.cfg.num_groups)),
+                    )
+                else:
+                    pred_idx, gt_idx = self._linear_sum_assignment(cost_cpu)
             matches.append(
                 {
                     "pred_indices": pred_idx,

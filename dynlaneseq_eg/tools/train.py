@@ -115,6 +115,11 @@ def main() -> None:
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
     accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
     approx_epochs = planned_iters * accumulation_steps / max(len(loader), 1)
+    row_reference_cfg = (
+        cfg.get("model", {})
+        .get("structured_query", {})
+        .get("row_reference", {})
+    )
     print(
         {
             "model": cfg.get("model", {}).get("name", "DynLaneSeq"),
@@ -134,6 +139,11 @@ def main() -> None:
             "seg_aux_amp_dtype": str(cfg.get("model", {}).get("seg_aux", {}).get("amp_dtype", "inherit")),
             "channels_last": channels_last,
             "compile_model": bool(train_cfg.get("compile_model", False)),
+            "row_reference_sampling_backend": (
+                str(row_reference_cfg.get("sampling_backend", "grid_sample"))
+                if bool(row_reference_cfg.get("enabled", False))
+                else None
+            ),
             "clip_grad_norm": float(train_cfg.get("clip_grad_norm", 1.0)),
             "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),

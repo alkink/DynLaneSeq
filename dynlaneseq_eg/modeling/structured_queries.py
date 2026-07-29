@@ -128,6 +128,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         dropout: float = 0.1,
         num_groups: int = 1,
         offsets_px: tuple[float, ...] = (-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0),
+        sampling_backend: str = "grid_sample",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -145,6 +146,12 @@ class ReferenceGuidedRowLayer(nn.Module):
         if not bool((offsets < 0).any() and (offsets == 0).any() and (offsets > 0).any()):
             raise ValueError("row_reference.offsets_px must span negative, zero, and positive offsets")
         self.register_buffer("offsets_px", offsets, persistent=True)
+        self.sampling_backend = str(sampling_backend).strip().lower()
+        if self.sampling_backend not in {"grid_sample", "linear_gather"}:
+            raise ValueError(
+                "row_reference.sampling_backend must be grid_sample or "
+                f"linear_gather, got {sampling_backend!r}"
+            )
 
         self.local_query = nn.Linear(self.dim, self.dim, bias=False)
         self.local_key = nn.Linear(self.dim, self.dim, bias=False)
@@ -182,7 +189,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         self.norm_ffn = nn.LayerNorm(self.dim)
         self.drop = nn.Dropout(dropout)
 
-    def _sample_local_profiles(
+    def _sample_local_profiles_grid(
         self,
         row_value_features: torch.Tensor,
         reference_x_rows: torch.Tensor,
@@ -245,6 +252,108 @@ class ReferenceGuidedRowLayer(nn.Module):
             )
         return sampled.to(dtype=row_value_features.dtype)
 
+    def _sample_local_profiles_linear(
+        self,
+        row_value_features: torch.Tensor,
+        reference_x_rows: torch.Tensor,
+        *,
+        input_w: int,
+    ) -> torch.Tensor:
+        """Sample the same profiles without materializing an FP32 image map.
+
+        ``row_value_features`` already has exactly the decoder's row count.
+        The legacy grid therefore samples every y coordinate at an integer
+        feature row and only interpolates horizontally.  Expressing that
+        special case directly avoids, once per decoder block:
+
+        * an FP32 copy of the complete P2 tensor;
+        * an NCHW permutation/contiguous copy;
+        * construction of a two-dimensional grid; and
+        * a general two-dimensional ``grid_sample`` kernel.
+
+        Coordinates are still computed in FP32.  Feature interpolation is
+        performed in the AMP tensor dtype, matching the dtype returned by the
+        legacy FP32 island while retaining the fast BF16 path.
+        """
+
+        b, rows, x_bins, channels = row_value_features.shape
+        rb, instances, reference_rows = reference_x_rows.shape
+        if rb != b or reference_rows != rows:
+            raise ValueError(
+                "reference_x_rows must match row evidence: "
+                f"got {tuple(reference_x_rows.shape)} for "
+                f"{tuple(row_value_features.shape)}"
+            )
+        device_type = row_value_features.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            reference = reference_x_rows.float()
+            offsets = self.offsets_px.to(device=reference.device, dtype=torch.float32)
+            sample_x = (reference.unsqueeze(-1) + offsets.view(1, 1, 1, -1)).clamp(
+                min=0.0,
+                max=float(max(int(input_w) - 1, 1)),
+            )
+            feature_x = sample_x * float(max(x_bins - 1, 0)) / float(
+                max(int(input_w) - 1, 1)
+            )
+            left = feature_x.floor().to(dtype=torch.long)
+            right = (left + 1).clamp(max=max(x_bins - 1, 0))
+            alpha = feature_x - left.to(dtype=feature_x.dtype)
+
+        # Flatten batch and row together. Advanced indexing selects only the
+        # requested N*K horizontal locations; unlike gather with an expanded
+        # channel index, it does not materialize a large int64 index tensor.
+        flat_features = row_value_features.reshape(b * rows, x_bins, channels)
+        offsets_count = int(left.shape[-1])
+        left = left.permute(0, 2, 1, 3).reshape(b * rows, instances * offsets_count)
+        right = right.permute(0, 2, 1, 3).reshape(b * rows, instances * offsets_count)
+        alpha = alpha.permute(0, 2, 1, 3).reshape(
+            b * rows,
+            instances * offsets_count,
+            1,
+        )
+        row_index = torch.arange(
+            b * rows,
+            device=row_value_features.device,
+        ).view(-1, 1)
+        paired_index = torch.stack((left, right), dim=-1).reshape(
+            b * rows,
+            instances * offsets_count * 2,
+        )
+        paired_value = flat_features[row_index, paired_index].view(
+            b * rows,
+            instances * offsets_count,
+            2,
+            channels,
+        )
+        left_value = paired_value[:, :, 0]
+        right_value = paired_value[:, :, 1]
+        alpha = alpha.to(dtype=row_value_features.dtype)
+        sampled = torch.lerp(left_value, right_value, alpha)
+        return (
+            sampled.view(b, rows, instances, offsets_count, channels)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+
+    def _sample_local_profiles(
+        self,
+        row_value_features: torch.Tensor,
+        reference_x_rows: torch.Tensor,
+        *,
+        input_w: int,
+    ) -> torch.Tensor:
+        if self.sampling_backend == "linear_gather":
+            return self._sample_local_profiles_linear(
+                row_value_features,
+                reference_x_rows,
+                input_w=input_w,
+            )
+        return self._sample_local_profiles_grid(
+            row_value_features,
+            reference_x_rows,
+            input_w=input_w,
+        )
+
     def _grouped_inter_attention(
         self,
         q: torch.Tensor,
@@ -299,7 +408,17 @@ class ReferenceGuidedRowLayer(nn.Module):
             self.num_heads,
             head_dim,
         )
-        key = self.local_key(profiles).view(
+        # Key and value consume the same very large sampled-profile matrix.
+        # A single GEMM with concatenated (parameter-compatible) weights
+        # avoids launching and reading that matrix twice.  The two original
+        # Linear modules remain intact, so old checkpoints and optimizer state
+        # load without conversion.
+        key_value = F.linear(
+            profiles,
+            torch.cat((self.local_key.weight, self.local_value.weight), dim=0),
+        )
+        key, value = key_value.split(self.dim, dim=-1)
+        key = key.view(
             b,
             n,
             r,
@@ -307,7 +426,7 @@ class ReferenceGuidedRowLayer(nn.Module):
             self.num_heads,
             head_dim,
         ).permute(0, 1, 2, 4, 3, 5)
-        value = self.local_value(profiles).view(
+        value = value.view(
             b,
             n,
             r,
@@ -315,7 +434,14 @@ class ReferenceGuidedRowLayer(nn.Module):
             self.num_heads,
             head_dim,
         ).permute(0, 1, 2, 4, 3, 5)
-        attention = (query.unsqueeze(-2) * key).sum(dim=-1) / math.sqrt(float(head_dim))
+        # Contract directly instead of materializing [B,N,R,H,K,D] products.
+        # At the paper resolution the two legacy multiply-then-reduce
+        # expressions each create a large temporary once per decoder block.
+        attention = torch.einsum(
+            "bnrhd,bnrhkd->bnrhk",
+            query,
+            key,
+        ) / math.sqrt(float(head_dim))
         attention = attention + self.relative_offset_bias.view(
             1,
             1,
@@ -324,7 +450,11 @@ class ReferenceGuidedRowLayer(nn.Module):
             offsets,
         )
         attention = torch.softmax(attention, dim=-1)
-        context = (attention.unsqueeze(-1) * value).sum(dim=-2).reshape(b, n, r, c)
+        context = torch.einsum(
+            "bnrhk,bnrhkd->bnrhd",
+            attention,
+            value,
+        ).reshape(b, n, r, c)
 
         x_norm = 2.0 * reference_x_rows.to(dtype=row_tokens.dtype) / float(
             max(int(input_w) - 1, 1)
@@ -453,6 +583,12 @@ class StructuredLaneQueryHead(nn.Module):
                         dropout=float(dropout),
                         num_groups=self.num_groups,
                         offsets_px=offsets_px,
+                        sampling_backend=str(
+                            self.row_reference_cfg.get(
+                                "sampling_backend",
+                                "grid_sample",
+                            )
+                        ),
                     )
                     for _ in range(int(num_layers))
                 ]
