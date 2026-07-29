@@ -183,6 +183,9 @@ def train_one_epoch(
     max_iters = max_iters or int(cfg.get("training", {}).get("max_iters", len(dataloader)))
     end_iter = start_iter + max_iters
     wall_start = time.perf_counter()
+    last_log_time = wall_start
+    last_log_iteration = start_iter
+    last_log_processed_images = 0
     loader_len = max(len(dataloader), 1) if hasattr(dataloader, "__len__") else 1
     processed_images = 0
     micro_in_step = 0
@@ -259,9 +262,17 @@ def train_one_epoch(
                 if (iteration + 1) % log_interval == 0:
                     done = max(iteration + 1 - start_iter, 1)
                     total = max(max_iters, 1)
-                    elapsed = time.perf_counter() - wall_start
-                    sec_per_iter = elapsed / done
-                    img_per_sec = processed_images / max(elapsed, 1e-6)
+                    now = time.perf_counter()
+                    elapsed = now - wall_start
+                    # Report the most recent log window rather than averaging
+                    # from process start.  A cold torch.compile step can take
+                    # minutes; including it forever made a healthy steady-state
+                    # run look artificially slow for thousands of iterations.
+                    window_elapsed = max(now - last_log_time, 1e-6)
+                    window_iterations = max(iteration + 1 - last_log_iteration, 1)
+                    window_images = max(processed_images - last_log_processed_images, 0)
+                    sec_per_iter = window_elapsed / float(window_iterations)
+                    img_per_sec = float(window_images) / window_elapsed
                     eta = sec_per_iter * max(total - done, 0)
                     pct = 100.0 * done / total
                     epoch = float((iteration + 1) * accumulation_steps) / float(loader_len)
@@ -273,6 +284,9 @@ def train_one_epoch(
                         f"eta {_format_duration(eta)} | "
                     )
                     print(logger.format_and_reset(prefix=prefix))
+                    last_log_time = now
+                    last_log_iteration = iteration + 1
+                    last_log_processed_images = processed_images
             if visualizer is not None:
                 visualizer(images, targets, metas, outputs, iteration + 1)
             iteration += 1

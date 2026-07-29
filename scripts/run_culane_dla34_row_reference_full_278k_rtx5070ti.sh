@@ -33,12 +33,15 @@ if required not in arches:
     )
 '
 
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_lanerownet_5070ti}"
+# Reuse the cache populated by the profiler and the pre-existing 5070 Ti
+# launcher.  A new cache name needlessly forced a full cold compilation.
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_lanerownet}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # This is the validated, memory-safe setting measured at 20.65 img/s.  Keep
 # the exact same micro-batch split on both GPUs so hardware does not introduce
 # an additional BatchNorm/gradient-accumulation variable.
+echo "Note: the first speed line may include cold compilation; subsequent lines are windowed."
 DATA_ROOT="${DATA_ROOT:-/workspace/CULane}" \
 BATCH_SIZE="${BATCH_SIZE:-4}" \
 GRAD_ACCUM="${GRAD_ACCUM:-4}" \
