@@ -48,6 +48,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--evidence-width", type=int, default=400)
     parser.add_argument(
+        "--conditioning-mode",
+        choices=("per_row", "lane_shared"),
+        default="per_row",
+        help=(
+            "per_row reproduces the original flexible probe. lane_shared "
+            "generates one dynamic visual filter per lane and reuses it over "
+            "all rows, matching the whole-lane coherence bias of CondLSTR."
+        ),
+    )
+    parser.add_argument(
+        "--explicit-coordinates",
+        action="store_true",
+        help=(
+            "Append normalized image-row and horizontal coordinates to the "
+            "visual evidence before the probe tower, as in dynamic mask heads."
+        ),
+    )
+    parser.add_argument(
         "--state-source",
         choices=("final", "initial"),
         default="final",
@@ -107,16 +125,26 @@ class QueryConditionedDenseCurveProbe(nn.Module):
         num_rows: int,
         evidence_width: int,
         input_w: int,
+        conditioning_mode: str = "per_row",
+        explicit_coordinates: bool = False,
     ) -> None:
         super().__init__()
         if hidden_dim % 8 != 0:
             raise ValueError("hidden_dim must be divisible by 8 for GroupNorm")
+        conditioning_mode = str(conditioning_mode).strip().lower()
+        if conditioning_mode not in {"per_row", "lane_shared"}:
+            raise ValueError(
+                "conditioning_mode must be 'per_row' or 'lane_shared'"
+            )
         self.num_rows = int(num_rows)
         self.evidence_width = int(evidence_width)
         self.input_w = int(input_w)
         self.hidden_dim = int(hidden_dim)
+        self.conditioning_mode = conditioning_mode
+        self.explicit_coordinates = bool(explicit_coordinates)
+        feature_in_dim = int(in_dim) + (2 if self.explicit_coordinates else 0)
         self.feature_tower = nn.Sequential(
-            nn.Conv2d(int(in_dim), int(hidden_dim), kernel_size=1, bias=False),
+            nn.Conv2d(feature_in_dim, int(hidden_dim), kernel_size=1, bias=False),
             nn.GroupNorm(8, int(hidden_dim)),
             nn.GELU(),
             nn.Conv2d(
@@ -151,6 +179,30 @@ class QueryConditionedDenseCurveProbe(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+        if self.explicit_coordinates:
+            batch, _channels, height, width = p2.shape
+            row_coord = torch.linspace(
+                -1.0,
+                1.0,
+                height,
+                device=p2.device,
+                dtype=p2.dtype,
+            ).view(1, 1, height, 1)
+            x_coord = torch.linspace(
+                -1.0,
+                1.0,
+                width,
+                device=p2.device,
+                dtype=p2.dtype,
+            ).view(1, 1, 1, width)
+            coordinates = torch.cat(
+                [
+                    row_coord.expand(batch, -1, -1, width),
+                    x_coord.expand(batch, -1, height, -1),
+                ],
+                dim=1,
+            )
+            p2 = torch.cat([p2, coordinates], dim=1)
         return self.feature_tower(p2)
 
     def score_encoded(
@@ -169,10 +221,20 @@ class QueryConditionedDenseCurveProbe(nn.Module):
         if int(encoded_features.shape[0]) != int(row_states.shape[0]):
             raise ValueError("feature/state batch sizes differ")
         visual = encoded_features.permute(0, 2, 3, 1).contiguous()
-        dynamic = self.state_projection(row_states)
-        logits = torch.einsum("bnrd,brxd->bnrx", dynamic, visual)
+        if self.conditioning_mode == "per_row":
+            dynamic = self.state_projection(row_states)
+            logits = torch.einsum("bnrd,brxd->bnrx", dynamic, visual)
+            bias = self.row_bias(row_states)
+        else:
+            # A single dynamic filter must explain the complete lane.  Unlike
+            # the per-row probe, it cannot select a different visual template
+            # independently at every height.
+            lane_state = row_states.mean(dim=2)
+            dynamic = self.state_projection(lane_state)
+            logits = torch.einsum("bnd,brxd->bnrx", dynamic, visual)
+            bias = self.row_bias(lane_state).unsqueeze(2)
         logits = logits / math.sqrt(float(self.hidden_dim))
-        return logits + self.row_bias(row_states)
+        return logits + bias
 
     def forward(self, p2: torch.Tensor, row_states: torch.Tensor) -> torch.Tensor:
         return self.score_encoded(self.encode_features(p2), row_states)
@@ -596,6 +658,8 @@ def main() -> None:
         num_rows=int(model_cfg.get("num_rows", 72)),
         evidence_width=int(args.evidence_width),
         input_w=int(model_cfg.get("input_w", 800)),
+        conditioning_mode=args.conditioning_mode,
+        explicit_coordinates=bool(args.explicit_coordinates),
     ).to(device)
     if args.load_probe:
         payload = torch.load(args.load_probe, map_location="cpu")
@@ -714,6 +778,8 @@ def main() -> None:
         "seed": int(args.seed),
         "train_steps": int(args.train_steps),
         "state_source": args.state_source,
+        "conditioning_mode": args.conditioning_mode,
+        "explicit_coordinates": bool(args.explicit_coordinates),
         "images": int(images_seen),
         "sample_strategy": args.sample_strategy,
         "sampled_dataset_indices": sampled_indices,

@@ -33,6 +33,26 @@ def test_dense_probe_shape_and_decode_range() -> None:
     assert bool((curves < 70.0).all())
 
 
+def test_lane_shared_probe_uses_one_dynamic_filter_across_rows() -> None:
+    probe = QueryConditionedDenseCurveProbe(
+        in_dim=16,
+        state_dim=12,
+        hidden_dim=8,
+        num_rows=5,
+        evidence_width=7,
+        input_w=70,
+        conditioning_mode="lane_shared",
+        explicit_coordinates=True,
+    )
+    p2 = torch.randn(2, 16, 3, 4)
+    states = torch.randn(2, 3, 5, 12)
+    logits = probe(p2, states)
+    assert logits.shape == (2, 3, 5, 7)
+    logits.mean().backward()
+    assert probe.state_projection[1].weight.grad is not None
+    assert probe.feature_tower[0].weight.shape[1] == 18
+
+
 def test_group_zero_matches_filters_repeated_training_groups() -> None:
     match = {
         "pred_indices": torch.tensor([0, 3, 8, 11, 16, 19]),

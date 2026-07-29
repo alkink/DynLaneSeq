@@ -14,6 +14,13 @@ EVAL_MAX_BATCHES="${EVAL_MAX_BATCHES:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 STATE_SOURCE="${STATE_SOURCE:-final}"
+CONDITIONING_MODE="${CONDITIONING_MODE:-per_row}"
+EXPLICIT_COORDINATES="${EXPLICIT_COORDINATES:-0}"
+
+coordinate_args=()
+if [[ "$EXPLICIT_COORDINATES" == "1" ]]; then
+  coordinate_args+=(--explicit-coordinates)
+fi
 
 python -m dynlaneseq_eg.tools.probe_query_conditioned_dense_curve \
   --config "$CONFIG" \
@@ -29,6 +36,8 @@ python -m dynlaneseq_eg.tools.probe_query_conditioned_dense_curve \
   --hidden-dim 64 \
   --evidence-width 400 \
   --state-source "$STATE_SOURCE" \
+  --conditioning-mode "$CONDITIONING_MODE" \
+  "${coordinate_args[@]}" \
   --learning-rate 1e-3 \
   --line-width 30.0 \
   --amp-dtype "$AMP_DTYPE" \

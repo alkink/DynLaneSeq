@@ -4,6 +4,7 @@ import torch
 
 from dynlaneseq_eg.tools.probe_frozen_p2_lane_discovery import (
     FrozenP2LaneDiscoveryProbe,
+    TeacherSeedConditionMetrics,
     _curve_loss,
     _gaussian_heatmap_targets,
     _topk_seeds,
@@ -72,3 +73,18 @@ def test_topk_seeds_returns_heatmap_peak() -> None:
     )
     assert peaks.tolist() == [[[2, 3]]]
     assert scores[0, 0] > 0.99
+
+
+def test_teacher_seed_metrics_partition_base_hits_and_misses() -> None:
+    metrics = TeacherSeedConditionMetrics()
+    metrics.update(
+        torch.tensor([0.8, 0.2, 0.6, 0.4]),
+        torch.tensor([0.9, 0.7, 0.4, 0.1]),
+    )
+    summary = metrics.summary()
+    assert summary["lanes"] == 4
+    assert summary["paired_recall_050"] == 0.5
+    assert summary["base_hit_lanes"] == 2
+    assert summary["base_hit_paired_recall_050"] == 0.5
+    assert summary["base_miss_lanes"] == 2
+    assert summary["base_miss_paired_recall_050"] == 0.5

@@ -21,6 +21,7 @@ from dynlaneseq_eg.evaluation.proposal_recall import line_iou_against_gt
 from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import soft_expected_x
 from dynlaneseq_eg.modeling.structured_queries import RowAwareCrossAttentionLayer
+from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak-nms-radius", type=int, default=2)
     parser.add_argument("--eval-max-batches", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--sample-strategy",
+        choices=("sequential", "uniform"),
+        default="uniform",
+    )
     parser.add_argument("--line-width", type=float, default=30.0)
     parser.add_argument("--amp-dtype", choices=("none", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--log-interval", type=int, default=50)
@@ -427,6 +433,69 @@ class ProbeMetrics:
         }
 
 
+@dataclass
+class TeacherSeedConditionMetrics:
+    """Paired tracing quality when the lower lane seed is supplied."""
+
+    lanes: int = 0
+    hits_050: int = 0
+    hits_070: int = 0
+    iou_sum: float = 0.0
+    base_hit_lanes: int = 0
+    base_hit_hits_050: int = 0
+    base_hit_hits_070: int = 0
+    base_hit_iou_sum: float = 0.0
+    base_miss_lanes: int = 0
+    base_miss_hits_050: int = 0
+    base_miss_hits_070: int = 0
+    base_miss_iou_sum: float = 0.0
+
+    def update(self, base_iou: torch.Tensor, paired_iou: torch.Tensor) -> None:
+        if base_iou.shape != paired_iou.shape:
+            raise RuntimeError(
+                "Teacher-seed/base GT count mismatch: "
+                f"{tuple(paired_iou.shape)} != {tuple(base_iou.shape)}"
+            )
+        paired = paired_iou.float()
+        base = base_iou.float()
+        base_hit = base >= 0.5
+        base_miss = ~base_hit
+        self.lanes += int(paired.numel())
+        self.hits_050 += int((paired >= 0.5).sum())
+        self.hits_070 += int((paired >= 0.7).sum())
+        self.iou_sum += float(paired.sum())
+        self.base_hit_lanes += int(base_hit.sum())
+        self.base_hit_hits_050 += int((base_hit & (paired >= 0.5)).sum())
+        self.base_hit_hits_070 += int((base_hit & (paired >= 0.7)).sum())
+        self.base_hit_iou_sum += float(paired[base_hit].sum())
+        self.base_miss_lanes += int(base_miss.sum())
+        self.base_miss_hits_050 += int((base_miss & (paired >= 0.5)).sum())
+        self.base_miss_hits_070 += int((base_miss & (paired >= 0.7)).sum())
+        self.base_miss_iou_sum += float(paired[base_miss].sum())
+
+    def summary(self) -> dict[str, float | int]:
+        return {
+            "lanes": self.lanes,
+            "paired_recall_050": self.hits_050 / max(self.lanes, 1),
+            "paired_recall_070": self.hits_070 / max(self.lanes, 1),
+            "paired_mean_iou": self.iou_sum / max(self.lanes, 1),
+            "base_hit_lanes": self.base_hit_lanes,
+            "base_hit_paired_recall_050": self.base_hit_hits_050
+            / max(self.base_hit_lanes, 1),
+            "base_hit_paired_recall_070": self.base_hit_hits_070
+            / max(self.base_hit_lanes, 1),
+            "base_hit_paired_mean_iou": self.base_hit_iou_sum
+            / max(self.base_hit_lanes, 1),
+            "base_miss_lanes": self.base_miss_lanes,
+            "base_miss_paired_recall_050": self.base_miss_hits_050
+            / max(self.base_miss_lanes, 1),
+            "base_miss_paired_recall_070": self.base_miss_hits_070
+            / max(self.base_miss_lanes, 1),
+            "base_miss_paired_mean_iou": self.base_miss_iou_sum
+            / max(self.base_miss_lanes, 1),
+        }
+
+
 def _seed_distances_px(
     peaks: torch.Tensor,
     target: dict[str, torch.Tensor],
@@ -547,6 +616,34 @@ def _update_teacher_seed_stats(
     metrics.teacher_seed_best_hits_070 += int((best >= 0.7).sum())
 
 
+def _paired_teacher_seed_ious(
+    teacher_candidates: torch.Tensor,
+    lane_indices: list[int],
+    target: dict[str, torch.Tensor],
+    *,
+    line_width: float,
+) -> torch.Tensor:
+    gt_x = target["x_rows"].to(
+        device=teacher_candidates.device,
+        dtype=teacher_candidates.dtype,
+    )
+    valid = target["valid_mask"].to(device=teacher_candidates.device).bool()
+    values: list[torch.Tensor] = []
+    for proposal_index, lane_index in enumerate(lane_indices):
+        iou = line_iou_against_gt(
+            teacher_candidates[proposal_index : proposal_index + 1],
+            gt_x[lane_index],
+            valid[lane_index],
+            line_width=float(line_width),
+        )
+        values.append(iou[0] if iou.numel() else teacher_candidates.new_zeros(()))
+    return (
+        torch.stack(values).float()
+        if values
+        else teacher_candidates.new_zeros((0,), dtype=torch.float32)
+    )
+
+
 @torch.no_grad()
 def evaluate_probe(
     base_model: nn.Module,
@@ -565,8 +662,13 @@ def evaluate_probe(
     num_instances: int,
     num_groups: int,
     line_width: float,
-) -> ProbeMetrics:
+) -> tuple[ProbeMetrics, dict[str, TeacherSeedConditionMetrics]]:
     metrics = ProbeMetrics()
+    teacher_conditions = {
+        "correct_p2": TeacherSeedConditionMetrics(),
+        "wrong_image_p2": TeacherSeedConditionMetrics(),
+        "zero_p2": TeacherSeedConditionMetrics(),
+    }
     group_size = num_instances // max(num_groups, 1)
     base_model.eval()
     probe.eval()
@@ -620,6 +722,21 @@ def evaluate_probe(
                 teacher_yx,
             )
             teacher_candidates = teacher_decoded["pred_x_rows"][0].float()
+            wrong_sample_index = (sample_index + 1) % int(images.shape[0])
+            wrong_teacher_decoded = probe.decode_curves(
+                probe_outputs["hidden"][
+                    wrong_sample_index : wrong_sample_index + 1
+                ],
+                teacher_yx,
+            )
+            wrong_teacher_candidates = wrong_teacher_decoded["pred_x_rows"][0].float()
+            zero_teacher_decoded = probe.decode_curves(
+                torch.zeros_like(
+                    probe_outputs["hidden"][sample_index : sample_index + 1]
+                ),
+                teacher_yx,
+            )
+            zero_teacher_candidates = zero_teacher_decoded["pred_x_rows"][0].float()
             base_iou = _best_iou_per_gt(base_candidates, target, line_width=line_width)
             probe_iou = _best_iou_per_gt(probe_candidates, target, line_width=line_width)
             if base_iou.shape != probe_iou.shape:
@@ -668,7 +785,19 @@ def evaluate_probe(
                 target,
                 line_width=line_width,
             )
-    return metrics
+            for condition_name, condition_candidates in (
+                ("correct_p2", teacher_candidates),
+                ("wrong_image_p2", wrong_teacher_candidates),
+                ("zero_p2", zero_teacher_candidates),
+            ):
+                paired_iou = _paired_teacher_seed_ious(
+                    condition_candidates,
+                    teacher_lane_indices,
+                    target,
+                    line_width=line_width,
+                )
+                teacher_conditions[condition_name].update(base_iou, paired_iou)
+    return metrics, teacher_conditions
 
 
 def main() -> None:
@@ -727,6 +856,12 @@ def main() -> None:
     )
     train_loader = build_dataloader(cfg, split="train", training=True)
     eval_loader = build_dataloader(cfg, split="val", training=False)
+    eval_loader, sampled_indices = select_diagnostic_loader(
+        eval_loader,
+        strategy=str(args.sample_strategy),
+        max_batches=int(args.eval_max_batches),
+        num_workers=int(args.num_workers),
+    )
 
     amp_dtype = {
         "float16": torch.float16,
@@ -804,7 +939,7 @@ def main() -> None:
             )
             running = {"total": 0.0, "heatmap": 0.0, "curve": 0.0}
 
-    metrics = evaluate_probe(
+    metrics, teacher_conditions = evaluate_probe(
         base_model,
         probe,
         eval_loader,
@@ -827,6 +962,8 @@ def main() -> None:
         "base_model_frozen": True,
         "train_split": "train",
         "eval_split": "val",
+        "sample_strategy": str(args.sample_strategy),
+        "sampled_dataset_indices": sampled_indices,
         "config": args.config,
         "checkpoint": args.checkpoint,
         "seed": int(args.seed),
@@ -840,8 +977,14 @@ def main() -> None:
             "top_k": int(args.top_k),
         },
         "metrics": metrics.summary(),
+        "teacher_seed_conditions": {
+            name: value.summary()
+            for name, value in teacher_conditions.items()
+        },
     }
-    print(json.dumps(payload, indent=2))
+    compact = dict(payload)
+    compact.pop("sampled_dataset_indices")
+    print(json.dumps(compact, indent=2))
 
     if args.save_probe:
         probe_path = Path(args.save_probe)

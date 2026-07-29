@@ -1270,3 +1270,196 @@ loss to the frozen checkpoint.
 Exact output:
 
 - `outputs/diagnostics/frozen_p2_centerline_separability/dla34_225k_uniform64_1000steps.json`.
+
+## 34. Lane-shared dynamic correlation learns existing lanes, not missing ones
+
+The previous per-row dynamic P2 readout could fail simply because every row
+generated an independent visual filter. We therefore added a CondLSTR-like
+control that pools one lane state, generates one dynamic filter for the whole
+lane, and reuses that filter over every row. Explicit normalized x/y channels
+were included in the visual tower. The detector and P2 were frozen.
+
+On the same uniform 64-image subset, the lane-shared probe improves over the
+per-row probe:
+
+| Frozen query-conditioned P2 probe | R@0.50 | R@0.70 | Paired mean IoU | Base misses recovered @0.50 |
+|---|---:|---:|---:|---:|
+| Per-row dynamic filters | 21.72 | 2.71 | 0.308 | 0 / 86 |
+| One lane-shared dynamic filter | 28.96 | 8.60 | 0.346 | 1 / 86 |
+| Lane-shared, wrong-image P2 | 2.26 | 0.00 | 0.117 | -- |
+
+The correct-versus-wrong-image gap proves that the shared filter reads P2
+rather than reproducing a pure lane prior. Sharing lane identity also helps
+whole-curve consistency. Nevertheless, nearly all useful proposals remain a
+subset of the lanes already found by the production decoder.
+
+We then jointly optimized the SimpleFPN, projected P2, structured decoder,
+auxiliary dense heads, and the pretrained lane-shared probe for 500 short
+steps. The auxiliary head improved from `28.96` to `34.84` R@0.50 and from
+`0.346` to `0.381` paired mean IoU, but still recovered only one current miss.
+The production decoder changed from `61.09 / 43.44` to `60.63 / 41.63`
+R@0.50/R@0.70. Thus the added gradient improves already represented lanes; it
+does not create a missing-lane hypothesis in a mature representation.
+
+Exact outputs:
+
+- `outputs/diagnostics/dla34_lane_shared_dynamic_mask_1000_uniform64.json`;
+- `outputs/diagnostics/joint_lane_shared_coherence/base_vs_candidate_uniform64.json`;
+- `outputs/diagnostics/joint_lane_shared_coherence/candidate_lane_shared_probe_uniform64.json`.
+
+## 35. A GT-free sequence linker cannot assemble the missing curves
+
+To test whether the remaining issue was only curve linking, we bypassed the
+query decoder and ran dynamic programming directly over the frozen-P2
+discovery-centerline logits. The linker extracts eight smooth paths without
+using GT. Maximum horizontal steps of 4, 8, and 16 bins and movement penalties
+of 0, 0.05, and 0.1 were predeclared. A batch-rolled wrong-image P2 is the
+image-specificity control.
+
+The strongest standalone configuration reaches `40.72%` R@0.50 and `13.12%`
+R@0.70, versus `1.81% / 0.00%` with wrong-image P2. The visual signal is
+therefore real. However, every valid linked lane is already covered by the
+production decoder:
+
+| GT-free P2 path diagnostic | Result |
+|---|---:|
+| Production decoder R@0.50 / R@0.70 | 61.09 / 43.44 |
+| Best linked paths R@0.50 / R@0.70 | 40.72 / 13.12 |
+| Base misses recovered @0.50 / @0.70 | 0 / 86; 0 / 125 |
+| Oracle union gain @0.50 / @0.70 | 0.00 / 0.00 points |
+
+This result rejects the narrow claim that a generic smoothness or Viterbi
+linker can turn the existing union-centerline evidence into the missing
+curves. P2 supports coherent paths primarily where the production decoder is
+already successful.
+
+Exact output:
+
+- `outputs/diagnostics/centerline_path_linking/dla34_225k_uniform64.json`.
+
+## 36. An exact lower-lane seed does not unlock hard-lane tracing
+
+The earlier endpoint probe was undertrained and evaluated on a different,
+easier subset. We repeated it for 1000 steps and added paired controls on the
+uniform 64-image subset. During teacher-seed evaluation, each lane receives
+its exact GT lower endpoint. Correct P2, batch-rolled wrong-image P2, and zero
+P2 use the identical endpoint coordinates and decoder.
+
+| GT-endpoint-conditioned tracer | All R@0.50 | Base-miss R@0.50 | Base-miss mean IoU |
+|---|---:|---:|---:|
+| Correct P2 | 20.81 | 15.12 | 0.258 |
+| Wrong-image P2 | 15.84 | 15.12 | 0.245 |
+| Zero P2 | 0.00 | 0.00 | 0.026 |
+
+Correct P2 helps on the 135 production hits (`24.44%` versus `16.30%`
+R@0.50), so the tracer is capable of using the image. On the exact 86 misses,
+however, correct and wrong-image P2 each recover thirteen lanes and differ by
+only `0.013` mean IoU. The learned endpoint heatmap reaches `44.34%` recall
+within 32 pixels, yet its complete curves recover only `2 / 86` production
+misses.
+
+Therefore the missing ingredient is not merely one initial x/y seed. A single
+correct local cue does not reveal a lane-specific path through the frozen
+hard-lane representation.
+
+Exact output:
+
+- `outputs/diagnostics/teacher_seed_tracing/dla34_225k_uniform64_1000.json`.
+
+## 37. Frozen P2 does not preserve usable seed-to-curve identity on hard misses
+
+The final ambiguity was whether the endpoint tracer architecture obscured a
+lane-identity signal already present in P2. A direct correlation probe was
+therefore trained on frozen P2. Given an exact GT lower endpoint, it projects
+the feature at that endpoint into a query and scores every horizontal P2
+position at every row. It has no production lane query, matcher, NMS, quality
+head, or predicted reference curve.
+
+The controls independently replace the scored image, the endpoint feature,
+or horizontal structure:
+
+| Seed-conditioned P2 correlation | All R@0.50 | Base-hit R@0.50 | Base-miss R@0.50 | Base-miss mean IoU |
+|---|---:|---:|---:|---:|
+| Correct seed feature + correct P2 | 28.51 | 45.19 | 2.33 | 0.183 |
+| Correct seed feature + wrong-image P2 | 2.26 | 3.70 | 0.00 | 0.093 |
+| Wrong-image seed feature + correct P2 | 27.15 | 42.96 | 2.33 | 0.179 |
+| Zero seed feature + correct P2 | 12.67 | 20.74 | 0.00 | 0.108 |
+| Horizontally averaged P2 | 0.00 | 0.00 | 0.00 | 0.008 |
+
+P2 is spatially image-grounded: using the wrong image or removing horizontal
+structure collapses performance. But on production misses the correct
+endpoint feature and a feature sampled from the wrong image perform
+essentially identically. The visual endpoint feature therefore does not carry
+a usable “same lane across rows” identity for those hard lanes. The correct
+P2 map retains some local evidence (`0.183` versus `0.093` mean IoU), but it
+does not support a coherent curve.
+
+Exact output:
+
+- `outputs/diagnostics/seed_conditioned_p2_identity/dla34_225k_uniform64_1000.json`.
+
+## 38. Final causal boundary
+
+The experiments now separate the ceiling into a specific interface failure
+rather than a generic capacity claim.
+
+### Functioning or secondary components
+
+- Backbone-to-FPN-to-decoder gradients and image grounding function.
+- Fused P2 is more useful than raw C2/C3 and contains spatial lane evidence.
+- Learned horizontal key position is ordered, essential, and strongly used.
+- Row DFL, expected-x decoding, LineIoU, range, quality, NMS, and grouped
+  assignment can affect calibration or strict localization but do not explain
+  the shared missing-lane set.
+- Deep supervision and lane-balanced reduction improve optimization details,
+  not unique curve coverage.
+- The decoder refines a lane well after it has acquired a coherent hypothesis.
+
+### Primary bottleneck
+
+The projected P2 map receives instance-specific gradients through the final
+query losses, but its direct dense auxiliary objectives are shared
+lane/centerline maps rather than lane-specific curve fields. The structured
+decoder begins from image-independent instance-plus-row tokens.
+At every block, each row independently searches the complete horizontal row.
+Horizontal position is added to the attention **keys**, while the values
+contain only projected visual features. Vertical same-lane interaction occurs
+after this lookup. There is no explicit image-derived lane reference curve
+that is updated across blocks and constrains which row fragments belong to
+one hypothesis.
+
+This arrangement works when the lane is visually strong: P2 values vary
+enough for static ordinal queries to acquire it, after which vertical
+attention refines the geometry. On shadowed, occluded, short, or ambiguous
+lanes, P2 retains scattered local lane evidence but not a globally separable
+instance path. Stronger backbones feed the same acquisition interface, so
+ResNet-101 and DLA-34 improve already acquired lanes without adding many new
+ones. This explains the backbone-insensitive F1 ceiling without requiring a
+backbone wiring bug.
+
+The most precise supported diagnosis is therefore:
+
+> **LaneRowNet lacks a jointly learned, image-derived, lane-specific curve
+> reference between P2 and row refinement. Its current union-style visual
+> representation and image-independent row queries cannot associate
+> fragmented hard-lane evidence into a new coherent hypothesis.**
+
+This is an architectural/supervision mismatch, not one proven faulty line of
+code. The next full intervention should keep the final row-distribution head
+but add a curve-level acquisition stage trained from initialization:
+
+1. generate a coarse per-lane reference curve through query-conditioned dense
+   P2 correlation, not a single endpoint;
+2. use that evolving reference to sample or locally attend P2 at every decoder
+   block;
+3. feed the selected reference coordinate back into the row state;
+4. supervise every intermediate reference curve with one-to-one lane
+   assignment;
+5. retain a no-harm residual path so confident existing geometry need not be
+   replaced.
+
+A DAB/Deformable-DETR-style **row-reference decoder** implements these
+properties more directly than a larger generic FPN, another union
+segmentation loss, or post-hoc ROI refinement. It should be tested first with
+a short from-initialization subset gate; mature-checkpoint adapters repeatedly
+learn only the lanes already present.
