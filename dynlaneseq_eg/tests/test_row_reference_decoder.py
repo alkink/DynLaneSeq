@@ -116,3 +116,24 @@ def test_reference_gate_configs_differ_only_in_reference_switch() -> None:
     for key in ("matcher", "loss", "optimizer", "scheduler", "training"):
         assert control[key] == candidate[key]
 
+
+def test_full_reference_config_preserves_validated_candidate_contract() -> None:
+    short = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_row_reference_gate_10k.yaml"
+    )
+    full = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_"
+        "fpn256_l4_dfl_rowref_r15_deepsup_50ep.yaml"
+    )
+
+    assert full["model"]["structured_query"] == short["model"]["structured_query"]
+    assert full["matcher"] == short["matcher"]
+    assert full["loss"] == short["loss"]
+    assert full["optimizer"] == short["optimizer"]
+    assert full["training"]["seed"] == 3407
+    assert full["training"]["batch_size"] == 4
+    assert full["training"]["gradient_accumulation_steps"] == 4
+    assert full["training"]["max_iters"] == 278000
+    assert full["scheduler"]["total_iters"] == 278000

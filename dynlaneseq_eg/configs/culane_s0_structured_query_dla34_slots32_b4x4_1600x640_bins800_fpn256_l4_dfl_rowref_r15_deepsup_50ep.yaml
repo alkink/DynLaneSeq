@@ -1,0 +1,52 @@
+_base_: culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_50ep
+
+# Full-schedule version of the predeclared 10k row-reference candidate.  The
+# decoder architecture and losses are unchanged from the successful short
+# gate; only the optimizer schedule and training horizon return to the 50
+# epoch CULane protocol.
+model:
+  structured_query:
+    num_groups: 1
+    intermediate_supervision: true
+    row_reference:
+      enabled: true
+      offsets_px: [-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0]
+      visual_logit_scale: 8.0
+      initial_prior_sigma_px: 240.0
+      initial_prior_strength: 1.0
+      output_prior_sigma_px: 96.0
+      output_prior_strength: 1.5
+  seg_aux:
+    amp_dtype: bfloat16
+
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  object_cost_type: neg_probability
+  line_iou_radius: 15.0
+
+loss:
+  line_iou_radius: 15.0
+  w_smooth: 0.0
+  lambda_intermediate: 0.5
+  intermediate_layer_weights: [1.0, 2.0, 3.0]
+
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 278000
+  amp: true
+  amp_dtype: bfloat16
+  check_finite_grad: true
+  compile_model: false
+  vis_interval: 25000
+  checkpoint_interval: 25000

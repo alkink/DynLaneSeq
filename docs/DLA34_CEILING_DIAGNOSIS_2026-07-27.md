@@ -1503,3 +1503,37 @@ A pass authorizes the full training run but is not itself a benchmark result.
 A failure rejects this concrete row-reference implementation; it would not
 mathematically prove that every possible lane-specific acquisition mechanism
 is ineffective.
+
+## 40. The from-initialization row-reference trajectory is strongly positive
+
+The original 64-image gate failed only its deliberately strict no-harm
+condition: at 10k it recovered 96 control misses but lost 15 control hits.
+Every acquisition and image-grounding metric was strongly positive.  A
+predeclared follow-up therefore evaluated all saved checkpoints on the same
+uniform 256-image validation subset (870 lanes):
+
+| Iteration | Control R@0.50 | Row-reference R@0.50 | Gain | Control R@0.70 | Row-reference R@0.70 | Gain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2.5k | 16.09 | 57.01 | +40.92 | 1.03 | 21.49 | +20.46 |
+| 5k | 25.98 | 60.92 | +34.94 | 4.25 | 30.23 | +25.98 |
+| 7.5k | 30.80 | 72.76 | +41.95 | 9.89 | 43.10 | +33.22 |
+| 10k | 35.40 | 73.79 | +38.39 | 10.57 | 45.63 | +35.06 |
+
+At 10k, mean best IoU improves from `0.4314` to `0.6186`, scored
+Top-4 recall@0.50 improves from `12.18%` to `58.51%`, and correct-image
+recall exceeds the batch-rolled wrong-image control by `42.53` points.  The
+candidate recovers 385 control misses, loses 51 control hits, and produces a
+net gain of 334 lanes at IoU 0.50.  The strict-IoU advantage grows throughout
+training rather than collapsing as the control learns.
+
+This is still a raw-proposal diagnostic rather than benchmark F1, and it does
+not establish a no-harm superset of the control.  It does, however, reject the
+explanation that the 64-image result was sampling noise or only an
+image-independent anchor prior.  The validated candidate is therefore promoted
+unchanged to a fresh 278k full schedule:
+
+- config:
+  `culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_50ep.yaml`;
+- launcher: `scripts/run_culane_dla34_row_reference_full_278k.sh`;
+- the 10k checkpoint is not resumed because its cosine schedule terminated at
+  10k and is a diagnostic model, not a prefix of the full schedule.
