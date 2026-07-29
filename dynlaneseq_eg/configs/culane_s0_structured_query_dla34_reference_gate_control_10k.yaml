@@ -1,0 +1,45 @@
+_base_: culane_s0_structured_query_dla34_slots32_b8x2_1600x640_bins800_fpn256_l4_dfl_50ep.yaml
+
+output_dir: outputs/diagnostics/dla34_reference_gate_control_10k
+
+# Matched control for the row-reference gate.  This changes the training
+# contract shared by both short runs, but deliberately keeps the production
+# global-row visual attention.  The candidate config inherits this file and
+# changes only structured_query.row_reference.enabled.
+model:
+  structured_query:
+    num_groups: 1
+    intermediate_supervision: true
+  seg_aux:
+    amp_dtype: bfloat16
+
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  object_cost_type: neg_probability
+  line_iou_radius: 15.0
+
+loss:
+  line_iou_radius: 15.0
+  w_smooth: 0.0
+  lambda_intermediate: 0.5
+  intermediate_layer_weights: [1.0, 2.0, 3.0]
+
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 10000
+  amp: true
+  amp_dtype: bfloat16
+  check_finite_grad: true
+  compile_model: false
+  vis_interval: 25000
+  checkpoint_interval: 2500
+

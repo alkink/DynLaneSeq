@@ -1463,3 +1463,43 @@ properties more directly than a larger generic FPN, another union
 segmentation loss, or post-hoc ROI refinement. It should be tested first with
 a short from-initialization subset gate; mature-checkpoint adapters repeatedly
 learn only the lanes already present.
+
+## 39. Predeclared from-initialization row-reference gate
+
+The failure boundary above does **not** prove that one particular decoder
+implementation will improve the final benchmark. Before spending a complete
+278k schedule, the branch therefore contains a paired 10k gate:
+
+- `culane_s0_structured_query_dla34_reference_gate_control_10k.yaml` keeps the
+  production global-row visual lookup;
+- `culane_s0_structured_query_dla34_row_reference_gate_10k.yaml` replaces only
+  that lookup with an image-derived, per-lane reference curve and local P2
+  sampling;
+- both runs use DLA-34, seed 3407, 32 candidates, one-to-one assignment,
+  radius 15, zero smoothness weight, four decoder blocks, identical
+  intermediate supervision, optimizer, schedule, batch, and losses.
+
+The candidate first correlates every learned lane-row state with the complete
+P2 row to initialize one explicit x reference per lane-row pair. Each decoder
+block then samples a seven-point horizontal P2 profile around the current
+curve, updates the structured row state, predicts a full horizontal
+distribution, and passes its expected x to the next block. Horizontal
+coordinates are injected explicitly and all operations remain
+differentiable, so final and intermediate geometry losses reach the initial
+reference, local sampler, P2 projection, FPN, and backbone from the first
+training step.
+
+The primary gate is raw all-query proposal geometry on a fixed uniform
+64-image validation subset. Score thresholds, Top-K, quality, and NMS cannot
+create a pass. At IoU 0.50 the candidate must:
+
+1. recover at least five unique lanes missed by the matched control;
+2. lose no more than two control hits;
+3. obtain a positive net recall and mean-best-IoU change;
+4. exceed its batch-rolled wrong-image evidence control by at least five
+   recall points.
+
+A pass authorizes the full training run but is not itself a benchmark result.
+A failure rejects this concrete row-reference implementation; it would not
+mathematically prove that every possible lane-specific acquisition mechanism
+is ineffective.

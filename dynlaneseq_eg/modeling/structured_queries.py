@@ -110,6 +110,263 @@ class RowAwareCrossAttentionLayer(nn.Module):
         return lane_rows.view(b, n, r, c).contiguous()
 
 
+class ReferenceGuidedRowLayer(nn.Module):
+    """Refine lane-row states from P2 evidence sampled around an explicit curve.
+
+    Unlike :class:`RowAwareCrossAttentionLayer`, this layer does not ask every
+    row state to search the complete image row again.  It samples a small,
+    differentiable horizontal profile around the current per-lane reference,
+    lets the row state select evidence within that profile, and then applies
+    the same inter-lane and intra-lane interactions as the original decoder.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        num_heads: int = 8,
+        ff_dim: int = 1024,
+        dropout: float = 0.1,
+        num_groups: int = 1,
+        offsets_px: tuple[float, ...] = (-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0),
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.num_groups = int(num_groups)
+        if self.num_groups < 1:
+            raise ValueError("structured_query.num_groups must be >= 1")
+        if self.dim % self.num_heads:
+            raise ValueError("reference-guided attention requires dim divisible by num_heads")
+        offsets = torch.tensor(tuple(float(value) for value in offsets_px), dtype=torch.float32)
+        if offsets.ndim != 1 or int(offsets.numel()) < 3:
+            raise ValueError("row_reference.offsets_px must contain at least three values")
+        if not bool((offsets[1:] > offsets[:-1]).all()):
+            raise ValueError("row_reference.offsets_px must be strictly increasing")
+        if not bool((offsets < 0).any() and (offsets == 0).any() and (offsets > 0).any()):
+            raise ValueError("row_reference.offsets_px must span negative, zero, and positive offsets")
+        self.register_buffer("offsets_px", offsets, persistent=True)
+
+        self.local_query = nn.Linear(self.dim, self.dim, bias=False)
+        self.local_key = nn.Linear(self.dim, self.dim, bias=False)
+        self.local_value = nn.Linear(self.dim, self.dim, bias=False)
+        self.local_out = nn.Linear(self.dim, self.dim)
+        self.coordinate_proj = nn.Sequential(
+            nn.Linear(2, self.dim),
+            nn.GELU(),
+            nn.Linear(self.dim, self.dim),
+        )
+        self.relative_offset_bias = nn.Parameter(
+            torch.zeros(self.num_heads, int(offsets.numel()))
+        )
+        self.inter_attn = nn.MultiheadAttention(
+            self.dim,
+            self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.intra_attn = nn.MultiheadAttention(
+            self.dim,
+            self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, self.dim),
+        )
+        self.norm_cross = nn.LayerNorm(self.dim)
+        self.norm_inter = nn.LayerNorm(self.dim)
+        self.norm_intra = nn.LayerNorm(self.dim)
+        self.norm_ffn = nn.LayerNorm(self.dim)
+        self.drop = nn.Dropout(dropout)
+
+    def _sample_local_profiles(
+        self,
+        row_value_features: torch.Tensor,
+        reference_x_rows: torch.Tensor,
+        *,
+        input_w: int,
+    ) -> torch.Tensor:
+        """Vectorized bilinear sampling with an FP32 grid-sample island.
+
+        CUDA ``grid_sample`` support for BF16 varies across the PyTorch
+        versions used on the training servers.  Keeping only this operation in
+        FP32 preserves gradients and avoids making the rest of the decoder
+        leave autocast.
+        """
+
+        b, rows, _, channels = row_value_features.shape
+        rb, instances, reference_rows = reference_x_rows.shape
+        if rb != b or reference_rows != rows:
+            raise ValueError(
+                "reference_x_rows must match row evidence: "
+                f"got {tuple(reference_x_rows.shape)} for "
+                f"{tuple(row_value_features.shape)}"
+            )
+        device_type = row_value_features.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            feature_map = row_value_features.float().permute(0, 3, 1, 2).contiguous()
+            reference = reference_x_rows.float()
+            offsets = self.offsets_px.to(device=reference.device, dtype=reference.dtype)
+            sample_x = (reference.unsqueeze(-1) + offsets.view(1, 1, 1, -1)).clamp(
+                min=0.0,
+                max=float(max(int(input_w) - 1, 1)),
+            )
+            grid_x = 2.0 * sample_x / float(max(int(input_w) - 1, 1)) - 1.0
+            grid_y = torch.linspace(
+                -1.0,
+                1.0,
+                rows,
+                device=reference.device,
+                dtype=reference.dtype,
+            ).view(1, 1, rows, 1)
+            grid_y = grid_y.expand(b, instances, rows, int(offsets.numel()))
+            grid = torch.stack((grid_x, grid_y), dim=-1).reshape(
+                b,
+                instances * rows,
+                int(offsets.numel()),
+                2,
+            )
+            sampled = F.grid_sample(
+                feature_map,
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            sampled = sampled.permute(0, 2, 3, 1).reshape(
+                b,
+                instances,
+                rows,
+                int(offsets.numel()),
+                channels,
+            )
+        return sampled.to(dtype=row_value_features.dtype)
+
+    def _grouped_inter_attention(
+        self,
+        q: torch.Tensor,
+        batch_rows: int,
+        num_instances: int,
+        num_groups: int | None = None,
+    ) -> torch.Tensor:
+        active_num_groups = self.num_groups if num_groups is None else int(num_groups)
+        if active_num_groups < 1:
+            raise ValueError("active num_groups must be >= 1")
+        if active_num_groups == 1:
+            return self.inter_attn(q, q, q, need_weights=False)[0]
+        if num_instances % active_num_groups != 0:
+            raise ValueError(
+                f"num_instances={num_instances} must be divisible by "
+                f"active num_groups={active_num_groups}"
+            )
+        group_size = num_instances // active_num_groups
+        grouped = q.view(batch_rows, active_num_groups, group_size, q.shape[-1])
+        grouped = grouped.reshape(batch_rows * active_num_groups, group_size, q.shape[-1])
+        delta = self.inter_attn(grouped, grouped, grouped, need_weights=False)[0]
+        return delta.view(batch_rows, active_num_groups, group_size, q.shape[-1]).reshape(
+            batch_rows,
+            num_instances,
+            q.shape[-1],
+        )
+
+    def forward(
+        self,
+        row_tokens: torch.Tensor,
+        row_value_features: torch.Tensor,
+        reference_x_rows: torch.Tensor,
+        *,
+        input_w: int,
+        num_groups: int | None = None,
+    ) -> torch.Tensor:
+        b, n, r, c = row_tokens.shape
+        if c != self.dim:
+            raise ValueError(f"row token dim {c} does not match layer dim {self.dim}")
+        profiles = self._sample_local_profiles(
+            row_value_features,
+            reference_x_rows,
+            input_w=int(input_w),
+        )
+        offsets = int(profiles.shape[3])
+        head_dim = self.dim // self.num_heads
+
+        query = self.local_query(self.norm_cross(row_tokens)).view(
+            b,
+            n,
+            r,
+            self.num_heads,
+            head_dim,
+        )
+        key = self.local_key(profiles).view(
+            b,
+            n,
+            r,
+            offsets,
+            self.num_heads,
+            head_dim,
+        ).permute(0, 1, 2, 4, 3, 5)
+        value = self.local_value(profiles).view(
+            b,
+            n,
+            r,
+            offsets,
+            self.num_heads,
+            head_dim,
+        ).permute(0, 1, 2, 4, 3, 5)
+        attention = (query.unsqueeze(-2) * key).sum(dim=-1) / math.sqrt(float(head_dim))
+        attention = attention + self.relative_offset_bias.view(
+            1,
+            1,
+            1,
+            self.num_heads,
+            offsets,
+        )
+        attention = torch.softmax(attention, dim=-1)
+        context = (attention.unsqueeze(-1) * value).sum(dim=-2).reshape(b, n, r, c)
+
+        x_norm = 2.0 * reference_x_rows.to(dtype=row_tokens.dtype) / float(
+            max(int(input_w) - 1, 1)
+        ) - 1.0
+        y_norm = torch.linspace(
+            -1.0,
+            1.0,
+            r,
+            device=row_tokens.device,
+            dtype=row_tokens.dtype,
+        ).view(1, 1, r).expand(b, n, r)
+        coordinate_code = self.coordinate_proj(torch.stack((x_norm, y_norm), dim=-1))
+        row_tokens = row_tokens + self.drop(self.local_out(context) + coordinate_code)
+
+        # Same-row competition and same-lane vertical continuity match the
+        # original structured decoder; only visual acquisition changes.
+        q = row_tokens.permute(0, 2, 1, 3).reshape(b * r, n, c)
+        q_norm = self.norm_inter(q)
+        q = q + self.drop(
+            self._grouped_inter_attention(
+                q_norm,
+                batch_rows=b * r,
+                num_instances=n,
+                num_groups=num_groups,
+            )
+        )
+        q = q.view(b, r, n, c).permute(0, 2, 1, 3).contiguous()
+        lane_rows = q.reshape(b * n, r, c)
+        lane_rows_norm = self.norm_intra(lane_rows)
+        lane_rows = lane_rows + self.drop(
+            self.intra_attn(
+                lane_rows_norm,
+                lane_rows_norm,
+                lane_rows_norm,
+                need_weights=False,
+            )[0]
+        )
+        lane_rows_norm = self.norm_ffn(lane_rows)
+        lane_rows = lane_rows + self.drop(self.ffn(lane_rows_norm))
+        return lane_rows.view(b, n, r, c).contiguous()
+
+
 class StructuredLaneQueryHead(nn.Module):
     """Instance-geometry S0 head with row-wise image evidence.
 
@@ -134,6 +391,7 @@ class StructuredLaneQueryHead(nn.Module):
         exist_prior_prob: float | None = None,
         intermediate_supervision: bool = False,
         inference_group_index: int | None = None,
+        row_reference: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -147,6 +405,8 @@ class StructuredLaneQueryHead(nn.Module):
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
         self.intermediate_supervision = bool(intermediate_supervision)
         self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
+        self.row_reference_cfg = dict(row_reference or {})
+        self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -176,18 +436,88 @@ class StructuredLaneQueryHead(nn.Module):
             nn.GroupNorm(8, self.dim),
             nn.GELU(),
         )
-        self.layers = nn.ModuleList(
-            [
-                RowAwareCrossAttentionLayer(
-                    dim=self.dim,
-                    num_heads=int(num_heads),
-                    ff_dim=int(ff_dim),
-                    dropout=float(dropout),
-                    num_groups=self.num_groups,
+        if self.row_reference_enabled:
+            offsets_px = tuple(
+                float(value)
+                for value in self.row_reference_cfg.get(
+                    "offsets_px",
+                    [-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0],
                 )
-                for _ in range(int(num_layers))
-            ]
-        )
+            )
+            self.layers = nn.ModuleList(
+                [
+                    ReferenceGuidedRowLayer(
+                        dim=self.dim,
+                        num_heads=int(num_heads),
+                        ff_dim=int(ff_dim),
+                        dropout=float(dropout),
+                        num_groups=self.num_groups,
+                        offsets_px=offsets_px,
+                    )
+                    for _ in range(int(num_layers))
+                ]
+            )
+            self.reference_query_norm = nn.LayerNorm(self.dim)
+            self.reference_query = nn.Linear(self.dim, self.dim, bias=False)
+            self.reference_key = nn.Linear(self.dim, self.dim, bias=False)
+            self.reference_context = nn.Linear(self.dim, self.dim)
+            self.reference_coordinate = nn.Sequential(
+                nn.Linear(2, self.dim),
+                nn.GELU(),
+                nn.Linear(self.dim, self.dim),
+            )
+            visual_scale = float(self.row_reference_cfg.get("visual_logit_scale", 8.0))
+            if visual_scale <= 0.0:
+                raise ValueError("row_reference.visual_logit_scale must be positive")
+            self.reference_logit_scale = nn.Parameter(
+                torch.tensor(math.log(visual_scale), dtype=torch.float32)
+            )
+            self.initial_prior_sigma_px = float(
+                self.row_reference_cfg.get("initial_prior_sigma_px", 240.0)
+            )
+            self.initial_prior_strength = float(
+                self.row_reference_cfg.get("initial_prior_strength", 1.0)
+            )
+            self.output_prior_sigma_px = float(
+                self.row_reference_cfg.get("output_prior_sigma_px", 96.0)
+            )
+            self.output_prior_strength = float(
+                self.row_reference_cfg.get("output_prior_strength", 1.5)
+            )
+            if self.initial_prior_sigma_px <= 0.0 or self.output_prior_sigma_px <= 0.0:
+                raise ValueError("row-reference prior sigmas must be positive")
+            if self.initial_prior_strength < 0.0 or self.output_prior_strength < 0.0:
+                raise ValueError("row-reference prior strengths must be non-negative")
+            group_size = self.num_instances // self.num_groups
+            bottom = torch.linspace(0.08, 0.92, group_size, dtype=torch.float32)
+            bottom = bottom.repeat(self.num_groups)
+            row_fraction = torch.linspace(0.0, 1.0, self.num_rows, dtype=torch.float32)
+            centers = 0.5 + (bottom[:, None] - 0.5) * (
+                0.35 + 0.65 * row_fraction[None, :]
+            )
+            self.reference_anchor_logits = nn.Parameter(
+                torch.logit(centers.clamp(1e-4, 1.0 - 1e-4))
+            )
+        else:
+            self.layers = nn.ModuleList(
+                [
+                    RowAwareCrossAttentionLayer(
+                        dim=self.dim,
+                        num_heads=int(num_heads),
+                        ff_dim=int(ff_dim),
+                        dropout=float(dropout),
+                        num_groups=self.num_groups,
+                    )
+                    for _ in range(int(num_layers))
+                ]
+            )
+            self.reference_query_norm = None
+            self.reference_query = None
+            self.reference_key = None
+            self.reference_context = None
+            self.reference_coordinate = None
+            self.reference_logit_scale = None
+            self.reference_anchor_logits = None
         self.row_norm = nn.LayerNorm(self.dim)
         self.lane_norm = nn.LayerNorm(self.dim)
         self.row_x = nn.Linear(self.dim, self.x_bins)
@@ -213,6 +543,96 @@ class StructuredLaneQueryHead(nn.Module):
             feat_key = feat_key + x_pos
         return feat_value, feat_key
 
+    def _reference_prior_logits(
+        self,
+        reference_x_rows: torch.Tensor,
+        *,
+        x_bins: int,
+        sigma_px: float,
+        strength: float,
+    ) -> torch.Tensor:
+        positions = torch.linspace(
+            0.0,
+            float(max(self.input_w - 1, 1)),
+            int(x_bins),
+            device=reference_x_rows.device,
+            dtype=reference_x_rows.dtype,
+        )
+        distance = (positions.view(1, 1, 1, -1) - reference_x_rows.unsqueeze(-1)) / float(
+            sigma_px
+        )
+        return -0.5 * float(strength) * distance.square()
+
+    def _resize_reference_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if int(logits.shape[-1]) == self.x_bins:
+            return logits
+        b, n, r, _ = logits.shape
+        resized = F.interpolate(
+            logits.reshape(b * n * r, 1, int(logits.shape[-1])),
+            size=self.x_bins,
+            mode="linear",
+            align_corners=True,
+        )
+        return resized.reshape(b, n, r, self.x_bins)
+
+    def _initialize_image_reference(
+        self,
+        row_tokens: torch.Tensor,
+        row_value_features: torch.Tensor,
+        row_key_features: torch.Tensor,
+        anchor_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.reference_query_norm is None
+            or self.reference_query is None
+            or self.reference_key is None
+            or self.reference_context is None
+            or self.reference_coordinate is None
+            or self.reference_logit_scale is None
+        ):
+            raise RuntimeError("row-reference modules were not initialized")
+        query = F.normalize(
+            self.reference_query(self.reference_query_norm(row_tokens)),
+            dim=-1,
+            eps=1e-6,
+        )
+        key = F.normalize(self.reference_key(row_key_features), dim=-1, eps=1e-6)
+        visual_logits = torch.einsum("bnrc,brxc->bnrx", query, key)
+        visual_logits = visual_logits * self.reference_logit_scale.exp().clamp(
+            min=1.0,
+            max=100.0,
+        )
+
+        anchor_x = torch.sigmoid(anchor_logits).to(dtype=row_tokens.dtype)
+        anchor_x = anchor_x * float(max(self.input_w - 1, 1))
+        prior = self._reference_prior_logits(
+            anchor_x.unsqueeze(0),
+            x_bins=self.evidence_x_bins,
+            sigma_px=self.initial_prior_sigma_px,
+            strength=self.initial_prior_strength,
+        )
+        reference_logits = visual_logits + prior
+        probability = torch.softmax(reference_logits, dim=-1)
+        context = torch.einsum("bnrx,brxc->bnrc", probability, row_value_features)
+        full_logits = self._resize_reference_logits(reference_logits)
+        reference_x = soft_expected_x(
+            full_logits,
+            input_w=self.input_w,
+            x_bins=self.x_bins,
+        )
+
+        x_norm = 2.0 * reference_x / float(max(self.input_w - 1, 1)) - 1.0
+        y_norm = torch.linspace(
+            -1.0,
+            1.0,
+            self.num_rows,
+            device=row_tokens.device,
+            dtype=row_tokens.dtype,
+        ).view(1, 1, self.num_rows).expand_as(x_norm)
+        coordinate = self.reference_coordinate(torch.stack((x_norm, y_norm), dim=-1))
+        row_tokens = row_tokens + self.reference_context(context) + coordinate
+        return row_tokens, reference_x
+
     def forward(
         self,
         features: torch.Tensor,
@@ -222,11 +642,15 @@ class StructuredLaneQueryHead(nn.Module):
         dtype = features.dtype
         device = features.device
         instance = self.instance_tokens.weight.to(device=device, dtype=dtype)
+        instance_start = 0
+        instance_end = self.num_instances
         active_num_groups = self.num_groups
         if inference_only and self.inference_group_index is not None:
             group_size = self.num_instances // self.num_groups
             group_start = self.inference_group_index * group_size
-            instance = instance[group_start : group_start + group_size]
+            instance_start = group_start
+            instance_end = group_start + group_size
+            instance = instance[instance_start:instance_end]
             # The retained group must interact as one complete candidate set.
             # This is mathematically the same group-isolated attention it saw
             # during training, without evaluating the three train-only groups.
@@ -236,30 +660,77 @@ class StructuredLaneQueryHead(nn.Module):
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
         row_value_features, row_key_features = self._row_features(features)
 
-        intermediate_row_tokens = []
-        for layer_index, layer in enumerate(self.layers):
-            row_tokens = layer(
+        intermediate_outputs: list[dict[str, torch.Tensor]] = []
+        if self.row_reference_enabled:
+            if self.reference_anchor_logits is None:
+                raise RuntimeError("row-reference anchors were not initialized")
+            anchor_logits = self.reference_anchor_logits[instance_start:instance_end]
+            row_tokens, reference_x = self._initialize_image_reference(
                 row_tokens,
                 row_value_features,
                 row_key_features,
-                num_groups=active_num_groups,
+                anchor_logits,
             )
-            if (
-                self.intermediate_supervision
-                and not inference_only
-                and layer_index < len(self.layers) - 1
-            ):
-                intermediate_row_tokens.append(row_tokens)
-
-        outputs = self._predict_from_row_tokens(row_tokens, instance, include_quality=True)
+            outputs: dict[str, torch.Tensor] | None = None
+            for layer_index, layer in enumerate(self.layers):
+                if not isinstance(layer, ReferenceGuidedRowLayer):
+                    raise TypeError("row-reference mode requires ReferenceGuidedRowLayer")
+                row_tokens = layer(
+                    row_tokens,
+                    row_value_features,
+                    reference_x,
+                    input_w=self.input_w,
+                    num_groups=active_num_groups,
+                )
+                row_logit_bias = self._reference_prior_logits(
+                    reference_x,
+                    x_bins=self.x_bins,
+                    sigma_px=self.output_prior_sigma_px,
+                    strength=self.output_prior_strength,
+                )
+                layer_outputs = self._predict_from_row_tokens(
+                    row_tokens,
+                    instance,
+                    include_quality=layer_index == len(self.layers) - 1,
+                    row_x_logit_bias=row_logit_bias,
+                    input_reference_x_rows=reference_x,
+                )
+                reference_x = layer_outputs["pred_x_rows"]
+                if (
+                    self.intermediate_supervision
+                    and not inference_only
+                    and layer_index < len(self.layers) - 1
+                ):
+                    intermediate_outputs.append(layer_outputs)
+                outputs = layer_outputs
+            if outputs is None:
+                raise ValueError("row-reference decoder requires at least one decoder layer")
+        else:
+            intermediate_row_tokens = []
+            for layer_index, layer in enumerate(self.layers):
+                row_tokens = layer(
+                    row_tokens,
+                    row_value_features,
+                    row_key_features,
+                    num_groups=active_num_groups,
+                )
+                if (
+                    self.intermediate_supervision
+                    and not inference_only
+                    and layer_index < len(self.layers) - 1
+                ):
+                    intermediate_row_tokens.append(row_tokens)
+            outputs = self._predict_from_row_tokens(row_tokens, instance, include_quality=True)
+            if self.intermediate_supervision and not inference_only:
+                intermediate_outputs = [
+                    self._predict_from_row_tokens(tokens, instance, include_quality=False)
+                    for tokens in intermediate_row_tokens
+                ]
         row_tokens = outputs["structured_row_tokens"]
         if not isinstance(row_tokens, torch.Tensor):
             raise TypeError("structured_row_tokens must be a tensor")
         if self.intermediate_supervision and not inference_only:
-            outputs["aux_outputs"] = [
-                self._predict_from_row_tokens(tokens, instance, include_quality=False)
-                for tokens in intermediate_row_tokens
-            ]
+            outputs["aux_outputs"] = intermediate_outputs
         if inference_only:
             return {
                 "exist_logits": outputs["exist_logits"],
@@ -280,6 +751,8 @@ class StructuredLaneQueryHead(nn.Module):
         instance: torch.Tensor,
         *,
         include_quality: bool,
+        row_x_logit_bias: torch.Tensor | None = None,
+        input_reference_x_rows: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Apply the shared lane heads to one decoder-layer state.
 
@@ -292,6 +765,13 @@ class StructuredLaneQueryHead(nn.Module):
         instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
         lane_query = self.lane_norm(row_tokens.mean(dim=2) + row_tokens.amax(dim=2) + instance_residual)
         row_x_logits = self.row_x(row_tokens)
+        if row_x_logit_bias is not None:
+            if row_x_logit_bias.shape != row_x_logits.shape:
+                raise ValueError(
+                    "row_x_logit_bias shape must match row logits: "
+                    f"{tuple(row_x_logit_bias.shape)} vs {tuple(row_x_logits.shape)}"
+                )
+            row_x_logits = row_x_logits + row_x_logit_bias.to(dtype=row_x_logits.dtype)
         pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
@@ -304,6 +784,8 @@ class StructuredLaneQueryHead(nn.Module):
             "queries": lane_query,
             "structured_row_tokens": row_tokens,
         }
+        if input_reference_x_rows is not None:
+            outputs["input_reference_x_rows"] = input_reference_x_rows
         if include_quality:
             outputs["quality_logits"] = self.quality(lane_query).squeeze(-1)
         return outputs
@@ -329,4 +811,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
         intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
         inference_group_index=structured_cfg.get("inference_group_index"),
+        row_reference=structured_cfg.get("row_reference"),
     )

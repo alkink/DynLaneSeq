@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_reference_gate_control_10k.yaml
+
+output_dir: outputs/diagnostics/dla34_row_reference_gate_10k
+
+model:
+  structured_query:
+    row_reference:
+      enabled: true
+      # The first dense correlation can acquire a lane globally.  Subsequent
+      # blocks only read P2 near the evolving curve reference.
+      offsets_px: [-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0]
+      visual_logit_scale: 8.0
+      initial_prior_sigma_px: 240.0
+      initial_prior_strength: 1.0
+      output_prior_sigma_px: 96.0
+      output_prior_strength: 1.5
+
