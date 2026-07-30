@@ -138,3 +138,34 @@ def test_optimizer_state_remap_preserves_moments_and_new_group_lrs() -> None:
             target.state[parameter]["exp_avg"],
             expected_exp_avg[parameter],
         )
+
+
+def test_optimizer_state_remap_allows_new_target_parameters() -> None:
+    old_layer = nn.Linear(4, 4)
+    new_layer = nn.Linear(4, 1)
+    source = torch.optim.AdamW(old_layer.parameters(), lr=1e-4)
+    source.zero_grad(set_to_none=True)
+    old_layer(torch.ones(2, 4)).sum().backward()
+    source.step()
+    old_parameters = list(old_layer.parameters())
+    new_parameters = list(new_layer.parameters())
+    target = torch.optim.AdamW(
+        [
+            {"params": old_parameters, "lr": 2e-6, "name": "old"},
+            {"params": new_parameters, "lr": 1e-4, "name": "new"},
+        ]
+    )
+
+    stats = remap_optimizer_state_by_parameter(
+        source,
+        target,
+        allow_target_superset=True,
+    )
+
+    assert stats["parameters"] == len(old_parameters) + len(new_parameters)
+    assert stats["state_entries"] == len(old_parameters)
+    assert stats["new_parameters"] == len(new_parameters)
+    for parameter in old_parameters:
+        assert "exp_avg" in target.state[parameter]
+    for parameter in new_parameters:
+        assert target.state[parameter] == {}

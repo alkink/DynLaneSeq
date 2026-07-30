@@ -523,6 +523,206 @@ class ReferenceGuidedRowLayer(nn.Module):
         return lane_rows.view(b, n, r, c).contiguous()
 
 
+class SetAwareLaneSelectionHead(nn.Module):
+    """Residual, permutation-equivariant scorer over the lane proposal set.
+
+    The residual is initialized to zero, so enabling this head on an existing
+    checkpoint exactly preserves the deployed existence-quality score before
+    fine-tuning.  Geometry summaries are supplied as detached observations;
+    gradients reach the decoder through the lane and row-state features
+    instead of directly pushing coordinates merely to make scoring easier.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        input_w: int,
+        hidden_dim: int = 256,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        ff_dim: int = 512,
+        dropout: float = 0.1,
+        curve_samples: int = 20,
+        base_quality_power: float = 0.5,
+        range_temperature: float = 0.02,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.curve_samples = int(curve_samples)
+        self.base_quality_power = float(base_quality_power)
+        self.range_temperature = float(range_temperature)
+        if self.curve_samples < 1:
+            raise ValueError("set_selection.curve_samples must be positive")
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError("set_selection.hidden_dim must be divisible by num_heads")
+        if self.base_quality_power < 0.0:
+            raise ValueError("set_selection.base_quality_power must be non-negative")
+        if self.range_temperature <= 0.0:
+            raise ValueError("set_selection.range_temperature must be positive")
+
+        # lane state + visible-row state + ten geometry/confidence summaries
+        # + base score + sampled x/confidence pairs.
+        input_dim = 2 * self.dim + 11 + 2 * self.curve_samples
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_projection = nn.Linear(input_dim, int(hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=int(hidden_dim),
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=int(num_layers),
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(int(hidden_dim))
+        self.output = nn.Linear(int(hidden_dim), 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def _base_probability(self, outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        exist = torch.softmax(outputs["exist_logits"].float(), dim=-1)[..., 0]
+        quality_logits = outputs.get("quality_logits")
+        if self.base_quality_power > 0.0 and quality_logits is not None:
+            quality = torch.sigmoid(quality_logits.float()).clamp_min(1e-6)
+            exist = exist * quality.pow(self.base_quality_power)
+        return exist.clamp(1e-6, 1.0 - 1e-6)
+
+    def forward(
+        self,
+        outputs: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row_tokens = outputs["structured_row_tokens"]
+        lane_query = outputs["queries"]
+        ranges = sort_range_norm(outputs["range_norm"].detach().float())
+        pred_x = outputs["pred_x_rows"].detach().float()
+        row_logits = outputs["row_x_logits"].detach().float()
+        batch, candidates, rows, _channels = row_tokens.shape
+
+        y_norm = torch.linspace(
+            0.0,
+            1.0,
+            rows,
+            device=row_tokens.device,
+            dtype=torch.float32,
+        ).view(1, 1, rows)
+        temperature = max(self.range_temperature, 1e-4)
+        row_weight = torch.sigmoid((y_norm - ranges[..., :1]) / temperature)
+        row_weight = row_weight * torch.sigmoid(
+            (ranges[..., 1:] - y_norm) / temperature
+        )
+        denominator = row_weight.sum(dim=-1, keepdim=True).clamp_min(1e-4)
+        row_weight_state = row_weight.to(dtype=row_tokens.dtype)
+        denominator_state = denominator.to(dtype=row_tokens.dtype)
+        visible_row_state = (
+            row_tokens * row_weight_state.unsqueeze(-1)
+        ).sum(dim=2) / denominator_state
+        centered_state = row_tokens - visible_row_state.unsqueeze(2)
+        state_variance = (
+            centered_state.float().square().mean(dim=-1) * row_weight
+        ).sum(dim=-1, keepdim=True) / denominator
+
+        log_max_probability = row_logits.amax(dim=-1) - torch.logsumexp(
+            row_logits,
+            dim=-1,
+        )
+        row_confidence = log_max_probability.exp()
+        confidence_mean = (
+            row_confidence * row_weight
+        ).sum(dim=-1, keepdim=True) / denominator
+        confidence_max = row_confidence.amax(dim=-1, keepdim=True)
+
+        pred_x_norm = pred_x / float(max(self.input_w - 1, 1))
+        first_difference = (
+            pred_x_norm[..., 1:] - pred_x_norm[..., :-1]
+        ).abs()
+        first_weight = row_weight[..., 1:] * row_weight[..., :-1]
+        slope = (
+            first_difference * first_weight
+        ).sum(dim=-1, keepdim=True) / first_weight.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-4)
+        second_difference = (
+            pred_x_norm[..., 2:]
+            - 2.0 * pred_x_norm[..., 1:-1]
+            + pred_x_norm[..., :-2]
+        ).abs()
+        second_weight = (
+            row_weight[..., 2:]
+            * row_weight[..., 1:-1]
+            * row_weight[..., :-2]
+        )
+        curvature = (
+            second_difference * second_weight
+        ).sum(dim=-1, keepdim=True) / second_weight.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-4)
+
+        reference = outputs.get("input_reference_x_rows")
+        if reference is None:
+            reference_mean = pred_x.new_zeros((batch, candidates, 1))
+            reference_max = pred_x.new_zeros((batch, candidates, 1))
+        else:
+            reference_delta = (
+                pred_x - reference.detach().float()
+            ).abs() / float(max(self.input_w - 1, 1))
+            reference_mean = (
+                reference_delta * row_weight
+            ).sum(dim=-1, keepdim=True) / denominator
+            reference_max = reference_delta.amax(dim=-1, keepdim=True)
+
+        sample_count = min(self.curve_samples, rows)
+        sample_ids = torch.linspace(
+            0,
+            rows - 1,
+            sample_count,
+            device=pred_x.device,
+        ).round().long()
+        sampled_x = pred_x_norm.index_select(-1, sample_ids)
+        sampled_confidence = row_confidence.index_select(-1, sample_ids)
+        if sample_count < self.curve_samples:
+            padding = self.curve_samples - sample_count
+            sampled_x = F.pad(sampled_x, (0, padding))
+            sampled_confidence = F.pad(sampled_confidence, (0, padding))
+
+        base_probability = self._base_probability(outputs).detach()
+        scalar_features = torch.cat(
+            (
+                ranges,
+                ranges[..., 1:] - ranges[..., :1],
+                confidence_mean,
+                confidence_max,
+                slope,
+                curvature,
+                reference_mean,
+                reference_max,
+                state_variance,
+                base_probability.unsqueeze(-1),
+                sampled_x,
+                sampled_confidence,
+            ),
+            dim=-1,
+        ).to(dtype=lane_query.dtype)
+        features = torch.cat(
+            (lane_query, visible_row_state, scalar_features),
+            dim=-1,
+        )
+        hidden = self.input_projection(self.input_norm(features))
+        hidden = self.encoder(hidden)
+        delta_logits = self.output(self.output_norm(hidden)).squeeze(-1)
+        base_logits = torch.logit(base_probability)
+        selection_logits = base_logits + delta_logits.float()
+        return selection_logits, delta_logits
+
+
 class StructuredLaneQueryHead(nn.Module):
     """Instance-geometry S0 head with row-wise image evidence.
 
@@ -548,6 +748,7 @@ class StructuredLaneQueryHead(nn.Module):
         intermediate_supervision: bool = False,
         inference_group_index: int | None = None,
         row_reference: dict[str, Any] | None = None,
+        set_selection: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -563,6 +764,8 @@ class StructuredLaneQueryHead(nn.Module):
         self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
         self.row_reference_cfg = dict(row_reference or {})
         self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
+        self.set_selection_cfg = dict(set_selection or {})
+        self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
         if self.num_groups < 1:
             raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
@@ -698,6 +901,26 @@ class StructuredLaneQueryHead(nn.Module):
         self.exist = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 2))
         self.range = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 2))
         self.quality = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 1))
+        self.set_selection_head = (
+            SetAwareLaneSelectionHead(
+                self.dim,
+                input_w=self.input_w,
+                hidden_dim=int(self.set_selection_cfg.get("hidden_dim", self.dim)),
+                num_layers=int(self.set_selection_cfg.get("num_layers", 2)),
+                num_heads=int(self.set_selection_cfg.get("num_heads", num_heads)),
+                ff_dim=int(self.set_selection_cfg.get("ff_dim", 2 * self.dim)),
+                dropout=float(self.set_selection_cfg.get("dropout", dropout)),
+                curve_samples=int(self.set_selection_cfg.get("curve_samples", 20)),
+                base_quality_power=float(
+                    self.set_selection_cfg.get("base_quality_power", 0.5)
+                ),
+                range_temperature=float(
+                    self.set_selection_cfg.get("range_temperature", 0.02)
+                ),
+            )
+            if self.set_selection_enabled
+            else None
+        )
         nn.init.constant_(self.range[-1].weight, 0.0)
         with torch.no_grad():
             self.range[-1].bias.copy_(torch.tensor([-2.0, 2.0]))
@@ -900,18 +1123,25 @@ class StructuredLaneQueryHead(nn.Module):
                     self._predict_from_row_tokens(tokens, instance, include_quality=False)
                     for tokens in intermediate_row_tokens
                 ]
+        if self.set_selection_head is not None:
+            selection_logits, selection_delta_logits = self.set_selection_head(outputs)
+            outputs["selection_logits"] = selection_logits
+            outputs["selection_delta_logits"] = selection_delta_logits
         row_tokens = outputs["structured_row_tokens"]
         if not isinstance(row_tokens, torch.Tensor):
             raise TypeError("structured_row_tokens must be a tensor")
         if self.intermediate_supervision and not inference_only:
             outputs["aux_outputs"] = intermediate_outputs
         if inference_only:
-            return {
+            inference_outputs = {
                 "exist_logits": outputs["exist_logits"],
                 "pred_x_rows": outputs["pred_x_rows"],
                 "range_norm": outputs["range_norm"],
                 "quality_logits": outputs["quality_logits"],
             }
+            if "selection_logits" in outputs:
+                inference_outputs["selection_logits"] = outputs["selection_logits"]
+            return inference_outputs
         # Keep the public debug container without running reductions that are
         # not consumed by training, evaluation, or model outputs.  In
         # particular, abs() on the full row-evidence tensor otherwise
@@ -986,4 +1216,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
         inference_group_index=structured_cfg.get("inference_group_index"),
         row_reference=structured_cfg.get("row_reference"),
+        set_selection=structured_cfg.get("set_selection"),
     )

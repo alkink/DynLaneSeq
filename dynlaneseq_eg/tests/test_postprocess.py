@@ -101,3 +101,26 @@ def test_quality_only_score_respects_quality_power_for_thresholding():
     )[0]
     assert len(kept) == 1
     assert len(removed) == 0
+
+
+def test_set_selection_score_can_override_existing_ranking():
+    pred_x = torch.stack(
+        [torch.full((72,), 80.0), torch.full((72,), 220.0)],
+        dim=0,
+    ).unsqueeze(0)
+    outputs = {
+        "exist_logits": torch.tensor([[[5.0, -5.0], [-5.0, 5.0]]]),
+        "quality_logits": torch.tensor([[5.0, -5.0]]),
+        "selection_logits": torch.tensor([[-5.0, 5.0]]),
+        "pred_x_rows": pred_x,
+        "range_norm": torch.tensor([[[0.1, 0.9], [0.1, 0.9]]]),
+    }
+    lanes = predictions_to_lanes(
+        outputs,
+        score_thresh=0.0,
+        top_k=1,
+        score_mode="selection",
+    )[0]
+
+    mean_x = sum(x for x, _ in lanes[0]) / len(lanes[0])
+    assert mean_x > 150.0

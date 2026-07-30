@@ -418,6 +418,86 @@ def test_quality_loss_has_gradient():
     assert quality_logits.grad.abs().sum() > 0
 
 
+def test_set_selection_targets_keep_one_unique_proposal_per_lane() -> None:
+    pred_x = torch.stack(
+        (
+            torch.full((8,), 10.0),
+            torch.full((8,), 10.0),
+            torch.full((8,), 50.0),
+        ),
+        dim=0,
+    ).unsqueeze(0)
+    outputs = {
+        "pred_x_rows": pred_x,
+        "range_norm": torch.tensor(
+            [[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]]
+        ),
+    }
+    targets = [
+        {
+            "x_rows": torch.stack(
+                (torch.full((8,), 10.0), torch.full((8,), 50.0)),
+                dim=0,
+            ),
+            "valid_mask": torch.ones((2, 8), dtype=torch.bool),
+            "range_y": torch.tensor([[0.0, 8.0], [0.0, 8.0]]),
+            "x_bins": torch.zeros((2, 8), dtype=torch.long),
+        }
+    ]
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=64,
+            input_h=8,
+            set_selection_line_width=30.0,
+            set_selection_min_valid_rows=5,
+        )
+    )
+    selection_targets = criterion.compute_set_selection_targets(
+        outputs,
+        targets,
+    )
+
+    assert selection_targets.shape == (1, 3)
+    assert int((selection_targets > 0.99).sum()) == 2
+    assert float(selection_targets[0, 2]) > 0.99
+    assert int((selection_targets[0, :2] > 0.99).sum()) == 1
+
+
+def test_set_selection_loss_backpropagates_to_selection_logits() -> None:
+    selection_logits = torch.zeros((1, 2), requires_grad=True)
+    outputs = {
+        "selection_logits": selection_logits,
+        "selection_delta_logits": selection_logits,
+        "pred_x_rows": torch.stack(
+            (torch.full((8,), 10.0), torch.full((8,), 50.0)),
+            dim=0,
+        ).unsqueeze(0),
+        "range_norm": torch.tensor([[[0.0, 1.0], [0.0, 1.0]]]),
+    }
+    targets = [
+        {
+            "x_rows": torch.full((1, 8), 10.0),
+            "valid_mask": torch.ones((1, 8), dtype=torch.bool),
+            "range_y": torch.tensor([[0.0, 8.0]]),
+            "x_bins": torch.zeros((1, 8), dtype=torch.long),
+        }
+    ]
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=64,
+            input_h=8,
+            w_set_selection=1.0,
+        )
+    )
+    losses = criterion.compute_set_selection_loss(outputs, targets)
+    assert torch.isfinite(losses["total"])
+    losses["total"].backward()
+
+    assert selection_logits.grad is not None
+    assert float(selection_logits.grad.abs().sum()) > 0.0
+    assert float(losses["target_positive_fraction"]) == 0.5
+
+
 def test_s3_cascade_matching_uses_final_assignment():
     target = _target()
     coarse_x = torch.full((1, 2, 72), 400.0)

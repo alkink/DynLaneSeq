@@ -78,6 +78,13 @@ def predictions_to_lanes(
         p_lane = exist_score
         if quality_score_power > 0 and quality is not None:
             p_lane = p_lane * quality.pow(float(quality_score_power))
+    elif score_mode in {"selection", "set_selection", "set"}:
+        selection_logits = outputs.get("selection_logits")
+        if selection_logits is None:
+            raise ValueError(
+                "postprocess score_mode='selection' requires selection_logits"
+            )
+        p_lane = torch.sigmoid(selection_logits.float())
     else:
         raise ValueError(f"Unsupported postprocess score_mode: {score_mode!r}")
     pred_x = outputs["pred_x_rows"].clamp(0, input_w - 1)

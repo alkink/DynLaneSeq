@@ -67,6 +67,13 @@ def _quality_scores(stage: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.sigmoid(quality.float())
 
 
+def _selection_scores(stage: dict[str, torch.Tensor]) -> torch.Tensor | None:
+    logits = stage.get("selection_logits")
+    if logits is None:
+        return None
+    return torch.sigmoid(logits.float())
+
+
 def _new_counter() -> dict[str, Any]:
     return {"hits": 0, "gt": 0, "best_iou_sum": 0.0, "images": 0}
 
@@ -152,6 +159,7 @@ def main() -> None:
             all_ids = torch.nonzero(candidate_valid, as_tuple=False).flatten().tolist()
             exist_scores = stage_scores(stage, quality_power=0.0)
             quality_scores = _quality_scores(stage)
+            selection_scores = _selection_scores(stage)
             for iou_threshold in args.iou_thresholds:
                 _update(counters[(stage_name, "all_raw", 0, iou_threshold, None, None)], iou, all_ids, iou_threshold)
                 for top_k in top_k_values:
@@ -159,6 +167,70 @@ def main() -> None:
                     quality_ids = _rank_ids(quality_scores, candidate_valid, top_k)
                     _update(counters[(stage_name, "exist_topk", top_k, iou_threshold, 0.0, None)], iou, exist_ids, iou_threshold)
                     _update(counters[(stage_name, "quality_topk", top_k, iou_threshold, None, None)], iou, quality_ids, iou_threshold)
+                    if selection_scores is not None:
+                        selection_ids = _rank_ids(
+                            selection_scores,
+                            candidate_valid,
+                            top_k,
+                        )
+                        _update(
+                            counters[
+                                (
+                                    stage_name,
+                                    "selection_topk",
+                                    top_k,
+                                    iou_threshold,
+                                    None,
+                                    None,
+                                )
+                            ],
+                            iou,
+                            selection_ids,
+                            iou_threshold,
+                        )
+                        for score_threshold in args.score_thresholds:
+                            selection_trace = trace_postprocess(
+                                stage,
+                                input_h=input_h,
+                                input_w=input_w,
+                                score_thresh=score_threshold,
+                                quality_power=0.0,
+                                min_valid_rows=args.min_valid_rows,
+                                nms_distance_thresh_px=nms_distance,
+                                nms_min_overlap_points=nms_overlap,
+                                top_k=top_k,
+                                row_visibility_thresh=args.row_visibility_thresh,
+                                score_override={
+                                    index: float(selection_scores[index])
+                                    for index in range(
+                                        int(selection_scores.shape[0])
+                                    )
+                                },
+                            )
+                            selection_nms_ids = list(
+                                selection_trace["selected_ids"]
+                            )
+                            selection_key = (
+                                stage_name,
+                                "selection_topk_nms",
+                                top_k,
+                                iou_threshold,
+                                None,
+                                score_threshold,
+                            )
+                            _update(
+                                counters[selection_key],
+                                iou,
+                                selection_nms_ids,
+                                iou_threshold,
+                            )
+                            if (
+                                args.exact_postprocess
+                                and abs(float(iou_threshold) - 0.5) < 1e-9
+                            ):
+                                exact_selections[selection_key][
+                                    record["image_id"]
+                                ] = selection_nms_ids
 
                     oracle = cardinality_oracle_assignment(iou, iou_threshold, top_k, candidate_valid)
                     oracle_ids = list(oracle.proposal_ids)

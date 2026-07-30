@@ -21,11 +21,12 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 STAGE_TENSOR_FIELDS = (
     "pred_x_rows",
     "exist_logits",
     "quality_logits",
+    "selection_logits",
     "range_norm",
     "row_visibility_logits",
 )

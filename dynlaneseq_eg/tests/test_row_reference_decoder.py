@@ -54,6 +54,97 @@ def test_reference_decoder_preserves_public_output_contract() -> None:
     }
 
 
+def test_set_selection_starts_as_exact_existing_score_residual() -> None:
+    torch.manual_seed(9)
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=4,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=1,
+        row_reference={
+            "enabled": True,
+            "offsets_px": [-16.0, 0.0, 16.0],
+            "initial_prior_sigma_px": 16.0,
+            "output_prior_sigma_px": 8.0,
+        },
+        set_selection={
+            "enabled": True,
+            "hidden_dim": 32,
+            "num_layers": 1,
+            "num_heads": 4,
+            "ff_dim": 64,
+            "dropout": 0.0,
+            "curve_samples": 4,
+            "base_quality_power": 0.5,
+        },
+    ).eval()
+    features = torch.randn(2, 32, 8, 12)
+    with torch.inference_mode():
+        output = head(features)
+        inference = head(features, inference_only=True)
+
+    expected = torch.softmax(output["exist_logits"].float(), dim=-1)[..., 0]
+    expected = expected * torch.sigmoid(
+        output["quality_logits"].float()
+    ).pow(0.5)
+    torch.testing.assert_close(
+        torch.sigmoid(output["selection_logits"]),
+        expected,
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    assert float(output["selection_delta_logits"].abs().max()) == 0.0
+    assert "selection_logits" in inference
+    torch.testing.assert_close(
+        inference["selection_logits"],
+        output["selection_logits"],
+    )
+
+
+def test_set_selection_can_backpropagate_into_decoder_state_features() -> None:
+    torch.manual_seed(10)
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=4,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=1,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=1,
+        set_selection={
+            "enabled": True,
+            "hidden_dim": 32,
+            "num_layers": 1,
+            "num_heads": 4,
+            "ff_dim": 64,
+            "dropout": 0.0,
+            "curve_samples": 4,
+        },
+    )
+    assert head.set_selection_head is not None
+    with torch.no_grad():
+        head.set_selection_head.output.weight.fill_(0.01)
+    features = torch.randn(2, 32, 8, 12, requires_grad=True)
+    output = head(features)
+    output["selection_logits"].sum().backward()
+
+    assert features.grad is not None
+    assert float(features.grad.abs().sum()) > 0.0
+    assert head.layers[0].ffn[0].weight.grad is not None
+    assert float(head.layers[0].ffn[0].weight.grad.abs().sum()) > 0.0
+
+
 def test_reference_decoder_backpropagates_through_image_and_reference() -> None:
     torch.manual_seed(11)
     head = _head()
@@ -362,3 +453,37 @@ def test_from55k_evidence_lr_trajectory_only_extends_probe_horizon() -> None:
         "warmup_iters": 0,
         "min_lr_ratio": 1.0,
     }
+
+
+def test_joint_set_selection_config_is_matched_65k_to70k_intervention() -> None:
+    control = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from65k_selective_cooldown_10k.yaml"
+    )
+    candidate = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from65k_joint_set_selection_5k.yaml"
+    )
+
+    for key in ("matcher", "augmentation", "dataset", "dataloader", "scheduler"):
+        assert candidate[key] == control[key]
+    assert candidate["training"]["seed"] == control["training"]["seed"] == 3407
+    assert candidate["training"]["batch_size"] == control["training"]["batch_size"]
+    assert candidate["training"]["gradient_accumulation_steps"] == 4
+    assert candidate["training"]["max_iters"] == 5000
+    assert candidate["model"]["structured_query"]["set_selection"]["enabled"] is True
+    assert "set_selection" not in control["model"]["structured_query"]
+    assert candidate["loss"]["w_set_selection"] == 1.0
+    assert control["loss"].get("w_set_selection", 0.0) == 0.0
+    candidate_groups = {
+        group["name"]: group
+        for group in candidate["optimizer"]["parameter_groups"]
+    }
+    control_groups = {
+        group["name"]: group
+        for group in control["optimizer"]["parameter_groups"]
+    }
+    assert set(candidate_groups) == set(control_groups) | {"set_selection"}
+    for name in control_groups:
+        assert candidate_groups[name] == control_groups[name]
+    assert candidate_groups["set_selection"]["lr"] == 1e-4

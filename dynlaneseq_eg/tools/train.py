@@ -242,11 +242,33 @@ def main() -> None:
                     "optimizer-group remap requires optimizer state in checkpoint"
                 )
             model.load_state_dict(payload["model"], strict=False)
-            source_optimizer = build_optimizer(source_cfg, model)
+            source_model_state = payload["model"]
+            newly_added_parameters = []
+            for name, parameter in model.named_parameters():
+                source_tensor = source_model_state.get(name)
+                if (
+                    source_tensor is None
+                    or tuple(source_tensor.shape) != tuple(parameter.shape)
+                ):
+                    newly_added_parameters.append((name, parameter))
+            original_requires_grad = {
+                parameter: bool(parameter.requires_grad)
+                for _, parameter in newly_added_parameters
+            }
+            try:
+                for _, parameter in newly_added_parameters:
+                    parameter.requires_grad_(False)
+                source_optimizer = build_optimizer(source_cfg, model)
+            finally:
+                for _, parameter in newly_added_parameters:
+                    parameter.requires_grad_(
+                        original_requires_grad[parameter]
+                    )
             source_optimizer.load_state_dict(payload["optimizer"])
             remap_stats = remap_optimizer_state_by_parameter(
                 source_optimizer,
                 optimizer,
+                allow_target_superset=bool(newly_added_parameters),
             )
             if scaler is not None and "scaler" in payload:
                 scaler.load_state_dict(payload["scaler"])
@@ -256,6 +278,9 @@ def main() -> None:
             print(
                 {
                     "resume_optimizer_group_remap": remap_stats,
+                    "new_optimizer_parameters": [
+                        name for name, _ in newly_added_parameters
+                    ],
                     "scheduler_state_restored": False,
                 }
             )

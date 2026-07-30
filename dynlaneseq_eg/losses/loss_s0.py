@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from dynlaneseq_eg.modeling.common import sort_range_norm
+from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 from .matcher_s0 import HungarianMatcherS0
 
 
@@ -30,6 +30,12 @@ class LossConfig:
     seg_pos_weight: float = 1.0
     seg_extra_weights: dict[str, float] = field(default_factory=dict)
     w_quality: float = 0.0
+    w_set_selection: float = 0.0
+    set_selection_line_width: float = 30.0
+    set_selection_focal_beta: float = 2.0
+    set_selection_rank_weight: float = 0.25
+    set_selection_target_margin: float = 0.10
+    set_selection_min_valid_rows: int = 5
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -104,6 +110,17 @@ class S0Criterion(nn.Module):
         loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches) if self.cfg.w_line_iou != 0 else zero
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
+        if self.cfg.w_set_selection != 0:
+            set_selection = self.compute_set_selection_loss(outputs, targets)
+        else:
+            set_selection = {
+                "total": zero,
+                "quality": zero,
+                "ranking": zero,
+                "target_mean": zero,
+                "target_positive_fraction": zero,
+                "delta_abs": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
@@ -123,6 +140,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_line_iou * loss_line_iou
             + self.cfg.w_seg * loss_seg
             + self.cfg.w_quality * loss_quality
+            + self.cfg.w_set_selection * set_selection["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -138,6 +156,14 @@ class S0Criterion(nn.Module):
             "loss_line_iou": loss_line_iou,
             "loss_seg": loss_seg,
             "loss_quality": loss_quality,
+            "loss_set_selection": set_selection["total"],
+            "loss_set_selection_quality": set_selection["quality"],
+            "loss_set_selection_ranking": set_selection["ranking"],
+            "set_selection_target_mean": set_selection["target_mean"],
+            "set_selection_target_positive_fraction": set_selection[
+                "target_positive_fraction"
+            ],
+            "set_selection_delta_abs": set_selection["delta_abs"],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
             "weight_row_dfl": zero.new_tensor(row_dfl_weight),
@@ -531,6 +557,163 @@ class S0Criterion(nn.Module):
             qualities = qualities * (valid_count > 0).to(dtype=qualities.dtype)
             target_quality[bi, pred_idx] = qualities.detach().to(dtype=target_quality.dtype)
         return F.binary_cross_entropy_with_logits(quality_logits, target_quality)
+
+    @torch.no_grad()
+    def compute_set_selection_targets(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Build one unique continuous-quality target per ground-truth lane.
+
+        The target is a range-aware row-strip IoU surrogate aligned with the
+        30-pixel CULane raster metric.  Assignment deliberately ignores the
+        current proposal score: the selection objective must teach which
+        geometry is useful instead of reproducing the existing ranking.
+        """
+
+        pred_x = outputs["pred_x_rows"].detach().float()
+        ranges = sort_range_norm(outputs["range_norm"].detach().float())
+        batch, candidates, rows = pred_x.shape
+        y_rows = fixed_y_rows(
+            rows,
+            int(self.cfg.input_h),
+            device=pred_x.device,
+            dtype=pred_x.dtype,
+        )
+        line_width = float(self.cfg.set_selection_line_width)
+        min_valid_rows = int(self.cfg.set_selection_min_valid_rows)
+        pairwise_rows: list[torch.Tensor] = []
+        for batch_index, target in enumerate(targets):
+            gt_x = target["x_rows"].to(
+                device=pred_x.device,
+                dtype=pred_x.dtype,
+            )
+            gt_valid = target["valid_mask"].to(pred_x.device).bool()
+            gt_valid = gt_valid & torch.isfinite(gt_x)
+            valid_gt = gt_valid.sum(dim=-1) >= min_valid_rows
+            gt_x = gt_x[valid_gt]
+            gt_valid = gt_valid[valid_gt]
+            if int(gt_x.shape[0]) == 0:
+                pairwise_rows.append(pred_x.new_zeros((candidates, 0)))
+                continue
+
+            pred_valid = (
+                (y_rows.view(1, -1) >= ranges[batch_index, :, :1] * float(self.cfg.input_h))
+                & (y_rows.view(1, -1) <= ranges[batch_index, :, 1:] * float(self.cfg.input_h))
+                & torch.isfinite(pred_x[batch_index])
+            )
+            candidate_valid = pred_valid.sum(dim=-1) >= min_valid_rows
+            pred = pred_x[batch_index, :, None, :]
+            gt = gt_x[None, :, :]
+            both = pred_valid[:, None, :] & gt_valid[None, :, :]
+            either = pred_valid[:, None, :] | gt_valid[None, :, :]
+            overlap = (line_width - (pred - gt).abs()).clamp(min=0.0)
+            overlap = torch.where(both, overlap, torch.zeros_like(overlap))
+            union = torch.where(
+                both,
+                2.0 * line_width - overlap,
+                torch.where(
+                    either,
+                    torch.full_like(overlap, line_width),
+                    torch.zeros_like(overlap),
+                ),
+            )
+            quality = overlap.sum(dim=-1) / union.sum(dim=-1).clamp_min(1e-6)
+            quality[~candidate_valid] = 0.0
+            pairwise_rows.append(quality)
+
+        # One D2H synchronization for the complete micro-batch, followed by
+        # tiny per-image Hungarian solves on CPU and one H2D target transfer.
+        nonempty = [row.reshape(-1) for row in pairwise_rows if row.numel() > 0]
+        flat_cpu = (
+            torch.cat(nonempty, dim=0).cpu()
+            if nonempty
+            else torch.empty(0, dtype=torch.float32)
+        )
+        target_cpu = torch.zeros(
+            (batch, candidates),
+            dtype=torch.float32,
+        )
+        offset = 0
+        for batch_index, quality in enumerate(pairwise_rows):
+            if quality.numel() == 0:
+                continue
+            elements = int(quality.numel())
+            quality_cpu = flat_cpu[offset : offset + elements].view_as(quality)
+            offset += elements
+            pred_indices, gt_indices = HungarianMatcherS0._linear_sum_assignment(
+                1.0 - quality_cpu
+            )
+            if pred_indices.numel() > 0:
+                target_cpu[batch_index, pred_indices] = quality_cpu[
+                    pred_indices,
+                    gt_indices,
+                ]
+        return target_cpu.to(device=pred_x.device)
+
+    def compute_set_selection_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        logits = outputs.get("selection_logits")
+        if logits is None:
+            raise ValueError(
+                "w_set_selection > 0 requires model.structured_query."
+                "set_selection.enabled=true"
+            )
+        selection_logits = logits.float()
+        selection_targets = self.compute_set_selection_targets(
+            outputs,
+            targets,
+        ).to(dtype=selection_logits.dtype)
+        probability = torch.sigmoid(selection_logits)
+        modulation = (
+            selection_targets - probability
+        ).abs().pow(float(self.cfg.set_selection_focal_beta))
+        quality_loss = (
+            modulation
+            * F.binary_cross_entropy_with_logits(
+                selection_logits,
+                selection_targets,
+                reduction="none",
+            )
+        ).mean()
+
+        target_delta = (
+            selection_targets.unsqueeze(-1)
+            - selection_targets.unsqueeze(-2)
+        )
+        pair_weight = (
+            target_delta - float(self.cfg.set_selection_target_margin)
+        ).clamp_min(0.0)
+        logit_delta = (
+            selection_logits.unsqueeze(-1)
+            - selection_logits.unsqueeze(-2)
+        )
+        ranking_loss = (
+            F.softplus(-logit_delta) * pair_weight.detach()
+        ).sum() / pair_weight.sum().clamp_min(1e-6)
+        total = quality_loss + float(
+            self.cfg.set_selection_rank_weight
+        ) * ranking_loss
+        delta = outputs.get("selection_delta_logits")
+        delta_abs = (
+            delta.detach().float().abs().mean()
+            if isinstance(delta, torch.Tensor)
+            else selection_logits.detach().sum() * 0.0
+        )
+        return {
+            "total": total,
+            "quality": quality_loss,
+            "ranking": ranking_loss,
+            "target_mean": selection_targets.detach().mean(),
+            "target_positive_fraction": (
+                selection_targets.detach() > 0.0
+            ).float().mean(),
+            "delta_abs": delta_abs,
+        }
 
     def compute_seg_loss(
         self,

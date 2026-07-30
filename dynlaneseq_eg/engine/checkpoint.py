@@ -9,12 +9,16 @@ import torch
 def remap_optimizer_state_by_parameter(
     source_optimizer: torch.optim.Optimizer,
     target_optimizer: torch.optim.Optimizer,
+    *,
+    allow_target_superset: bool = False,
 ) -> dict[str, int]:
     """Move per-parameter optimizer state across a new group topology.
 
-    Both optimizers must reference the exact same Parameter objects. Group
-    hyperparameters intentionally come from ``target_optimizer``; only AdamW
-    moments and step counters are preserved from ``source_optimizer``.
+    By default both optimizers must reference the exact same Parameter
+    objects.  ``allow_target_superset`` additionally supports a newly added
+    module: old parameters retain AdamW moments while target-only parameters
+    start with empty optimizer state. Group hyperparameters intentionally come
+    from ``target_optimizer``.
     """
 
     source_parameters = {
@@ -27,7 +31,12 @@ def remap_optimizer_state_by_parameter(
         for group in target_optimizer.param_groups
         for parameter in group["params"]
     }
-    if source_parameters != target_parameters:
+    parameter_sets_valid = (
+        source_parameters <= target_parameters
+        if allow_target_superset
+        else source_parameters == target_parameters
+    )
+    if not parameter_sets_valid:
         raise ValueError(
             "cannot remap optimizer state: source and target parameter sets differ"
         )
@@ -39,12 +48,15 @@ def remap_optimizer_state_by_parameter(
             raise ValueError("source optimizer state contains an unknown parameter")
         target_optimizer.state[parameter] = state
         migrated += 1
-    return {
+    stats = {
         "parameters": len(target_parameters),
         "state_entries": migrated,
         "source_groups": len(source_optimizer.param_groups),
         "target_groups": len(target_optimizer.param_groups),
     }
+    if source_parameters != target_parameters:
+        stats["new_parameters"] = len(target_parameters - source_parameters)
+    return stats
 
 
 def save_checkpoint(

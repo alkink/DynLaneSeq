@@ -1,0 +1,87 @@
+_base_: culane_s0_structured_query_dla34_rowref_from65k_selective_cooldown_10k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from65k_joint_set_selection_5k
+
+# Causal 65k -> 70k diagnostic. All pre-existing parameter groups follow the
+# exact first half of the matched selective-cooldown control. The only new
+# mechanism is a zero-residual set scorer whose loss reaches final decoder
+# states; its initial score is exactly the existing exist*quality^0.5 score.
+model:
+  structured_query:
+    set_selection:
+      enabled: true
+      hidden_dim: 256
+      num_layers: 2
+      num_heads: 8
+      ff_dim: 512
+      # No selector-only dropout: this keeps the existing decoder's stochastic
+      # path aligned with the matched control during the causal 5k test.
+      dropout: 0.0
+      curve_samples: 20
+      base_quality_power: 0.5
+      range_temperature: 0.02
+
+loss:
+  w_set_selection: 1.0
+  set_selection_line_width: 30.0
+  set_selection_focal_beta: 2.0
+  set_selection_rank_weight: 0.25
+  set_selection_target_margin: 0.10
+  set_selection_min_valid_rows: 5
+
+optimizer:
+  base_lr: 0.00001
+  backbone_lr: 0.0
+  evidence_lr: 0.000002
+  parameter_groups:
+    - name: set_selection
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.
+    - name: visual_neck
+      lr: 0.000002
+      prefixes:
+        - encoder.fpn.
+        - encoder.proj.
+        - encoder.ms_proj.
+    - name: reference_initializer
+      lr: 0.000002
+      prefixes:
+        - structured_query_head.instance_tokens.
+        - structured_query_head.row_tokens.
+        - structured_query_head.x_tokens.
+        - structured_query_head.feature_proj.
+        - structured_query_head.reference_
+    - name: decoder_l1
+      lr: 0.000002
+      prefixes:
+        - structured_query_head.layers.0.
+    - name: decoder_later
+      lr: 0.000005
+      prefixes:
+        - structured_query_head.layers.1.
+        - structured_query_head.layers.2.
+        - structured_query_head.layers.3.
+    - name: prediction_heads
+      lr: 0.00001
+      prefixes:
+        - structured_query_head.row_norm.
+        - structured_query_head.row_x.
+        - structured_query_head.lane_norm.
+        - structured_query_head.exist.
+        - structured_query_head.range.
+        - structured_query_head.quality.
+
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 0
+  min_lr_ratio: 0.2
+
+postprocess:
+  score_mode: selection
+
+training:
+  max_iters: 5000
+  vis_interval: 2500
+  checkpoint_interval: 2500
