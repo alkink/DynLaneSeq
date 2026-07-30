@@ -14,6 +14,7 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 LEARNING_RATE="${LEARNING_RATE:-0.001}"
 QUALITY_FOCAL_BETA="${QUALITY_FOCAL_BETA:-2.0}"
+TARGET_MODE="${TARGET_MODE:-all_proposal}"
 RANK_LOSS_WEIGHT="${RANK_LOSS_WEIGHT:-0.25}"
 RANK_TARGET_MARGIN="${RANK_TARGET_MARGIN:-0.10}"
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
@@ -42,6 +43,7 @@ python -u -m dynlaneseq_eg.tools.probe_row_reference_quality_rescoring \
   --amp-dtype "$AMP_DTYPE" \
   --learning-rate "$LEARNING_RATE" \
   --quality-focal-beta "$QUALITY_FOCAL_BETA" \
+  --target-mode "$TARGET_MODE" \
   --rank-loss-weight "$RANK_LOSS_WEIGHT" \
   --rank-target-margin "$RANK_TARGET_MARGIN" \
   --line-width 30 \

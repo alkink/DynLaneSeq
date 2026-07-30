@@ -9,6 +9,7 @@ import random
 from typing import Any
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -48,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--quality-focal-beta", type=float, default=2.0)
+    parser.add_argument(
+        "--target-mode",
+        choices=("all_proposal", "unique_hungarian"),
+        default="all_proposal",
+        help=(
+            "all_proposal assigns every candidate its best GT IoU; "
+            "unique_hungarian assigns at most one candidate per GT and "
+            "treats remaining duplicates as negatives."
+        ),
+    )
     parser.add_argument("--rank-loss-weight", type=float, default=0.25)
     parser.add_argument("--rank-target-margin", type=float, default=0.10)
     parser.add_argument("--line-width", type=float, default=30.0)
@@ -189,6 +200,70 @@ def all_proposal_quality_targets(
         else:
             target_rows.append(pairwise.max(dim=0).values)
     return torch.stack(target_rows, dim=0), pairwise_rows
+
+
+def unique_hungarian_quality_targets(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    input_h: int,
+    line_width: float,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Set-aware quality targets with one positive proposal per GT lane."""
+
+    all_targets, pairwise_rows = all_proposal_quality_targets(
+        outputs,
+        targets,
+        input_h=input_h,
+        line_width=line_width,
+    )
+    unique_targets = torch.zeros_like(all_targets)
+    for batch_index, pairwise in enumerate(pairwise_rows):
+        if int(pairwise.shape[0]) == 0 or int(pairwise.shape[1]) == 0:
+            continue
+        gt_indices, candidate_indices = linear_sum_assignment(
+            1.0 - pairwise.detach().cpu().numpy()
+        )
+        if len(gt_indices) == 0:
+            continue
+        gt_tensor = torch.as_tensor(
+            gt_indices,
+            device=pairwise.device,
+            dtype=torch.long,
+        )
+        candidate_tensor = torch.as_tensor(
+            candidate_indices,
+            device=pairwise.device,
+            dtype=torch.long,
+        )
+        assigned_quality = pairwise[gt_tensor, candidate_tensor]
+        unique_targets[batch_index, candidate_tensor] = assigned_quality
+    return unique_targets, pairwise_rows
+
+
+def quality_targets_for_mode(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    input_h: int,
+    line_width: float,
+    target_mode: str,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if target_mode == "all_proposal":
+        return all_proposal_quality_targets(
+            outputs,
+            targets,
+            input_h=input_h,
+            line_width=line_width,
+        )
+    if target_mode == "unique_hungarian":
+        return unique_hungarian_quality_targets(
+            outputs,
+            targets,
+            input_h=input_h,
+            line_width=line_width,
+        )
+    raise ValueError(f"unsupported quality target mode: {target_mode!r}")
 
 
 def query_features(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -379,6 +454,7 @@ def evaluate_probes(
     top_k: int,
     quality_power: float,
     quality_focal_beta: float,
+    target_mode: str,
 ) -> dict[str, Any]:
     model.eval()
     query_probe.eval()
@@ -402,11 +478,12 @@ def evaluate_probes(
             images = images.to(device, non_blocking=True)
         with _amp_context(device, amp_dtype):
             outputs = _frozen_outputs(model, images)
-        quality_targets, pairwise_rows = all_proposal_quality_targets(
+        quality_targets, pairwise_rows = quality_targets_for_mode(
             outputs,
             targets,
             input_h=input_h,
             line_width=line_width,
+            target_mode=target_mode,
         )
         q_features = query_features(outputs)
         g_features = geometry_aware_features(outputs, input_w=input_w)
@@ -638,11 +715,12 @@ def main() -> None:
             images = images.to(device, non_blocking=True)
         with torch.no_grad(), _amp_context(device, amp_dtype):
             outputs = _frozen_outputs(model, images)
-        targets_quality, _pairwise = all_proposal_quality_targets(
+        targets_quality, _pairwise = quality_targets_for_mode(
             outputs,
             targets,
             input_h=input_h,
             line_width=args.line_width,
+            target_mode=args.target_mode,
         )
         q_features = query_features(outputs)
         g_features = geometry_aware_features(outputs, input_w=input_w)
@@ -723,6 +801,7 @@ def main() -> None:
         top_k=args.top_k,
         quality_power=args.quality_power,
         quality_focal_beta=args.quality_focal_beta,
+        target_mode=args.target_mode,
     )
     verdict = _probe_verdict(
         evaluation,
@@ -749,10 +828,16 @@ def main() -> None:
         "line_width": float(args.line_width),
         "top_k": int(args.top_k),
         "quality_power": float(args.quality_power),
-        "quality_target": (
-            "maximum range-aware row-space raster-IoU surrogate to any "
-            "ground-truth lane, for every proposal"
-        ),
+        "quality_target": {
+            "mode": args.target_mode,
+            "description": (
+                "maximum range-aware row-space raster-IoU surrogate to any "
+                "ground-truth lane, for every proposal"
+                if args.target_mode == "all_proposal"
+                else "maximum-sum Hungarian assignment over range-aware "
+                "row-space IoU; at most one positive proposal per GT"
+            ),
+        },
         "quality_loss": {
             "name": "quality_focal_plus_pairwise_ranking",
             "focal_beta": float(args.quality_focal_beta),
@@ -784,6 +869,7 @@ def main() -> None:
                 "source_checkpoint": args.checkpoint,
                 "source_iteration": int(checkpoint_iteration),
                 "train_steps": int(args.train_steps),
+                "target_mode": args.target_mode,
             },
             save_path,
         )

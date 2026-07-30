@@ -9,6 +9,7 @@ from dynlaneseq_eg.tools.probe_row_reference_quality_rescoring import (
     pairwise_lane_quality,
     pairwise_quality_ranking_loss,
     quality_focal_loss,
+    unique_hungarian_quality_targets,
 )
 
 
@@ -69,6 +70,35 @@ def test_all_proposal_targets_score_unmatched_geometric_candidates() -> None:
     assert target_quality.shape == (1, 3)
     assert target_quality[0, 0] > 0.99
     assert target_quality[0, 1] > 0.90
+    assert target_quality[0, 2] == 0.0
+
+
+def test_unique_hungarian_target_suppresses_duplicate_candidates() -> None:
+    outputs = {
+        "pred_x_rows": torch.tensor(
+            [[
+                [20.0, 20.0, 20.0, 20.0],
+                [21.0, 21.0, 21.0, 21.0],
+                [80.0, 80.0, 80.0, 80.0],
+            ]]
+        ),
+        "range_norm": torch.tensor([[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]]),
+    }
+    targets = [
+        {
+            "x_rows": torch.tensor([[20.0, 20.0, 20.0, 20.0]]),
+            "valid_mask": torch.ones((1, 4), dtype=torch.bool),
+        }
+    ]
+    target_quality, _ = unique_hungarian_quality_targets(
+        outputs,
+        targets,
+        input_h=40,
+        line_width=30.0,
+    )
+    assert target_quality.shape == (1, 3)
+    assert target_quality[0, 0] > 0.99
+    assert target_quality[0, 1] == 0.0
     assert target_quality[0, 2] == 0.0
 
 
