@@ -329,3 +329,36 @@ def test_from55k_evidence_lr_probe_changes_only_optimizer_rates_and_horizon() ->
         "warmup_iters": 0,
         "min_lr_ratio": 1.0,
     }
+
+
+def test_from55k_evidence_lr_trajectory_only_extends_probe_horizon() -> None:
+    probe = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from55k_evidence1e5_probe_5k.yaml"
+    )
+    trajectory = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from55k_evidence1e5_to75k.yaml"
+    )
+
+    for key in (
+        "model",
+        "matcher",
+        "loss",
+        "augmentation",
+        "dataset",
+        "dataloader",
+        "optimizer",
+    ):
+        assert trajectory[key] == probe[key]
+    assert trajectory["training"]["seed"] == probe["training"]["seed"] == 3407
+    assert trajectory["training"]["batch_size"] == 4
+    assert trajectory["training"]["gradient_accumulation_steps"] == 4
+    assert trajectory["training"]["max_iters"] == 20000
+    assert trajectory["training"]["checkpoint_interval"] == 5000
+    assert trajectory["scheduler"] == {
+        "name": "constant",
+        "total_iters": 20000,
+        "warmup_iters": 0,
+        "min_lr_ratio": 1.0,
+    }

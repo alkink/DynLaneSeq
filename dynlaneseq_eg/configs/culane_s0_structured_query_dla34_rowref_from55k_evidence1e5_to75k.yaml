@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_rowref_from55k_evidence1e5_probe_5k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from55k_evidence1e5_to75k
+
+# One uninterrupted, iteration-matched trajectory from the exact 55k state.
+# Keeping this as a single process preserves the same seeded loader/augmentation
+# stream used by the 2e-6 floor control from 55k to 75k.
+scheduler:
+  name: constant
+  total_iters: 20000
+  warmup_iters: 0
+  min_lr_ratio: 1.0
+
+training:
+  max_iters: 20000
+  vis_interval: 5000
+  checkpoint_interval: 5000
