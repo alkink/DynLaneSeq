@@ -266,3 +266,36 @@ def test_from50k_cooldown_changes_only_schedule_and_evidence_lr() -> None:
         "warmup_iters": 0,
         "min_lr_ratio": 0.1,
     }
+
+
+def test_from55k_extension_preserves_model_and_uses_constant_floor_lr() -> None:
+    cooldown = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from50k_cooldown_5k.yaml"
+    )
+    extension = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from55k_floor_to75k.yaml"
+    )
+
+    for key in (
+        "model",
+        "matcher",
+        "loss",
+        "augmentation",
+        "dataset",
+        "dataloader",
+        "optimizer",
+    ):
+        assert extension[key] == cooldown[key]
+    assert extension["training"]["seed"] == cooldown["training"]["seed"] == 3407
+    assert extension["training"]["batch_size"] == 4
+    assert extension["training"]["gradient_accumulation_steps"] == 4
+    assert extension["training"]["max_iters"] == 20000
+    assert extension["training"]["checkpoint_interval"] == 5000
+    assert extension["scheduler"] == {
+        "name": "constant",
+        "total_iters": 20000,
+        "warmup_iters": 0,
+        "min_lr_ratio": 1.0,
+    }

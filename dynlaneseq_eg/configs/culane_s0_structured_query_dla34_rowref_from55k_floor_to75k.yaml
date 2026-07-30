@@ -1,0 +1,21 @@
+_base_: culane_s0_structured_query_dla34_rowref_from50k_cooldown_5k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from50k_evidence_lr2e5_cooldown_5k
+
+# Stability extension of the successful 50k -> 55k rollback-and-cool run.
+# This config must only be used with --resume so AdamW moments and the LR
+# values stored at 55k are retained.  The preceding cosine has reached:
+#   backbone groups: 1e-6
+#   structured/evidence groups: 2e-6
+#   remaining model groups: 1e-5
+# A constant scheduler deliberately prevents any LR restart or increase.
+scheduler:
+  name: constant
+  total_iters: 20000
+  warmup_iters: 0
+  min_lr_ratio: 1.0
+
+training:
+  max_iters: 20000
+  vis_interval: 5000
+  checkpoint_interval: 5000
