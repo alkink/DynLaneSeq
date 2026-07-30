@@ -14,6 +14,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inputs", nargs="+", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-csv", required=True)
+    parser.add_argument(
+        "--allow-fixed-control",
+        action="store_true",
+        help=(
+            "Allow every candidate checkpoint to be compared with one fixed "
+            "control iteration; order the trajectory by candidate iteration."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -24,17 +32,27 @@ def _load(path: str) -> dict[str, Any]:
     return payload
 
 
-def _flatten(payload: dict[str, Any]) -> dict[str, Any]:
+def _flatten(
+    payload: dict[str, Any],
+    *,
+    allow_fixed_control: bool = False,
+) -> dict[str, Any]:
     control = payload["control"]
     candidate = payload["candidate"]
     summary = payload["summary"]
-    if int(control["iteration"]) != int(candidate["iteration"]):
+    control_iteration = int(control["iteration"])
+    candidate_iteration = int(candidate["iteration"])
+    if control_iteration != candidate_iteration and not allow_fixed_control:
         raise ValueError("control and candidate checkpoint iterations differ")
     if control["sampled_dataset_indices"] != candidate["sampled_dataset_indices"]:
         raise ValueError("control and candidate did not use the same images")
 
     row: dict[str, Any] = {
-        "iteration": int(control["iteration"]),
+        "iteration": (
+            candidate_iteration if allow_fixed_control else control_iteration
+        ),
+        "control_iteration": control_iteration,
+        "candidate_iteration": candidate_iteration,
         "images": int(payload["images"]),
         "lanes": int(summary["lanes"]),
         "control_mean_best_iou": float(summary["control_mean_best_iou"]),
@@ -76,11 +94,29 @@ def _flatten(payload: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def summarize(paths: list[str]) -> dict[str, Any]:
+def summarize(
+    paths: list[str],
+    *,
+    allow_fixed_control: bool = False,
+) -> dict[str, Any]:
     payloads = [_load(path) for path in paths]
-    rows = sorted((_flatten(payload) for payload in payloads), key=lambda row: row["iteration"])
+    rows = sorted(
+        (
+            _flatten(payload, allow_fixed_control=allow_fixed_control)
+            for payload in payloads
+        ),
+        key=lambda row: row["iteration"],
+    )
     if not rows:
         raise ValueError("at least one gate result is required")
+    if allow_fixed_control:
+        control_iterations = {
+            int(payload["control"]["iteration"]) for payload in payloads
+        }
+        if len(control_iterations) != 1:
+            raise ValueError(
+                "--allow-fixed-control requires one shared control iteration"
+            )
 
     reference_indices = payloads[0]["control"]["sampled_dataset_indices"]
     for path, payload in zip(paths[1:], payloads[1:]):
@@ -112,8 +148,14 @@ def summarize(paths: list[str]) -> dict[str, Any]:
         "diagnostic_only": True,
         "warning": (
             "Checkpoint trajectory of raw proposal geometry on a fixed validation "
-            "subset; this is not an official CULane F1 result."
+            "subset; this is not an official CULane F1 result. "
+            + (
+                "Every candidate is compared with one fixed control checkpoint."
+                if allow_fixed_control
+                else "Control and candidate checkpoints are iteration-matched."
+            )
         ),
+        "fixed_control": bool(allow_fixed_control),
         "sample_strategy": payloads[0]["sample_strategy"],
         "sampled_dataset_indices": reference_indices,
         "trajectory": rows,
@@ -125,7 +167,10 @@ def summarize(paths: list[str]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    result = summarize(args.inputs)
+    result = summarize(
+        args.inputs,
+        allow_fixed_control=bool(args.allow_fixed_control),
+    )
 
     output_json = Path(args.output_json)
     output_json.parent.mkdir(parents=True, exist_ok=True)

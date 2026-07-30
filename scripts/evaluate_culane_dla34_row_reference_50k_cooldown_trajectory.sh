@@ -59,6 +59,7 @@ done
 
 "${PYTHON}" -u -m dynlaneseq_eg.tools.summarize_row_reference_gate_trajectory \
   --inputs "${result_files[@]}" \
+  --allow-fixed-control \
   --output-json "${RESULT_DIR}/trajectory_summary.json" \
   --output-csv "${RESULT_DIR}/trajectory_summary.csv"
 
