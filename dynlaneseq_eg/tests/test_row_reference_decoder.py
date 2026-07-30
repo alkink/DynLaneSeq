@@ -299,3 +299,33 @@ def test_from55k_extension_preserves_model_and_uses_constant_floor_lr() -> None:
         "warmup_iters": 0,
         "min_lr_ratio": 1.0,
     }
+
+
+def test_from55k_evidence_lr_probe_changes_only_optimizer_rates_and_horizon() -> None:
+    floor = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from55k_floor_to75k.yaml"
+    )
+    probe = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from55k_evidence1e5_probe_5k.yaml"
+    )
+
+    for key in ("model", "matcher", "loss", "augmentation", "dataset", "dataloader"):
+        assert probe[key] == floor[key]
+    assert probe["optimizer"]["backbone_lr"] == 1e-6
+    assert probe["optimizer"]["base_lr"] == 1e-5
+    assert probe["optimizer"]["evidence_lr"] == 1e-5
+    assert probe["optimizer"]["weight_decay"] == floor["optimizer"]["weight_decay"]
+    assert probe["optimizer"]["betas"] == floor["optimizer"]["betas"]
+    assert probe["training"]["seed"] == floor["training"]["seed"] == 3407
+    assert probe["training"]["batch_size"] == 4
+    assert probe["training"]["gradient_accumulation_steps"] == 4
+    assert probe["training"]["max_iters"] == 5000
+    assert probe["training"]["checkpoint_interval"] == 2500
+    assert probe["scheduler"] == {
+        "name": "constant",
+        "total_iters": 5000,
+        "warmup_iters": 0,
+        "min_lr_ratio": 1.0,
+    }

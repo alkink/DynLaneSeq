@@ -1,0 +1,22 @@
+_base_: culane_s0_structured_query_dla34_rowref_from55k_floor_to75k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from55k_evidence1e5_probe_5k
+
+# Controlled 55k -> 60k LR probe. The launcher restores the exact 55k model
+# and AdamW state, keeps backbone/model groups at their stored floors, and
+# changes only evidence_decay/evidence_no_decay from 2e-6 to 1e-5.
+optimizer:
+  backbone_lr: 0.000001
+  base_lr: 0.00001
+  evidence_lr: 0.00001
+
+scheduler:
+  name: constant
+  total_iters: 5000
+  warmup_iters: 0
+  min_lr_ratio: 1.0
+
+training:
+  max_iters: 5000
+  vis_interval: 2500
+  checkpoint_interval: 2500

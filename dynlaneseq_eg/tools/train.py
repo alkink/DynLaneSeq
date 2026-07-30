@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from pathlib import Path
 
@@ -29,6 +30,77 @@ def model_init_start_iteration(init_from: str, init_iteration: int) -> int:
     if init_iteration >= 0 and not init_from:
         raise ValueError("--init-iteration requires --init-from")
     return int(init_iteration) if init_iteration >= 0 else 0
+
+
+def parse_optimizer_group_lr_overrides(specs: list[str]) -> dict[str, float]:
+    """Parse repeatable ``GROUP=LR`` optimizer overrides."""
+    overrides: dict[str, float] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(
+                f"invalid optimizer group LR override {spec!r}; expected GROUP=LR"
+            )
+        name, raw_lr = (part.strip() for part in spec.split("=", 1))
+        if not name:
+            raise ValueError("optimizer group LR override has an empty group name")
+        if name in overrides:
+            raise ValueError(f"duplicate optimizer group LR override: {name}")
+        try:
+            lr = float(raw_lr)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid LR {raw_lr!r} for optimizer group {name!r}"
+            ) from exc
+        if not math.isfinite(lr) or lr < 0.0:
+            raise ValueError(
+                f"optimizer group LR must be finite and non-negative: {name}={lr}"
+            )
+        overrides[name] = lr
+    return overrides
+
+
+def apply_optimizer_group_lr_overrides(
+    optimizer: torch.optim.Optimizer,
+    overrides: dict[str, float],
+) -> dict[str, dict[str, float]]:
+    """Change selected group LRs after restoring optimizer state.
+
+    This deliberately leaves parameters and AdamW moments untouched.  Group
+    names must be unique so an experimental intervention cannot silently
+    affect an unintended parameter set.
+    """
+    groups_by_name: dict[str, dict] = {}
+    duplicate_names: set[str] = set()
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        if name in groups_by_name:
+            duplicate_names.add(name)
+        groups_by_name[name] = group
+    if duplicate_names:
+        raise ValueError(
+            "optimizer contains duplicate group names: "
+            + ", ".join(sorted(repr(name) for name in duplicate_names))
+        )
+    missing = sorted(set(overrides) - set(groups_by_name))
+    if missing:
+        raise ValueError(
+            "optimizer LR override refers to missing groups: "
+            + ", ".join(missing)
+            + "; available groups: "
+            + ", ".join(sorted(name for name in groups_by_name if name))
+        )
+
+    changes: dict[str, dict[str, float]] = {}
+    for name, lr in overrides.items():
+        group = groups_by_name[name]
+        previous = float(group["lr"])
+        group["lr"] = float(lr)
+        # A resumed constant-schedule experiment never reads ``initial_lr``,
+        # but keeping it consistent makes the checkpoint audit unambiguous.
+        if "initial_lr" in group:
+            group["initial_lr"] = float(lr)
+        changes[name] = {"before": previous, "after": float(lr)}
+    return changes
 
 
 def main() -> None:
@@ -65,7 +137,23 @@ def main() -> None:
         default=0,
         help="Override training.gradient_accumulation_steps.",
     )
+    parser.add_argument(
+        "--resume-group-lr",
+        action="append",
+        default=[],
+        metavar="GROUP=LR",
+        help=(
+            "After restoring --resume, change only the named optimizer group's "
+            "current LR while preserving parameters and optimizer moments. "
+            "Repeat for multiple groups; supported only with no/constant scheduler."
+        ),
+    )
     args = parser.parse_args()
+    resume_group_lr_overrides = parse_optimizer_group_lr_overrides(
+        args.resume_group_lr
+    )
+    if resume_group_lr_overrides and not args.resume:
+        raise ValueError("--resume-group-lr requires --resume")
     cfg = load_config(args.config)
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
@@ -122,6 +210,17 @@ def main() -> None:
         print(f"initialized compatible weights from {args.init_from}: {stats}")
     if args.resume:
         start_iter = load_checkpoint(args.resume, model, optimizer, scaler, strict=False, scheduler=scheduler)
+        if resume_group_lr_overrides:
+            if scheduler is not None:
+                raise ValueError(
+                    "--resume-group-lr is supported only with a no/constant "
+                    "scheduler so a scheduler cannot silently overwrite it"
+                )
+            changes = apply_optimizer_group_lr_overrides(
+                optimizer,
+                resume_group_lr_overrides,
+            )
+            print({"resume_optimizer_lr_overrides": changes})
     if bool(train_cfg.get("compile_model", False)):
         compile_kwargs = {}
         if train_cfg.get("compile_backend") is not None:
@@ -175,6 +274,10 @@ def main() -> None:
             "clip_grad_norm_mode": str(train_cfg.get("clip_grad_norm_mode", "global")),
             "log_interval": int(cfg.get("training", {}).get("log_interval", 10)),
             "scheduler": cfg.get("scheduler", {"name": "none"}),
+            "optimizer_group_lrs": {
+                str(group.get("name", index)): float(group["lr"])
+                for index, group in enumerate(optimizer.param_groups)
+            },
         }
     )
 
