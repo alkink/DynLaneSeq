@@ -1,0 +1,27 @@
+_base_: culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_50ep.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from50k_evidence_lr2e5_cooldown_5k
+
+# Causal rollback-and-cool diagnostic:
+#   - initialize model weights from the healthy 50k checkpoint;
+#   - deliberately discard the old AdamW moments and scheduler state;
+#   - preserve the architecture, matcher, losses, deep supervision, seed,
+#     batch size, and augmentations;
+#   - reduce only the optimizer group containing structured_query_head from
+#     2e-4 to 2e-5, then cool it to 2e-6 over 5k optimizer steps.
+#
+# The launcher supplies --init-iteration 50000. This prevents DFL warmup from
+# restarting and labels the two checkpoints as 52.5k and 55k.
+optimizer:
+  evidence_lr: 0.00002
+
+scheduler:
+  name: cosine
+  total_iters: 5000
+  warmup_iters: 0
+  min_lr_ratio: 0.1
+
+training:
+  max_iters: 5000
+  vis_interval: 2500
+  checkpoint_interval: 2500

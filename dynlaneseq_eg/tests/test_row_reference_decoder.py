@@ -234,3 +234,35 @@ def test_full_reference_config_preserves_validated_candidate_contract() -> None:
     assert full["training"]["gradient_accumulation_steps"] == 4
     assert full["training"]["max_iters"] == 278000
     assert full["scheduler"]["total_iters"] == 278000
+
+
+def test_from50k_cooldown_changes_only_schedule_and_evidence_lr() -> None:
+    full = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_"
+        "fpn256_l4_dfl_rowref_r15_deepsup_50ep.yaml"
+    )
+    cooldown = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from50k_cooldown_5k.yaml"
+    )
+
+    for key in ("model", "matcher", "loss", "augmentation", "dataset", "dataloader"):
+        assert cooldown[key] == full[key]
+    assert cooldown["optimizer"]["base_lr"] == full["optimizer"]["base_lr"]
+    assert cooldown["optimizer"]["backbone_lr"] == full["optimizer"]["backbone_lr"]
+    assert cooldown["optimizer"]["weight_decay"] == full["optimizer"]["weight_decay"]
+    assert cooldown["optimizer"]["betas"] == full["optimizer"]["betas"]
+    assert full["optimizer"]["evidence_lr"] == 0.0002
+    assert cooldown["optimizer"]["evidence_lr"] == 0.00002
+    assert cooldown["training"]["seed"] == full["training"]["seed"] == 3407
+    assert cooldown["training"]["batch_size"] == full["training"]["batch_size"] == 4
+    assert cooldown["training"]["gradient_accumulation_steps"] == 4
+    assert cooldown["training"]["max_iters"] == 5000
+    assert cooldown["training"]["checkpoint_interval"] == 2500
+    assert cooldown["scheduler"] == {
+        "name": "cosine",
+        "total_iters": 5000,
+        "warmup_iters": 0,
+        "min_lr_ratio": 0.1,
+    }

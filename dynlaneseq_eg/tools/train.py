@@ -24,12 +24,29 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def model_init_start_iteration(init_from: str, init_iteration: int) -> int:
+    """Resolve a logical iteration without restoring optimizer state."""
+    if init_iteration >= 0 and not init_from:
+        raise ValueError("--init-iteration requires --init-from")
+    return int(init_iteration) if init_iteration >= 0 else 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", default="")
     parser.add_argument("--init-from", default="", help="Initialize compatible model weights only; optimizer and iteration stay fresh.")
+    parser.add_argument(
+        "--init-iteration",
+        type=int,
+        default=-1,
+        help=(
+            "Logical starting iteration used with --init-from. Model weights are "
+            "loaded without optimizer/scheduler state, while curricula, logs, and "
+            "checkpoint names continue from this iteration."
+        ),
+    )
     parser.add_argument("--max-iters", type=int, default=0)
     parser.add_argument("--output-dir", default="", help="Override cfg.output_dir.")
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
@@ -99,7 +116,7 @@ def main() -> None:
     scheduler = build_scheduler(cfg, optimizer, total_iters=planned_iters)
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive")
-    start_iter = 0
+    start_iter = model_init_start_iteration(args.init_from, args.init_iteration)
     if args.init_from:
         stats = load_compatible_model_weights(args.init_from, model)
         print(f"initialized compatible weights from {args.init_from}: {stats}")
