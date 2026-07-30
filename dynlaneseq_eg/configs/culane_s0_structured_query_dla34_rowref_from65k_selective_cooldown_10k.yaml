@@ -1,0 +1,56 @@
+_base_: culane_s0_structured_query_dla34_rowref_from55k_evidence1e5_to75k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from65k_selective_cooldown_10k
+
+# Diagnostic continuation from the best 65k checkpoint. The architecture,
+# matcher, losses, augmentations, effective batch size, and AdamW moments stay
+# fixed. Only optimizer topology/LRs and the fresh 10k cooldown are changed.
+optimizer:
+  base_lr: 0.00001
+  backbone_lr: 0.0
+  evidence_lr: 0.000002
+  parameter_groups:
+    - name: visual_neck
+      lr: 0.000002
+      prefixes:
+        - encoder.fpn.
+        - encoder.proj.
+        - encoder.ms_proj.
+    - name: reference_initializer
+      lr: 0.000002
+      prefixes:
+        - structured_query_head.instance_tokens.
+        - structured_query_head.row_tokens.
+        - structured_query_head.x_tokens.
+        - structured_query_head.feature_proj.
+        - structured_query_head.reference_
+    - name: decoder_l1
+      lr: 0.000002
+      prefixes:
+        - structured_query_head.layers.0.
+    - name: decoder_later
+      lr: 0.000005
+      prefixes:
+        - structured_query_head.layers.1.
+        - structured_query_head.layers.2.
+        - structured_query_head.layers.3.
+    - name: prediction_heads
+      lr: 0.00001
+      prefixes:
+        - structured_query_head.row_norm.
+        - structured_query_head.row_x.
+        - structured_query_head.lane_norm.
+        - structured_query_head.exist.
+        - structured_query_head.range.
+        - structured_query_head.quality.
+
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 0
+  min_lr_ratio: 0.2
+
+training:
+  max_iters: 10000
+  vis_interval: 5000
+  checkpoint_interval: 5000

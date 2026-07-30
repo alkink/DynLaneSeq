@@ -9,7 +9,12 @@ import numpy as np
 import torch
 
 from dynlaneseq_eg.config import load_config
-from dynlaneseq_eg.engine.checkpoint import load_checkpoint, load_compatible_model_weights, save_checkpoint
+from dynlaneseq_eg.engine.checkpoint import (
+    load_checkpoint,
+    load_compatible_model_weights,
+    remap_optimizer_state_by_parameter,
+    save_checkpoint,
+)
 from dynlaneseq_eg.engine.logger import SmoothedLogger
 from dynlaneseq_eg.engine.train_one_epoch import train_one_epoch
 from dynlaneseq_eg.engine.visualizer import save_prediction_visuals
@@ -148,12 +153,28 @@ def main() -> None:
             "Repeat for multiple groups; supported only with no/constant scheduler."
         ),
     )
+    parser.add_argument(
+        "--resume-remap-optimizer-groups",
+        action="store_true",
+        help=(
+            "Restore model weights and per-parameter optimizer moments while "
+            "using the parameter-group topology and scheduler from the new "
+            "config. The checkpoint must contain its original expanded config."
+        ),
+    )
     args = parser.parse_args()
     resume_group_lr_overrides = parse_optimizer_group_lr_overrides(
         args.resume_group_lr
     )
     if resume_group_lr_overrides and not args.resume:
         raise ValueError("--resume-group-lr requires --resume")
+    if args.resume_remap_optimizer_groups and not args.resume:
+        raise ValueError("--resume-remap-optimizer-groups requires --resume")
+    if args.resume_remap_optimizer_groups and resume_group_lr_overrides:
+        raise ValueError(
+            "--resume-remap-optimizer-groups cannot be combined with "
+            "--resume-group-lr"
+        )
     cfg = load_config(args.config)
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
@@ -209,7 +230,44 @@ def main() -> None:
         stats = load_compatible_model_weights(args.init_from, model)
         print(f"initialized compatible weights from {args.init_from}: {stats}")
     if args.resume:
-        start_iter = load_checkpoint(args.resume, model, optimizer, scaler, strict=False, scheduler=scheduler)
+        if args.resume_remap_optimizer_groups:
+            payload = torch.load(args.resume, map_location="cpu")
+            source_cfg = payload.get("cfg")
+            if not isinstance(source_cfg, dict) or not source_cfg:
+                raise ValueError(
+                    "optimizer-group remap requires the checkpoint's original cfg"
+                )
+            if "optimizer" not in payload:
+                raise ValueError(
+                    "optimizer-group remap requires optimizer state in checkpoint"
+                )
+            model.load_state_dict(payload["model"], strict=False)
+            source_optimizer = build_optimizer(source_cfg, model)
+            source_optimizer.load_state_dict(payload["optimizer"])
+            remap_stats = remap_optimizer_state_by_parameter(
+                source_optimizer,
+                optimizer,
+            )
+            if scaler is not None and "scaler" in payload:
+                scaler.load_state_dict(payload["scaler"])
+            start_iter = int(payload.get("iteration", 0))
+            del source_optimizer
+            del payload
+            print(
+                {
+                    "resume_optimizer_group_remap": remap_stats,
+                    "scheduler_state_restored": False,
+                }
+            )
+        else:
+            start_iter = load_checkpoint(
+                args.resume,
+                model,
+                optimizer,
+                scaler,
+                strict=False,
+                scheduler=scheduler,
+            )
         if resume_group_lr_overrides:
             if scheduler is not None:
                 raise ValueError(

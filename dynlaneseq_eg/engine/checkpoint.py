@@ -6,6 +6,47 @@ from typing import Any
 import torch
 
 
+def remap_optimizer_state_by_parameter(
+    source_optimizer: torch.optim.Optimizer,
+    target_optimizer: torch.optim.Optimizer,
+) -> dict[str, int]:
+    """Move per-parameter optimizer state across a new group topology.
+
+    Both optimizers must reference the exact same Parameter objects. Group
+    hyperparameters intentionally come from ``target_optimizer``; only AdamW
+    moments and step counters are preserved from ``source_optimizer``.
+    """
+
+    source_parameters = {
+        parameter
+        for group in source_optimizer.param_groups
+        for parameter in group["params"]
+    }
+    target_parameters = {
+        parameter
+        for group in target_optimizer.param_groups
+        for parameter in group["params"]
+    }
+    if source_parameters != target_parameters:
+        raise ValueError(
+            "cannot remap optimizer state: source and target parameter sets differ"
+        )
+
+    target_optimizer.state.clear()
+    migrated = 0
+    for parameter, state in source_optimizer.state.items():
+        if parameter not in target_parameters:
+            raise ValueError("source optimizer state contains an unknown parameter")
+        target_optimizer.state[parameter] = state
+        migrated += 1
+    return {
+        "parameters": len(target_parameters),
+        "state_entries": migrated,
+        "source_groups": len(source_optimizer.param_groups),
+        "target_groups": len(target_optimizer.param_groups),
+    }
+
+
 def save_checkpoint(
     path: str | Path,
     model,

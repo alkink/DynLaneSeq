@@ -195,6 +195,37 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
     evidence_lr = opt_cfg.get("evidence_lr")
     evidence_lr = float(evidence_lr) if evidence_lr is not None else None
     wd = float(opt_cfg.get("weight_decay", 1e-4))
+    custom_specs = []
+    custom_group_names: set[str] = set()
+    for raw_spec in opt_cfg.get("parameter_groups", []):
+        if not isinstance(raw_spec, dict):
+            raise ValueError("optimizer.parameter_groups entries must be mappings")
+        group_name = str(raw_spec.get("name", "")).strip()
+        if not group_name:
+            raise ValueError("optimizer.parameter_groups entry has an empty name")
+        if group_name in custom_group_names:
+            raise ValueError(f"duplicate optimizer parameter-group name: {group_name}")
+        prefixes = tuple(str(value) for value in raw_spec.get("prefixes", []))
+        if not prefixes or any(not prefix for prefix in prefixes):
+            raise ValueError(
+                f"optimizer parameter group {group_name!r} needs non-empty prefixes"
+            )
+        group_lr = float(raw_spec.get("lr", base_lr))
+        if not math.isfinite(group_lr) or group_lr < 0.0:
+            raise ValueError(
+                f"optimizer parameter group {group_name!r} has invalid LR {group_lr}"
+            )
+        custom_group_names.add(group_name)
+        custom_specs.append(
+            {
+                "name": group_name,
+                "prefixes": prefixes,
+                "lr": group_lr,
+                "decay": [],
+                "no_decay": [],
+                "matched_names": [],
+            }
+        )
     decay = []
     no_decay = []
     backbone_decay = []
@@ -207,6 +238,20 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
         if not param.requires_grad:
             continue
         is_no_decay = param.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower()
+        custom_matches = [
+            spec for spec in custom_specs if name.startswith(spec["prefixes"])
+        ]
+        if len(custom_matches) > 1:
+            raise ValueError(
+                f"parameter {name!r} matches multiple custom optimizer groups: "
+                + ", ".join(spec["name"] for spec in custom_matches)
+            )
+        if custom_matches:
+            spec = custom_matches[0]
+            bucket = "no_decay" if is_no_decay else "decay"
+            spec[bucket].append(param)
+            spec["matched_names"].append(name)
+            continue
         is_backbone = ".backbone." in name or name.startswith("encoder.backbone")
         is_row_decoder = row_decoder_lr is not None and (name.startswith("row_decoder.") or name.startswith("row_embedding."))
         is_evidence = evidence_lr is not None and (
@@ -241,7 +286,29 @@ def build_optimizer(cfg: dict[str, Any], model: torch.nn.Module) -> torch.optim.
             no_decay.append(param)
         else:
             decay.append(param)
-    groups = [
+    custom_groups = []
+    for spec in custom_specs:
+        if not spec["matched_names"]:
+            raise ValueError(
+                f"custom optimizer group {spec['name']!r} matched no parameters"
+            )
+        custom_groups.extend(
+            [
+                {
+                    "params": spec["decay"],
+                    "lr": spec["lr"],
+                    "weight_decay": wd,
+                    "name": f"{spec['name']}_decay",
+                },
+                {
+                    "params": spec["no_decay"],
+                    "lr": spec["lr"],
+                    "weight_decay": 0.0,
+                    "name": f"{spec['name']}_no_decay",
+                },
+            ]
+        )
+    groups = custom_groups + [
         {"params": backbone_decay, "lr": backbone_lr, "weight_decay": wd, "name": "backbone_decay"},
         {"params": backbone_no_decay, "lr": backbone_lr, "weight_decay": 0.0, "name": "backbone_no_decay"},
         {"params": row_decay, "lr": row_decoder_lr or base_lr, "weight_decay": wd, "name": "row_decoder_decay"},
