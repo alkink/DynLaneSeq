@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_rowref_from65k_selective_cooldown_10k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from65k_object0p5_matcher_5k
+
+# Matched 65k -> 70k causal intervention. Architecture, losses, optimizer
+# groups/LRs, augmentation, effective batch size, AdamW moments, and the first
+# half of the selective-cooldown schedule remain identical to the control.
+#
+# Only the lane-confidence term in Hungarian assignment is reduced from 2.0 to
+# 0.5. Geometry costs remain unchanged.
+matcher:
+  lambda_obj: 0.5
+
+training:
+  max_iters: 5000
+  vis_interval: 2500
+  checkpoint_interval: 2500

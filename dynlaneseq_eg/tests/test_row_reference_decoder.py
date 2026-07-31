@@ -530,3 +530,40 @@ def test_no_object_matcher_config_is_single_change_65k_to70k_intervention() -> N
     assert final_matcher.cfg.lambda_obj == 0.0
     assert criterion.matcher is not None
     assert criterion.matcher.cfg.lambda_obj == 0.0
+
+
+def test_object0p5_matcher_config_is_single_change_65k_to70k_intervention() -> None:
+    control = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from65k_selective_cooldown_10k.yaml"
+    )
+    candidate = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_rowref_from65k_object0p5_matcher_5k.yaml"
+    )
+
+    for key in (
+        "model",
+        "loss",
+        "augmentation",
+        "dataset",
+        "dataloader",
+        "optimizer",
+        "scheduler",
+    ):
+        assert candidate[key] == control[key]
+
+    expected_matcher = dict(control["matcher"])
+    expected_matcher["lambda_obj"] = 0.5
+    assert candidate["matcher"] == expected_matcher
+    assert control["matcher"]["lambda_obj"] == 2.0
+    assert candidate["training"]["seed"] == control["training"]["seed"] == 3407
+    assert candidate["training"]["batch_size"] == control["training"]["batch_size"]
+    assert candidate["training"]["gradient_accumulation_steps"] == 4
+    assert candidate["training"]["max_iters"] == 5000
+
+    final_matcher = build_matcher(candidate)
+    criterion = build_criterion(candidate)
+    assert final_matcher.cfg.lambda_obj == 0.5
+    assert criterion.matcher is not None
+    assert criterion.matcher.cfg.lambda_obj == 0.5

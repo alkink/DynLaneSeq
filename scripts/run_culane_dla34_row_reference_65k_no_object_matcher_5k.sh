@@ -12,6 +12,7 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
 AUTO_RESUME="${AUTO_RESUME:-1}"
+EXPECTED_LAMBDA_OBJ="${EXPECTED_LAMBDA_OBJ:-0.0}"
 TARGET_ITERATION=70000
 FINAL_CHECKPOINT="${OUT_DIR}/iter_$(printf '%07d' "${TARGET_ITERATION}").pt"
 
@@ -36,7 +37,7 @@ if [[ -z "${SOURCE_CHECKPOINT:-}" || ! -f "${SOURCE_CHECKPOINT}" ]]; then
   exit 1
 fi
 if [[ -f "${FINAL_CHECKPOINT}" ]]; then
-  echo "No-object matcher diagnostic already reached 70k: ${FINAL_CHECKPOINT}"
+  echo "Matcher-weight diagnostic already reached 70k: ${FINAL_CHECKPOINT}"
   exit 0
 fi
 
@@ -104,10 +105,12 @@ if [[ -n "${LATEST_PARTIAL}" ]]; then
   fi
   START_ITERATION="$(
     "${PYTHON}" -c '
+import math
 import sys
 import torch
 
 path = sys.argv[1]
+expected_lambda_obj = float(sys.argv[2])
 payload = torch.load(path, map_location="cpu")
 iteration = int(payload.get("iteration", -1))
 if not 65000 < iteration < 70000:
@@ -119,17 +122,21 @@ cfg = payload.get("cfg")
 if not isinstance(cfg, dict):
     raise SystemExit("partial checkpoint is missing its expanded config")
 matcher = cfg.get("matcher", {})
-if float(matcher.get("lambda_obj", float("nan"))) != 0.0:
+actual_lambda_obj = float(matcher.get("lambda_obj", float("nan")))
+if not math.isclose(
+    actual_lambda_obj, expected_lambda_obj, rel_tol=0.0, abs_tol=1e-12
+):
     raise SystemExit(
         "refusing non-candidate partial checkpoint: "
-        f"matcher.lambda_obj={matcher.get('lambda_obj')}"
+        f"matcher.lambda_obj={matcher.get('lambda_obj')}, "
+        f"expected {expected_lambda_obj}"
     )
 if "optimizer" not in payload or "scheduler" not in payload:
     raise SystemExit(
         "partial checkpoint must contain optimizer and scheduler state"
     )
 print(iteration)
-' "${LATEST_PARTIAL}"
+' "${LATEST_PARTIAL}" "${EXPECTED_LAMBDA_OBJ}"
   )"
   RUN_ITERS="$((TARGET_ITERATION - START_ITERATION))"
   RUN_CHECKPOINT="${LATEST_PARTIAL}"
@@ -139,13 +146,23 @@ fi
 
 config_audit="$(
   "${PYTHON}" -c '
+import math
 import sys
 from dynlaneseq_eg.config import load_config
 
 cfg = load_config(sys.argv[1])
+expected_lambda_obj = float(sys.argv[2])
 matcher = cfg["matcher"]
-if float(matcher["lambda_obj"]) != 0.0:
-    raise SystemExit(f"expected matcher.lambda_obj=0, got {matcher['"'"'lambda_obj'"'"']}")
+if not math.isclose(
+    float(matcher["lambda_obj"]),
+    expected_lambda_obj,
+    rel_tol=0.0,
+    abs_tol=1e-12,
+):
+    raise SystemExit(
+        f"expected matcher.lambda_obj={expected_lambda_obj}, "
+        f"got {matcher['"'"'lambda_obj'"'"']}"
+    )
 expected = {
     "lambda_point": 5.0,
     "lambda_range": 1.0,
@@ -164,13 +181,13 @@ if cfg["model"]["structured_query"].get("set_selection", {}).get("enabled", Fals
 if float(cfg["loss"].get("w_set_selection", 0.0)) != 0.0:
     raise SystemExit("set-selection loss must be disabled")
 print(
-    "lambda_obj=0, lambda_point=5, lambda_range=1, "
+    f"lambda_obj={expected_lambda_obj:g}, lambda_point=5, lambda_range=1, "
     "lambda_line_iou=1, one matcher per supervised output"
 )
-' "${CONFIG}"
+' "${CONFIG}" "${EXPECTED_LAMBDA_OBJ}"
 )"
 
-echo "No-object matcher causal diagnostic: 65000 -> ${TARGET_ITERATION}"
+echo "Matcher-weight causal diagnostic: 65000 -> ${TARGET_ITERATION}"
 echo "Source checkpoint: ${SOURCE_CHECKPOINT}"
 echo "Stored LR audit: ${checkpoint_audit}"
 echo "Matcher audit: ${config_audit}"
