@@ -132,7 +132,6 @@ for key in (
     "model",
     "loss",
     "augmentation",
-    "dataset",
     "dataloader",
     "optimizer",
     "scheduler",
@@ -142,6 +141,18 @@ for key in (
             f"checkpoint/target config mismatch in {key}; "
             "refusing an unmatched continuation"
         )
+# ``--dataset-root`` is a machine-local path override written into every
+# checkpoint. It is not an experimental setting, so compare the remaining
+# dataset protocol fields while deliberately ignoring only ``root``.
+checkpoint_dataset = dict(cfg.get("dataset", {}))
+target_dataset = dict(target_cfg.get("dataset", {}))
+checkpoint_dataset.pop("root", None)
+target_dataset.pop("root", None)
+if checkpoint_dataset != target_dataset:
+    raise SystemExit(
+        "checkpoint/target config mismatch in dataset protocol; "
+        "refusing an unmatched continuation"
+    )
 matcher = cfg.get("matcher", {})
 target_matcher = target_cfg["matcher"]
 if matcher != target_matcher or not math.isclose(
