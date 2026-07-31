@@ -189,6 +189,7 @@ def load_or_collect_cache(
     device: str | torch.device = "cuda",
     cache_dir: str | Path = "outputs/diagnostic_cache",
     reuse_cache: bool = False,
+    require_cache: bool = False,
     max_batches: int = 0,
     eval_batch_size: int | None = None,
     num_workers: int | None = None,
@@ -220,7 +221,7 @@ def load_or_collect_cache(
         effective_eval_batch_size,
         sample_strategy,
     )
-    if reuse_cache and cache_path.exists():
+    if (reuse_cache or require_cache) and cache_path.exists():
         try:
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
         except TypeError:  # PyTorch versions before weights_only was added.
@@ -229,6 +230,11 @@ def load_or_collect_cache(
         if _upgrade_cache_paths(cached, project_root, dataset_root):
             torch.save(cached, cache_path)
         return cached
+    if require_cache:
+        raise FileNotFoundError(
+            "Required diagnostic cache is missing; refusing to run model "
+            f"inference: {cache_path}"
+        )
 
     torch_device = torch.device(device)
     model = build_model(cfg).to(torch_device)

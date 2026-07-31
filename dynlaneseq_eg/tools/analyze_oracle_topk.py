@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="")
     parser.add_argument("--cache-dir", default="outputs/diagnostic_cache")
     parser.add_argument("--reuse-cache", action="store_true")
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Require an existing cache and refuse to run model inference.",
+    )
     parser.add_argument("--exact-postprocess", action="store_true")
     return parser.parse_args()
 
@@ -97,6 +102,10 @@ def _finish(counter: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _official_metric_key(iou_threshold: float) -> str:
+    return f"official_iou_{float(iou_threshold):g}"
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
@@ -109,7 +118,8 @@ def main() -> None:
         dataset_root=args.dataset_root or None,
         device=args.device,
         cache_dir=args.cache_dir,
-        reuse_cache=args.reuse_cache,
+        reuse_cache=bool(args.reuse_cache or args.cache_only),
+        require_cache=bool(args.cache_only),
         max_batches=args.max_batches,
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
@@ -224,10 +234,7 @@ def main() -> None:
                                 selection_nms_ids,
                                 iou_threshold,
                             )
-                            if (
-                                args.exact_postprocess
-                                and abs(float(iou_threshold) - 0.5) < 1e-9
-                            ):
+                            if args.exact_postprocess:
                                 exact_selections[selection_key][
                                     record["image_id"]
                                 ] = selection_nms_ids
@@ -257,7 +264,7 @@ def main() -> None:
                         oracle_nms_ids,
                         iou_threshold,
                     )
-                    if args.exact_postprocess and abs(float(iou_threshold) - 0.5) < 1e-9:
+                    if args.exact_postprocess:
                         exact_selections[(stage_name, "oracle_topk_nms", top_k, iou_threshold, None, None)][record["image_id"]] = oracle_nms_ids
 
                     for quality_power in args.quality_powers:
@@ -292,7 +299,7 @@ def main() -> None:
                                 score_threshold,
                             )
                             _update(counters[key], iou, selected_ids, iou_threshold)
-                            if args.exact_postprocess and abs(float(iou_threshold) - 0.5) < 1e-9:
+                            if args.exact_postprocess:
                                 exact_selections[key][record["image_id"]] = selected_ids
 
     rows: list[dict[str, Any]] = []
@@ -308,11 +315,12 @@ def main() -> None:
             **_finish(counters[key]),
         }
         if args.exact_postprocess and key in exact_selections:
-            row["official_iou_0.5"] = exact_official_counts(
+            official_key = _official_metric_key(float(iou_threshold))
+            row[official_key] = exact_official_counts(
                 cache["records"],
                 stage_name,
                 exact_selections[key],
-                iou_threshold=0.5,
+                iou_threshold=float(iou_threshold),
                 width=int(round(args.line_width)),
             )
         rows.append(row)
