@@ -1,0 +1,19 @@
+_base_: culane_s0_structured_query_dla34_rowref_from65k_selective_cooldown_10k.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_from65k_no_object_matcher_5k
+
+# Causal 65k -> 70k matcher intervention.  Architecture, losses, optimizer
+# groups/LRs, augmentation, effective batch size, AdamW moments, and the first
+# half of the selective-cooldown schedule remain matched to the control.
+#
+# The sole intervention removes current lane-confidence from Hungarian
+# assignment.  Point, range, and LineIoU costs remain active.  The resulting
+# per-output assignment is then shared by existence, geometry, DFL, and
+# (for the final output) quality supervision.
+matcher:
+  lambda_obj: 0.0
+
+training:
+  max_iters: 5000
+  vis_interval: 2500
+  checkpoint_interval: 2500
