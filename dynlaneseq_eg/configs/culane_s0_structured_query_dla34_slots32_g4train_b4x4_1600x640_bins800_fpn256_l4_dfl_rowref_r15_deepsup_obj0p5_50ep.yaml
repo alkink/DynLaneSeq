@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_slots32_g4train_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep
+
+# Matched causal intervention for the score/selection bottleneck.  The
+# row-reference decoder, radius-15 geometry objective, deep supervision,
+# lambda_obj=0.5 matcher cost, seed, optimizer, and 278k cosine horizon are
+# inherited unchanged.  Only the assignment/interaction contract changes:
+# four isolated groups each receive one Hungarian match per GT.
+model:
+  structured_query:
+    num_groups: 4
+
+matcher:
+  assignment: grouped_one_to_many
+  num_groups: 4
+

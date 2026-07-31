@@ -148,6 +148,15 @@ def main() -> None:
         else post.get("lane_nms_min_overlap_points", 5)
     )
     stage_names = sorted({name for record in cache["records"] for name in record["stages"]})
+    candidate_counts_by_stage = {}
+    for stage_name in stage_names:
+        for record in cache["records"]:
+            stage = record["stages"].get(stage_name)
+            if stage is not None:
+                candidate_counts_by_stage[stage_name] = int(
+                    stage["pred_x_rows"].shape[0]
+                )
+                break
     counters: dict[tuple[Any, ...], dict[str, Any]] = defaultdict(_new_counter)
     exact_selections: dict[tuple[Any, ...], dict[str, list[int]]] = defaultdict(dict)
 
@@ -177,6 +186,49 @@ def main() -> None:
                     quality_ids = _rank_ids(quality_scores, candidate_valid, top_k)
                     _update(counters[(stage_name, "exist_topk", top_k, iou_threshold, 0.0, None)], iou, exist_ids, iou_threshold)
                     _update(counters[(stage_name, "quality_topk", top_k, iou_threshold, None, None)], iou, quality_ids, iou_threshold)
+                    # Train-many/infer-one deploys one unique query group and
+                    # ranks it by quality alone.  Keep this path separate from
+                    # ``model_topk_nms`` (existence * quality**power), otherwise
+                    # a quality-only deployment cannot be evaluated with the
+                    # exact official-raster counts or a frozen validation
+                    # threshold without rewriting predictions for every value.
+                    quality_override = {
+                        index: float(quality_scores[index])
+                        for index in range(int(quality_scores.shape[0]))
+                    }
+                    for score_threshold in args.score_thresholds:
+                        quality_trace = trace_postprocess(
+                            stage,
+                            input_h=input_h,
+                            input_w=input_w,
+                            score_thresh=score_threshold,
+                            quality_power=0.0,
+                            min_valid_rows=args.min_valid_rows,
+                            nms_distance_thresh_px=nms_distance,
+                            nms_min_overlap_points=nms_overlap,
+                            top_k=top_k,
+                            row_visibility_thresh=args.row_visibility_thresh,
+                            score_override=quality_override,
+                        )
+                        quality_selected_ids = list(quality_trace["selected_ids"])
+                        quality_key = (
+                            stage_name,
+                            "quality_topk_nms",
+                            top_k,
+                            iou_threshold,
+                            1.0,
+                            score_threshold,
+                        )
+                        _update(
+                            counters[quality_key],
+                            iou,
+                            quality_selected_ids,
+                            iou_threshold,
+                        )
+                        if args.exact_postprocess:
+                            exact_selections[quality_key][record["image_id"]] = (
+                                quality_selected_ids
+                            )
                     if selection_scores is not None:
                         selection_ids = _rank_ids(
                             selection_scores,
@@ -342,6 +394,7 @@ def main() -> None:
             iou_space="official_raster" if args.exact_postprocess else "row_space",
             nms_distance_thresh_px=nms_distance,
             nms_min_overlap_points=nms_overlap,
+            candidate_counts_by_stage=candidate_counts_by_stage,
         ),
         "rows": rows,
     }

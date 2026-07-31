@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_slots32_g4train_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+# Deployment view of the exact same trained checkpoint.  Group zero is fixed
+# before training; no validation-time group cherry-picking is performed.
+model:
+  structured_query:
+    inference_group_index: 0
+
+postprocess:
+  # Each retained group contains unique one-to-one assignments.  Quality is
+  # trained as assignment-aware line IoU, so it is the sole deployed score.
+  score_mode: quality
+  quality_score_power: 1.0
+  lane_nms_distance_thresh_px: 0.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4
+
