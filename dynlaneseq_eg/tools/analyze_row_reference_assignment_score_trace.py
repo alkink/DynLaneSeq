@@ -76,6 +76,9 @@ class CandidateTraceAccumulator:
     score_sum: float = 0.0
     exist_sum: float = 0.0
     quality_sum: float = 0.0
+    exist_target_sum: float = 0.0
+    quality_target_sum: float = 0.0
+    quality_target_ge_050: int = 0
     best_iou_sum: float = 0.0
     matched_by_layer: list[int] = field(default_factory=list)
     ever_matched: int = 0
@@ -101,6 +104,8 @@ class CandidateTraceAccumulator:
         score: float,
         exist: float,
         quality: float,
+        exist_target: float,
+        quality_target: float,
         best_iou: float,
         status: str,
         assignments: list[int | None],
@@ -111,6 +116,9 @@ class CandidateTraceAccumulator:
         self.score_sum += float(score)
         self.exist_sum += float(exist)
         self.quality_sum += float(quality)
+        self.exist_target_sum += float(exist_target)
+        self.quality_target_sum += float(quality_target)
+        self.quality_target_ge_050 += int(float(quality_target) >= 0.50)
         self.best_iou_sum += float(best_iou)
         self.statuses[str(status)] += 1
         flags = [value is not None for value in assignments]
@@ -140,6 +148,18 @@ class CandidateTraceAccumulator:
             "mean_score": self.score_sum / count,
             "mean_exist_probability": self.exist_sum / count,
             "mean_quality_probability": self.quality_sum / count,
+            "mean_training_exist_target": self.exist_target_sum / count,
+            "mean_training_quality_target": self.quality_target_sum / count,
+            "mean_exist_target_minus_probability": (
+                self.exist_target_sum - self.exist_sum
+            )
+            / count,
+            "mean_quality_target_minus_probability": (
+                self.quality_target_sum - self.quality_sum
+            )
+            / count,
+            "training_quality_target_ge_050_fraction": self.quality_target_ge_050
+            / count,
             "mean_best_official_iou": self.best_iou_sum / count,
             "postprocess_status": dict(self.statuses),
             "matched_fraction_by_decoder_layer": [
@@ -225,6 +245,8 @@ def _update_scope(
     score: float,
     exist: float,
     quality: float,
+    exist_target: float,
+    quality_target: float,
     best_iou: float,
     status: str,
     assignments: list[int | None],
@@ -233,6 +255,8 @@ def _update_scope(
         score=score,
         exist=exist,
         quality=quality,
+        exist_target=exist_target,
+        quality_target=quality_target,
         best_iou=best_iou,
         status=status,
         assignments=assignments,
@@ -247,6 +271,35 @@ def _fp_label(best_iou: float, gt_count: int, threshold: float, near_min: float)
     if float(best_iou) >= float(near_min):
         return "near_miss_fp"
     return "background_fp"
+
+
+def _training_quality_targets_for_image(
+    pred_x_rows: torch.Tensor,
+    target: dict[str, torch.Tensor],
+    final_assignment: dict[int, int],
+    *,
+    radius: float,
+) -> torch.Tensor:
+    """Reproduce the historical quality target used by ``S0Criterion``."""
+
+    targets = pred_x_rows.new_zeros((int(pred_x_rows.shape[0]),), dtype=torch.float32)
+    for proposal_index, gt_index in final_assignment.items():
+        gt_x = target["x_rows"][int(gt_index)].to(
+            device=pred_x_rows.device,
+            dtype=torch.float32,
+        )
+        valid = target["valid_mask"][int(gt_index)].to(pred_x_rows.device).bool()
+        valid = valid & torch.isfinite(gt_x)
+        if not bool(valid.any()):
+            continue
+        pred = pred_x_rows[int(proposal_index)].float()
+        overlap = (
+            torch.minimum(pred + float(radius), gt_x + float(radius))
+            - torch.maximum(pred - float(radius), gt_x - float(radius))
+        ).clamp(min=0.0)
+        union = (4.0 * float(radius) - overlap).clamp(min=1e-6)
+        targets[int(proposal_index)] = (overlap[valid] / union[valid]).mean()
+    return targets
 
 
 def _provisional_diagnosis(threshold_summary: dict[str, Any]) -> dict[str, Any]:
@@ -423,6 +476,13 @@ def _analyze_run(
                 _assignment_map(layer_matches[image_index])
                 for layer_matches in matches_by_layer
             ]
+            final_assignment = assignments_by_layer[-1]
+            training_quality_target = _training_quality_targets_for_image(
+                outputs["pred_x_rows"][image_index].detach(),
+                targets_cpu[image_index],
+                final_assignment,
+                radius=float(cfg.get("loss", {}).get("line_iou_radius", 15.0)),
+            ).cpu()
             iou, _valid_gt, candidate_valid = diagnostic_iou_matrix(
                 record,
                 stage_name,
@@ -489,6 +549,8 @@ def _analyze_run(
                         "score": float(scores[proposal_index]),
                         "exist": float(exist[proposal_index]),
                         "quality": float(quality[proposal_index]),
+                        "exist_target": float(proposal_index in final_assignment),
+                        "quality_target": float(training_quality_target[proposal_index]),
                         "best_iou": value,
                         "status": status,
                         "assignments": assignment_trace,
