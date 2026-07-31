@@ -11,6 +11,7 @@ DEVICE="${DEVICE:-cuda}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 SEG_AUX_AMP_DTYPE="${SEG_AUX_AMP_DTYPE:-bfloat16}"
+AUTO_RESUME="${AUTO_RESUME:-1}"
 TARGET_ITERATION=70000
 FINAL_CHECKPOINT="${OUT_DIR}/iter_$(printf '%07d' "${TARGET_ITERATION}").pt"
 
@@ -37,11 +38,6 @@ fi
 if [[ -f "${FINAL_CHECKPOINT}" ]]; then
   echo "No-object matcher diagnostic already reached 70k: ${FINAL_CHECKPOINT}"
   exit 0
-fi
-if find "${OUT_DIR}" -maxdepth 1 -type f -name 'iter_*.pt' -print -quit 2>/dev/null | grep -q .; then
-  echo "Refusing to mix a partial run into ${OUT_DIR}." >&2
-  echo "Use a new empty OUT_DIR or resume that checkpoint explicitly." >&2
-  exit 1
 fi
 
 checkpoint_audit="$(
@@ -83,6 +79,64 @@ print(", ".join(f"{name}={groups[name]:.3g}" for name in expected))
 ' "${SOURCE_CHECKPOINT}"
 )"
 
+RUN_ITERS=5000
+START_ITERATION=65000
+RUN_CHECKPOINT="${SOURCE_CHECKPOINT}"
+RESUME_DESCRIPTION="65k source with optimizer-group remapping"
+TRAIN_RESUME_ARGS=(
+  --resume "${SOURCE_CHECKPOINT}"
+  --resume-remap-optimizer-groups
+)
+
+LATEST_PARTIAL=""
+if [[ -d "${OUT_DIR}" ]]; then
+  LATEST_PARTIAL="$(
+    find "${OUT_DIR}" -maxdepth 1 -type f -name 'iter_*.pt' -print 2>/dev/null \
+      | sort -V \
+      | tail -n 1
+  )"
+fi
+if [[ -n "${LATEST_PARTIAL}" ]]; then
+  if [[ "${AUTO_RESUME}" != "1" ]]; then
+    echo "Partial candidate run exists: ${LATEST_PARTIAL}" >&2
+    echo "Set AUTO_RESUME=1 or use a new empty OUT_DIR." >&2
+    exit 1
+  fi
+  START_ITERATION="$(
+    "${PYTHON}" -c '
+import sys
+import torch
+
+path = sys.argv[1]
+payload = torch.load(path, map_location="cpu")
+iteration = int(payload.get("iteration", -1))
+if not 65000 < iteration < 70000:
+    raise SystemExit(
+        f"partial checkpoint iteration must be between 65000 and 70000, "
+        f"got {iteration} in {path}"
+    )
+cfg = payload.get("cfg")
+if not isinstance(cfg, dict):
+    raise SystemExit("partial checkpoint is missing its expanded config")
+matcher = cfg.get("matcher", {})
+if float(matcher.get("lambda_obj", float("nan"))) != 0.0:
+    raise SystemExit(
+        "refusing non-candidate partial checkpoint: "
+        f"matcher.lambda_obj={matcher.get('lambda_obj')}"
+    )
+if "optimizer" not in payload or "scheduler" not in payload:
+    raise SystemExit(
+        "partial checkpoint must contain optimizer and scheduler state"
+    )
+print(iteration)
+' "${LATEST_PARTIAL}"
+  )"
+  RUN_ITERS="$((TARGET_ITERATION - START_ITERATION))"
+  RUN_CHECKPOINT="${LATEST_PARTIAL}"
+  RESUME_DESCRIPTION="candidate partial with optimizer and scheduler restoration"
+  TRAIN_RESUME_ARGS=(--resume "${LATEST_PARTIAL}")
+fi
+
 config_audit="$(
   "${PYTHON}" -c '
 import sys
@@ -121,7 +175,10 @@ echo "Source checkpoint: ${SOURCE_CHECKPOINT}"
 echo "Stored LR audit: ${checkpoint_audit}"
 echo "Matcher audit: ${config_audit}"
 echo "Architecture/new parameters: unchanged/none"
-echo "Old AdamW moments: preserved through optimizer-group remapping"
+echo "Run checkpoint: ${RUN_CHECKPOINT}"
+echo "Resume mode: ${RESUME_DESCRIPTION}"
+echo "Remaining optimizer steps: ${RUN_ITERS}"
+echo "Old AdamW moments: preserved"
 echo "Old parameter LRs/schedule: exact first 5k of the matched cooldown control"
 echo "Output: ${OUT_DIR}"
 echo "Batch/accum/effective: ${BATCH_SIZE}/${GRAD_ACCUM}/$((BATCH_SIZE * GRAD_ACCUM))"
@@ -138,9 +195,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   --device "${DEVICE}" \
   --dataset-root "${DATA_ROOT}" \
   --output-dir "${OUT_DIR}" \
-  --max-iters 5000 \
+  --max-iters "${RUN_ITERS}" \
   --batch-size "${BATCH_SIZE}" \
   --grad-accum "${GRAD_ACCUM}" \
   --seg-aux-amp-dtype "${SEG_AUX_AMP_DTYPE}" \
-  --resume "${SOURCE_CHECKPOINT}" \
-  --resume-remap-optimizer-groups
+  "${TRAIN_RESUME_ARGS[@]}"
