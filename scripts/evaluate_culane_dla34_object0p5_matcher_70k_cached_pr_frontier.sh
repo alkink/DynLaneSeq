@@ -5,11 +5,13 @@ cd "$(dirname "$0")/.."
 
 PYTHON="${PYTHON:-python}"
 DATA_ROOT="${DATA_ROOT:-/workspace/CULane}"
+DEVICE="${DEVICE:-cpu}"
 CACHE_DIR="${CACHE_DIR:-outputs/diagnostic_cache}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/diagnostics/object0p5_matcher_70k_pr_frontier}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 MAX_BATCHES="${MAX_BATCHES:-64}"
+CACHE_ONLY="${CACHE_ONLY:-1}"
 QUALITY_POWERS="${QUALITY_POWERS:-0.0 0.25 0.5}"
 SCORE_THRESHOLDS="${SCORE_THRESHOLDS:--1 0.025 0.05 0.075 0.10 0.125 0.15 0.175 0.20 0.25 0.30 0.40 0.50 0.60 0.70 0.80 0.90}"
 IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.5 0.75}"
@@ -38,10 +40,25 @@ read -r -a quality_args <<< "${QUALITY_POWERS}"
 read -r -a score_args <<< "${SCORE_THRESHOLDS}"
 read -r -a iou_args <<< "${IOU_THRESHOLDS}"
 
+cache_args=(--reuse-cache)
+case "${CACHE_ONLY}" in
+  1|true|TRUE|yes|YES)
+    cache_args=(--cache-only)
+    cache_mode="cache-only; model inference is forbidden"
+    ;;
+  0|false|FALSE|no|NO)
+    cache_mode="reuse cache when available; otherwise run model inference"
+    ;;
+  *)
+    echo "CACHE_ONLY must be 0/1 (or true/false), got: ${CACHE_ONLY}" >&2
+    exit 1
+    ;;
+esac
+
 common_args=(
   --split val
   --dataset-root "${DATA_ROOT}"
-  --device cpu
+  --device "${DEVICE}"
   --top-k-values 4
   --iou-thresholds "${iou_args[@]}"
   --quality-powers "${quality_args[@]}"
@@ -54,13 +71,14 @@ common_args=(
   --num-workers "${NUM_WORKERS}"
   --sample-strategy uniform
   --cache-dir "${CACHE_DIR}"
-  --cache-only
+  "${cache_args[@]}"
   --exact-postprocess
 )
 
 mkdir -p "${OUTPUT_DIR}"
 
-echo "Cache-only matched PR frontier; model inference is forbidden."
+echo "Matched official PR frontier: ${cache_mode}."
+echo "Device: ${DEVICE}"
 echo "Quality powers: ${QUALITY_POWERS}"
 echo "Score thresholds: ${SCORE_THRESHOLDS}"
 echo "Official IoU thresholds: ${IOU_THRESHOLDS}"
