@@ -673,10 +673,17 @@ class SetAwareLaneSelectionHead(nn.Module):
             exist = exist * quality.pow(self.base_quality_power)
         return exist.clamp(1e-6, 1.0 - 1e-6)
 
-    def forward(
+    def build_selection_features(
         self,
         outputs: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Build the frozen proposal descriptors consumed by the set scorer.
+
+        Keeping feature construction separate from scoring lets diagnostics
+        freeze the detector (including curve-aligned evidence extraction) and
+        train only the selection transformer.  The normal forward path still
+        calls this method, so the refactor does not change deployed scores.
+        """
         row_tokens = outputs["structured_row_tokens"]
         lane_query = outputs["queries"]
         observe = (
@@ -828,13 +835,26 @@ class SetAwareLaneSelectionHead(nn.Module):
                 (lane_query, visible_row_state, scalar_features),
                 dim=-1,
             )
+        return features
+
+    def score_selection_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Score descriptors returned by :meth:`build_selection_features`."""
+
         hidden = self.input_projection(self.input_norm(features))
         hidden = self.encoder(hidden)
-        raw_logits = self.output(self.output_norm(hidden)).squeeze(-1).float()
+        return self.output(self.output_norm(hidden)).squeeze(-1).float()
+
+    def forward(
+        self,
+        outputs: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.build_selection_features(outputs)
+        raw_logits = self.score_selection_features(features)
         if self.unified_score:
             # Keep the legacy diagnostic key in the output contract, but make
             # its value explicit: unified mode has no residual/delta path.
             return raw_logits, torch.zeros_like(raw_logits)
+        base_probability = self._base_probability(outputs).detach()
         base_logits = torch.logit(base_probability)
         return base_logits + raw_logits, raw_logits
 
