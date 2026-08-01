@@ -51,6 +51,7 @@ class LossConfig:
     lambda_geometry_draft: float = 0.0
     lambda_intermediate: float = 0.0
     intermediate_layer_weights: tuple[float, ...] = ()
+    lambda_training_auxiliary: float = 0.0
     geometry_reduction: str = "global_rows"
 
 
@@ -205,6 +206,176 @@ class S0Criterion(nn.Module):
             )
         out = self.add_geometry_draft_loss(out, raw_outputs, targets, matches)
         out = self.add_intermediate_losses(out, raw_outputs, targets)
+        out = self.add_training_auxiliary_losses(out, raw_outputs, targets)
+        return out
+
+    def add_training_auxiliary_losses(
+        self,
+        losses: dict[str, torch.Tensor],
+        outputs: dict[str, object],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Supervise train-only query groups without diluting the primary set.
+
+        The normal criterion above sees only the 32 deployable candidates.
+        Auxiliary groups receive their own grouped one-to-many assignments and
+        contribute a separately weighted objective.  Encoder auxiliaries and
+        set-selection are intentionally excluded because these query groups do
+        not exist at inference time.
+        """
+
+        strength = float(self.cfg.lambda_training_auxiliary)
+        auxiliary = outputs.get("_training_auxiliary_outputs")
+        if strength <= 0.0:
+            if isinstance(auxiliary, dict):
+                raise ValueError(
+                    "model emitted training auxiliary queries but "
+                    "loss.lambda_training_auxiliary is not positive"
+                )
+            return losses
+        if not isinstance(auxiliary, dict):
+            raise ValueError(
+                "lambda_training_auxiliary > 0 requires model training auxiliary outputs"
+            )
+        auxiliary_matches = outputs.get("_training_auxiliary_matches")
+        if not isinstance(auxiliary_matches, (list, tuple)):
+            raise ValueError("training auxiliary outputs require precomputed matches")
+
+        zero = self._zero_anchor(auxiliary).sum() * 0.0
+        row_dfl_weight = self.row_dfl_weight()
+        aux_exist = (
+            self.compute_exist_loss(auxiliary, auxiliary_matches)
+            if self.cfg.w_exist != 0
+            else zero
+        )
+        aux_point = (
+            self.compute_point_loss(auxiliary, targets, auxiliary_matches)
+            if self.cfg.w_point != 0
+            else zero
+        )
+        aux_range = (
+            self.compute_range_loss(auxiliary, targets, auxiliary_matches)
+            if self.cfg.w_range != 0
+            else zero
+        )
+        aux_smooth = (
+            self.compute_smoothness_loss(auxiliary, targets, auxiliary_matches)
+            if self.cfg.w_smooth != 0
+            else zero
+        )
+        aux_line_iou = (
+            self.compute_line_iou_loss(auxiliary, targets, auxiliary_matches)
+            if self.cfg.w_line_iou != 0
+            else zero
+        )
+        aux_quality = (
+            self.compute_quality_loss(auxiliary, targets, auxiliary_matches)
+            if self.cfg.w_quality != 0
+            else zero
+        )
+        aux_row_dfl = (
+            self.compute_row_dfl_loss(auxiliary, targets, auxiliary_matches)
+            if row_dfl_weight != 0
+            else zero
+        )
+        auxiliary_total = (
+            self.cfg.w_exist * aux_exist
+            + self.cfg.w_point * aux_point
+            + self.cfg.w_range * aux_range
+            + self.cfg.w_smooth * aux_smooth
+            + self.cfg.w_line_iou * aux_line_iou
+            + self.cfg.w_quality * aux_quality
+            + row_dfl_weight * aux_row_dfl
+        )
+
+        auxiliary_layers = outputs.get("_training_auxiliary_aux_outputs")
+        auxiliary_layer_matches = outputs.get(
+            "_training_auxiliary_aux_matches"
+        )
+        auxiliary_intermediate = zero
+        if float(self.cfg.lambda_intermediate) > 0.0:
+            if not isinstance(auxiliary_layers, (list, tuple)) or not auxiliary_layers:
+                raise ValueError(
+                    "deeply supervised training auxiliaries require intermediate outputs"
+                )
+            if not isinstance(auxiliary_layer_matches, (list, tuple)) or len(
+                auxiliary_layer_matches
+            ) != len(auxiliary_layers):
+                raise ValueError(
+                    "training auxiliary intermediate outputs require matching assignments"
+                )
+            configured_weights = tuple(
+                float(value) for value in self.cfg.intermediate_layer_weights
+            )
+            layer_weights = configured_weights or tuple(
+                1.0 for _ in auxiliary_layers
+            )
+            if len(layer_weights) != len(auxiliary_layers):
+                raise ValueError(
+                    "training auxiliary intermediate weights must match decoder layers"
+                )
+            normalizer = float(sum(layer_weights))
+            if normalizer <= 0.0:
+                raise ValueError("training auxiliary intermediate weights must sum positive")
+            for layer, layer_matches, layer_weight in zip(
+                auxiliary_layers,
+                auxiliary_layer_matches,
+                layer_weights,
+            ):
+                if not isinstance(layer, dict):
+                    raise TypeError("training auxiliary decoder output must be a dictionary")
+                layer_zero = self._zero_anchor(layer).sum() * 0.0
+                layer_exist = (
+                    self.compute_exist_loss(layer, layer_matches)
+                    if self.cfg.w_exist != 0
+                    else layer_zero
+                )
+                layer_point = (
+                    self.compute_point_loss(layer, targets, layer_matches)
+                    if self.cfg.w_point != 0
+                    else layer_zero
+                )
+                layer_range = (
+                    self.compute_range_loss(layer, targets, layer_matches)
+                    if self.cfg.w_range != 0
+                    else layer_zero
+                )
+                layer_line_iou = (
+                    self.compute_line_iou_loss(layer, targets, layer_matches)
+                    if self.cfg.w_line_iou != 0
+                    else layer_zero
+                )
+                layer_row_dfl = (
+                    self.compute_row_dfl_loss(layer, targets, layer_matches)
+                    if row_dfl_weight != 0
+                    else layer_zero
+                )
+                layer_total = (
+                    self.cfg.w_exist * layer_exist
+                    + self.cfg.w_point * layer_point
+                    + self.cfg.w_range * layer_range
+                    + self.cfg.w_line_iou * layer_line_iou
+                    + row_dfl_weight * layer_row_dfl
+                )
+                auxiliary_intermediate = auxiliary_intermediate + (
+                    float(layer_weight) / normalizer
+                ) * layer_total
+            auxiliary_total = auxiliary_total + float(
+                self.cfg.lambda_intermediate
+            ) * auxiliary_intermediate
+
+        out = dict(losses)
+        out["loss_total"] = out["loss_total"] + strength * auxiliary_total
+        out["loss_training_auxiliary_total"] = auxiliary_total
+        out["loss_training_auxiliary_exist"] = aux_exist
+        out["loss_training_auxiliary_point"] = aux_point
+        out["loss_training_auxiliary_range"] = aux_range
+        out["loss_training_auxiliary_smooth"] = aux_smooth
+        out["loss_training_auxiliary_line_iou"] = aux_line_iou
+        out["loss_training_auxiliary_quality"] = aux_quality
+        out["loss_training_auxiliary_row_dfl"] = aux_row_dfl
+        out["loss_training_auxiliary_intermediate"] = auxiliary_intermediate
+        out["weight_training_auxiliary"] = zero.new_tensor(strength)
         return out
 
     def add_intermediate_losses(
@@ -375,7 +546,9 @@ class S0Criterion(nn.Module):
             loss = alpha_t * (1.0 - p_t).pow(float(self.cfg.focal_gamma)) * ce
             return loss.mean()
         weight = torch.tensor([1.0, self.cfg.no_lane_weight], device=logits.device, dtype=logits.dtype)
-        return F.cross_entropy(logits.view(b * n, 2), target.view(b * n), weight=weight)
+        # Candidate subsets are views in the hybrid primary/auxiliary decoder;
+        # reshape handles their non-contiguous candidate dimension safely.
+        return F.cross_entropy(logits.reshape(b * n, 2), target.reshape(b * n), weight=weight)
 
     @staticmethod
     def _zero_anchor(outputs: dict[str, torch.Tensor]) -> torch.Tensor:

@@ -36,6 +36,14 @@ class HungarianMatcherS0:
         self,
         output_sequence: list[dict[str, torch.Tensor]] | tuple[dict[str, torch.Tensor], ...],
         targets: list[dict[str, torch.Tensor]],
+        *,
+        assignment: str | None = None,
+        group_sizes: tuple[int, ...] | list[int] | None = None,
+        assignment_specs: list[
+            tuple[str, tuple[int, ...] | list[int] | None]
+        ]
+        | tuple[tuple[str, tuple[int, ...] | list[int] | None], ...]
+        | None = None,
     ) -> list[list[dict[str, torch.Tensor]]]:
         """Match several decoder outputs with one device round trip.
 
@@ -46,6 +54,11 @@ class HungarianMatcherS0:
         only the transport of the already-computed cost matrices and integer
         pairs is batched across layers.
         """
+
+        if assignment_specs is not None and (assignment is not None or group_sizes is not None):
+            raise ValueError(
+                "assignment_specs cannot be combined with assignment/group_sizes"
+            )
 
         normalized_outputs = []
         pending_by_output = []
@@ -68,6 +81,40 @@ class HungarianMatcherS0:
         if not normalized_outputs:
             return []
 
+        if assignment_specs is None:
+            active_assignment = self.cfg.assignment if assignment is None else str(assignment)
+            active_group_sizes = (
+                None if group_sizes is None else tuple(int(size) for size in group_sizes)
+            )
+            normalized_specs = [
+                (active_assignment, active_group_sizes)
+                for _ in normalized_outputs
+            ]
+        else:
+            if len(assignment_specs) != len(normalized_outputs):
+                raise ValueError(
+                    "assignment_specs must match output_sequence length: "
+                    f"got {len(assignment_specs)} specs for {len(normalized_outputs)} outputs"
+                )
+            normalized_specs = [
+                (
+                    str(spec_assignment),
+                    None
+                    if spec_sizes is None
+                    else tuple(int(size) for size in spec_sizes),
+                )
+                for spec_assignment, spec_sizes in assignment_specs
+            ]
+        for spec_assignment, spec_sizes in normalized_specs:
+            if spec_sizes is not None and (
+                not spec_sizes or any(size < 1 for size in spec_sizes)
+            ):
+                raise ValueError("group_sizes must contain positive integers")
+            if spec_sizes is not None and spec_assignment != "grouped_one_to_many":
+                raise ValueError(
+                    "explicit group_sizes require grouped_one_to_many assignment"
+                )
+
         # Deep supervision calls the matcher once for every decoder output.
         # The matrices are tiny, so concatenate every layer and image and pay
         # for exactly one device synchronization while preserving the
@@ -86,7 +133,10 @@ class HungarianMatcherS0:
 
         solved_by_output = []
         flat_offset = 0
-        for pending in pending_by_output:
+        for pending, (active_assignment, active_group_sizes) in zip(
+            pending_by_output,
+            normalized_specs,
+        ):
             solved = []
             for cost, stats, num_gt in pending:
                 if num_gt == 0:
@@ -99,11 +149,17 @@ class HungarianMatcherS0:
                         int(cost.shape[1]),
                     )
                     flat_offset += numel
-                    if self.cfg.assignment == "grouped_one_to_many":
-                        pred_idx, gt_idx = self._grouped_assignment(
-                            cost_cpu,
-                            num_groups=max(1, int(self.cfg.num_groups)),
-                        )
+                    if active_assignment == "grouped_one_to_many":
+                        if active_group_sizes is not None:
+                            pred_idx, gt_idx = self._grouped_assignment_with_sizes(
+                                cost_cpu,
+                                active_group_sizes,
+                            )
+                        else:
+                            pred_idx, gt_idx = self._grouped_assignment(
+                                cost_cpu,
+                                num_groups=max(1, int(self.cfg.num_groups)),
+                            )
                     else:
                         pred_idx, gt_idx = self._linear_sum_assignment(cost_cpu)
                 solved.append((pred_idx, gt_idx, stats, num_gt))
@@ -285,6 +341,32 @@ class HungarianMatcherS0:
                 continue
             pred_parts.append(row + start)
             gt_parts.append(col)
+        if not pred_parts:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+        return torch.cat(pred_parts, dim=0), torch.cat(gt_parts, dim=0)
+
+    def _grouped_assignment_with_sizes(
+        self,
+        cost: torch.Tensor,
+        group_sizes: tuple[int, ...] | list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sizes = tuple(int(size) for size in group_sizes)
+        if not sizes or any(size < 1 for size in sizes):
+            raise ValueError("group_sizes must contain positive integers")
+        if sum(sizes) != int(cost.shape[0]):
+            raise ValueError(
+                f"group_sizes sum to {sum(sizes)}, expected {int(cost.shape[0])} predictions"
+            )
+        pred_parts = []
+        gt_parts = []
+        start = 0
+        for size in sizes:
+            end = start + size
+            row, col = self._linear_sum_assignment(cost[start:end])
+            if row.numel() > 0:
+                pred_parts.append(row + start)
+                gt_parts.append(col)
+            start = end
         if not pred_parts:
             return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
         return torch.cat(pred_parts, dim=0), torch.cat(gt_parts, dim=0)

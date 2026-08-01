@@ -89,6 +89,59 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
         return outputs, matches
     outputs = model(images)
     aux_outputs = outputs.get("aux_outputs") if isinstance(outputs, dict) else None
+    training_auxiliary = (
+        outputs.get("_training_auxiliary_outputs")
+        if isinstance(outputs, dict)
+        else None
+    )
+    training_auxiliary_layers = (
+        outputs.get("_training_auxiliary_aux_outputs")
+        if isinstance(outputs, dict)
+        else None
+    )
+    training_auxiliary_group_sizes = (
+        outputs.get("_training_auxiliary_group_sizes")
+        if isinstance(outputs, dict)
+        else None
+    )
+    if isinstance(training_auxiliary, dict) and hasattr(matcher, "match_many"):
+        main_layers = list(aux_outputs) if isinstance(aux_outputs, (list, tuple)) else []
+        auxiliary_layers = (
+            list(training_auxiliary_layers)
+            if isinstance(training_auxiliary_layers, (list, tuple))
+            else []
+        )
+        if not isinstance(training_auxiliary_group_sizes, (list, tuple)):
+            raise ValueError(
+                "training auxiliary outputs require explicit group sizes"
+            )
+        group_sizes = tuple(int(size) for size in training_auxiliary_group_sizes)
+        sequence = (
+            outputs,
+            *main_layers,
+            training_auxiliary,
+            *auxiliary_layers,
+        )
+        assignment_specs = [
+            (str(matcher.cfg.assignment), None)
+            for _ in range(1 + len(main_layers))
+        ] + [
+            ("grouped_one_to_many", group_sizes)
+            for _ in range(1 + len(auxiliary_layers))
+        ]
+        all_matches = matcher.match_many(
+            sequence,
+            targets,
+            assignment_specs=assignment_specs,
+        )
+        main_count = 1 + len(main_layers)
+        matches = all_matches[0]
+        outputs["_aux_matches"] = all_matches[1:main_count]
+        outputs["_training_auxiliary_matches"] = all_matches[main_count]
+        outputs["_training_auxiliary_aux_matches"] = all_matches[
+            main_count + 1 :
+        ]
+        return outputs, matches
     if (
         isinstance(aux_outputs, (list, tuple))
         and aux_outputs

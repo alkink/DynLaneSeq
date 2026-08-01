@@ -6,6 +6,7 @@ import torch
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.factory import build_criterion, build_dataloader, build_matcher, build_model
+from dynlaneseq_eg.engine.train_one_epoch import forward_with_matches
 from dynlaneseq_eg.modeling.common import nested_to_device
 
 
@@ -23,8 +24,14 @@ def main() -> None:
     images, targets, metas = next(iter(loader))
     images = images.to(device)
     targets = nested_to_device(targets, device)
-    outputs = model(images)
-    matches = matcher(outputs, targets)
+    outputs, matches = forward_with_matches(
+        model,
+        images,
+        targets,
+        matcher,
+        cfg,
+        iteration=0,
+    )
     losses = criterion(outputs, targets, matches)
     losses["loss_total"].backward()
     print({k: float(v.detach().cpu()) for k, v in losses.items()})
@@ -33,4 +40,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

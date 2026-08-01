@@ -10,6 +10,47 @@ from torch.nn import functional as F
 from .common import soft_expected_x, sort_range_norm
 
 
+def _heterogeneous_group_attention(
+    attention: nn.MultiheadAttention,
+    q: torch.Tensor,
+    group_sizes: tuple[int, ...],
+) -> torch.Tensor:
+    """Apply self-attention independently to possibly unequal query groups.
+
+    Groups with the same width are folded into the batch dimension so the
+    32+8+8+8 hybrid layout needs only two attention calls, not four.  This
+    preserves strict isolation between the inference group and train-only
+    auxiliary groups without padding the small groups to 32 queries.
+    """
+
+    sizes = tuple(int(size) for size in group_sizes)
+    if not sizes or any(size < 1 for size in sizes):
+        raise ValueError("group_sizes must contain positive integers")
+    if sum(sizes) != int(q.shape[1]):
+        raise ValueError(
+            f"group_sizes sum to {sum(sizes)}, expected {int(q.shape[1])} queries"
+        )
+    if len(sizes) == 1:
+        return attention(q, q, q, need_weights=False)[0]
+
+    batch_rows = int(q.shape[0])
+    chunks = list(torch.split(q, sizes, dim=1))
+    outputs: list[torch.Tensor | None] = [None] * len(chunks)
+    indices_by_size: dict[int, list[int]] = {}
+    for index, size in enumerate(sizes):
+        indices_by_size.setdefault(size, []).append(index)
+    for size, indices in indices_by_size.items():
+        folded = torch.cat([chunks[index] for index in indices], dim=0)
+        folded_delta = attention(folded, folded, folded, need_weights=False)[0]
+        for index, delta in zip(indices, folded_delta.split(batch_rows, dim=0)):
+            if int(delta.shape[1]) != size:
+                raise RuntimeError("grouped attention returned an unexpected width")
+            outputs[index] = delta
+    if any(output is None for output in outputs):
+        raise RuntimeError("grouped attention failed to populate every group")
+    return torch.cat([output for output in outputs if output is not None], dim=1)
+
+
 class RowAwareCrossAttentionLayer(nn.Module):
     """Let lane-row tokens read row evidence and exchange structured context."""
 
@@ -46,7 +87,12 @@ class RowAwareCrossAttentionLayer(nn.Module):
         batch_rows: int,
         num_instances: int,
         num_groups: int | None = None,
+        group_sizes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        if group_sizes is not None:
+            if int(q.shape[0]) != int(batch_rows) or int(q.shape[1]) != int(num_instances):
+                raise ValueError("grouped attention shape metadata does not match q")
+            return _heterogeneous_group_attention(self.inter_attn, q, group_sizes)
         active_num_groups = self.num_groups if num_groups is None else int(num_groups)
         if active_num_groups < 1:
             raise ValueError("active num_groups must be >= 1")
@@ -71,6 +117,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
         row_key_features: torch.Tensor,
         *,
         num_groups: int | None = None,
+        group_sizes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         b, n, r, c = row_tokens.shape
         _, rv, x_bins, _ = row_value_features.shape
@@ -95,6 +142,7 @@ class RowAwareCrossAttentionLayer(nn.Module):
                 batch_rows=b * r,
                 num_instances=n,
                 num_groups=num_groups,
+                group_sizes=group_sizes,
             )
         )
         q = q.view(b, r, n, c).permute(0, 2, 1, 3).contiguous()
@@ -374,7 +422,12 @@ class ReferenceGuidedRowLayer(nn.Module):
         batch_rows: int,
         num_instances: int,
         num_groups: int | None = None,
+        group_sizes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        if group_sizes is not None:
+            if int(q.shape[0]) != int(batch_rows) or int(q.shape[1]) != int(num_instances):
+                raise ValueError("grouped attention shape metadata does not match q")
+            return _heterogeneous_group_attention(self.inter_attn, q, group_sizes)
         active_num_groups = self.num_groups if num_groups is None else int(num_groups)
         if active_num_groups < 1:
             raise ValueError("active num_groups must be >= 1")
@@ -403,6 +456,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         *,
         input_w: int,
         num_groups: int | None = None,
+        group_sizes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         b, n, r, c = row_tokens.shape
         if c != self.dim:
@@ -505,6 +559,7 @@ class ReferenceGuidedRowLayer(nn.Module):
                 batch_rows=b * r,
                 num_instances=n,
                 num_groups=num_groups,
+                group_sizes=group_sizes,
             )
         )
         q = q.view(b, r, n, c).permute(0, 2, 1, 3).contiguous()
@@ -747,18 +802,55 @@ class StructuredLaneQueryHead(nn.Module):
         exist_prior_prob: float | None = None,
         intermediate_supervision: bool = False,
         inference_group_index: int | None = None,
+        training_auxiliary_group_sizes: list[int] | tuple[int, ...] | None = None,
         row_reference: dict[str, Any] | None = None,
         set_selection: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.dim = int(dim)
-        self.num_instances = int(num_instances)
+        self.primary_num_instances = int(num_instances)
+        self.training_auxiliary_group_sizes = tuple(
+            int(size) for size in (training_auxiliary_group_sizes or ())
+        )
+        if any(size < 1 for size in self.training_auxiliary_group_sizes):
+            raise ValueError(
+                "structured_query.training_auxiliary_group_sizes must contain positive integers"
+            )
+        self.num_instances = self.primary_num_instances + sum(
+            self.training_auxiliary_group_sizes
+        )
         self.num_rows = int(num_rows)
         self.x_bins = int(x_bins)
         self.evidence_x_bins = int(evidence_x_bins) if evidence_x_bins is not None else self.x_bins
         self.input_w = int(input_w)
         self.use_x_pos = bool(use_x_pos)
-        self.num_groups = int(num_groups)
+        legacy_num_groups = int(num_groups)
+        if self.training_auxiliary_group_sizes:
+            if legacy_num_groups != 1:
+                raise ValueError(
+                    "training_auxiliary_group_sizes requires num_groups=1 for the primary group"
+                )
+            if inference_group_index is not None:
+                raise ValueError(
+                    "training_auxiliary_group_sizes already fixes inference to the primary group"
+                )
+            self.interaction_group_sizes = (
+                self.primary_num_instances,
+                *self.training_auxiliary_group_sizes,
+            )
+            self.num_groups = len(self.interaction_group_sizes)
+        else:
+            self.num_groups = legacy_num_groups
+            if self.num_groups < 1:
+                raise ValueError("structured_query.num_groups must be >= 1")
+            if self.num_instances % self.num_groups != 0:
+                raise ValueError(
+                    f"structured_query.num_instances={self.num_instances} must be divisible by num_groups={self.num_groups}"
+                )
+            group_size = self.num_instances // self.num_groups
+            self.interaction_group_sizes = tuple(
+                group_size for _ in range(self.num_groups)
+            )
         self.exist_prior_prob = None if exist_prior_prob is None else float(exist_prior_prob)
         self.intermediate_supervision = bool(intermediate_supervision)
         self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
@@ -766,14 +858,8 @@ class StructuredLaneQueryHead(nn.Module):
         self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
-        if self.num_groups < 1:
-            raise ValueError("structured_query.num_groups must be >= 1")
         if self.evidence_x_bins < 1:
             raise ValueError("structured_query.evidence_x_bins must be >= 1")
-        if self.num_instances % self.num_groups != 0:
-            raise ValueError(
-                f"structured_query.num_instances={self.num_instances} must be divisible by num_groups={self.num_groups}"
-            )
         if self.inference_group_index is not None and not 0 <= self.inference_group_index < self.num_groups:
             raise ValueError(
                 "structured_query.inference_group_index must be in "
@@ -782,7 +868,10 @@ class StructuredLaneQueryHead(nn.Module):
         if self.exist_prior_prob is not None and not 0.0 < self.exist_prior_prob < 1.0:
             raise ValueError("structured_query.exist_prior_prob must be between 0 and 1")
 
-        self.instance_tokens = nn.Embedding(self.num_instances, self.dim)
+        # Keep the deployable embedding identical to the 32-query control.
+        # Train-only embeddings are initialized after every shared module so
+        # their extra RNG draws cannot perturb the control parameter seed.
+        self.instance_tokens = nn.Embedding(self.primary_num_instances, self.dim)
         self.row_tokens = nn.Embedding(self.num_rows, self.dim)
         self.x_tokens = nn.Embedding(self.evidence_x_bins, self.dim) if self.use_x_pos else None
         nn.init.normal_(self.instance_tokens.weight, std=0.02)
@@ -865,9 +954,12 @@ class StructuredLaneQueryHead(nn.Module):
                 raise ValueError("row-reference prior sigmas must be positive")
             if self.initial_prior_strength < 0.0 or self.output_prior_strength < 0.0:
                 raise ValueError("row-reference prior strengths must be non-negative")
-            group_size = self.num_instances // self.num_groups
-            bottom = torch.linspace(0.08, 0.92, group_size, dtype=torch.float32)
-            bottom = bottom.repeat(self.num_groups)
+            bottom = torch.linspace(
+                0.08,
+                0.92,
+                self.primary_num_instances,
+                dtype=torch.float32,
+            )
             row_fraction = torch.linspace(0.0, 1.0, self.num_rows, dtype=torch.float32)
             centers = 0.5 + (bottom[:, None] - 0.5) * (
                 0.35 + 0.65 * row_fraction[None, :]
@@ -875,6 +967,29 @@ class StructuredLaneQueryHead(nn.Module):
             self.reference_anchor_logits = nn.Parameter(
                 torch.logit(centers.clamp(1e-4, 1.0 - 1e-4))
             )
+            if self.training_auxiliary_group_sizes:
+                auxiliary_bottom = torch.cat(
+                    [
+                        torch.linspace(
+                            0.08,
+                            0.92,
+                            group_size,
+                            dtype=torch.float32,
+                        )
+                        for group_size in self.training_auxiliary_group_sizes
+                    ],
+                    dim=0,
+                )
+                auxiliary_centers = 0.5 + (auxiliary_bottom[:, None] - 0.5) * (
+                    0.35 + 0.65 * row_fraction[None, :]
+                )
+                self.training_auxiliary_reference_anchor_logits = nn.Parameter(
+                    torch.logit(
+                        auxiliary_centers.clamp(1e-4, 1.0 - 1e-4)
+                    )
+                )
+            else:
+                self.training_auxiliary_reference_anchor_logits = None
         else:
             self.layers = nn.ModuleList(
                 [
@@ -895,6 +1010,7 @@ class StructuredLaneQueryHead(nn.Module):
             self.reference_coordinate = None
             self.reference_logit_scale = None
             self.reference_anchor_logits = None
+            self.training_auxiliary_reference_anchor_logits = None
         self.row_norm = nn.LayerNorm(self.dim)
         self.lane_norm = nn.LayerNorm(self.dim)
         self.row_x = nn.Linear(self.dim, self.x_bins)
@@ -927,6 +1043,13 @@ class StructuredLaneQueryHead(nn.Module):
             if self.exist_prior_prob is not None:
                 lane_logit = 0.5 * math.log(self.exist_prior_prob / (1.0 - self.exist_prior_prob))
                 self.exist[-1].bias.copy_(self.exist[-1].bias.new_tensor([lane_logit, -lane_logit]))
+        self.training_auxiliary_instance_tokens = (
+            nn.Embedding(sum(self.training_auxiliary_group_sizes), self.dim)
+            if self.training_auxiliary_group_sizes
+            else None
+        )
+        if self.training_auxiliary_instance_tokens is not None:
+            nn.init.normal_(self.training_auxiliary_instance_tokens.weight, std=0.02)
 
     def _row_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.feature_proj(features)
@@ -1039,10 +1162,30 @@ class StructuredLaneQueryHead(nn.Module):
         dtype = features.dtype
         device = features.device
         instance = self.instance_tokens.weight.to(device=device, dtype=dtype)
+        if (
+            self.training_auxiliary_instance_tokens is not None
+            and not inference_only
+        ):
+            instance = torch.cat(
+                (
+                    instance,
+                    self.training_auxiliary_instance_tokens.weight.to(
+                        device=device,
+                        dtype=dtype,
+                    ),
+                ),
+                dim=0,
+            )
         instance_start = 0
-        instance_end = self.num_instances
+        instance_end = int(instance.shape[0])
         active_num_groups = self.num_groups
-        if inference_only and self.inference_group_index is not None:
+        active_group_sizes: tuple[int, ...] | None = None
+        if inference_only and self.training_auxiliary_group_sizes:
+            instance_end = self.primary_num_instances
+            instance = instance[:instance_end]
+            active_num_groups = 1
+            active_group_sizes = (self.primary_num_instances,)
+        elif inference_only and self.inference_group_index is not None:
             group_size = self.num_instances // self.num_groups
             group_start = self.inference_group_index * group_size
             instance_start = group_start
@@ -1052,6 +1195,8 @@ class StructuredLaneQueryHead(nn.Module):
             # This is mathematically the same group-isolated attention it saw
             # during training, without evaluating the three train-only groups.
             active_num_groups = 1
+        elif self.training_auxiliary_group_sizes:
+            active_group_sizes = self.interaction_group_sizes
         row = self.row_tokens.weight.to(device=device, dtype=dtype)
         row_tokens = instance[:, None, :] + row[None, :, :]
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
@@ -1061,7 +1206,19 @@ class StructuredLaneQueryHead(nn.Module):
         if self.row_reference_enabled:
             if self.reference_anchor_logits is None:
                 raise RuntimeError("row-reference anchors were not initialized")
-            anchor_logits = self.reference_anchor_logits[instance_start:instance_end]
+            all_anchor_logits = self.reference_anchor_logits
+            if (
+                self.training_auxiliary_reference_anchor_logits is not None
+                and not inference_only
+            ):
+                all_anchor_logits = torch.cat(
+                    (
+                        all_anchor_logits,
+                        self.training_auxiliary_reference_anchor_logits,
+                    ),
+                    dim=0,
+                )
+            anchor_logits = all_anchor_logits[instance_start:instance_end]
             row_tokens, reference_x = self._initialize_image_reference(
                 row_tokens,
                 row_value_features,
@@ -1078,6 +1235,7 @@ class StructuredLaneQueryHead(nn.Module):
                     reference_x,
                     input_w=self.input_w,
                     num_groups=active_num_groups,
+                    group_sizes=active_group_sizes,
                 )
                 row_logit_bias = self._reference_prior_logits(
                     reference_x,
@@ -1110,6 +1268,7 @@ class StructuredLaneQueryHead(nn.Module):
                     row_value_features,
                     row_key_features,
                     num_groups=active_num_groups,
+                    group_sizes=active_group_sizes,
                 )
                 if (
                     self.intermediate_supervision
@@ -1123,6 +1282,44 @@ class StructuredLaneQueryHead(nn.Module):
                     self._predict_from_row_tokens(tokens, instance, include_quality=False)
                     for tokens in intermediate_row_tokens
                 ]
+        if self.training_auxiliary_group_sizes and not inference_only:
+            full_count = self.num_instances
+            primary_end = self.primary_num_instances
+            auxiliary_outputs = self._slice_prediction_outputs(
+                outputs,
+                primary_end,
+                full_count,
+                full_count,
+            )
+            outputs = self._slice_prediction_outputs(
+                outputs,
+                0,
+                primary_end,
+                full_count,
+            )
+            primary_intermediate_outputs = []
+            auxiliary_intermediate_outputs = []
+            for layer_outputs in intermediate_outputs:
+                primary_intermediate_outputs.append(
+                    self._slice_prediction_outputs(
+                        layer_outputs,
+                        0,
+                        primary_end,
+                        full_count,
+                    )
+                )
+                auxiliary_intermediate_outputs.append(
+                    self._slice_prediction_outputs(
+                        layer_outputs,
+                        primary_end,
+                        full_count,
+                        full_count,
+                    )
+                )
+            intermediate_outputs = primary_intermediate_outputs
+            outputs["_training_auxiliary_outputs"] = auxiliary_outputs
+            outputs["_training_auxiliary_aux_outputs"] = auxiliary_intermediate_outputs
+            outputs["_training_auxiliary_group_sizes"] = self.training_auxiliary_group_sizes
         if self.set_selection_head is not None:
             selection_logits, selection_delta_logits = self.set_selection_head(outputs)
             outputs["selection_logits"] = selection_logits
@@ -1148,6 +1345,27 @@ class StructuredLaneQueryHead(nn.Module):
         # materializes a roughly 500 MiB temporary at the paper batch size.
         outputs["structured_debug"] = {}
         return outputs
+
+    @staticmethod
+    def _slice_prediction_outputs(
+        outputs: dict[str, torch.Tensor],
+        start: int,
+        end: int,
+        candidate_count: int,
+    ) -> dict[str, torch.Tensor]:
+        """Slice the candidate axis while preserving scalar/debug tensors."""
+
+        sliced: dict[str, torch.Tensor] = {}
+        for key, value in outputs.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 2
+                and int(value.shape[1]) == int(candidate_count)
+            ):
+                sliced[key] = value[:, int(start) : int(end)]
+            else:
+                sliced[key] = value
+        return sliced
 
     def _predict_from_row_tokens(
         self,
@@ -1215,6 +1433,9 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         exist_prior_prob=structured_cfg.get("exist_prior_prob"),
         intermediate_supervision=bool(structured_cfg.get("intermediate_supervision", False)),
         inference_group_index=structured_cfg.get("inference_group_index"),
+        training_auxiliary_group_sizes=structured_cfg.get(
+            "training_auxiliary_group_sizes"
+        ),
         row_reference=structured_cfg.get("row_reference"),
         set_selection=structured_cfg.get("set_selection"),
     )

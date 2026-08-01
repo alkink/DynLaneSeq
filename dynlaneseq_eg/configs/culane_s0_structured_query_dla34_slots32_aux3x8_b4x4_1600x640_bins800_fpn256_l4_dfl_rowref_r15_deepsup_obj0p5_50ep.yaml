@@ -1,0 +1,20 @@
+_base_: culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_slots32_aux3x8_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep
+
+# Preserve the complete 32-query global one-to-one inference set.  Three
+# isolated eight-query groups exist only during training and each receives an
+# independent Hungarian match per GT.  They share decoder/head weights but do
+# not exchange same-row attention with the primary group.
+model:
+  structured_query:
+    training_auxiliary_group_sizes: [8, 8, 8]
+
+loss:
+  # Main loss remains unchanged and is computed only on the deployable 32
+  # queries.  The normalized auxiliary objective contributes half as much.
+  lambda_training_auxiliary: 0.5
+
+training:
+  checkpoint_interval: 5000
+

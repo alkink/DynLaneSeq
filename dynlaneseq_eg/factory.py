@@ -101,6 +101,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         lambda_geometry_draft=float(loss.get("lambda_geometry_draft", 0.0)),
         lambda_intermediate=float(loss.get("lambda_intermediate", 0.0)),
         intermediate_layer_weights=tuple(float(v) for v in loss.get("intermediate_layer_weights", [])),
+        lambda_training_auxiliary=float(
+            loss.get("lambda_training_auxiliary", 0.0)
+        ),
         geometry_reduction=str(loss.get("geometry_reduction", "global_rows")),
     )
     if "smoothness_contiguous" in getattr(LossConfig, "__dataclass_fields__", {}):
