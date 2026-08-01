@@ -8,6 +8,7 @@ DATA_ROOT="${DATA_ROOT:-/workspace/CULane}"
 DEVICE="${DEVICE:-cuda}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
+OFFICIAL_IOU_WORKERS="${OFFICIAL_IOU_WORKERS:-${NUM_WORKERS}}"
 
 CONTROL_CONFIG="${CONTROL_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml}"
 CONTROL_CHECKPOINT="${CONTROL_CHECKPOINT:-outputs/culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep/iter_0025000.pt}"
@@ -69,10 +70,8 @@ print("checkpoint audit passed: paired 25k primary32 control and aux3x8 candidat
 PY
 
 mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}"
-CONTROL_Q025_JSON="${OUTPUT_DIR}/control_q0p25_full_val.json"
-CANDIDATE_Q025_JSON="${OUTPUT_DIR}/candidate_q0p25_full_val.json"
-CONTROL_HISTORICAL_JSON="${OUTPUT_DIR}/control_q0p50_thr0p30_full_val.json"
-CANDIDATE_HISTORICAL_JSON="${OUTPUT_DIR}/candidate_q0p50_thr0p30_full_val.json"
+CONTROL_JSON="${OUTPUT_DIR}/control_fixed_points_full_val.json"
+CANDIDATE_JSON="${OUTPUT_DIR}/candidate_fixed_points_full_val.json"
 SUMMARY_JSON="${OUTPUT_DIR}/summary.json"
 
 common_args=(
@@ -81,61 +80,44 @@ common_args=(
   --device "${DEVICE}"
   --top-k-values 4
   --iou-thresholds 0.5 0.75
+  --quality-powers 0.25 0.50
+  --score-thresholds 0.15 0.20 0.30
+  --operating-points 0.25:0.15 0.25:0.20 0.50:0.30
+  --fixed-points-only
   --line-width 30
   --nms-distance-thresh-px 20.0
   --nms-min-overlap-points 5
   --max-batches 0
   --eval-batch-size "${EVAL_BATCH_SIZE}"
   --num-workers "${NUM_WORKERS}"
+  --official-iou-workers "${OFFICIAL_IOU_WORKERS}"
   --sample-strategy sequential
   --cache-dir "${CACHE_DIR}"
   --reuse-cache
   --exact-postprocess
 )
 
-echo "===== 1/5 control full val: frozen q=0.25, thresholds=0.15/0.20 ====="
+echo "===== 1/3 control full val: all three fixed operating points in one pass ====="
 "${PYTHON}" -u -m dynlaneseq_eg.tools.analyze_oracle_topk \
   --config "${CONTROL_CONFIG}" \
   --checkpoint "${CONTROL_CHECKPOINT}" \
-  --quality-powers 0.25 \
-  --score-thresholds 0.15 0.20 \
-  --output-json "${CONTROL_Q025_JSON}" \
+  --output-json "${CONTROL_JSON}" \
   "${common_args[@]}"
 
-echo "===== 2/5 candidate full val: frozen q=0.25, thresholds=0.15/0.20 ====="
+echo "===== 2/3 candidate full val: all three fixed operating points in one pass ====="
 "${PYTHON}" -u -m dynlaneseq_eg.tools.analyze_oracle_topk \
   --config "${CANDIDATE_CONFIG}" \
   --checkpoint "${CANDIDATE_CHECKPOINT}" \
-  --quality-powers 0.25 \
-  --score-thresholds 0.15 0.20 \
-  --output-json "${CANDIDATE_Q025_JSON}" \
+  --output-json "${CANDIDATE_JSON}" \
   "${common_args[@]}"
 
-echo "===== 3/5 control historical setting: q=0.50, threshold=0.30 ====="
-"${PYTHON}" -u -m dynlaneseq_eg.tools.analyze_oracle_topk \
-  --config "${CONTROL_CONFIG}" \
-  --checkpoint "${CONTROL_CHECKPOINT}" \
-  --quality-powers 0.50 \
-  --score-thresholds 0.30 \
-  --output-json "${CONTROL_HISTORICAL_JSON}" \
-  "${common_args[@]}"
-
-echo "===== 4/5 candidate historical setting: q=0.50, threshold=0.30 ====="
-"${PYTHON}" -u -m dynlaneseq_eg.tools.analyze_oracle_topk \
-  --config "${CANDIDATE_CONFIG}" \
-  --checkpoint "${CANDIDATE_CHECKPOINT}" \
-  --quality-powers 0.50 \
-  --score-thresholds 0.30 \
-  --output-json "${CANDIDATE_HISTORICAL_JSON}" \
-  "${common_args[@]}"
-
-echo "===== 5/5 fixed-point full-validation confirmation ====="
+echo "===== 3/3 fixed-point full-validation confirmation ====="
 "${PYTHON}" -u -m \
   dynlaneseq_eg.tools.summarize_hybrid_primary_auxiliary_full_validation \
-  --control-q025-json "${CONTROL_Q025_JSON}" \
-  --candidate-q025-json "${CANDIDATE_Q025_JSON}" \
-  --control-historical-json "${CONTROL_HISTORICAL_JSON}" \
-  --candidate-historical-json "${CANDIDATE_HISTORICAL_JSON}" \
+  --control-q025-json "${CONTROL_JSON}" \
+  --candidate-q025-json "${CANDIDATE_JSON}" \
+  --control-historical-json "${CONTROL_JSON}" \
+  --candidate-historical-json "${CANDIDATE_JSON}" \
   --output-json "${SUMMARY_JSON}"
 
 echo "Full-validation result: ${SUMMARY_JSON}"

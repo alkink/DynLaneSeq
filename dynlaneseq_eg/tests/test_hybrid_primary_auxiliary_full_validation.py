@@ -4,7 +4,10 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
+import torch
 
+from dynlaneseq_eg.evaluation import candidate_diagnostics
+from dynlaneseq_eg.tools.analyze_oracle_topk import _resolve_operating_points
 from dynlaneseq_eg.tools.summarize_hybrid_primary_auxiliary_full_validation import (
     summarize,
 )
@@ -165,3 +168,78 @@ def test_full_validation_summary_rejects_subset_reports() -> None:
 
     with pytest.raises(ValueError, match="refuses a max-batches subset"):
         summarize(control, candidate, control_historical, candidate_historical)
+
+
+def test_full_validation_summary_accepts_combined_fixed_point_reports() -> None:
+    control = _q025_report(candidate=False)
+    control["rows"].extend(_historical_report(candidate=False)["rows"])
+    candidate = _q025_report(candidate=True)
+    candidate["rows"].extend(_historical_report(candidate=True)["rows"])
+
+    payload = summarize(control, candidate, control, candidate)
+
+    assert payload["selected_operating_points"]["candidate"]["score_threshold"] == 0.20
+    assert payload["historical_q0.50_score0.30"]["candidate"]["quality_power"] == 0.50
+
+
+def test_explicit_operating_points_are_paired_not_cartesian() -> None:
+    points = _resolve_operating_points(
+        ["0.25:0.15", "0.25:0.20", "0.50:0.30", "0.25:0.15"],
+        [0.25, 0.50],
+        [0.15, 0.20, 0.30],
+    )
+    assert points == [(0.25, 0.15), (0.25, 0.20), (0.50, 0.30)]
+
+
+def test_operating_points_keep_legacy_cartesian_default() -> None:
+    assert _resolve_operating_points([], [0.25, 0.50], [0.15, 0.30]) == [
+        (0.25, 0.15),
+        (0.25, 0.30),
+        (0.50, 0.15),
+        (0.50, 0.30),
+    ]
+
+
+@pytest.mark.parametrize("encoded", [["bad"], ["0.25:1.1"], ["-0.1:0.2"]])
+def test_operating_points_reject_invalid_values(encoded: list[str]) -> None:
+    with pytest.raises(ValueError):
+        _resolve_operating_points(encoded, [0.25], [0.15])
+
+
+def test_parallel_official_iou_cache_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    def fake_iou(record, stage_name, **_kwargs):
+        value = float(record["value"])
+        return torch.tensor([[value]]), torch.tensor([True])
+
+    monkeypatch.setattr(
+        candidate_diagnostics,
+        "official_proposal_gt_iou_matrix",
+        fake_iou,
+    )
+    template = {
+        "metadata": {},
+        "records": [
+            {"value": index, "stages": {"main": {}}}
+            for index in range(6)
+        ],
+    }
+    sequential = deepcopy(template)
+    sequential["metadata"]["cache_path"] = str(tmp_path / "sequential.pt")
+    parallel = deepcopy(template)
+    parallel["metadata"]["cache_path"] = str(tmp_path / "parallel.pt")
+
+    candidate_diagnostics.ensure_official_iou_cache(sequential, workers=1)
+    candidate_diagnostics.ensure_official_iou_cache(parallel, workers=3)
+
+    for expected, actual in zip(sequential["records"], parallel["records"]):
+        assert torch.equal(
+            expected["stages"]["main"]["official_iou"],
+            actual["stages"]["main"]["official_iou"],
+        )
+        assert torch.equal(
+            expected["stages"]["main"]["official_candidate_valid"],
+            actual["stages"]["main"]["official_candidate_valid"],
+        )

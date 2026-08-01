@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -704,6 +705,7 @@ def ensure_official_iou_cache(
     line_width: float = 30.0,
     min_valid_rows: int = 5,
     row_visibility_thresh: float = 0.0,
+    workers: int = 0,
 ) -> dict[str, Any]:
     signature = {
         "line_width": float(line_width),
@@ -716,17 +718,48 @@ def ensure_official_iou_cache(
         for stage in record.get("stages", {}).values()
     ):
         return cache
-    for record in tqdm(cache.get("records", []), ncols=80, desc="official IoU cache"):
-        for stage_name, stage in record.get("stages", {}).items():
-            matrix, candidate_valid = official_proposal_gt_iou_matrix(
+    records = cache.get("records", [])
+
+    def compute(record: dict[str, Any]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        return {
+            stage_name: official_proposal_gt_iou_matrix(
                 record,
                 stage_name,
                 line_width=line_width,
                 min_valid_rows=min_valid_rows,
                 row_visibility_thresh=row_visibility_thresh,
             )
-            stage["official_iou"] = matrix
-            stage["official_candidate_valid"] = candidate_valid.cpu()
+            for stage_name in record.get("stages", {})
+        }
+
+    worker_count = max(0, int(workers))
+    if worker_count > 1:
+        # Avoid multiplying the Python worker count by OpenCV's own thread
+        # pool (for example 12 x 12 runnable threads on a 12-core host).
+        previous_cv_threads = cv2.getNumThreads()
+        cv2.setNumThreads(1)
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                computed = executor.map(compute, records)
+                iterator = tqdm(
+                    zip(records, computed),
+                    total=len(records),
+                    ncols=80,
+                    desc="official IoU cache",
+                )
+                for record, stage_results in iterator:
+                    for stage_name, (matrix, candidate_valid) in stage_results.items():
+                        stage = record["stages"][stage_name]
+                        stage["official_iou"] = matrix
+                        stage["official_candidate_valid"] = candidate_valid.cpu()
+        finally:
+            cv2.setNumThreads(previous_cv_threads)
+    else:
+        for record in tqdm(records, ncols=80, desc="official IoU cache"):
+            for stage_name, (matrix, candidate_valid) in compute(record).items():
+                stage = record["stages"][stage_name]
+                stage["official_iou"] = matrix
+                stage["official_candidate_valid"] = candidate_valid.cpu()
     cache["metadata"]["official_iou_cache"] = signature
     cache_path = Path(cache["metadata"].get("cache_path", ""))
     if cache_path:

@@ -34,6 +34,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou-thresholds", type=float, nargs="+", default=[0.3, 0.5, 0.7])
     parser.add_argument("--quality-powers", type=float, nargs="+", default=[0.0, 0.25, 0.5])
     parser.add_argument("--score-thresholds", type=float, nargs="+", default=[0.4, 0.5, 0.55])
+    parser.add_argument(
+        "--operating-points",
+        nargs="+",
+        default=[],
+        metavar="QUALITY:SCORE",
+        help=(
+            "Evaluate only these paired model-score operating points instead "
+            "of the Cartesian product of --quality-powers and "
+            "--score-thresholds. Example: 0.25:0.15 0.25:0.20 0.50:0.30."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-points-only",
+        action="store_true",
+        help=(
+            "Skip auxiliary ranking/NMS strategies and compute only all-raw, "
+            "quality-top-k, oracle-top-k, and the requested operating points."
+        ),
+    )
     parser.add_argument("--line-width", type=float, default=30.0)
     parser.add_argument("--min-valid-rows", type=int, default=5)
     parser.add_argument("--nms-distance-thresh-px", type=float, default=None)
@@ -42,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--official-iou-workers",
+        type=int,
+        default=0,
+        help="CPU threads used to construct the exact official-raster IoU cache.",
+    )
     parser.add_argument(
         "--sample-strategy",
         choices=("sequential", "uniform"),
@@ -106,10 +131,48 @@ def _official_metric_key(iou_threshold: float) -> str:
     return f"official_iou_{float(iou_threshold):g}"
 
 
+def _resolve_operating_points(
+    encoded: list[str] | tuple[str, ...],
+    quality_powers: list[float] | tuple[float, ...],
+    score_thresholds: list[float] | tuple[float, ...],
+) -> list[tuple[float, float]]:
+    if encoded:
+        points = []
+        for value in encoded:
+            parts = str(value).split(":")
+            if len(parts) != 2:
+                raise ValueError(
+                    "operating points must use QUALITY:SCORE syntax; "
+                    f"got {value!r}"
+                )
+            quality_power, score_threshold = map(float, parts)
+            if quality_power < 0.0:
+                raise ValueError("quality power must be non-negative")
+            if not 0.0 <= score_threshold <= 1.0:
+                raise ValueError("score threshold must be in [0, 1]")
+            point = (quality_power, score_threshold)
+            if point not in points:
+                points.append(point)
+        if not points:
+            raise ValueError("at least one operating point is required")
+        return points
+    return [
+        (float(quality_power), float(score_threshold))
+        for quality_power in quality_powers
+        for score_threshold in score_thresholds
+    ]
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
     top_k_values = [args.top_k] if args.top_k is not None else list(args.top_k_values)
+    operating_points = _resolve_operating_points(
+        args.operating_points,
+        args.quality_powers,
+        args.score_thresholds,
+    )
+    active_quality_powers = sorted({point[0] for point in operating_points})
     cache = load_or_collect_cache(
         args.config,
         args.checkpoint,
@@ -133,6 +196,7 @@ def main() -> None:
             line_width=args.line_width,
             min_valid_rows=args.min_valid_rows,
             row_visibility_thresh=args.row_visibility_thresh,
+            workers=args.official_iou_workers,
         )
     input_h = int(metadata["input_h"])
     input_w = int(metadata["input_w"])
@@ -179,6 +243,98 @@ def main() -> None:
             exist_scores = stage_scores(stage, quality_power=0.0)
             quality_scores = _quality_scores(stage)
             selection_scores = _selection_scores(stage)
+            if args.fixed_points_only:
+                # The selected proposal IDs do not depend on the evaluation
+                # IoU threshold.  Compute each deployment trace once per image
+                # and reuse it for every requested IoU threshold.
+                for iou_threshold in args.iou_thresholds:
+                    _update(
+                        counters[
+                            (
+                                stage_name,
+                                "all_raw",
+                                0,
+                                iou_threshold,
+                                None,
+                                None,
+                            )
+                        ],
+                        iou,
+                        all_ids,
+                        iou_threshold,
+                    )
+                for top_k in top_k_values:
+                    quality_ids = _rank_ids(quality_scores, candidate_valid, top_k)
+                    point_selections = {}
+                    for quality_power, score_threshold in operating_points:
+                        trace = trace_postprocess(
+                            stage,
+                            input_h=input_h,
+                            input_w=input_w,
+                            score_thresh=score_threshold,
+                            quality_power=quality_power,
+                            min_valid_rows=args.min_valid_rows,
+                            nms_distance_thresh_px=nms_distance,
+                            nms_min_overlap_points=nms_overlap,
+                            top_k=top_k,
+                            row_visibility_thresh=args.row_visibility_thresh,
+                        )
+                        point_selections[(quality_power, score_threshold)] = list(
+                            trace["selected_ids"]
+                        )
+
+                    for iou_threshold in args.iou_thresholds:
+                        _update(
+                            counters[
+                                (
+                                    stage_name,
+                                    "quality_topk",
+                                    top_k,
+                                    iou_threshold,
+                                    None,
+                                    None,
+                                )
+                            ],
+                            iou,
+                            quality_ids,
+                            iou_threshold,
+                        )
+                        oracle = cardinality_oracle_assignment(
+                            iou,
+                            iou_threshold,
+                            top_k,
+                            candidate_valid,
+                        )
+                        _update(
+                            counters[
+                                (
+                                    stage_name,
+                                    "oracle_topk",
+                                    top_k,
+                                    iou_threshold,
+                                    None,
+                                    None,
+                                )
+                            ],
+                            iou,
+                            list(oracle.proposal_ids),
+                            iou_threshold,
+                        )
+                        for point, selected_ids in point_selections.items():
+                            quality_power, score_threshold = point
+                            key = (
+                                stage_name,
+                                "model_topk_nms",
+                                top_k,
+                                iou_threshold,
+                                quality_power,
+                                score_threshold,
+                            )
+                            _update(counters[key], iou, selected_ids, iou_threshold)
+                            if args.exact_postprocess:
+                                exact_selections[key][record["image_id"]] = selected_ids
+                continue
+
             for iou_threshold in args.iou_thresholds:
                 _update(counters[(stage_name, "all_raw", 0, iou_threshold, None, None)], iou, all_ids, iou_threshold)
                 for top_k in top_k_values:
@@ -186,12 +342,6 @@ def main() -> None:
                     quality_ids = _rank_ids(quality_scores, candidate_valid, top_k)
                     _update(counters[(stage_name, "exist_topk", top_k, iou_threshold, 0.0, None)], iou, exist_ids, iou_threshold)
                     _update(counters[(stage_name, "quality_topk", top_k, iou_threshold, None, None)], iou, quality_ids, iou_threshold)
-                    # Train-many/infer-one deploys one unique query group and
-                    # ranks it by quality alone.  Keep this path separate from
-                    # ``model_topk_nms`` (existence * quality**power), otherwise
-                    # a quality-only deployment cannot be evaluated with the
-                    # exact official-raster counts or a frozen validation
-                    # threshold without rewriting predictions for every value.
                     quality_override = {
                         index: float(quality_scores[index])
                         for index in range(int(quality_scores.shape[0]))
@@ -250,6 +400,10 @@ def main() -> None:
                             selection_ids,
                             iou_threshold,
                         )
+                        selection_override = {
+                            index: float(selection_scores[index])
+                            for index in range(int(selection_scores.shape[0]))
+                        }
                         for score_threshold in args.score_thresholds:
                             selection_trace = trace_postprocess(
                                 stage,
@@ -262,16 +416,9 @@ def main() -> None:
                                 nms_min_overlap_points=nms_overlap,
                                 top_k=top_k,
                                 row_visibility_thresh=args.row_visibility_thresh,
-                                score_override={
-                                    index: float(selection_scores[index])
-                                    for index in range(
-                                        int(selection_scores.shape[0])
-                                    )
-                                },
+                                score_override=selection_override,
                             )
-                            selection_nms_ids = list(
-                                selection_trace["selected_ids"]
-                            )
+                            selection_nms_ids = list(selection_trace["selected_ids"])
                             selection_key = (
                                 stage_name,
                                 "selection_topk_nms",
@@ -287,9 +434,9 @@ def main() -> None:
                                 iou_threshold,
                             )
                             if args.exact_postprocess:
-                                exact_selections[selection_key][
-                                    record["image_id"]
-                                ] = selection_nms_ids
+                                exact_selections[selection_key][record["image_id"]] = (
+                                    selection_nms_ids
+                                )
 
                     oracle = cardinality_oracle_assignment(iou, iou_threshold, top_k, candidate_valid)
                     oracle_ids = list(oracle.proposal_ids)
@@ -318,8 +465,7 @@ def main() -> None:
                     )
                     if args.exact_postprocess:
                         exact_selections[(stage_name, "oracle_topk_nms", top_k, iou_threshold, None, None)][record["image_id"]] = oracle_nms_ids
-
-                    for quality_power in args.quality_powers:
+                    for quality_power in active_quality_powers:
                         scores = stage_scores(stage, quality_power=quality_power)
                         ranked_ids = _rank_ids(scores, candidate_valid, top_k)
                         _update(
@@ -328,31 +474,31 @@ def main() -> None:
                             ranked_ids,
                             iou_threshold,
                         )
-                        for score_threshold in args.score_thresholds:
-                            trace = trace_postprocess(
-                                stage,
-                                input_h=input_h,
-                                input_w=input_w,
-                                score_thresh=score_threshold,
-                                quality_power=quality_power,
-                                min_valid_rows=args.min_valid_rows,
-                                nms_distance_thresh_px=nms_distance,
-                                nms_min_overlap_points=nms_overlap,
-                                top_k=top_k,
-                                row_visibility_thresh=args.row_visibility_thresh,
-                            )
-                            selected_ids = list(trace["selected_ids"])
-                            key = (
-                                stage_name,
-                                "model_topk_nms",
-                                top_k,
-                                iou_threshold,
-                                quality_power,
-                                score_threshold,
-                            )
-                            _update(counters[key], iou, selected_ids, iou_threshold)
-                            if args.exact_postprocess:
-                                exact_selections[key][record["image_id"]] = selected_ids
+                    for quality_power, score_threshold in operating_points:
+                        trace = trace_postprocess(
+                            stage,
+                            input_h=input_h,
+                            input_w=input_w,
+                            score_thresh=score_threshold,
+                            quality_power=quality_power,
+                            min_valid_rows=args.min_valid_rows,
+                            nms_distance_thresh_px=nms_distance,
+                            nms_min_overlap_points=nms_overlap,
+                            top_k=top_k,
+                            row_visibility_thresh=args.row_visibility_thresh,
+                        )
+                        selected_ids = list(trace["selected_ids"])
+                        key = (
+                            stage_name,
+                            "model_topk_nms",
+                            top_k,
+                            iou_threshold,
+                            quality_power,
+                            score_threshold,
+                        )
+                        _update(counters[key], iou, selected_ids, iou_threshold)
+                        if args.exact_postprocess:
+                            exact_selections[key][record["image_id"]] = selected_ids
 
     rows: list[dict[str, Any]] = []
     for key in sorted(counters, key=lambda value: tuple("" if item is None else str(item) for item in value)):
@@ -388,8 +534,13 @@ def main() -> None:
             tool="analyze_oracle_topk",
             top_k_values=top_k_values,
             iou_thresholds=args.iou_thresholds,
-            quality_powers=args.quality_powers,
-            score_thresholds=args.score_thresholds,
+            quality_powers=active_quality_powers,
+            score_thresholds=sorted({point[1] for point in operating_points}),
+            operating_points=[
+                {"quality_power": quality_power, "score_threshold": score_threshold}
+                for quality_power, score_threshold in operating_points
+            ],
+            fixed_points_only=bool(args.fixed_points_only),
             line_width=args.line_width,
             iou_space="official_raster" if args.exact_postprocess else "row_space",
             nms_distance_thresh_px=nms_distance,
