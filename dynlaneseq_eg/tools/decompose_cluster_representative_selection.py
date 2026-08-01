@@ -247,6 +247,31 @@ def _dominant_diagnosis(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "joint_interaction": "joint_interaction_beyond_best_single",
         "nms_partition": "nms_partition_loss",
     }
+    mean_headroom = {
+        label: sum(
+            float(row["headroom_points"][metric])
+            for row in results.values()
+        )
+        / float(max(len(results), 1))
+        for label, metric in names.items()
+    }
+    ordered = sorted(mean_headroom, key=mean_headroom.get, reverse=True)
+    lead = float(mean_headroom[ordered[0]]) - float(mean_headroom[ordered[1]])
+    if lead >= 2.0:
+        diagnosis = f"{ordered[0]}_is_primary"
+        confidence = "strong"
+    else:
+        diagnosis = "mixed_cluster_and_representative_failure"
+        confidence = "moderate"
+    return {
+        "diagnosis": diagnosis,
+        "confidence": confidence,
+        "mean_headroom_points": mean_headroom,
+        "note": (
+            "Representative and cluster-ranking counterfactuals are parallel "
+            "oracles and must not be added together."
+        ),
+    }
 
 
 def verify_reference_report(
@@ -283,31 +308,6 @@ def verify_reference_report(
     return {
         "matched": True,
         "comparisons": comparisons,
-    }
-    mean_headroom = {
-        label: sum(
-            float(row["headroom_points"][metric])
-            for row in results.values()
-        )
-        / float(max(len(results), 1))
-        for label, metric in names.items()
-    }
-    ordered = sorted(mean_headroom, key=mean_headroom.get, reverse=True)
-    lead = float(mean_headroom[ordered[0]]) - float(mean_headroom[ordered[1]])
-    if lead >= 2.0:
-        diagnosis = f"{ordered[0]}_is_primary"
-        confidence = "strong"
-    else:
-        diagnosis = "mixed_cluster_and_representative_failure"
-        confidence = "moderate"
-    return {
-        "diagnosis": diagnosis,
-        "confidence": confidence,
-        "mean_headroom_points": mean_headroom,
-        "note": (
-            "Representative and cluster-ranking counterfactuals are parallel "
-            "oracles and must not be added together."
-        ),
     }
 
 

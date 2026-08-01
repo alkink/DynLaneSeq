@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from dynlaneseq_eg.tools.decompose_cluster_representative_selection import (
+    _dominant_diagnosis,
     _finish,
     decompose_one_image,
     nms_clusters_from_trace,
@@ -126,3 +127,17 @@ def test_joint_interaction_is_reported_separately() -> None:
     assert headroom["within_selected_cluster_representative"] == 0.0
     assert headroom["cluster_ranking_with_source_representatives"] == 0.0
     assert headroom["joint_interaction_beyond_best_single"] == 50.0
+
+
+def test_dominant_diagnosis_returns_cluster_ranking() -> None:
+    row = {
+        "headroom_points": {
+            "within_selected_cluster_representative": 5.0,
+            "cluster_ranking_with_source_representatives": 15.0,
+            "joint_interaction_beyond_best_single": 3.0,
+            "nms_partition_loss": 0.0,
+        }
+    }
+    decision = _dominant_diagnosis({"0.50": row, "0.70": row})
+    assert decision["diagnosis"] == "cluster_ranking_is_primary"
+    assert decision["confidence"] == "strong"
