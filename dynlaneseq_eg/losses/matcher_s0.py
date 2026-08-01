@@ -6,6 +6,7 @@ from itertools import combinations, permutations
 import torch
 
 from dynlaneseq_eg.modeling.common import sort_range_norm
+from .range_aware_iou import pairwise_range_aware_row_strip_iou
 
 
 @dataclass
@@ -21,6 +22,9 @@ class MatcherConfig:
     assignment: str = "hungarian"
     num_groups: int = 1
     object_cost_type: str = "neg_log_probability"
+    cost_type: str = "composite"
+    range_aware_line_width: float = 30.0
+    range_aware_min_valid_rows: int = 5
 
 
 class HungarianMatcherS0:
@@ -225,6 +229,39 @@ class HungarianMatcherS0:
                 "mean_cost_range": torch.tensor(0.0, device=device),
                 "mean_cost_line_iou": torch.tensor(0.0, device=device),
             }
+
+        cost_type = str(self.cfg.cost_type).strip().lower()
+        if cost_type in {
+            "range_aware_iou",
+            "range_aware_raster_iou",
+            "official_iou_surrogate",
+        }:
+            pairwise_iou, _candidate_valid, gt_lane_valid = (
+                pairwise_range_aware_row_strip_iou(
+                    pred_x_rows,
+                    range_norm,
+                    gt_x,
+                    gt_mask,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.range_aware_line_width),
+                    min_valid_rows=int(self.cfg.range_aware_min_valid_rows),
+                )
+            )
+            cost = 1.0 - pairwise_iou
+            cost = torch.where(
+                gt_lane_valid.view(1, m),
+                cost,
+                torch.full_like(cost, 1e6),
+            )
+            zero = cost.detach().new_zeros(())
+            return cost, {
+                "mean_cost_obj": zero,
+                "mean_cost_point": zero,
+                "mean_cost_range": zero,
+                "mean_cost_line_iou": cost.detach().mean(),
+            }
+        if cost_type not in {"composite", "legacy"}:
+            raise ValueError(f"Unsupported matcher.cost_type: {self.cfg.cost_type!r}")
 
         p_lane = torch.softmax(exist_logits, dim=-1)[:, 0]
         object_cost_type = str(self.cfg.object_cost_type).strip().lower()

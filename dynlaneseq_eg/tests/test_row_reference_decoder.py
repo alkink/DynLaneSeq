@@ -146,6 +146,62 @@ def test_set_selection_can_backpropagate_into_decoder_state_features() -> None:
     assert float(head.layers[0].ffn[0].weight.grad.abs().sum()) > 0.0
 
 
+def test_unified_selection_is_independent_of_legacy_scores_and_reads_p2() -> None:
+    torch.manual_seed(12)
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=4,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=1,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=1,
+        lane_pooling="mean",
+        row_reference={
+            "enabled": True,
+            "offsets_px": [-16.0, 0.0, 16.0],
+            "initial_prior_sigma_px": 16.0,
+            "output_prior_sigma_px": 8.0,
+        },
+        set_selection={
+            "enabled": True,
+            "unified_score": True,
+            "prior_prob": 0.05,
+            "hidden_dim": 32,
+            "num_layers": 1,
+            "num_heads": 4,
+            "ff_dim": 64,
+            "dropout": 0.0,
+            "curve_samples": 4,
+            "detach_geometry_features": True,
+            "use_curve_evidence": True,
+        },
+    ).train()
+    assert head.set_selection_head is not None
+    with torch.no_grad():
+        head.set_selection_head.output.weight.fill_(0.01)
+    features = torch.randn(2, 32, 8, 12, requires_grad=True)
+    output = head(features)
+    original_score, _ = head.set_selection_head(output)
+    changed = dict(output)
+    changed["exist_logits"] = torch.randn_like(output["exist_logits"]) * 100.0
+    changed["quality_logits"] = torch.randn_like(output["quality_logits"]) * 100.0
+    changed_score, _ = head.set_selection_head(changed)
+    torch.testing.assert_close(original_score, changed_score)
+
+    original_score.sum().backward()
+    assert features.grad is not None
+    assert float(features.grad.abs().sum()) > 0.0
+    # Detached curve coordinates prevent score loss from directly moving the
+    # row-distribution head solely to improve classification.
+    row_x_grad = head.row_x.weight.grad
+    assert row_x_grad is None or float(row_x_grad.abs().sum()) == 0.0
+
+
 def test_reference_decoder_backpropagates_through_image_and_reference() -> None:
     torch.manual_seed(11)
     head = _head()

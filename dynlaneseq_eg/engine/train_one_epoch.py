@@ -104,6 +104,12 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
         if isinstance(outputs, dict)
         else None
     )
+    reuse_final_assignment = bool(
+        cfg.get("matcher", {}).get(
+            "reuse_final_assignment_for_intermediate",
+            False,
+        )
+    )
     if isinstance(training_auxiliary, dict) and hasattr(matcher, "match_many"):
         main_layers = list(aux_outputs) if isinstance(aux_outputs, (list, tuple)) else []
         auxiliary_layers = (
@@ -116,42 +122,66 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
                 "training auxiliary outputs require explicit group sizes"
             )
         group_sizes = tuple(int(size) for size in training_auxiliary_group_sizes)
-        sequence = (
-            outputs,
-            *main_layers,
-            training_auxiliary,
-            *auxiliary_layers,
-        )
-        assignment_specs = [
-            (str(matcher.cfg.assignment), None)
-            for _ in range(1 + len(main_layers))
-        ] + [
-            ("grouped_one_to_many", group_sizes)
-            for _ in range(1 + len(auxiliary_layers))
-        ]
+        if reuse_final_assignment:
+            # The final geometry defines one stable ownership identity.  Deep
+            # supervision then improves the same candidates at earlier blocks
+            # instead of asking every block to solve a different Hungarian
+            # permutation.  Auxiliary groups keep their own grouped identity,
+            # but reuse it across their intermediate outputs as well.
+            sequence = (outputs, training_auxiliary)
+            assignment_specs = [
+                (str(matcher.cfg.assignment), None),
+                ("grouped_one_to_many", group_sizes),
+            ]
+        else:
+            sequence = (
+                outputs,
+                *main_layers,
+                training_auxiliary,
+                *auxiliary_layers,
+            )
+            assignment_specs = [
+                (str(matcher.cfg.assignment), None)
+                for _ in range(1 + len(main_layers))
+            ] + [
+                ("grouped_one_to_many", group_sizes)
+                for _ in range(1 + len(auxiliary_layers))
+            ]
         all_matches = matcher.match_many(
             sequence,
             targets,
             assignment_specs=assignment_specs,
         )
-        main_count = 1 + len(main_layers)
         matches = all_matches[0]
-        outputs["_aux_matches"] = all_matches[1:main_count]
-        outputs["_training_auxiliary_matches"] = all_matches[main_count]
-        outputs["_training_auxiliary_aux_matches"] = all_matches[
-            main_count + 1 :
-        ]
+        if reuse_final_assignment:
+            auxiliary_matches = all_matches[1]
+            outputs["_aux_matches"] = [matches for _ in main_layers]
+            outputs["_training_auxiliary_matches"] = auxiliary_matches
+            outputs["_training_auxiliary_aux_matches"] = [
+                auxiliary_matches for _ in auxiliary_layers
+            ]
+        else:
+            main_count = 1 + len(main_layers)
+            outputs["_aux_matches"] = all_matches[1:main_count]
+            outputs["_training_auxiliary_matches"] = all_matches[main_count]
+            outputs["_training_auxiliary_aux_matches"] = all_matches[
+                main_count + 1 :
+            ]
         return outputs, matches
     if (
         isinstance(aux_outputs, (list, tuple))
         and aux_outputs
         and hasattr(matcher, "match_many")
     ):
-        all_matches = matcher.match_many((outputs, *aux_outputs), targets)
-        matches = all_matches[0]
-        # Private training-only transport: the criterion consumes these exact
-        # per-layer assignments instead of repeating GPU/CPU matcher traffic.
-        outputs["_aux_matches"] = all_matches[1:]
+        if reuse_final_assignment:
+            matches = matcher(outputs, targets)
+            outputs["_aux_matches"] = [matches for _ in aux_outputs]
+        else:
+            all_matches = matcher.match_many((outputs, *aux_outputs), targets)
+            matches = all_matches[0]
+            # Private training-only transport: the criterion consumes these exact
+            # per-layer assignments instead of repeating GPU/CPU matcher traffic.
+            outputs["_aux_matches"] = all_matches[1:]
     else:
         matches = matcher(outputs, targets)
     return outputs, matches

@@ -6,8 +6,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
+from dynlaneseq_eg.modeling.common import sort_range_norm
 from .matcher_s0 import HungarianMatcherS0
+from .range_aware_iou import pairwise_range_aware_row_strip_iou
 
 
 @dataclass
@@ -36,6 +37,9 @@ class LossConfig:
     set_selection_rank_weight: float = 0.25
     set_selection_target_margin: float = 0.10
     set_selection_min_valid_rows: int = 5
+    set_selection_share_matcher_assignment: bool = False
+    set_selection_negative_weight: float = 1.0
+    set_selection_positive_floor: float = 0.0
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -73,6 +77,10 @@ class S0Criterion(nn.Module):
         }:
             raise ValueError(
                 f"Unsupported loss.geometry_reduction: {self.cfg.geometry_reduction!r}"
+            )
+        if not 0.0 <= float(self.cfg.set_selection_positive_floor) < 1.0:
+            raise ValueError(
+                "set_selection_positive_floor must be in [0, 1)"
             )
 
     def lane_balanced_geometry(self) -> bool:
@@ -112,7 +120,11 @@ class S0Criterion(nn.Module):
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
         if self.cfg.w_set_selection != 0:
-            set_selection = self.compute_set_selection_loss(outputs, targets)
+            set_selection = self.compute_set_selection_loss(
+                outputs,
+                targets,
+                matches,
+            )
         else:
             set_selection = {
                 "total": zero,
@@ -736,6 +748,7 @@ class S0Criterion(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Build one unique continuous-quality target per ground-truth lane.
 
@@ -746,14 +759,8 @@ class S0Criterion(nn.Module):
         """
 
         pred_x = outputs["pred_x_rows"].detach().float()
-        ranges = sort_range_norm(outputs["range_norm"].detach().float())
-        batch, candidates, rows = pred_x.shape
-        y_rows = fixed_y_rows(
-            rows,
-            int(self.cfg.input_h),
-            device=pred_x.device,
-            dtype=pred_x.dtype,
-        )
+        ranges = outputs["range_norm"].detach().float()
+        batch, candidates, _rows = pred_x.shape
         line_width = float(self.cfg.set_selection_line_width)
         min_valid_rows = int(self.cfg.set_selection_min_valid_rows)
         pairwise_rows: list[torch.Tensor] = []
@@ -763,38 +770,48 @@ class S0Criterion(nn.Module):
                 dtype=pred_x.dtype,
             )
             gt_valid = target["valid_mask"].to(pred_x.device).bool()
-            gt_valid = gt_valid & torch.isfinite(gt_x)
-            valid_gt = gt_valid.sum(dim=-1) >= min_valid_rows
-            gt_x = gt_x[valid_gt]
-            gt_valid = gt_valid[valid_gt]
             if int(gt_x.shape[0]) == 0:
                 pairwise_rows.append(pred_x.new_zeros((candidates, 0)))
                 continue
-
-            pred_valid = (
-                (y_rows.view(1, -1) >= ranges[batch_index, :, :1] * float(self.cfg.input_h))
-                & (y_rows.view(1, -1) <= ranges[batch_index, :, 1:] * float(self.cfg.input_h))
-                & torch.isfinite(pred_x[batch_index])
+            quality, _candidate_valid, _valid_gt = (
+                pairwise_range_aware_row_strip_iou(
+                    pred_x[batch_index],
+                    ranges[batch_index],
+                    gt_x,
+                    gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=line_width,
+                    min_valid_rows=min_valid_rows,
+                )
             )
-            candidate_valid = pred_valid.sum(dim=-1) >= min_valid_rows
-            pred = pred_x[batch_index, :, None, :]
-            gt = gt_x[None, :, :]
-            both = pred_valid[:, None, :] & gt_valid[None, :, :]
-            either = pred_valid[:, None, :] | gt_valid[None, :, :]
-            overlap = (line_width - (pred - gt).abs()).clamp(min=0.0)
-            overlap = torch.where(both, overlap, torch.zeros_like(overlap))
-            union = torch.where(
-                both,
-                2.0 * line_width - overlap,
-                torch.where(
-                    either,
-                    torch.full_like(overlap, line_width),
-                    torch.zeros_like(overlap),
-                ),
-            )
-            quality = overlap.sum(dim=-1) / union.sum(dim=-1).clamp_min(1e-6)
-            quality[~candidate_valid] = 0.0
             pairwise_rows.append(quality)
+
+        if bool(self.cfg.set_selection_share_matcher_assignment):
+            if matches is None or len(matches) != batch:
+                raise ValueError(
+                    "set_selection_share_matcher_assignment requires the final "
+                    "matcher assignments"
+                )
+            target = pred_x.new_zeros((batch, candidates))
+            for batch_index, (quality, match) in enumerate(
+                zip(pairwise_rows, matches)
+            ):
+                pred_indices = match["pred_indices"].to(pred_x.device)
+                gt_indices = match["gt_indices"].to(pred_x.device)
+                if pred_indices.numel() > 0:
+                    matched_quality = quality[
+                        pred_indices,
+                        gt_indices,
+                    ]
+                    positive_floor = float(self.cfg.set_selection_positive_floor)
+                    # The assignment identity is supervised even while the
+                    # from-scratch geometry is still poor.  As localization
+                    # improves, the continuous IoU term raises the target
+                    # toward one and supplies the desired quality ordering.
+                    target[batch_index, pred_indices] = positive_floor + (
+                        1.0 - positive_floor
+                    ) * matched_quality
+            return target
 
         # One D2H synchronization for the complete micro-batch, followed by
         # tiny per-image Hungarian solves on CPU and one H2D target transfer.
@@ -829,6 +846,7 @@ class S0Criterion(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]] | None = None,
     ) -> dict[str, torch.Tensor]:
         logits = outputs.get("selection_logits")
         if logits is None:
@@ -838,21 +856,31 @@ class S0Criterion(nn.Module):
             )
         selection_logits = logits.float()
         selection_targets = self.compute_set_selection_targets(
-            outputs,
-            targets,
+            outputs, targets, matches
         ).to(dtype=selection_logits.dtype)
         probability = torch.sigmoid(selection_logits)
         modulation = (
             selection_targets - probability
         ).abs().pow(float(self.cfg.set_selection_focal_beta))
-        quality_loss = (
+        per_candidate_quality = (
             modulation
             * F.binary_cross_entropy_with_logits(
                 selection_logits,
                 selection_targets,
                 reduction="none",
             )
-        ).mean()
+        )
+        negative_weight = float(self.cfg.set_selection_negative_weight)
+        if negative_weight <= 0.0:
+            raise ValueError("set_selection_negative_weight must be positive")
+        candidate_weight = torch.where(
+            selection_targets > 0.0,
+            torch.ones_like(selection_targets),
+            torch.full_like(selection_targets, negative_weight),
+        )
+        quality_loss = (
+            per_candidate_quality * candidate_weight
+        ).sum() / candidate_weight.sum().clamp_min(1.0)
 
         target_delta = (
             selection_targets.unsqueeze(-1)

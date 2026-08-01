@@ -46,6 +46,11 @@ def build_matcher(cfg: dict[str, Any]) -> HungarianMatcherS0:
             assignment=str(m.get("assignment", "hungarian")),
             num_groups=int(m.get("num_groups", 1)),
             object_cost_type=str(m.get("object_cost_type", "neg_log_probability")),
+            cost_type=str(m.get("cost_type", "composite")),
+            range_aware_line_width=float(m.get("range_aware_line_width", 30.0)),
+            range_aware_min_valid_rows=int(
+                m.get("range_aware_min_valid_rows", 5)
+            ),
         )
     )
 
@@ -86,6 +91,15 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         ),
         set_selection_min_valid_rows=int(
             loss.get("set_selection_min_valid_rows", 5)
+        ),
+        set_selection_share_matcher_assignment=bool(
+            loss.get("set_selection_share_matcher_assignment", False)
+        ),
+        set_selection_negative_weight=float(
+            loss.get("set_selection_negative_weight", 1.0)
+        ),
+        set_selection_positive_floor=float(
+            loss.get("set_selection_positive_floor", 0.0)
         ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),

@@ -1,0 +1,83 @@
+_base_: culane_s0_structured_query_dla34_slots32_aux3x8_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_unified_selection_gate_10k
+
+# One coherent train/deploy contract:
+#   * 32 global primary queries are the only deployable candidate set;
+#   * three isolated 8-query groups add geometry supervision only;
+#   * one score head learns unique final-set membership and geometry quality;
+#   * the exact same range-aware assignment supervises final geometry,
+#     intermediate layers, and final-set selection.
+model:
+  structured_query:
+    lane_pooling: mean
+    training_auxiliary_group_sizes: [8, 8, 8]
+    set_selection:
+      enabled: true
+      unified_score: true
+      # Roughly 3--4 lanes among 32 primary candidates.
+      prior_prob: 0.10
+      hidden_dim: 256
+      num_layers: 2
+      num_heads: 8
+      ff_dim: 512
+      dropout: 0.0
+      curve_samples: 20
+      range_temperature: 0.02
+      # Geometry is observed rather than directly displaced by score loss.
+      # Decoder row states and curve-aligned P2 evidence remain learnable.
+      detach_geometry_features: true
+      use_curve_evidence: true
+
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  cost_type: range_aware_iou
+  range_aware_line_width: 30.0
+  range_aware_min_valid_rows: 5
+  reuse_final_assignment_for_intermediate: true
+
+loss:
+  # Existence and the old matched-only quality head are removed from the
+  # optimization objective. They remain in the checkpoint schema solely for
+  # backwards-compatible model loading; inference never consumes them.
+  w_exist: 0.0
+  w_quality: 0.0
+  w_set_selection: 1.0
+  set_selection_line_width: 30.0
+  set_selection_min_valid_rows: 5
+  set_selection_share_matcher_assignment: true
+  # A selected query is positive from the first iteration; its target rises
+  # continuously from 0.5 toward 1.0 with range-aware localization IoU.
+  set_selection_positive_floor: 0.5
+  set_selection_negative_weight: 0.25
+  set_selection_focal_beta: 2.0
+  set_selection_rank_weight: 0.25
+  set_selection_target_margin: 0.10
+  lambda_training_auxiliary: 0.5
+
+postprocess:
+  score_mode: selection
+  # The gate deliberately tests whether learned unique-set selection can
+  # deploy without geometry-based duplicate suppression.
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 10000
+  amp: true
+  amp_dtype: bfloat16
+  check_finite_grad: true
+  compile_model: true
+  compile_mode: default
+  vis_interval: 25000
+  checkpoint_interval: 2500

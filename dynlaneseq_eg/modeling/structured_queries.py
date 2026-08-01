@@ -579,13 +579,13 @@ class ReferenceGuidedRowLayer(nn.Module):
 
 
 class SetAwareLaneSelectionHead(nn.Module):
-    """Residual, permutation-equivariant scorer over the lane proposal set.
+    """Permutation-equivariant scorer over the complete lane proposal set.
 
-    The residual is initialized to zero, so enabling this head on an existing
-    checkpoint exactly preserves the deployed existence-quality score before
-    fine-tuning.  Geometry summaries are supplied as detached observations;
-    gradients reach the decoder through the lane and row-state features
-    instead of directly pushing coordinates merely to make scoring easier.
+    Legacy mode remains a zero-initialized residual on top of the deployed
+    existence-quality score for checkpoint-compatible diagnostics. Unified
+    mode is a standalone score: it sees the exact final curve distribution,
+    visible row states, curve-aligned P2 evidence, and the other candidates.
+    It never consumes or multiplies the legacy existence/quality scores.
     """
 
     def __init__(
@@ -601,6 +601,10 @@ class SetAwareLaneSelectionHead(nn.Module):
         curve_samples: int = 20,
         base_quality_power: float = 0.5,
         range_temperature: float = 0.02,
+        unified_score: bool = False,
+        prior_prob: float = 0.05,
+        detach_geometry_features: bool = True,
+        use_curve_evidence: bool = False,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -608,6 +612,10 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.curve_samples = int(curve_samples)
         self.base_quality_power = float(base_quality_power)
         self.range_temperature = float(range_temperature)
+        self.unified_score = bool(unified_score)
+        self.prior_prob = float(prior_prob)
+        self.detach_geometry_features = bool(detach_geometry_features)
+        self.use_curve_evidence = bool(use_curve_evidence)
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -616,10 +624,19 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("set_selection.base_quality_power must be non-negative")
         if self.range_temperature <= 0.0:
             raise ValueError("set_selection.range_temperature must be positive")
+        if not 0.0 < self.prior_prob < 1.0:
+            raise ValueError("set_selection.prior_prob must be between zero and one")
 
-        # lane state + visible-row state + ten geometry/confidence summaries
-        # + base score + sampled x/confidence pairs.
-        input_dim = 2 * self.dim + 11 + 2 * self.curve_samples
+        # Unified mode uses two range-masked row-state summaries and optional
+        # exact final-curve P2 evidence. Legacy mode preserves the historical
+        # lane-query + visible-row input and includes its base score scalar.
+        state_streams = 2 + int(self.unified_score and self.use_curve_evidence)
+        scalar_count = 10 + int(not self.unified_score)
+        input_dim = (
+            state_streams * self.dim
+            + scalar_count
+            + 2 * self.curve_samples
+        )
         self.input_norm = nn.LayerNorm(input_dim)
         self.input_projection = nn.Linear(input_dim, int(hidden_dim))
         encoder_layer = nn.TransformerEncoderLayer(
@@ -638,8 +655,15 @@ class SetAwareLaneSelectionHead(nn.Module):
         )
         self.output_norm = nn.LayerNorm(int(hidden_dim))
         self.output = nn.Linear(int(hidden_dim), 1)
-        nn.init.zeros_(self.output.weight)
-        nn.init.zeros_(self.output.bias)
+        if self.unified_score:
+            nn.init.normal_(self.output.weight, std=0.01)
+            nn.init.constant_(
+                self.output.bias,
+                math.log(self.prior_prob / (1.0 - self.prior_prob)),
+            )
+        else:
+            nn.init.zeros_(self.output.weight)
+            nn.init.zeros_(self.output.bias)
 
     def _base_probability(self, outputs: dict[str, torch.Tensor]) -> torch.Tensor:
         exist = torch.softmax(outputs["exist_logits"].float(), dim=-1)[..., 0]
@@ -655,9 +679,14 @@ class SetAwareLaneSelectionHead(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         row_tokens = outputs["structured_row_tokens"]
         lane_query = outputs["queries"]
-        ranges = sort_range_norm(outputs["range_norm"].detach().float())
-        pred_x = outputs["pred_x_rows"].detach().float()
-        row_logits = outputs["row_x_logits"].detach().float()
+        observe = (
+            (lambda value: value.detach())
+            if self.detach_geometry_features
+            else (lambda value: value)
+        )
+        ranges = sort_range_norm(observe(outputs["range_norm"]).float())
+        pred_x = observe(outputs["pred_x_rows"]).float()
+        row_logits = observe(outputs["row_x_logits"]).float()
         batch, candidates, rows, _channels = row_tokens.shape
 
         y_norm = torch.linspace(
@@ -688,6 +717,15 @@ class SetAwareLaneSelectionHead(nn.Module):
             dim=-1,
         )
         row_confidence = log_max_probability.exp()
+        confidence_row_weight = row_weight * row_confidence
+        confidence_denominator = confidence_row_weight.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-4)
+        confidence_weighted_state = (
+            row_tokens
+            * confidence_row_weight.to(dtype=row_tokens.dtype).unsqueeze(-1)
+        ).sum(dim=2) / confidence_denominator.to(dtype=row_tokens.dtype)
         confidence_mean = (
             row_confidence * row_weight
         ).sum(dim=-1, keepdim=True) / denominator
@@ -727,7 +765,7 @@ class SetAwareLaneSelectionHead(nn.Module):
             reference_max = pred_x.new_zeros((batch, candidates, 1))
         else:
             reference_delta = (
-                pred_x - reference.detach().float()
+                pred_x - observe(reference).float()
             ).abs() / float(max(self.input_w - 1, 1))
             reference_mean = (
                 reference_delta * row_weight
@@ -748,34 +786,57 @@ class SetAwareLaneSelectionHead(nn.Module):
             sampled_x = F.pad(sampled_x, (0, padding))
             sampled_confidence = F.pad(sampled_confidence, (0, padding))
 
-        base_probability = self._base_probability(outputs).detach()
-        scalar_features = torch.cat(
-            (
-                ranges,
-                ranges[..., 1:] - ranges[..., :1],
-                confidence_mean,
-                confidence_max,
-                slope,
-                curvature,
-                reference_mean,
-                reference_max,
-                state_variance,
-                base_probability.unsqueeze(-1),
-                sampled_x,
-                sampled_confidence,
-            ),
-            dim=-1,
-        ).to(dtype=lane_query.dtype)
-        features = torch.cat(
-            (lane_query, visible_row_state, scalar_features),
-            dim=-1,
-        )
+        scalar_parts = [
+            ranges,
+            ranges[..., 1:] - ranges[..., :1],
+            confidence_mean,
+            confidence_max,
+            slope,
+            curvature,
+            reference_mean,
+            reference_max,
+            state_variance,
+        ]
+        if self.unified_score:
+            state_parts = [visible_row_state, confidence_weighted_state]
+            if self.use_curve_evidence:
+                curve_evidence = outputs.get("selection_curve_evidence")
+                if not isinstance(curve_evidence, torch.Tensor):
+                    raise ValueError(
+                        "unified set selection with curve evidence requires "
+                        "selection_curve_evidence"
+                    )
+                curve_state = (
+                    curve_evidence
+                    * row_weight.to(dtype=curve_evidence.dtype).unsqueeze(-1)
+                ).sum(dim=2) / denominator.to(dtype=curve_evidence.dtype)
+                state_parts.append(curve_state)
+            scalar_parts.extend((sampled_x, sampled_confidence))
+            scalar_features = torch.cat(scalar_parts, dim=-1).to(
+                dtype=row_tokens.dtype
+            )
+            features = torch.cat((*state_parts, scalar_features), dim=-1)
+        else:
+            base_probability = self._base_probability(outputs).detach()
+            scalar_parts.extend(
+                (base_probability.unsqueeze(-1), sampled_x, sampled_confidence)
+            )
+            scalar_features = torch.cat(scalar_parts, dim=-1).to(
+                dtype=lane_query.dtype
+            )
+            features = torch.cat(
+                (lane_query, visible_row_state, scalar_features),
+                dim=-1,
+            )
         hidden = self.input_projection(self.input_norm(features))
         hidden = self.encoder(hidden)
-        delta_logits = self.output(self.output_norm(hidden)).squeeze(-1)
+        raw_logits = self.output(self.output_norm(hidden)).squeeze(-1).float()
+        if self.unified_score:
+            # Keep the legacy diagnostic key in the output contract, but make
+            # its value explicit: unified mode has no residual/delta path.
+            return raw_logits, torch.zeros_like(raw_logits)
         base_logits = torch.logit(base_probability)
-        selection_logits = base_logits + delta_logits.float()
-        return selection_logits, delta_logits
+        return base_logits + raw_logits, raw_logits
 
 
 class StructuredLaneQueryHead(nn.Module):
@@ -805,6 +866,7 @@ class StructuredLaneQueryHead(nn.Module):
         training_auxiliary_group_sizes: list[int] | tuple[int, ...] | None = None,
         row_reference: dict[str, Any] | None = None,
         set_selection: dict[str, Any] | None = None,
+        lane_pooling: str = "mean_max",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -858,6 +920,11 @@ class StructuredLaneQueryHead(nn.Module):
         self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
+        self.lane_pooling = str(lane_pooling).strip().lower()
+        if self.lane_pooling not in {"mean_max", "mean"}:
+            raise ValueError(
+                "structured_query.lane_pooling must be mean_max or mean"
+            )
         if self.evidence_x_bins < 1:
             raise ValueError("structured_query.evidence_x_bins must be >= 1")
         if self.inference_group_index is not None and not 0 <= self.inference_group_index < self.num_groups:
@@ -1033,6 +1100,21 @@ class StructuredLaneQueryHead(nn.Module):
                 range_temperature=float(
                     self.set_selection_cfg.get("range_temperature", 0.02)
                 ),
+                unified_score=bool(
+                    self.set_selection_cfg.get("unified_score", False)
+                ),
+                prior_prob=float(
+                    self.set_selection_cfg.get("prior_prob", 0.05)
+                ),
+                detach_geometry_features=bool(
+                    self.set_selection_cfg.get(
+                        "detach_geometry_features",
+                        True,
+                    )
+                ),
+                use_curve_evidence=bool(
+                    self.set_selection_cfg.get("use_curve_evidence", False)
+                ),
             )
             if self.set_selection_enabled
             else None
@@ -1062,6 +1144,73 @@ class StructuredLaneQueryHead(nn.Module):
             x_pos = self.x_tokens.weight.to(device=features.device, dtype=features.dtype).view(1, 1, x, c)
             feat_key = feat_key + x_pos
         return feat_value, feat_key
+
+    def _sample_final_curve_evidence(
+        self,
+        row_value_features: torch.Tensor,
+        pred_x_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Linearly sample P2 at the exact final predicted curve.
+
+        The row dimension is already aligned, so only horizontal interpolation
+        is required. The interpolation weight remains differentiable with
+        respect to final x while avoiding a general 2-D grid-sample kernel.
+        """
+
+        batch, rows, x_bins, channels = row_value_features.shape
+        if pred_x_rows.ndim != 3 or pred_x_rows.shape[0] != batch:
+            raise ValueError("pred_x_rows must have shape [batch, lanes, rows]")
+        if int(pred_x_rows.shape[-1]) != rows:
+            raise ValueError("pred_x_rows must share the P2 row count")
+        candidates = int(pred_x_rows.shape[1])
+        with torch.autocast(
+            device_type=row_value_features.device.type,
+            enabled=False,
+        ):
+            feature_x = pred_x_rows.float().clamp(
+                0.0,
+                float(max(self.input_w - 1, 1)),
+            )
+            feature_x = feature_x * float(max(x_bins - 1, 0)) / float(
+                max(self.input_w - 1, 1)
+            )
+            left = feature_x.floor().long()
+            right = (left + 1).clamp(max=max(x_bins - 1, 0))
+            alpha = feature_x - left.to(dtype=feature_x.dtype)
+
+        flat = row_value_features.reshape(batch * rows, x_bins, channels)
+        left = left.permute(0, 2, 1).reshape(batch * rows, candidates)
+        right = right.permute(0, 2, 1).reshape(batch * rows, candidates)
+        alpha = alpha.permute(0, 2, 1).reshape(
+            batch * rows,
+            candidates,
+            1,
+        )
+        row_index = torch.arange(
+            batch * rows,
+            device=row_value_features.device,
+        ).view(-1, 1)
+        paired_index = torch.stack((left, right), dim=-1).reshape(
+            batch * rows,
+            candidates * 2,
+        )
+        values = flat[row_index, paired_index].view(
+            batch * rows,
+            candidates,
+            2,
+            channels,
+        )
+        sampled = torch.lerp(
+            values[:, :, 0],
+            values[:, :, 1],
+            alpha.to(dtype=row_value_features.dtype),
+        )
+        return sampled.view(batch, rows, candidates, channels).permute(
+            0,
+            2,
+            1,
+            3,
+        ).contiguous()
 
     def _reference_prior_logits(
         self,
@@ -1321,6 +1470,19 @@ class StructuredLaneQueryHead(nn.Module):
             outputs["_training_auxiliary_aux_outputs"] = auxiliary_intermediate_outputs
             outputs["_training_auxiliary_group_sizes"] = self.training_auxiliary_group_sizes
         if self.set_selection_head is not None:
+            if self.set_selection_head.use_curve_evidence:
+                curve_x = outputs["pred_x_rows"]
+                if self.set_selection_head.detach_geometry_features:
+                    # Score learning may update the visual evidence tower, but
+                    # it must not move the curve merely to make the sampled
+                    # descriptor easier to classify.
+                    curve_x = curve_x.detach()
+                outputs["selection_curve_evidence"] = (
+                    self._sample_final_curve_evidence(
+                        row_value_features,
+                        curve_x,
+                    )
+                )
             selection_logits, selection_delta_logits = self.set_selection_head(outputs)
             outputs["selection_logits"] = selection_logits
             outputs["selection_delta_logits"] = selection_delta_logits
@@ -1385,7 +1547,10 @@ class StructuredLaneQueryHead(nn.Module):
         b = int(row_tokens.shape[0])
         row_tokens = self.row_norm(row_tokens)
         instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
-        lane_query = self.lane_norm(row_tokens.mean(dim=2) + row_tokens.amax(dim=2) + instance_residual)
+        lane_summary = row_tokens.mean(dim=2)
+        if self.lane_pooling == "mean_max":
+            lane_summary = lane_summary + row_tokens.amax(dim=2)
+        lane_query = self.lane_norm(lane_summary + instance_residual)
         row_x_logits = self.row_x(row_tokens)
         if row_x_logit_bias is not None:
             if row_x_logit_bias.shape != row_x_logits.shape:
@@ -1438,4 +1603,5 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         ),
         row_reference=structured_cfg.get("row_reference"),
         set_selection=structured_cfg.get("set_selection"),
+        lane_pooling=str(structured_cfg.get("lane_pooling", "mean_max")),
     )

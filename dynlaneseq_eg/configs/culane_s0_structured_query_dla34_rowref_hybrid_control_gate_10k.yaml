@@ -1,0 +1,25 @@
+_base_: culane_s0_structured_query_dla34_slots32_aux3x8_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+output_dir: outputs/diagnostics/dla34_rowref_hybrid_control_gate_10k
+
+# Matched short-run reference for the unified-selection redesign.  This is the
+# preserved primary-32 + auxiliary-3x8 model with its historical existence,
+# quality-product scoring, composite matcher, and NMS deployment contract.
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 10000
+  amp: true
+  amp_dtype: bfloat16
+  check_finite_grad: true
+  compile_model: true
+  compile_mode: default
+  vis_interval: 25000
+  checkpoint_interval: 2500

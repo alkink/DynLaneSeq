@@ -18,6 +18,10 @@ CONFIG = (
     "culane_s0_structured_query_dla34_slots32_aux3x8_b4x4_1600x640_"
     "bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml"
 )
+UNIFIED_CONFIG = (
+    "dynlaneseq_eg/configs/"
+    "culane_s0_structured_query_dla34_rowref_unified_selection_gate_10k.yaml"
+)
 
 
 def _head(*, with_training_auxiliary: bool = True) -> StructuredLaneQueryHead:
@@ -76,6 +80,27 @@ def test_hybrid_config_contract() -> None:
     assert cfg["loss"]["lambda_training_auxiliary"] == 0.5
     assert cfg["scheduler"]["total_iters"] == 278000
     assert cfg["training"]["seed"] == 3407
+
+
+def test_unified_selection_config_has_one_train_deploy_contract() -> None:
+    cfg = load_config(UNIFIED_CONFIG)
+    structured = cfg["model"]["structured_query"]
+    selection = structured["set_selection"]
+
+    assert structured["num_instances"] == 32
+    assert structured["training_auxiliary_group_sizes"] == [8, 8, 8]
+    assert structured["lane_pooling"] == "mean"
+    assert selection["unified_score"] is True
+    assert selection["use_curve_evidence"] is True
+    assert cfg["matcher"]["cost_type"] == "range_aware_iou"
+    assert cfg["matcher"]["reuse_final_assignment_for_intermediate"] is True
+    assert cfg["loss"]["set_selection_share_matcher_assignment"] is True
+    assert cfg["loss"]["w_exist"] == 0.0
+    assert cfg["loss"]["w_quality"] == 0.0
+    assert cfg["loss"]["set_selection_positive_floor"] == 0.5
+    assert cfg["postprocess"]["score_mode"] == "selection"
+    assert cfg["postprocess"]["lane_nms_distance_thresh_px"] == 0.0
+    assert cfg["scheduler"]["total_iters"] == 10000
 
 
 def test_hybrid_training_keeps_full_primary_set_and_hides_auxiliary_at_inference() -> None:
@@ -223,6 +248,144 @@ def test_hybrid_auxiliary_loss_is_separate_and_reaches_auxiliary_tokens() -> Non
     assert auxiliary_tokens is not None
     assert auxiliary_tokens.weight.grad is not None
     assert auxiliary_tokens.weight.grad.abs().sum().item() > 0.0
+
+
+def test_deep_supervision_reuses_final_primary_and_auxiliary_ownership() -> None:
+    torch.manual_seed(59)
+    model = _TinyHybridModel().train()
+    features = torch.randn(2, 32, 8, 12)
+    targets = _targets(batch=2)
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            input_w=64,
+            input_h=64,
+            cost_type="range_aware_iou",
+            range_aware_line_width=30.0,
+        )
+    )
+    cfg = {
+        "model": {"name": "DynLaneSeqS0"},
+        "matcher": {"reuse_final_assignment_for_intermediate": True},
+    }
+
+    outputs, matches = forward_with_matches(
+        model,
+        features,
+        targets,
+        matcher,
+        cfg,
+        iteration=0,
+    )
+
+    assert all(layer_matches is matches for layer_matches in outputs["_aux_matches"])
+    auxiliary_matches = outputs["_training_auxiliary_matches"]
+    assert all(
+        layer_matches is auxiliary_matches
+        for layer_matches in outputs["_training_auxiliary_aux_matches"]
+    )
+
+
+def test_unified_contract_runs_one_complete_training_step() -> None:
+    torch.manual_seed(61)
+    head = StructuredLaneQueryHead(
+        dim=32,
+        num_instances=8,
+        num_rows=8,
+        x_bins=16,
+        input_w=64,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=64,
+        dropout=0.0,
+        evidence_x_bins=12,
+        num_groups=1,
+        intermediate_supervision=True,
+        training_auxiliary_group_sizes=[2, 2],
+        lane_pooling="mean",
+        row_reference={
+            "enabled": True,
+            "offsets_px": [-16.0, 0.0, 16.0],
+            "initial_prior_sigma_px": 16.0,
+            "output_prior_sigma_px": 8.0,
+        },
+        set_selection={
+            "enabled": True,
+            "unified_score": True,
+            "hidden_dim": 32,
+            "num_layers": 1,
+            "num_heads": 4,
+            "ff_dim": 64,
+            "dropout": 0.0,
+            "curve_samples": 4,
+            "detach_geometry_features": True,
+            "use_curve_evidence": True,
+        },
+    )
+
+    class TinyUnified(torch.nn.Module):
+        def __init__(self, structured_head: StructuredLaneQueryHead) -> None:
+            super().__init__()
+            self.head = structured_head
+
+        def forward(self, value: torch.Tensor) -> dict[str, torch.Tensor]:
+            return self.head(value)
+
+    model = TinyUnified(head).train()
+    features = torch.randn(2, 32, 8, 12, requires_grad=True)
+    targets = _targets(batch=2)
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            input_w=64,
+            input_h=64,
+            cost_type="range_aware_iou",
+            range_aware_line_width=30.0,
+        )
+    )
+    criterion = S0Criterion(
+        LossConfig(
+            w_exist=0.0,
+            w_quality=0.0,
+            w_point=5.0,
+            w_range=1.0,
+            w_line_iou=1.0,
+            w_set_selection=1.0,
+            input_w=64,
+            input_h=64,
+            line_iou_radius=15.0,
+            set_selection_share_matcher_assignment=True,
+            set_selection_positive_floor=0.5,
+            set_selection_negative_weight=0.25,
+            lambda_intermediate=0.5,
+            intermediate_layer_weights=(1.0,),
+            lambda_training_auxiliary=0.5,
+        ),
+        matcher=matcher,
+    )
+    cfg = {
+        "model": {"name": "DynLaneSeqS0"},
+        "matcher": {"reuse_final_assignment_for_intermediate": True},
+    }
+    outputs, matches = forward_with_matches(
+        model,
+        features,
+        targets,
+        matcher,
+        cfg,
+        iteration=0,
+    )
+    losses = criterion(outputs, targets, matches)
+    losses["loss_total"].backward()
+
+    assert torch.isfinite(losses["loss_total"])
+    assert float(losses["loss_set_selection"]) > 0.0
+    assert features.grad is not None
+    assert float(features.grad.abs().sum()) > 0.0
+    assert head.set_selection_head is not None
+    assert head.set_selection_head.output.weight.grad is not None
+    auxiliary_tokens = head.training_auxiliary_instance_tokens
+    assert auxiliary_tokens is not None
+    assert auxiliary_tokens.weight.grad is not None
+    assert float(auxiliary_tokens.weight.grad.abs().sum()) > 0.0
 
 
 def test_hybrid_gate_requires_primary_geometry_and_strict_f1_signal() -> None:

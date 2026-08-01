@@ -498,6 +498,96 @@ def test_set_selection_loss_backpropagates_to_selection_logits() -> None:
     assert float(losses["target_positive_fraction"]) == 0.5
 
 
+def test_range_aware_matcher_and_selector_share_one_assignment() -> None:
+    rows = 8
+    # Both candidates have perfect x, but candidate zero hallucinates the lane
+    # over the complete image height. Candidate one has the correct range.
+    pred_x = torch.full((1, 2, rows), 20.0)
+    outputs = {
+        "exist_logits": torch.tensor([[[12.0, -12.0], [-12.0, 12.0]]]),
+        "pred_x_rows": pred_x,
+        "range_norm": torch.tensor([[[0.0, 1.0], [0.25, 0.70]]]),
+        "selection_logits": torch.zeros((1, 2), requires_grad=True),
+        "selection_delta_logits": torch.zeros((1, 2)),
+    }
+    valid = torch.zeros((1, rows), dtype=torch.bool)
+    valid[:, 2:6] = True
+    target_x = torch.full((1, rows), float("nan"))
+    target_x[:, 2:6] = 20.0
+    targets = [
+        {
+            "x_rows": target_x,
+            "valid_mask": valid,
+            "range_y": torch.tensor([[2.0, 5.0]]),
+        }
+    ]
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            input_w=64,
+            input_h=8,
+            cost_type="range_aware_iou",
+            range_aware_line_width=30.0,
+            range_aware_min_valid_rows=3,
+        )
+    )
+    matches = matcher(outputs, targets)
+
+    # Classification strongly favors candidate zero, proving that the new
+    # geometry-only assignment is what selects candidate one.
+    assert matches[0]["pred_indices"].tolist() == [1]
+    assert matches[0]["gt_indices"].tolist() == [0]
+
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=64,
+            input_h=8,
+            w_set_selection=1.0,
+            set_selection_line_width=30.0,
+            set_selection_min_valid_rows=3,
+            set_selection_share_matcher_assignment=True,
+            set_selection_positive_floor=0.5,
+        )
+    )
+    selection_targets = criterion.compute_set_selection_targets(
+        outputs,
+        targets,
+        matches,
+    )
+    assert selection_targets[0, 0].item() == 0.0
+    assert selection_targets[0, 1].item() > 0.99
+
+
+def test_selection_positive_floor_prevents_all_negative_cold_start() -> None:
+    rows = 8
+    outputs = {
+        "pred_x_rows": torch.full((1, 2, rows), 60.0),
+        "range_norm": torch.tensor([[[0.0, 1.0], [0.0, 1.0]]]),
+    }
+    targets = [
+        {
+            "x_rows": torch.full((1, rows), 5.0),
+            "valid_mask": torch.ones((1, rows), dtype=torch.bool),
+            "range_y": torch.tensor([[0.0, 7.0]]),
+        }
+    ]
+    matches = [
+        {
+            "pred_indices": torch.tensor([0]),
+            "gt_indices": torch.tensor([0]),
+        }
+    ]
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=64,
+            input_h=8,
+            set_selection_share_matcher_assignment=True,
+            set_selection_positive_floor=0.5,
+        )
+    )
+    target = criterion.compute_set_selection_targets(outputs, targets, matches)
+    torch.testing.assert_close(target, torch.tensor([[0.5, 0.0]]))
+
+
 def test_s3_cascade_matching_uses_final_assignment():
     target = _target()
     coarse_x = torch.full((1, 2, 72), 400.0)
