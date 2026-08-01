@@ -148,8 +148,8 @@ def _resolve_operating_points(
             quality_power, score_threshold = map(float, parts)
             if quality_power < 0.0:
                 raise ValueError("quality power must be non-negative")
-            if not 0.0 <= score_threshold <= 1.0:
-                raise ValueError("score threshold must be in [0, 1]")
+            if not -1.0 <= score_threshold <= 1.0:
+                raise ValueError("score threshold must be in [-1, 1]")
             point = (quality_power, score_threshold)
             if point not in points:
                 points.append(point)

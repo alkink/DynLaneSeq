@@ -1,0 +1,61 @@
+_base_: culane_s0_structured_query_dla34_slots32_b4x4_1600x640_bins800_fpn256_l4_dfl_rowref_r15_deepsup_obj0p5_50ep.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_coherent_lane_state_25k
+
+# Controlled architectural gate: one deployable query identity owns its
+# ordered row geometry, persistent lane state, foreground score, range, and
+# Hungarian target.  There is no second selector or train-only proposal set.
+model:
+  structured_query:
+    num_instances: 32
+    num_groups: 1
+    intermediate_supervision: true
+    lane_pooling: mean
+    lane_state:
+      enabled: true
+      num_heads: 8
+      ff_dim: 1024
+      dropout: 0.1
+    row_reference:
+      detach_between_layers: true
+    set_selection:
+      enabled: false
+
+# Every decoder layer solves its own strict 1:1 Hungarian assignment.  The
+# bounded foreground cost prevents confidence from overwhelming geometry.
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  lambda_obj: 0.5
+  object_cost_type: neg_probability
+  reuse_final_assignment_for_intermediate: false
+
+# Foreground supervision is the deployable score.  Quality/set-selection
+# heads are deliberately outside this gate so training and inference cannot
+# optimize different candidate identities.
+loss:
+  w_exist: 2.0
+  w_quality: 0.0
+  w_set_selection: 0.0
+
+postprocess:
+  score_mode: exist
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  lane_nms_min_overlap_points: 5
+  top_k: 4
+
+# The gate stops at 25k, but learning rates follow the unchanged 278k paper
+# schedule.  A short cosine horizon would answer a different question.
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 25000
+  checkpoint_interval: 5000

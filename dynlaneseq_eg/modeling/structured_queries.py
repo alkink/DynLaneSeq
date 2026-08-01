@@ -578,6 +578,69 @@ class ReferenceGuidedRowLayer(nn.Module):
         return lane_rows.view(b, n, r, c).contiguous()
 
 
+class PersistentLaneStateLayer(nn.Module):
+    """Update one lane-level state from that query's explicit row states.
+
+    The row decoder remains responsible for ordered geometry.  This module
+    gives existence and visible-range prediction a persistent state with the
+    *same query identity* instead of rebuilding a lane descriptor by pooling
+    rows independently at every decoder block.  Each lane state can only read
+    the rows belonging to that lane; inter-lane reasoning stays in the row
+    decoder where the assignment groups are already enforced.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        num_heads: int = 8,
+        ff_dim: int = 1024,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim),
+        )
+        self.norm_lane = nn.LayerNorm(dim)
+        self.norm_rows = nn.LayerNorm(dim)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        lane_state: torch.Tensor,
+        row_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if lane_state.ndim != 3 or row_states.ndim != 4:
+            raise ValueError(
+                "lane_state/row_states must have shapes [B,N,C]/[B,N,R,C]"
+            )
+        b, n, c = lane_state.shape
+        if row_states.shape[:2] != (b, n) or int(row_states.shape[-1]) != c:
+            raise ValueError("lane and row states must share batch/query/channel axes")
+
+        query = self.norm_lane(lane_state).reshape(b * n, 1, c)
+        rows = self.norm_rows(row_states).reshape(
+            b * n,
+            int(row_states.shape[2]),
+            c,
+        )
+        state = lane_state.reshape(b * n, 1, c)
+        state = state + self.drop(
+            self.cross_attn(query, rows, rows, need_weights=False)[0]
+        )
+        state = state + self.drop(self.ffn(self.norm_ffn(state)))
+        return state.reshape(b, n, c).contiguous()
+
+
 class SetAwareLaneSelectionHead(nn.Module):
     """Permutation-equivariant scorer over the complete lane proposal set.
 
@@ -885,6 +948,7 @@ class StructuredLaneQueryHead(nn.Module):
         inference_group_index: int | None = None,
         training_auxiliary_group_sizes: list[int] | tuple[int, ...] | None = None,
         row_reference: dict[str, Any] | None = None,
+        lane_state: dict[str, Any] | None = None,
         set_selection: dict[str, Any] | None = None,
         lane_pooling: str = "mean_max",
     ):
@@ -938,6 +1002,11 @@ class StructuredLaneQueryHead(nn.Module):
         self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
         self.row_reference_cfg = dict(row_reference or {})
         self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
+        self.detach_reference_between_layers = bool(
+            self.row_reference_cfg.get("detach_between_layers", False)
+        )
+        self.lane_state_cfg = dict(lane_state or {})
+        self.lane_state_enabled = bool(self.lane_state_cfg.get("enabled", False))
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
         self.lane_pooling = str(lane_pooling).strip().lower()
@@ -1098,6 +1167,23 @@ class StructuredLaneQueryHead(nn.Module):
             self.reference_logit_scale = None
             self.reference_anchor_logits = None
             self.training_auxiliary_reference_anchor_logits = None
+        self.lane_state_layers = nn.ModuleList(
+            [
+                PersistentLaneStateLayer(
+                    dim=self.dim,
+                    num_heads=int(
+                        self.lane_state_cfg.get("num_heads", num_heads)
+                    ),
+                    ff_dim=int(self.lane_state_cfg.get("ff_dim", ff_dim)),
+                    dropout=float(
+                        self.lane_state_cfg.get("dropout", dropout)
+                    ),
+                )
+                for _ in range(int(num_layers))
+            ]
+            if self.lane_state_enabled
+            else []
+        )
         self.row_norm = nn.LayerNorm(self.dim)
         self.lane_norm = nn.LayerNorm(self.dim)
         self.row_x = nn.Linear(self.dim, self.x_bins)
@@ -1369,6 +1455,11 @@ class StructuredLaneQueryHead(nn.Module):
         row = self.row_tokens.weight.to(device=device, dtype=dtype)
         row_tokens = instance[:, None, :] + row[None, :, :]
         row_tokens = row_tokens.unsqueeze(0).expand(b, -1, -1, -1).contiguous()
+        lane_state = (
+            instance.unsqueeze(0).expand(b, -1, -1).contiguous()
+            if self.lane_state_enabled
+            else None
+        )
         row_value_features, row_key_features = self._row_features(features)
 
         intermediate_outputs: list[dict[str, torch.Tensor]] = []
@@ -1406,6 +1497,11 @@ class StructuredLaneQueryHead(nn.Module):
                     num_groups=active_num_groups,
                     group_sizes=active_group_sizes,
                 )
+                if lane_state is not None:
+                    lane_state = self.lane_state_layers[layer_index](
+                        lane_state,
+                        row_tokens,
+                    )
                 row_logit_bias = self._reference_prior_logits(
                     reference_x,
                     x_bins=self.x_bins,
@@ -1418,8 +1514,15 @@ class StructuredLaneQueryHead(nn.Module):
                     include_quality=layer_index == len(self.layers) - 1,
                     row_x_logit_bias=row_logit_bias,
                     input_reference_x_rows=reference_x,
+                    lane_state=lane_state,
                 )
-                reference_x = layer_outputs["pred_x_rows"]
+                predicted_reference = layer_outputs["pred_x_rows"]
+                reference_x = (
+                    predicted_reference.detach()
+                    if self.detach_reference_between_layers
+                    and layer_index < len(self.layers) - 1
+                    else predicted_reference
+                )
                 if (
                     self.intermediate_supervision
                     and not inference_only
@@ -1430,7 +1533,9 @@ class StructuredLaneQueryHead(nn.Module):
             if outputs is None:
                 raise ValueError("row-reference decoder requires at least one decoder layer")
         else:
-            intermediate_row_tokens = []
+            intermediate_states: list[
+                tuple[torch.Tensor, torch.Tensor | None]
+            ] = []
             for layer_index, layer in enumerate(self.layers):
                 row_tokens = layer(
                     row_tokens,
@@ -1439,17 +1544,32 @@ class StructuredLaneQueryHead(nn.Module):
                     num_groups=active_num_groups,
                     group_sizes=active_group_sizes,
                 )
+                if lane_state is not None:
+                    lane_state = self.lane_state_layers[layer_index](
+                        lane_state,
+                        row_tokens,
+                    )
                 if (
                     self.intermediate_supervision
                     and not inference_only
                     and layer_index < len(self.layers) - 1
                 ):
-                    intermediate_row_tokens.append(row_tokens)
-            outputs = self._predict_from_row_tokens(row_tokens, instance, include_quality=True)
+                    intermediate_states.append((row_tokens, lane_state))
+            outputs = self._predict_from_row_tokens(
+                row_tokens,
+                instance,
+                include_quality=True,
+                lane_state=lane_state,
+            )
             if self.intermediate_supervision and not inference_only:
                 intermediate_outputs = [
-                    self._predict_from_row_tokens(tokens, instance, include_quality=False)
-                    for tokens in intermediate_row_tokens
+                    self._predict_from_row_tokens(
+                        tokens,
+                        instance,
+                        include_quality=False,
+                        lane_state=intermediate_lane_state,
+                    )
+                    for tokens, intermediate_lane_state in intermediate_states
                 ]
         if self.training_auxiliary_group_sizes and not inference_only:
             full_count = self.num_instances
@@ -1557,6 +1677,7 @@ class StructuredLaneQueryHead(nn.Module):
         include_quality: bool,
         row_x_logit_bias: torch.Tensor | None = None,
         input_reference_x_rows: torch.Tensor | None = None,
+        lane_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Apply the shared lane heads to one decoder-layer state.
 
@@ -1566,11 +1687,16 @@ class StructuredLaneQueryHead(nn.Module):
         """
         b = int(row_tokens.shape[0])
         row_tokens = self.row_norm(row_tokens)
-        instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
-        lane_summary = row_tokens.mean(dim=2)
-        if self.lane_pooling == "mean_max":
-            lane_summary = lane_summary + row_tokens.amax(dim=2)
-        lane_query = self.lane_norm(lane_summary + instance_residual)
+        if lane_state is not None:
+            if lane_state.shape != (b, int(row_tokens.shape[1]), self.dim):
+                raise ValueError("lane_state shape does not match row tokens")
+            lane_query = self.lane_norm(lane_state)
+        else:
+            instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
+            lane_summary = row_tokens.mean(dim=2)
+            if self.lane_pooling == "mean_max":
+                lane_summary = lane_summary + row_tokens.amax(dim=2)
+            lane_query = self.lane_norm(lane_summary + instance_residual)
         row_x_logits = self.row_x(row_tokens)
         if row_x_logit_bias is not None:
             if row_x_logit_bias.shape != row_x_logits.shape:
@@ -1622,6 +1748,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
             "training_auxiliary_group_sizes"
         ),
         row_reference=structured_cfg.get("row_reference"),
+        lane_state=structured_cfg.get("lane_state"),
         set_selection=structured_cfg.get("set_selection"),
         lane_pooling=str(structured_cfg.get("lane_pooling", "mean_max")),
     )

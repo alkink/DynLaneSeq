@@ -51,6 +51,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-valid-rows", type=int, default=5)
     parser.add_argument("--row-visibility-thresh", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=4)
+    parser.add_argument(
+        "--score-mode",
+        choices=("exist", "quality", "exist_quality", "selection"),
+        default="selection",
+        help="Score used for the deployed Top-K trace; ownership itself is score-free.",
+    )
+    parser.add_argument("--quality-power", type=float, default=0.5)
     parser.add_argument("--stable-iou-floor", type=float, default=0.30)
     parser.add_argument("--near-tie-margin", type=float, default=0.02)
     parser.add_argument("--min-owner-retention", type=float, default=0.75)
@@ -115,6 +122,38 @@ def _candidate_valid(stage: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.ones(count, dtype=torch.bool)
 
 
+def _deployment_scores(
+    stage: dict[str, torch.Tensor],
+    *,
+    score_mode: str,
+    quality_power: float,
+) -> torch.Tensor:
+    mode = str(score_mode).strip().lower()
+    exist = torch.softmax(stage["exist_logits"].float(), dim=-1)[..., 0]
+    quality_logits = stage.get("quality_logits")
+    quality = (
+        torch.sigmoid(quality_logits.float()).clamp_min(1e-6)
+        if quality_logits is not None
+        else None
+    )
+    if mode == "exist":
+        return exist
+    if mode == "quality":
+        if quality is None:
+            raise ValueError("quality score mode requires quality_logits")
+        return quality.pow(float(quality_power))
+    if mode == "exist_quality":
+        if quality is None or float(quality_power) <= 0.0:
+            return exist
+        return exist * quality.pow(float(quality_power))
+    if mode == "selection":
+        selection = stage.get("selection_logits")
+        if selection is None:
+            raise ValueError("selection score mode requires selection_logits")
+        return torch.sigmoid(selection.float())
+    raise ValueError(f"unsupported score mode: {score_mode!r}")
+
+
 @torch.no_grad()
 def _collect_checkpoint(
     model: torch.nn.Module,
@@ -161,8 +200,6 @@ def _collect_checkpoint(
             outputs = _frozen_outputs(model, images)
         device_targets = nested_to_device(batch_targets, device)
         training_matches = matcher(outputs, device_targets)
-        if "selection_logits" not in outputs:
-            raise ValueError("checkpoint does not expose unified selection logits")
         for batch_index, meta in enumerate(metas):
             stage = {
                 name: outputs[name][batch_index].detach().float().cpu()
@@ -217,7 +254,11 @@ def _collect_checkpoint(
                 for index in range(int(candidate_valid.shape[0]))
                 if bool(candidate_valid[index])
             ]
-            scores = torch.sigmoid(stage["selection_logits"])
+            scores = _deployment_scores(
+                stage,
+                score_mode=args.score_mode,
+                quality_power=args.quality_power,
+            )
             selected_ids = sorted(
                 valid_ids,
                 key=lambda index: float(scores[index]),
@@ -268,31 +309,42 @@ def _collect_checkpoint(
                     "candidate_valid": candidate_valid,
                 }
             )
+    summary = {
+        "images": len(records),
+        "gt_lanes": int(gt_total),
+        "raw_recall_050": raw_hits[0.5] / float(max(gt_total, 1)),
+        "raw_recall_070": raw_hits[0.7] / float(max(gt_total, 1)),
+        "deployment_score_mode": str(args.score_mode),
+        "deployment_top4_recall_050": selected_hits[0.5]
+        / float(max(gt_total, 1)),
+        "deployment_top4_recall_070": selected_hits[0.7]
+        / float(max(gt_total, 1)),
+        "oracle_top4_recall_050": oracle_hits[0.5]
+        / float(max(gt_total, 1)),
+        "oracle_top4_recall_070": oracle_hits[0.7]
+        / float(max(gt_total, 1)),
+        "near_tie_fraction_among_recoverable_gt": near_ties
+        / float(max(eligible_ties, 1)),
+        "near_tie_gt": int(near_ties),
+        "recoverable_gt_for_tie_test": int(eligible_ties),
+        "training_vs_official_owner_agreement": training_official_agreement
+        / float(max(training_official_pairs, 1)),
+    }
+    if str(args.score_mode) == "selection":
+        # Preserve the historical output keys for the original unified-
+        # selector diagnostic while exposing the generic deployment names.
+        summary["selection_top4_recall_050"] = summary[
+            "deployment_top4_recall_050"
+        ]
+        summary["selection_top4_recall_070"] = summary[
+            "deployment_top4_recall_070"
+        ]
     return {
         "checkpoint": checkpoint,
         "iteration": int(iteration),
         "dataset_indices": dataset_indices,
         "records": records,
-        "summary": {
-            "images": len(records),
-            "gt_lanes": int(gt_total),
-            "raw_recall_050": raw_hits[0.5] / float(max(gt_total, 1)),
-            "raw_recall_070": raw_hits[0.7] / float(max(gt_total, 1)),
-            "selection_top4_recall_050": selected_hits[0.5]
-            / float(max(gt_total, 1)),
-            "selection_top4_recall_070": selected_hits[0.7]
-            / float(max(gt_total, 1)),
-            "oracle_top4_recall_050": oracle_hits[0.5]
-            / float(max(gt_total, 1)),
-            "oracle_top4_recall_070": oracle_hits[0.7]
-            / float(max(gt_total, 1)),
-            "near_tie_fraction_among_recoverable_gt": near_ties
-            / float(max(eligible_ties, 1)),
-            "near_tie_gt": int(near_ties),
-            "recoverable_gt_for_tie_test": int(eligible_ties),
-            "training_vs_official_owner_agreement": training_official_agreement
-            / float(max(training_official_pairs, 1)),
-        },
+        "summary": summary,
     }
 
 
@@ -458,6 +510,8 @@ def main() -> None:
         "images": len(checkpoints[0]["records"]),
         "stable_iou_floor": float(args.stable_iou_floor),
         "near_tie_margin": float(args.near_tie_margin),
+        "score_mode": str(args.score_mode),
+        "quality_power": float(args.quality_power),
         "checkpoints": [_public_checkpoint(row) for row in checkpoints],
         "consecutive": consecutive,
         "first_to_last": first_to_last,
