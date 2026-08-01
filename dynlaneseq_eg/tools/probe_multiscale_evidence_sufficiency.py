@@ -503,7 +503,17 @@ def extract_frozen_sources(
                 mode="nearest",
             )
             p2 = encoder.proj(fpn.output(p2_topdown))
-            outputs = head(p2, inference_only=True)
+            # The frozen selector cache was produced by ``_frozen_outputs``,
+            # which deliberately calls the structured head with
+            # ``inference_only=False``.  In the unified-selector experiment
+            # that path evaluates the 32 primary queries together with the
+            # train-only auxiliary groups and slices the public predictions
+            # back to the primary 32 afterwards.  Although those groups are
+            # attention-isolated, changing the packed GEMM/attention shapes
+            # under BF16 can move soft-expected-x predictions measurably.  Run
+            # the exact cache-producing path here; otherwise the parity guard
+            # compares two numerically different execution contracts.
+            outputs = head(p2, inference_only=False)
     finally:
         handle.remove()
     row_states = captured.get("rows")
@@ -511,6 +521,18 @@ def extract_frozen_sources(
         raise RuntimeError("failed to capture final deployable row states")
 
     cached_curves = cached_curves.to(device=images.device, dtype=torch.float32)
+    primary_candidates = int(outputs["pred_x_rows"].shape[1])
+    if int(cached_curves.shape[1]) != primary_candidates:
+        raise ValueError(
+            "cache/model primary-candidate mismatch: "
+            f"cache={int(cached_curves.shape[1])}, model={primary_candidates}"
+        )
+    # The layer hook observes the packed primary+auxiliary tensor before the
+    # head slices its public outputs.  Only the leading primary candidates
+    # correspond to the cached/deployable candidate set.
+    if int(row_states.shape[1]) < primary_candidates:
+        raise ValueError("captured fewer row states than deployable candidates")
+    row_states = row_states[:, :primary_candidates]
     parity = (outputs["pred_x_rows"].float() - cached_curves).abs().amax()
     profiles = []
     feature_maps = (p2, p3, p4)
@@ -1449,9 +1471,11 @@ def main() -> None:
     feature_dim = int(preview["profiles"].shape[-1])
     if int(preview["profiles"].shape[3]) != len(SCALE_NAMES):
         raise ValueError("preview did not expose P2/P3/P4")
-    if float(preview["prediction_parity_max_abs_px"]) > 1.0:
+    preview_parity = float(preview["prediction_parity_max_abs_px"])
+    if preview_parity > 1.0:
         raise ValueError(
-            "checkpoint/cache prediction parity exceeded 1px; refusing the probe"
+            "checkpoint/cache prediction parity exceeded 1px "
+            f"(max_abs={preview_parity:.6f}px); refusing the probe"
         )
     del preview, preview_images
     if device.type == "cuda":
@@ -1608,7 +1632,10 @@ def main() -> None:
                 progress.write(f"step {step:04d}: " + " ".join(running_message))
     progress.close()
     if parity_max > 1.0:
-        raise ValueError("training prediction/cache parity exceeded 1px")
+        raise ValueError(
+            "training prediction/cache parity exceeded 1px "
+            f"(max_abs={parity_max:.6f}px)"
+        )
 
     train_eval_count = min(int(args.train_eval_images), len(full_positions))
     train_eval_positions = uniformly_spaced_indices(len(full_positions), train_eval_count)

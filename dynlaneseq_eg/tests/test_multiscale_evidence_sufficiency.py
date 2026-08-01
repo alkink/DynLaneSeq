@@ -141,16 +141,19 @@ class _FakeHead(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.layers = nn.ModuleList([_FakeRowLayer()])
+        self.last_inference_only: bool | None = None
 
     def forward(
         self,
         features: torch.Tensor,
         inference_only: bool = False,
     ) -> dict[str, torch.Tensor]:
+        self.last_inference_only = bool(inference_only)
         batch, channels, _height, _width = features.shape
         candidates, rows = 3, 5
+        packed_candidates = candidates if inference_only else candidates + 2
         state = features.mean(dim=(-2, -1)).view(batch, 1, 1, channels)
-        state = state.expand(batch, candidates, rows, channels).contiguous()
+        state = state.expand(batch, packed_candidates, rows, channels).contiguous()
         state = self.layers[-1](state)
         x = torch.linspace(8.0, 56.0, rows, device=features.device)
         x = x.view(1, 1, rows).expand(batch, candidates, rows)
@@ -203,3 +206,4 @@ def test_frozen_source_extraction_preserves_scale_row_offset_contract() -> None:
     assert result["row_states"].shape == (2, 3, 5, 4)
     assert float(result["prediction_parity_max_abs_px"]) == 0.0
     assert float((result["profiles"] - result["wrong_profiles"]).abs().max()) > 0.0
+    assert model.structured_query_head.last_inference_only is False
