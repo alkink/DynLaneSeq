@@ -13,6 +13,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/diagnostics/dla34_cluster_representative_decom
 BATCH_SIZE="${BATCH_SIZE:-64}"
 DEVICE="${DEVICE:-cuda}"
 
+if [[ ! -f "${REFERENCE_REPORT}" && -f outputs/diagnostics/four_slot_coverage_probe.json ]]; then
+  REFERENCE_REPORT=outputs/diagnostics/four_slot_coverage_probe.json
+fi
+
 for path in "${SOURCE_CHECKPOINT}" "${VAL_CACHE}" "${REFERENCE_REPORT}"; do
   if [[ ! -f "${path}" ]]; then
     echo "Missing required input: ${path}" >&2
