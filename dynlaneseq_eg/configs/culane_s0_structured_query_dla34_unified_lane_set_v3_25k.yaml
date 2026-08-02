@@ -1,0 +1,47 @@
+_base_: culane_s0_structured_query_dla34_coherent_lane_state_25k.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_unified_lane_set_v3_25k
+
+# One decoder state now owns the entire decision chain.  P2 remains the only
+# coordinate-producing memory. Pooled P4/P5 context creates a non-persistent
+# decision view of that state, so it can change the foreground score but can
+# neither write an x coordinate nor enter the next geometry block.
+model:
+  multi_scale_evidence:
+    enabled: true
+    scales: [p4, p5]
+  structured_query:
+    lane_state:
+      enabled: true
+      mode: causal_set
+      single_logit_score: true
+      num_heads: 8
+      ff_dim: 1024
+      dropout: 0.1
+      semantic_context:
+        enabled: true
+        scales: [p4, p5]
+        pool_size: [10, 25]
+
+# The single foreground logit is supervised as unique Hungarian membership.
+# The count term controls total foreground mass; the margin term makes each
+# assigned lane outrank the hardest unmatched duplicates.  Neither introduces
+# a second deployment score.
+loss:
+  w_exist: 2.0
+  w_quality: 0.0
+  w_set_selection: 0.0
+  w_cardinality: 0.10
+  w_score_margin: 0.25
+  score_margin: 0.50
+  score_margin_topk_negatives: 8
+
+postprocess:
+  score_mode: exist
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  max_iters: 25000
+  checkpoint_interval: 5000

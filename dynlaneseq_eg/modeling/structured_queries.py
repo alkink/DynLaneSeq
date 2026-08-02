@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .common import soft_expected_x, sort_range_norm
+from .unified_lane_set import UnifiedLaneSetLayer
 
 
 def _heterogeneous_group_attention(
@@ -1007,6 +1008,25 @@ class StructuredLaneQueryHead(nn.Module):
         )
         self.lane_state_cfg = dict(lane_state or {})
         self.lane_state_enabled = bool(self.lane_state_cfg.get("enabled", False))
+        self.lane_state_mode = str(
+            self.lane_state_cfg.get("mode", "read_only")
+        ).strip().lower()
+        if self.lane_state_mode not in {"read_only", "causal_set"}:
+            raise ValueError(
+                "structured_query.lane_state.mode must be read_only or causal_set"
+            )
+        if self.lane_state_mode == "causal_set" and not self.lane_state_enabled:
+            raise ValueError("causal_set lane state requires lane_state.enabled=true")
+        if self.lane_state_mode == "causal_set" and (
+            self.num_groups != 1 or self.training_auxiliary_group_sizes
+        ):
+            raise ValueError(
+                "causal_set lane state requires one deployable query set and "
+                "does not permit train-only query groups"
+            )
+        self.single_logit_score = bool(
+            self.lane_state_cfg.get("single_logit_score", False)
+        )
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
         self.lane_pooling = str(lane_pooling).strip().lower()
@@ -1169,15 +1189,31 @@ class StructuredLaneQueryHead(nn.Module):
             self.training_auxiliary_reference_anchor_logits = None
         self.lane_state_layers = nn.ModuleList(
             [
-                PersistentLaneStateLayer(
-                    dim=self.dim,
-                    num_heads=int(
-                        self.lane_state_cfg.get("num_heads", num_heads)
-                    ),
-                    ff_dim=int(self.lane_state_cfg.get("ff_dim", ff_dim)),
-                    dropout=float(
-                        self.lane_state_cfg.get("dropout", dropout)
-                    ),
+                (
+                    UnifiedLaneSetLayer(
+                        dim=self.dim,
+                        num_heads=int(
+                            self.lane_state_cfg.get("num_heads", num_heads)
+                        ),
+                        ff_dim=int(self.lane_state_cfg.get("ff_dim", ff_dim)),
+                        dropout=float(
+                            self.lane_state_cfg.get("dropout", dropout)
+                        ),
+                        semantic_context=self.lane_state_cfg.get(
+                            "semantic_context"
+                        ),
+                    )
+                    if self.lane_state_mode == "causal_set"
+                    else PersistentLaneStateLayer(
+                        dim=self.dim,
+                        num_heads=int(
+                            self.lane_state_cfg.get("num_heads", num_heads)
+                        ),
+                        ff_dim=int(self.lane_state_cfg.get("ff_dim", ff_dim)),
+                        dropout=float(
+                            self.lane_state_cfg.get("dropout", dropout)
+                        ),
+                    )
                 )
                 for _ in range(int(num_layers))
             ]
@@ -1187,7 +1223,11 @@ class StructuredLaneQueryHead(nn.Module):
         self.row_norm = nn.LayerNorm(self.dim)
         self.lane_norm = nn.LayerNorm(self.dim)
         self.row_x = nn.Linear(self.dim, self.x_bins)
-        self.exist = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 2))
+        self.exist = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.GELU(),
+            nn.Linear(self.dim, 1 if self.single_logit_score else 2),
+        )
         self.range = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 2))
         self.quality = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 1))
         self.set_selection_head = (
@@ -1229,8 +1269,19 @@ class StructuredLaneQueryHead(nn.Module):
         with torch.no_grad():
             self.range[-1].bias.copy_(torch.tensor([-2.0, 2.0]))
             if self.exist_prior_prob is not None:
-                lane_logit = 0.5 * math.log(self.exist_prior_prob / (1.0 - self.exist_prior_prob))
-                self.exist[-1].bias.copy_(self.exist[-1].bias.new_tensor([lane_logit, -lane_logit]))
+                lane_logit = math.log(
+                    self.exist_prior_prob / (1.0 - self.exist_prior_prob)
+                )
+                if self.single_logit_score:
+                    self.exist[-1].bias.copy_(
+                        self.exist[-1].bias.new_tensor([lane_logit])
+                    )
+                else:
+                    self.exist[-1].bias.copy_(
+                        self.exist[-1].bias.new_tensor(
+                            [0.5 * lane_logit, -0.5 * lane_logit]
+                        )
+                    )
         self.training_auxiliary_instance_tokens = (
             nn.Embedding(sum(self.training_auxiliary_group_sizes), self.dim)
             if self.training_auxiliary_group_sizes
@@ -1411,6 +1462,7 @@ class StructuredLaneQueryHead(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
+        multi_scale_features: dict[str, torch.Tensor] | None = None,
         inference_only: bool = False,
     ) -> dict[str, Any]:
         b = int(features.shape[0])
@@ -1460,6 +1512,7 @@ class StructuredLaneQueryHead(nn.Module):
             if self.lane_state_enabled
             else None
         )
+        decision_lane_state = lane_state
         row_value_features, row_key_features = self._row_features(features)
 
         intermediate_outputs: list[dict[str, torch.Tensor]] = []
@@ -1489,6 +1542,17 @@ class StructuredLaneQueryHead(nn.Module):
             for layer_index, layer in enumerate(self.layers):
                 if not isinstance(layer, ReferenceGuidedRowLayer):
                     raise TypeError("row-reference mode requires ReferenceGuidedRowLayer")
+                lane_layer = (
+                    self.lane_state_layers[layer_index]
+                    if lane_state is not None
+                    else None
+                )
+                if isinstance(lane_layer, UnifiedLaneSetLayer):
+                    lane_state = lane_layer.prepare(
+                        lane_state,
+                        group_sizes=active_group_sizes,
+                    )
+                    row_tokens = lane_layer.inject_rows(lane_state, row_tokens)
                 row_tokens = layer(
                     row_tokens,
                     row_value_features,
@@ -1497,11 +1561,20 @@ class StructuredLaneQueryHead(nn.Module):
                     num_groups=active_num_groups,
                     group_sizes=active_group_sizes,
                 )
-                if lane_state is not None:
-                    lane_state = self.lane_state_layers[layer_index](
+                if isinstance(lane_layer, UnifiedLaneSetLayer):
+                    lane_state = lane_layer.collect(lane_state, row_tokens)
+                    decision_lane_state = lane_layer.decision(
+                        lane_state,
+                        multi_scale_features=multi_scale_features,
+                    )
+                elif lane_layer is not None:
+                    lane_state = lane_layer(
                         lane_state,
                         row_tokens,
                     )
+                    decision_lane_state = lane_state
+                else:
+                    decision_lane_state = None
                 row_logit_bias = self._reference_prior_logits(
                     reference_x,
                     x_bins=self.x_bins,
@@ -1515,6 +1588,7 @@ class StructuredLaneQueryHead(nn.Module):
                     row_x_logit_bias=row_logit_bias,
                     input_reference_x_rows=reference_x,
                     lane_state=lane_state,
+                    decision_lane_state=decision_lane_state,
                 )
                 predicted_reference = layer_outputs["pred_x_rows"]
                 reference_x = (
@@ -1534,9 +1608,24 @@ class StructuredLaneQueryHead(nn.Module):
                 raise ValueError("row-reference decoder requires at least one decoder layer")
         else:
             intermediate_states: list[
-                tuple[torch.Tensor, torch.Tensor | None]
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                ]
             ] = []
             for layer_index, layer in enumerate(self.layers):
+                lane_layer = (
+                    self.lane_state_layers[layer_index]
+                    if lane_state is not None
+                    else None
+                )
+                if isinstance(lane_layer, UnifiedLaneSetLayer):
+                    lane_state = lane_layer.prepare(
+                        lane_state,
+                        group_sizes=active_group_sizes,
+                    )
+                    row_tokens = lane_layer.inject_rows(lane_state, row_tokens)
                 row_tokens = layer(
                     row_tokens,
                     row_value_features,
@@ -1544,22 +1633,34 @@ class StructuredLaneQueryHead(nn.Module):
                     num_groups=active_num_groups,
                     group_sizes=active_group_sizes,
                 )
-                if lane_state is not None:
-                    lane_state = self.lane_state_layers[layer_index](
+                if isinstance(lane_layer, UnifiedLaneSetLayer):
+                    lane_state = lane_layer.collect(lane_state, row_tokens)
+                    decision_lane_state = lane_layer.decision(
+                        lane_state,
+                        multi_scale_features=multi_scale_features,
+                    )
+                elif lane_layer is not None:
+                    lane_state = lane_layer(
                         lane_state,
                         row_tokens,
                     )
+                    decision_lane_state = lane_state
+                else:
+                    decision_lane_state = None
                 if (
                     self.intermediate_supervision
                     and not inference_only
                     and layer_index < len(self.layers) - 1
                 ):
-                    intermediate_states.append((row_tokens, lane_state))
+                    intermediate_states.append(
+                        (row_tokens, lane_state, decision_lane_state)
+                    )
             outputs = self._predict_from_row_tokens(
                 row_tokens,
                 instance,
                 include_quality=True,
                 lane_state=lane_state,
+                decision_lane_state=decision_lane_state,
             )
             if self.intermediate_supervision and not inference_only:
                 intermediate_outputs = [
@@ -1568,8 +1669,13 @@ class StructuredLaneQueryHead(nn.Module):
                         instance,
                         include_quality=False,
                         lane_state=intermediate_lane_state,
+                        decision_lane_state=intermediate_decision_state,
                     )
-                    for tokens, intermediate_lane_state in intermediate_states
+                    for (
+                        tokens,
+                        intermediate_lane_state,
+                        intermediate_decision_state,
+                    ) in intermediate_states
                 ]
         if self.training_auxiliary_group_sizes and not inference_only:
             full_count = self.num_instances
@@ -1678,6 +1784,7 @@ class StructuredLaneQueryHead(nn.Module):
         row_x_logit_bias: torch.Tensor | None = None,
         input_reference_x_rows: torch.Tensor | None = None,
         lane_state: torch.Tensor | None = None,
+        decision_lane_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Apply the shared lane heads to one decoder-layer state.
 
@@ -1691,12 +1798,21 @@ class StructuredLaneQueryHead(nn.Module):
             if lane_state.shape != (b, int(row_tokens.shape[1]), self.dim):
                 raise ValueError("lane_state shape does not match row tokens")
             lane_query = self.lane_norm(lane_state)
+            if decision_lane_state is None:
+                decision_query = lane_query
+            else:
+                if decision_lane_state.shape != lane_state.shape:
+                    raise ValueError(
+                        "decision_lane_state shape does not match lane state"
+                    )
+                decision_query = self.lane_norm(decision_lane_state)
         else:
             instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
             lane_summary = row_tokens.mean(dim=2)
             if self.lane_pooling == "mean_max":
                 lane_summary = lane_summary + row_tokens.amax(dim=2)
             lane_query = self.lane_norm(lane_summary + instance_residual)
+            decision_query = lane_query
         row_x_logits = self.row_x(row_tokens)
         if row_x_logit_bias is not None:
             if row_x_logit_bias.shape != row_x_logits.shape:
@@ -1708,19 +1824,34 @@ class StructuredLaneQueryHead(nn.Module):
         pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
+        raw_exist = self.exist(decision_query)
+        if self.single_logit_score:
+            foreground_logit = raw_exist.squeeze(-1)
+            exist_logits = torch.stack(
+                (foreground_logit, torch.zeros_like(foreground_logit)),
+                dim=-1,
+            )
+        else:
+            exist_logits = raw_exist
         outputs = {
-            "exist_logits": self.exist(lane_query),
+            "exist_logits": exist_logits,
             "pred_x_rows": pred_x_rows,
             "range_norm": range_norm,
             "row_x_logits": row_x_logits,
             "range_raw": range_raw,
             "queries": lane_query,
+            "decision_queries": decision_query,
             "structured_row_tokens": row_tokens,
         }
+        if self.single_logit_score:
+            # One scalar is now used by matching, foreground supervision and
+            # deployment.  The legacy two-logit tensor above is only an exact
+            # compatibility view: softmax(...)[0] == sigmoid(score_logit).
+            outputs["score_logits"] = foreground_logit
         if input_reference_x_rows is not None:
             outputs["input_reference_x_rows"] = input_reference_x_rows
         if include_quality:
-            outputs["quality_logits"] = self.quality(lane_query).squeeze(-1)
+            outputs["quality_logits"] = self.quality(decision_query).squeeze(-1)
         return outputs
 
 

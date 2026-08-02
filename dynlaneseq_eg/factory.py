@@ -76,6 +76,12 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         seg_pos_weight=float(loss.get("seg_pos_weight", 1.0)),
         seg_extra_weights=dict(loss.get("seg_extra_weights", {})),
         w_quality=float(loss.get("w_quality", 0.0)),
+        w_cardinality=float(loss.get("w_cardinality", 0.0)),
+        w_score_margin=float(loss.get("w_score_margin", 0.0)),
+        score_margin=float(loss.get("score_margin", 0.5)),
+        score_margin_topk_negatives=int(
+            loss.get("score_margin_topk_negatives", 8)
+        ),
         w_set_selection=float(loss.get("w_set_selection", 0.0)),
         set_selection_line_width=float(
             loss.get("set_selection_line_width", 30.0)

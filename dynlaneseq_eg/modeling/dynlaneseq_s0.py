@@ -475,11 +475,15 @@ class DynLaneSeqEncoder(nn.Module):
             fpn = self.fpn(feats)
             f_proj = self.proj(fpn)
             multi_scale_features = None
-        # A structured S0 inference pass consumes only the projected P2 map.
-        # Positional memory, the legacy lane-query decoder, and auxiliary
-        # training heads do not contribute to any written CULane prediction.
+        # Structured inference consumes projected P2 and, when explicitly
+        # configured, its projected semantic pyramid. Positional memory, the
+        # legacy lane-query decoder, and auxiliary training heads do not
+        # contribute to any written CULane prediction.
         if inference_only and structured_only:
-            return {"features": f_proj}
+            inference_features = {"features": f_proj}
+            if multi_scale_features is not None:
+                inference_features["multi_scale_features"] = multi_scale_features
+            return inference_features
         pos_embed = self.pos(f_proj)
         f_pos = f_proj + pos_embed
         mem_key = f_pos.flatten(2).transpose(1, 2).contiguous()
@@ -592,7 +596,11 @@ class DynLaneSeqS0(nn.Module):
             structured_only=structured_only,
         )
         if self.structured_query_head is not None:
-            out = self.structured_query_head(enc["features"], inference_only=bool(inference_only))
+            out = self.structured_query_head(
+                enc["features"],
+                multi_scale_features=enc.get("multi_scale_features"),
+                inference_only=bool(inference_only),
+            )
             if not inference_only:
                 out["memory"] = enc["memory"]
                 out["memory_key"] = enc["memory_key"]

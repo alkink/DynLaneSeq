@@ -31,6 +31,10 @@ class LossConfig:
     seg_pos_weight: float = 1.0
     seg_extra_weights: dict[str, float] = field(default_factory=dict)
     w_quality: float = 0.0
+    w_cardinality: float = 0.0
+    w_score_margin: float = 0.0
+    score_margin: float = 0.5
+    score_margin_topk_negatives: int = 8
     w_set_selection: float = 0.0
     set_selection_line_width: float = 30.0
     set_selection_focal_beta: float = 2.0
@@ -119,6 +123,16 @@ class S0Criterion(nn.Module):
         loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches) if self.cfg.w_line_iou != 0 else zero
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
+        loss_cardinality = (
+            self.compute_cardinality_loss(outputs, targets)
+            if self.cfg.w_cardinality != 0
+            else zero
+        )
+        loss_score_margin = (
+            self.compute_score_margin_loss(outputs, matches)
+            if self.cfg.w_score_margin != 0
+            else zero
+        )
         if self.cfg.w_set_selection != 0:
             set_selection = self.compute_set_selection_loss(
                 outputs,
@@ -153,6 +167,8 @@ class S0Criterion(nn.Module):
             + self.cfg.w_line_iou * loss_line_iou
             + self.cfg.w_seg * loss_seg
             + self.cfg.w_quality * loss_quality
+            + self.cfg.w_cardinality * loss_cardinality
+            + self.cfg.w_score_margin * loss_score_margin
             + self.cfg.w_set_selection * set_selection["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
@@ -169,6 +185,8 @@ class S0Criterion(nn.Module):
             "loss_line_iou": loss_line_iou,
             "loss_seg": loss_seg,
             "loss_quality": loss_quality,
+            "loss_cardinality": loss_cardinality,
+            "loss_score_margin": loss_score_margin,
             "loss_set_selection": set_selection["total"],
             "loss_set_selection_quality": set_selection["quality"],
             "loss_set_selection_ranking": set_selection["ranking"],
@@ -561,6 +579,76 @@ class S0Criterion(nn.Module):
         # Candidate subsets are views in the hybrid primary/auxiliary decoder;
         # reshape handles their non-contiguous candidate dimension safely.
         return F.cross_entropy(logits.reshape(b * n, 2), target.reshape(b * n), weight=weight)
+
+    def compute_cardinality_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Calibrate the NMS-free lane count without choosing a threshold.
+
+        Per-query focal supervision says which slot is foreground, but it does
+        not directly constrain the total probability mass emitted by a
+        32-query set.  This differentiable count objective makes an image with
+        four lanes carry approximately four foreground probabilities and a
+        cross/no-lane image carry approximately zero.  Geometry is not used in
+        the target, so the loss cannot improve its score by moving a curve.
+        """
+
+        logits = outputs["exist_logits"]
+        probability = torch.softmax(logits.float(), dim=-1)[..., 0]
+        predicted_count = probability.sum(dim=1)
+        target_count = probability.new_tensor(
+            [float(target["x_rows"].shape[0]) for target in targets]
+        )
+        return F.smooth_l1_loss(
+            predicted_count,
+            target_count,
+            beta=1.0,
+            reduction="mean",
+        )
+
+    def compute_score_margin_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        matches: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Force every assigned lane above the hardest unmatched duplicates.
+
+        This is a set-ranking objective, not a second score head.  It operates
+        on the exact foreground logit used by the matcher and deployment and
+        therefore cannot create the old existence/quality/selector mismatch.
+        """
+
+        logits = outputs["exist_logits"].float()
+        foreground = logits[..., 0] - logits[..., 1]
+        margin = float(self.cfg.score_margin)
+        topk = int(self.cfg.score_margin_topk_negatives)
+        if topk < 1:
+            raise ValueError("score_margin_topk_negatives must be positive")
+        total = foreground.sum() * 0.0
+        count = foreground.new_zeros(())
+        for batch_index, match in enumerate(matches):
+            positive_indices = match["pred_indices"].to(foreground.device)
+            if positive_indices.numel() == 0:
+                continue
+            negative_mask = torch.ones(
+                foreground.shape[1],
+                dtype=torch.bool,
+                device=foreground.device,
+            )
+            negative_mask[positive_indices] = False
+            negative = foreground[batch_index, negative_mask]
+            if negative.numel() == 0:
+                continue
+            hardest = negative.topk(min(topk, int(negative.numel()))).values
+            positive = foreground[batch_index, positive_indices]
+            pair_loss = F.softplus(
+                margin - positive.unsqueeze(-1) + hardest.unsqueeze(0)
+            )
+            total = total + pair_loss.sum()
+            count = count + pair_loss.new_tensor(float(pair_loss.numel()))
+        return total / count.clamp_min(1.0)
 
     @staticmethod
     def _zero_anchor(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
