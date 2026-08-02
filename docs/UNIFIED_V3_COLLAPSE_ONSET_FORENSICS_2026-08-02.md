@@ -714,6 +714,12 @@ Amaç yalnız hızlı bir kurtarma checkpoint'i üretmek olsaydı sıradaki kol
 `contract + scale` birleşimi olurdu. Amaç kök nedeni bulup sağlam bir nihai
 model kurmak olduğu için önce mevcut scale müdahalesi ikiye ayrılmalıdır.
 
+> **3 Ağustos strateji notu:** Bu ayrıştırma, yalnız mevcut V3'ün adli kök
+> nedenini tamamlamak için en yüksek bilgi değerli kısa deneydir. Projenin
+> kabul ölçütü 278k boyunca kararlı çalışan nihai bir model olarak
+> sabitlendiğinde artık ana geliştirme yolu değildir. Bölüm 15'teki yapısal V4
+> tasarımı bu planın önüne geçmiştir.
+
 Aynı 30k source ve aynı replay manifest ile iki yeni kol:
 
 | Kol | Lane-state LR | `row_norm/row_x` LR | Sorduğu soru |
@@ -767,3 +773,292 @@ En dürüst son cümle:
 > Fakat scale kolunun strict geometry kaybı hâlâ büyük; dolayısıyla sağlam
 > çözümün hangi alt grubu stabilize etmesi ve hangi yapısal geri beslemeyi
 > sınırlaması gerektiğini iki kısa ayrıştırma koluyla belirlemeliyiz.**
+
+---
+
+## 15. Stratejik düzeltme: hedef 5k kurtarma değil, 278k kararlılığı
+
+Mevcut V3 için dürüst cevap şudur:
+
+> **Hayır. 30k–35k arasında katastrofik biçimde çöken mevcut hesaplama
+> grafiğinin, yalnız LR ayarıyla 278k boyunca güvenilir çalışacağı
+> varsayılamaz.**
+
+Scale kolu arızanın bir parçasını kanıtlamıştır; nihai çözümü kanıtlamamıştır.
+Bu nedenle “readout-low mu, lane-state-low mu?” ayrımı artık yalnız açıklayıcı
+bir yan deneydir. Ana yol, hatanın oluşmasını yapısal olarak imkânsızlaştıran
+bir decoder sözleşmesidir.
+
+### 15.1 Mevcut V3'te 278k açısından kabul edilemez döngü
+
+Koddan doğrulanan akış:
+
+```text
+full-row image-conditioned initial reference
+                    |
+                    v
+lane-set state -> row state injection
+                    |
+                    v
+yalnız reference ±96 px içindeki 7 P2 noktası okunuyor
+                    |
+                    v
+ortak row_norm -> ortak serbest Linear(256, 800)
+                    |
+                    v
+görüntünün herhangi bir yerinde mutlak x tahmini
+                    |
+                    v
+detach -> sonraki katmanın sampling reference'ı
+```
+
+Buradaki yapısal uyumsuzluk:
+
+- gözlem alanı yereldir;
+- çıktı alanı bütün görüntüdür;
+- çıktı kafası dört farklı decoder state dağılımı tarafından paylaşılır;
+- her ara katman bağımsız Hungarian kimliğiyle aynı kafaya gradient verir;
+- yanlış mutlak çıktı bir sonraki katmanın ne göreceğini belirler;
+- yanlış sıçramayı sınırlayan hard trust region yoktur.
+
+Bu sistem küçük LR ile daha yavaş bozulabilir, fakat 278k kararlılığı için
+matematiksel bir güvence içermez.
+
+### 15.2 MapTR ve CondLSTR karşılaştırmasının öğrettiği şey
+
+Yerel kaynak kod karşılaştırması:
+
+```text
+/home/alki/projects/lanemodels/MapTR/
+/home/alki/projects/lanemodels/CondLSTR/
+```
+
+MapTR iterative refinement sırasında:
+
+- reference'a residual ekler;
+- yeni reference'ı detach eder;
+- `with_box_refine=true` olduğunda her decoder katmanına ayrı regression
+  branch kopyalar;
+- farklı layer state dağılımlarını tek bir ortak coordinate head'e zorlamaz.
+
+CondLSTR ise lane koordinatını query tarafından üretilen yoğun mask/regression
+alanından çıkarır. Geometri doğrudan image feature üzerinde tanımlıdır; serbest
+bir global coordinate classifier'ın kendi çıktısını sonraki local görüş alanı
+olarak tekrar beslediği bir döngü yoktur.
+
+Dolayısıyla problem “Transformer decoder prensipte çalışmıyor” değildir.
+Problem V3'ün şu özgül birleşimidir:
+
+```text
+local observation
++ shared absolute coordinate head
++ independent layer matching
++ detached recursive reference
++ high common LR
+```
+
+### 15.3 Unified Lane-Set V4: 278k-dayanıklı geometri sözleşmesi
+
+V4 tek bir tutarlı tasarım olarak aşağıdaki invariants'ları sağlamalıdır.
+
+#### A. Birinci katman gerçek global acquisition
+
+İlk geometry katmanı her row için bütün P2 yatay dizisini görür. İlk koordinat
+görüntüye bağlı dense similarity dağılımından çıkar:
+
+```text
+row query ---- normalized dot product ---- P2 row keys over full width
+                                  |
+                                  v
+                         absolute x distribution
+```
+
+Burada serbest `Linear(256, 800)` yerine, ayrı coordinate query/key
+projection'larıyla görüntüye bağlı logit üretilmesi tercih edilir. Böylece
+coordinate logiti gerçek bir uzamsal P2 konumuna bağlıdır.
+
+#### B. Sonraki katmanlar yalnız bounded local delta üretir
+
+Refinement katmanı reference çevresinde yoğun bir profil okur; örneğin
+`[-96,+96]` içinde 25–33 offset. Çıktı global 800-bin x değildir:
+
+```text
+delta_logits = similarity(row_query, sampled_P2[offset])
+delta_x      = expectation(delta_logits, offsets)
+x_next       = clamp(x_reference + delta_x, 0, W-1)
+```
+
+Temel invariant:
+
+```text
+|x_next - x_reference| <= refinement_radius
+```
+
+Model görmediği bir bölgeye tek adımda sıçrayamaz. Local observation ile local
+action aynı fiziksel koordinat sisteminde olur.
+
+#### C. Katman başına ayrı coordinate readout
+
+```text
+Layer 0 -> global coordinate query/key head
+Layer 1 -> local delta head 1
+Layer 2 -> local delta head 2
+Layer 3 -> local delta head 3
+```
+
+Ara katmanlar aynı `row_norm/row_x` affine sistemini paylaşmaz. Bu, layer-state
+dağılımları ve layerwise geometry gradientleri arasındaki çatışmayı tek bir
+head içinde biriktirmeyi önler.
+
+#### D. Kalıcı kimlik ile değişen content ayrılır
+
+Her lane için iki ayrı büyüklük korunur:
+
+```text
+e_i   = değişmeyen learned lane identity
+q_i^l = görüntüyle değişen lane content
+```
+
+Set attention Q/K girdisi:
+
+```text
+LN(q_i^l) + e_i + curve_position_code(x_i^l)
+```
+
+Value yalnız content taşır. Böylece attention content'i güncellese bile lane
+kimliği ve mevcut curve konumu kaybolmaz.
+
+#### E. Lane-to-row etkisi sınırlı residual olur
+
+Lane state row geometry'yi kontrolsüz tam-genlikli affine ile sürüklemez.
+Projection normalize edilir ve sabit/bounded bir residual ölçeği kullanılır:
+
+```text
+row <- row + alpha * normalized(lane_to_row(lane_state))
+0 < alpha <= güvenli sabit
+```
+
+Bu yol açıktır fakat row feature dağılımını 30k–35k'daki gibi hızla başka bir
+koordinat sistemine taşıyamaz.
+
+#### F. Geometry matching ve score geri beslemesi ayrılır
+
+```text
+Hungarian assignment: point + range + LineIoU; score cost = 0
+Intermediate layers: geometry-only loss
+Final layer: geometry + tek foreground/quality score
+Intermediate assignment: final query identity yeniden kullanılır
+```
+
+Final score, detached final geometry IoU'suna bağlı continuous target öğrenir.
+Score head'in girdisi geometry core'dan detach edilir; score loss geometry
+state'ini değiştiremez. Cardinality ve binary margin başlangıçta kapalıdır.
+
+Sonuç olarak:
+
+```text
+geometry -> score'a bilgi verir
+score -X-> matcher/geometry'ye geri kumanda vermez
+```
+
+#### G. Optimizer, görev sınırlarını yansıtır
+
+Başlangıç sözleşmesi:
+
+| Grup | Base LR |
+|---|---:|
+| DLA backbone | `1e-5` |
+| FPN/P2 projection | `1e-4` |
+| Row visual decoder | `1e-4` |
+| Lane-set state / collect / inject | `5e-5` |
+| Global/local coordinate heads | `5e-5` |
+| Instance/row identity embeddings | `5e-5` |
+| Final semantic score branch | `1e-4` |
+
+Norm ve bias parametreleri decay almaz; global gradient clipping korunur.
+Kritik fark bütün `structured_query_head.*` parametrelerinin tek `2e-4`
+evidence grubuna atılmamasıdır.
+
+### 15.4 Yeni mimari ağacı
+
+```text
+DLA-34 + SimpleFPN
+        |
+        +---------------- P2: yüksek çözünürlüklü geometri
+        |                         |
+        |                         v
+        |              Global row acquisition (Layer 0)
+        |                         |
+        |                         v
+        |                absolute image-grounded curve
+        |                         |
+        |          +--------------+--------------+
+        |          |              |              |
+        |          v              v              v
+        |      Local Δ L1     Local Δ L2     Local Δ L3
+        |      bounded        bounded        bounded
+        |      own head       own head       own head
+        |          |              |              |
+        |          +--------------+--------------+
+        |                         |
+        |                         v
+        |                 final ordered rows
+        |                         |
+        |                         +------> range
+        |                         |
+        +---- P4/P5 semantic ----+------> detached final score
+                                          |
+                                          v
+                                  Top-K / optional NMS
+```
+
+### 15.5 Tek ana eğitim: 0→278k, ilk 50k yapısal kabul kapısı
+
+Yeni tasarım bir 5k rescue olarak denenmemelidir. Sıfırdan, scheduler horizon
+başından itibaren `278000` olarak eğitilir. İlk 50k bu aynı koşunun erken kabul
+kapısıdır; başarılı olursa optimizer sıfırlanmadan aynı koşu 278k'ya devam
+eder.
+
+Checkpoint/audit sıklığı:
+
+```text
+0–50k: her 5k
+50–150k: her 10k veya 25k
+150–278k: her 25k
+```
+
+İlk 50k geçiş şartları yalnız F1 değildir:
+
+| Sözleşme | Fail-fast koşulu |
+|---|---|
+| All-32 R@.50 | 30k sonrası katastrofik düşüş yok |
+| All-32 R@.75 | iki ardışık checkpointte sert düşüş yok |
+| Local trust region | `|x_next-x_ref|` hiçbir örnekte radius'u aşmaz |
+| Reference coverage | layer boyunca monoton çöküş yok |
+| Head normları | 5k pencerede 2x runaway yok |
+| Update/weight | kritik gruplarda sürekli büyüyen trend yok |
+| Layer identity | final assignment reuse sözleşmesi ihlal edilmiyor |
+| Score feedback | score gradientinin geometry core'a normu tam sıfır |
+
+Bu koşu 50k'ya kadar sağlıklı kalmazsa 278k'ya devam edilmez. Sağlıklı
+kalırsa bu yalnız “kısa test başarılı” demek değildir; aynı optimizer state ve
+aynı 278k schedule ile gerçek uzun koşunun ilk bölümünün geçtiği anlamına
+gelir.
+
+### 15.6 Nihai karar
+
+Mevcut V3'ü LR yamalarıyla 278k'ya taşımak ana plan değildir. V3 adli
+deneyleri, yeni tasarımın hangi invariants'lara sahip olması gerektiğini
+öğretmiştir. Bundan sonraki ana mühendislik işi:
+
+```text
+shared absolute readout'u kaldır
+local observation'ı bounded local action ile eşleştir
+katman başına ayrı coordinate head kullan
+score'u geometry geri beslemesinden ayır
+kritik decoder gruplarını düşük ve ayrı LR ile eğit
+sıfırdan başlayan tek 278k koşusunu 50k fail-fast kapısıyla izle
+```
+
+Bu, küçük bir hiperparametre yaması değil; V3'ün kararsız geri besleme
+döngüsünü ortadan kaldıran genel mimari çözümdür.
