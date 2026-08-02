@@ -100,15 +100,49 @@ def flatten(payload: dict[str, Any]) -> dict[str, Any]:
             "0.50",
             "oracle_minus_direct_recall_points",
         ),
+        "all_candidates_recall_075": _nested(
+            payload, "capacity", "0.75", "all_candidates_recall"
+        ),
+        "direct_top4_recall_075": _nested(
+            payload, "capacity", "0.75", "direct_topk_recall"
+        ),
+        "oracle_top4_recall_075": _nested(
+            payload, "capacity", "0.75", "oracle_topk_recall"
+        ),
         "score_iou_pearson": _nested(
             payload,
             "score_official_iou_alignment",
             "pearson_score_vs_best_official_iou",
         ),
+        "matched_mean_score": _nested(
+            payload,
+            "score_official_iou_alignment",
+            "matched_mean_score",
+        ),
+        "unmatched_mean_score": _nested(
+            payload,
+            "score_official_iou_alignment",
+            "unmatched_mean_score",
+        ),
+        "matched_mean_best_official_iou": _nested(
+            payload,
+            "score_official_iou_alignment",
+            "matched_mean_best_official_iou",
+        ),
         "unique_candidate_ap_050": _nested(
             payload,
             "score_official_iou_alignment",
             "unique_candidate_ap_050",
+        ),
+        "mean_foreground_probability_mass": _nested(
+            payload,
+            "count_calibration",
+            "mean_foreground_probability_mass",
+        ),
+        "mean_training_target_lane_count": _nested(
+            payload,
+            "count_calibration",
+            "mean_training_target_lane_count",
         ),
         "probability_count_mae": _nested(
             payload,

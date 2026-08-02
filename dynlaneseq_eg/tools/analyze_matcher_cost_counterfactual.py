@@ -551,6 +551,7 @@ def main() -> None:
             )
             outputs = head(
                 encoded["features"],
+                multi_scale_features=encoded.get("multi_scale_features"),
                 inference_only=True,
             )
 
