@@ -1,0 +1,10 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v3_25k.yaml
+
+output_dir: outputs/diagnostics/dla34_unified_lane_set_v3_control_from25k_5k
+
+# Exact replay arm. Model, matcher, losses, optimizer, scheduler, and seed are
+# unchanged. A fresh process starts from the same 25k model/AdamW/scheduler
+# state as both interventions, making augmentation order matched across arms.
+training:
+  max_iters: 5000
+  checkpoint_interval: 1000

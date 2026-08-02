@@ -58,6 +58,12 @@ class LossConfig:
     lambda_coarse: float = 0.0
     lambda_geometry_draft: float = 0.0
     lambda_intermediate: float = 0.0
+    # ``None`` preserves the historical contract: intermediate decoder
+    # layers use the same foreground weight as the final layer.  A separate
+    # value lets a controlled experiment keep geometry deep supervision while
+    # preventing independently matched auxiliary layers from teaching the
+    # shared deployment score contradictory candidate identities.
+    w_intermediate_exist: float | None = None
     intermediate_layer_weights: tuple[float, ...] = ()
     lambda_training_auxiliary: float = 0.0
     geometry_reduction: str = "global_rows"
@@ -103,6 +109,10 @@ class S0Criterion(nn.Module):
         if weight == 0.0 or warmup <= 0:
             return weight
         return weight * min(1.0, float(self._iteration + 1) / float(warmup))
+
+    def intermediate_exist_weight(self) -> float:
+        value = self.cfg.w_intermediate_exist
+        return float(self.cfg.w_exist if value is None else value)
 
     def forward(
         self,
@@ -355,9 +365,10 @@ class S0Criterion(nn.Module):
                 if not isinstance(layer, dict):
                     raise TypeError("training auxiliary decoder output must be a dictionary")
                 layer_zero = self._zero_anchor(layer).sum() * 0.0
+                intermediate_exist_weight = self.intermediate_exist_weight()
                 layer_exist = (
                     self.compute_exist_loss(layer, layer_matches)
-                    if self.cfg.w_exist != 0
+                    if intermediate_exist_weight != 0.0
                     else layer_zero
                 )
                 layer_point = (
@@ -381,7 +392,7 @@ class S0Criterion(nn.Module):
                     else layer_zero
                 )
                 layer_total = (
-                    self.cfg.w_exist * layer_exist
+                    intermediate_exist_weight * layer_exist
                     + self.cfg.w_point * layer_point
                     + self.cfg.w_range * layer_range
                     + self.cfg.w_line_iou * layer_line_iou
@@ -445,6 +456,7 @@ class S0Criterion(nn.Module):
 
         normalizer = float(sum(layer_weights))
         row_dfl_weight = self.row_dfl_weight()
+        intermediate_exist_weight = self.intermediate_exist_weight()
         aggregate = losses["loss_total"].new_zeros(())
         component_sums = {
             "exist": aggregate.clone(),
@@ -474,7 +486,11 @@ class S0Criterion(nn.Module):
             if not isinstance(aux, dict):
                 raise TypeError("every auxiliary decoder output must be a dictionary")
             zero = self._zero_anchor(aux).sum() * 0.0
-            aux_exist = self.compute_exist_loss(aux, aux_matches) if self.cfg.w_exist != 0 else zero
+            aux_exist = (
+                self.compute_exist_loss(aux, aux_matches)
+                if intermediate_exist_weight != 0.0
+                else zero
+            )
             aux_point = self.compute_point_loss(aux, targets, aux_matches) if self.cfg.w_point != 0 else zero
             aux_range = self.compute_range_loss(aux, targets, aux_matches) if self.cfg.w_range != 0 else zero
             aux_line_iou = (
@@ -488,7 +504,7 @@ class S0Criterion(nn.Module):
                 else zero
             )
             aux_total = (
-                self.cfg.w_exist * aux_exist
+                intermediate_exist_weight * aux_exist
                 + self.cfg.w_point * aux_point
                 + self.cfg.w_range * aux_range
                 + self.cfg.w_line_iou * aux_line_iou
@@ -511,6 +527,9 @@ class S0Criterion(nn.Module):
         out["loss_intermediate_line_iou"] = component_sums["line_iou"]
         out["loss_intermediate_row_dfl"] = component_sums["row_dfl"]
         out["weight_intermediate"] = aggregate.new_tensor(strength)
+        out["weight_intermediate_exist"] = aggregate.new_tensor(
+            intermediate_exist_weight
+        )
         return out
 
     def add_geometry_draft_loss(

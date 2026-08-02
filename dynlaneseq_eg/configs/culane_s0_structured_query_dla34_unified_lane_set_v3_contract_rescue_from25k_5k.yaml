@@ -1,0 +1,16 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v3_control_from25k_5k.yaml
+
+output_dir: outputs/diagnostics/dla34_unified_lane_set_v3_contract_rescue_from25k_5k
+
+# Causal gate R1: remove score -> assignment feedback while retaining the
+# complete final foreground objective and all intermediate geometry losses.
+# Intermediate layers keep independent geometry-only Hungarian matches but do
+# not teach the shared deployment score a different candidate identity.
+matcher:
+  lambda_obj: 0.0
+  reuse_final_assignment_for_intermediate: false
+
+loss:
+  w_intermediate_exist: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0

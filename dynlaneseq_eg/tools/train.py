@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +107,55 @@ def apply_optimizer_group_lr_overrides(
             group["initial_lr"] = float(lr)
         changes[name] = {"before": previous, "after": float(lr)}
     return changes
+
+
+def align_scheduler_to_iteration(
+    scheduler,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+) -> dict[str, object]:
+    """Put a newly built scheduler at a resumed optimizer-step phase.
+
+    Optimizer-group remapping intentionally keeps the *new* group topology, so
+    the old scheduler state cannot be loaded when the number of groups changes.
+    Stepping the newly built scheduler to the checkpoint iteration preserves
+    its new base learning rates while matching the original cosine/multistep
+    phase.  Without this alignment, a 25k intervention silently restarts at
+    warmup step zero and is not a controlled continuation.
+    """
+
+    iteration = int(iteration)
+    if iteration < 0:
+        raise ValueError("scheduler alignment iteration must be non-negative")
+    if scheduler is None:
+        return {
+            "enabled": False,
+            "iteration": iteration,
+            "group_lrs": [float(group["lr"]) for group in optimizer.param_groups],
+        }
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The epoch parameter in `scheduler.step\(\)` was not necessary",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Detected call of `lr_scheduler.step\(\)` before `optimizer.step\(\)`",
+        )
+        scheduler.step(iteration)
+    if int(scheduler.last_epoch) != iteration:
+        raise RuntimeError(
+            "scheduler phase alignment failed: "
+            f"last_epoch={scheduler.last_epoch}, expected={iteration}"
+        )
+    return {
+        "enabled": True,
+        "iteration": iteration,
+        "last_epoch": int(scheduler.last_epoch),
+        "step_count": int(getattr(scheduler, "_step_count", 0)),
+        "base_lrs": [float(value) for value in scheduler.base_lrs],
+        "group_lrs": [float(group["lr"]) for group in optimizer.param_groups],
+    }
 
 
 def main() -> None:
@@ -273,6 +323,11 @@ def main() -> None:
             if scaler is not None and "scaler" in payload:
                 scaler.load_state_dict(payload["scaler"])
             start_iter = int(payload.get("iteration", 0))
+            scheduler_alignment = align_scheduler_to_iteration(
+                scheduler,
+                optimizer,
+                start_iter,
+            )
             del source_optimizer
             del payload
             print(
@@ -282,6 +337,7 @@ def main() -> None:
                         name for name, _ in newly_added_parameters
                     ],
                     "scheduler_state_restored": False,
+                    "scheduler_phase_alignment": scheduler_alignment,
                 }
             )
         else:

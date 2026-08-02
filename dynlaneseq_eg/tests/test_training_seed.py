@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from dynlaneseq_eg.tools.train import (
+    align_scheduler_to_iteration,
     apply_optimizer_group_lr_overrides,
     model_init_start_iteration,
     parse_optimizer_group_lr_overrides,
@@ -75,3 +76,36 @@ def test_resume_lr_override_rejects_unknown_group() -> None:
             optimizer,
             {"evidence_no_decay": 1e-5},
         )
+
+
+def test_scheduler_alignment_keeps_new_group_bases_at_resume_phase() -> None:
+    slow = torch.nn.Parameter(torch.tensor(1.0))
+    fast = torch.nn.Parameter(torch.tensor(2.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [slow], "lr": 5e-5, "name": "slow"},
+            {"params": [fast], "lr": 2e-4, "name": "fast"},
+        ]
+    )
+
+    def schedule(step: int) -> float:
+        return 0.01 + 0.99 * 0.5 * (
+            1.0 + np.cos(np.pi * float(step) / 278000.0)
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+    report = align_scheduler_to_iteration(scheduler, optimizer, 25000)
+    expected_factor = schedule(25000)
+
+    assert report["last_epoch"] == 25000
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(
+        5e-5 * expected_factor
+    )
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(
+        2e-4 * expected_factor
+    )
+    scheduler.step()
+    assert scheduler.last_epoch == 25001
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(
+        5e-5 * schedule(25001)
+    )

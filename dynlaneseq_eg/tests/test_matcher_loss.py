@@ -358,12 +358,68 @@ def test_s0_intermediate_supervision_matches_each_layer_and_backpropagates():
     assert torch.isfinite(losses["loss_total"])
     assert torch.isfinite(losses["loss_intermediate_total"])
     assert losses["weight_intermediate"].item() == 0.5
+    assert losses["weight_intermediate_exist"].item() == 2.0
     losses["loss_total"].backward()
     for auxiliary in auxiliaries:
         assert auxiliary["pred_x_rows"].grad is not None
         assert auxiliary["pred_x_rows"].grad.abs().sum() > 0
         assert auxiliary["row_x_logits"].grad is not None
         assert auxiliary["row_x_logits"].grad.abs().sum() > 0
+
+
+def test_intermediate_existence_can_be_disabled_without_disabling_geometry():
+    target = _target()
+
+    def prediction(offset: float):
+        return {
+            "exist_logits": torch.zeros((1, 2, 2), requires_grad=True),
+            "pred_x_rows": torch.full(
+                (1, 2, 72), 100.0 + offset, requires_grad=True
+            ),
+            "range_norm": torch.zeros((1, 2, 2), requires_grad=True),
+            "row_x_logits": torch.randn(
+                1, 2, 72, 200, requires_grad=True
+            ),
+        }
+
+    final = prediction(1.0)
+    auxiliary = prediction(8.0)
+    outputs = dict(final)
+    outputs["aux_outputs"] = [auxiliary]
+    matcher = HungarianMatcherS0(
+        MatcherConfig(
+            lambda_obj=0.0,
+            lambda_point=5.0,
+            lambda_range=1.0,
+        )
+    )
+    matches = matcher(final, [target])
+    criterion = S0Criterion(
+        LossConfig(
+            w_exist=2.0,
+            w_intermediate_exist=0.0,
+            w_point=5.0,
+            w_range=1.0,
+            w_line_iou=0.0,
+            w_row_dfl=0.5,
+            lambda_intermediate=0.5,
+            intermediate_layer_weights=(1.0,),
+        ),
+        matcher=matcher,
+    )
+    losses = criterion(outputs, [target], matches)
+    losses["loss_total"].backward()
+
+    assert losses["weight_intermediate_exist"].item() == 0.0
+    # The criterion's zero anchor keeps every emitted tensor connected for
+    # distributed/autograd safety, so the disabled branch receives an exact
+    # zero gradient rather than ``None``.
+    assert auxiliary["exist_logits"].grad is not None
+    assert auxiliary["exist_logits"].grad.abs().sum() == 0
+    assert auxiliary["pred_x_rows"].grad is not None
+    assert auxiliary["pred_x_rows"].grad.abs().sum() > 0
+    assert auxiliary["row_x_logits"].grad is not None
+    assert auxiliary["row_x_logits"].grad.abs().sum() > 0
 
 
 def test_geometry_draft_supervision_backprops_to_sampler_draft():

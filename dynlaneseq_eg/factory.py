@@ -120,6 +120,11 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         dynamic_proposal_heatmap_pos_weight=float(loss.get("dynamic_proposal_heatmap_pos_weight", 1.0)),
         lambda_geometry_draft=float(loss.get("lambda_geometry_draft", 0.0)),
         lambda_intermediate=float(loss.get("lambda_intermediate", 0.0)),
+        w_intermediate_exist=(
+            None
+            if loss.get("w_intermediate_exist") is None
+            else float(loss.get("w_intermediate_exist"))
+        ),
         intermediate_layer_weights=tuple(float(v) for v in loss.get("intermediate_layer_weights", [])),
         lambda_training_auxiliary=float(
             loss.get("lambda_training_auxiliary", 0.0)

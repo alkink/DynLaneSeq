@@ -1,0 +1,19 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v3_control_from25k_5k.yaml
+
+output_dir: outputs/diagnostics/dla34_unified_lane_set_v3_scale_rescue_from25k_5k
+
+# Causal gate R2: keep the original objective exactly, but slow only the two
+# mutually necessary decoder regions isolated by the frozen module swaps.
+# AdamW moments are remapped per parameter and the 278k cosine phase remains at
+# 25k; this is not an optimizer restart or a short-horizon cooldown.
+optimizer:
+  parameter_groups:
+    - name: unified_lane_state
+      prefixes:
+        - structured_query_head.lane_state_layers.
+      lr: 0.00005
+    - name: shared_row_readout
+      prefixes:
+        - structured_query_head.row_norm.
+        - structured_query_head.row_x.
+      lr: 0.00005
