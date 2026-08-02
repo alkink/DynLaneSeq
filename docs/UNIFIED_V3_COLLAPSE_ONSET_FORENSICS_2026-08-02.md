@@ -1,7 +1,7 @@
 # Unified Lane-Set V3 Collapse-Onset Forensics
 
 **Tarih:** 2 Ağustos 2026  
-**Durum:** 25k–50k checkpoint zaman çizelgesi tamamlandı; 30k→35k nedensellik kapısının sonucu bekleniyor  
+**Durum:** 25k–50k zaman çizelgesi ve 30k→35k üç kollu nedensellik kapısı tamamlandı; scale-factor ayrıştırma deneyi sırada
 **İlgili branch:** `diagnostic_v3_collapse_localization`  
 **İlgili commit:** `a03594f`  
 **Önceki teknik kayıt:** `docs/UNIFIED_V3_25K_TO75K_COLLAPSE_RESCUE_2026-08-02.md`
@@ -580,3 +580,190 @@ Bu yüzden sıradaki deney “daha fazla eğitim” veya “hemen baştan yeni m
 değil; aynı 30k state'inden başlayan contract-vs-scale nedensellik kapısıdır.
 Bu gate, bir sonraki büyük mimari kararın tahmine değil doğrudan kanıta
 dayanmasını sağlayacaktır.
+
+---
+
+## 14. 30k→35k üç kollu nedensellik kapısının gerçek sonucu
+
+Bu bölüm 3 Ağustos 2026'da, aşağıdaki yeni artefact'lar geldikten sonra
+eklenmiştir:
+
+```text
+outputs/diagnostics/summary.json
+outputs/diagnostics/control_uniform64.json
+outputs/diagnostics/contract_uniform64.json
+outputs/diagnostics/scale_uniform64.json
+```
+
+Üç kol da:
+
+- aynı `iter_0030000.pt` source state'inden başlamıştır;
+- 35k iteration'da ölçülmüştür;
+- aynı 64 validation görüntüsünü ve aynı dataset indekslerini kullanmıştır;
+- aynı frozen evaluation sözleşmesiyle değerlendirilmiştir.
+
+Bu nedenle kolların kendi aralarındaki fark anlamlıdır. Bununla birlikte
+64-image sonuçları resmî CULane validation/test sonucu değildir ve bu koşuda
+`gradient_images=0` olduğundan layerwise gradient çatışması henüz ölçülmüş
+değildir.
+
+### 14.1 Ana sonuç tablosu
+
+| Ölçüm | Source 30k | Control 35k | Contract 35k | Scale 35k |
+|---|---:|---:|---:|---:|
+| All-32 R@.50 | **94.12** | **0.00** | 41.63 | **72.40** |
+| All-32 R@.75 | **72.85** | **0.00** | **0.00** | **33.03** |
+| Direct Top-4 R@.50 | **72.40** | **0.00** | 29.41 | **50.23** |
+| Direct Top-4 R@.75 | **51.13** | **0.00** | **0.00** | **23.08** |
+| Matched mean IoU | **0.763** | 0.110 | 0.430 | **0.568** |
+| Matched score | 0.410 | 0.500 | 0.437 | 0.428 |
+| Unmatched score | 0.080 | 0.063 | 0.157 | **0.067** |
+| Score–IoU Pearson | 0.435 | 0.317 | **0.582** | 0.434 |
+| Foreground probability mass | 3.706 | 3.521 | **5.978** | **3.389** |
+| Frozen F1@.50, score 0.20 | **72.82** | **0.00** | 27.37 | **49.47** |
+
+En önemli üç gözlem:
+
+1. **Control çöküşü yeniden üretti.** Bu kez 35k'da All-32 recall tamamen
+   sıfır oldu. Dolayısıyla tarihsel çöküş tek bir eski DataLoader sırasına özgü
+   tesadüf değildir; sistem aynı sağlıklı 30k state'inden yeniden kararsız
+   çekim noktasına girebilmektedir.
+2. **Contract müdahalesi etkisiz değildir ama yetersizdir.** All-32 R@.50'yi
+   `%0` yerine `%41.63` seviyesinde tutmuş ve score–IoU korelasyonunu
+   iyileştirmiştir. Fakat R@.75 tamamen ölmüş, matched IoU `0.430`'a düşmüş ve
+   readout norm büyümesi neredeyse control kadar sürmüştür.
+3. **Scale müdahalesi açık ara en güçlü nedensel sinyaldir.** Objective
+   değiştirilmeden yalnız lane-state ve row-readout LR'sinin dörtte bire
+   indirilmesi All-32 R@.50'nin `%72.40`, R@.75'in `%33.03` olarak kalmasını
+   sağlamıştır. Bu, güncelleme ölçeğinin çöküşte yalnız korelasyon değil gerçek
+   bir nedensel faktör olduğunu gösterir.
+
+### 14.2 Parametre büyümesiyle geometry kaybının müdahale cevabı
+
+| Parametre | Source 30k | Control oranı | Contract oranı | Scale oranı |
+|---|---:|---:|---:|---:|
+| `row_norm.weight` | 31.38 | 1.421x | 1.393x | **1.089x** |
+| `row_norm.bias` | 5.06 | 2.915x | 2.666x | **1.368x** |
+| `row_x.weight` | 74.20 | 2.079x | 2.092x | **1.272x** |
+| `row_x.bias` | 3.40 | 2.510x | 2.515x | **1.386x** |
+| Readout relative delta | — | 1.265 | 1.257 | **0.332** |
+| Lane-state relative delta | — | 0.209 | 0.192 | **0.078** |
+
+Contract kolunda objective değişmesine rağmen `row_x.weight` yine yaklaşık
+iki katına çıkmıştır. Buna karşılık scale kolunda readout relative delta
+control'ün yaklaşık dörtte birine düşmüş ve kullanılabilir geometry'nin büyük
+bölümü korunmuştur. Müdahale ile hem parametre runaway'in hem geometry
+çöküşünün birlikte azalması, update scale hipotezini doğrudan güçlendirir.
+
+Ancak scale kolu bir başarı koşusu değildir:
+
+```text
+30k -> scale 35k
+All-32 R@.50: 94.12 -> 72.40
+All-32 R@.75: 72.85 -> 33.03
+matched IoU:  0.763 -> 0.568
+```
+
+Yani dört kat düşük LR yalnızca felaketi yavaşlatmış veya kısmen engellemiş;
+sağlıklı 30k geometrisini korumamıştır. Otomatik özetin
+`neither_minimal_intervention_is_sufficient` etiketi bu katı başarı eşiği
+açısından doğrudur. Fakat bu etiket, scale kolunun diğer koldan çok daha güçlü
+nedensel bilgi taşıdığını gizlememelidir.
+
+### 14.3 Güncellenmiş nedensellik hükmü
+
+Artık şu iddialar savunulabilir:
+
+| Güven | Sonuç |
+|---|---|
+| **Kesin** | Control aynı 30k source'tan yeniden çökmüştür; kararsızlık tekrarlanabilirdir. |
+| **Kesin** | Score/matcher/intermediate-score contract'ı değiştirmek tek başına geometry'yi korumaz. |
+| **Kesin** | Lane-state/readout güncelleme ölçeğini azaltmak çöküşü büyük ölçüde bastırır. |
+| **Kuvvetli** | Yüksek effective update, row-readout runaway ve geometry kaybı için gerekli veya çok güçlü bir büyütücüdür. |
+| **Kuvvetli** | Contract geri beslemesi ikincil katkı yapmaktadır; scale ile birleştiğinde ek kazanç verebilir. |
+| **Açık** | Asıl hassas grup lane-state mi, `row_norm/row_x` readout mu, yoksa karşılıklı co-adaptation mı? |
+| **Açık** | Düşük LR yapısal gradient çatışmasını çözüyor mu, yoksa yalnızca daha yavaş mı biriktiriyor? |
+| **Açık** | Detached local-reference zinciri scale kolundaki kalan strict-IoU kaybının ne kadarını büyütüyor? |
+
+Basit mekanik anlatımı:
+
+```text
+30k'da iyi lane state + iyi row readout
+                 |
+       yüksek güncelleme ölçeği
+                 v
+lane state ile readout birlikte hızla yer değiştiriyor
+                 |
+                 v
+yanlış fakat keskin x koordinatları
+                 |
+                 v
+sonraki layer yanlış yerel koridoru örnekliyor
+                 |
+                 v
+geometry tamamen çöküyor
+```
+
+Contract değişikliği bu zincirin assignment/score tarafından gelen kısmını
+hafifletiyor; fakat parametre runaway'i durdurmuyor. Scale değişikliği zincirin
+enerjisini doğrudan azaltıyor; bu yüzden daha fazla geometry koruyor.
+
+### 14.4 Bir sonraki en yüksek bilgi değerli deney
+
+Amaç yalnız hızlı bir kurtarma checkpoint'i üretmek olsaydı sıradaki kol
+`contract + scale` birleşimi olurdu. Amaç kök nedeni bulup sağlam bir nihai
+model kurmak olduğu için önce mevcut scale müdahalesi ikiye ayrılmalıdır.
+
+Aynı 30k source ve aynı replay manifest ile iki yeni kol:
+
+| Kol | Lane-state LR | `row_norm/row_x` LR | Sorduğu soru |
+|---|---:|---:|---|
+| Readout-low only | `2e-4` | `5e-5` | Runaway'i doğrudan readout update'i mi başlatıyor? |
+| Lane-state-low only | `5e-5` | `2e-4` | Readout, değişen lane-state dağılımını kovalamaya mı çalışıyor? |
+
+Mevcut sonuçlar 2×2 matrisin diğer iki köşesini zaten vermektedir:
+
+```text
+lane high + readout high = control, tam çöküş
+lane low  + readout low  = scale, kısmi koruma
+```
+
+Karar:
+
+- Readout-low only, both-low kadar iyiyse ana hassas aktör readout update'idir.
+- Lane-state-low only, both-low kadar iyiyse ana tetikleyici lane-state
+  dağılım driftidir.
+- İki tekil kol da çöker, yalnız both-low korunursa problem karşılıklı
+  co-adaptation'dır.
+
+Bu iki kolun ardından:
+
+1. Kazanan scale sözleşmesi `contract + scale` ile birleştirilir.
+2. 35k'da korunursa 40k ve 50k'ya uzatılır.
+3. Aynı anda layerwise geometry-gradient cosine, logit
+   `content/bias/prior` ayrıştırması ve reference `±96 px` coverage ölçülür.
+4. Düşük LR yalnızca çöküşü geciktiriyorsa shared auxiliary readout,
+   bounded local-delta prediction veya reference trust-region yapısal gate'i
+   açılır.
+5. Uzun vadeli sözleşme doğrulandıktan sonra model düşük LR gruplarıyla
+   **from scratch** eğitilir; 30k rescue checkpoint nihai benchmark modeli
+   olarak kullanılmaz.
+
+### 14.5 Bu sonuç neyi henüz kanıtlamaz?
+
+- Scale kolunun resmî full-test F1'ını kanıtlamaz.
+- Modelin 80+ olacağını kanıtlamaz.
+- “Sadece LR'yi düşür, problem çözüldü” sonucunu desteklemez.
+- Persistent lane identity veya global acquisition'ın gereksiz olduğunu
+  kanıtlamaz; yalnız bunlara geçmeden önce daha küçük ve daha doğrudan bir
+  scale-factor ayrımı olduğunu gösterir.
+- Shared-head gradient çatışmasını doğrulamaz; bu koşuda gradient audit
+  çalıştırılmamıştır.
+
+En dürüst son cümle:
+
+> **İlk kez gerçek bir müdahale ile çöküşü belirgin biçimde baskıladık. Ana
+> yön artık yalnız bir şüphe değil: lane-state/readout update ölçeği kritik.
+> Fakat scale kolunun strict geometry kaybı hâlâ büyük; dolayısıyla sağlam
+> çözümün hangi alt grubu stabilize etmesi ve hangi yapısal geri beslemeyi
+> sınırlaması gerektiğini iki kısa ayrıştırma koluyla belirlemeliyiz.**
