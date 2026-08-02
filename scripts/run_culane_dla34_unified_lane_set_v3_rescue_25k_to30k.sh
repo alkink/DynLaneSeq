@@ -7,7 +7,10 @@ PYTHON="${PYTHON:-python}"
 DATA_ROOT="${DATA_ROOT:-/workspace/CULane}"
 DEVICE="${DEVICE:-cuda}"
 SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-outputs/culane_s0_structured_query_dla34_unified_lane_set_v3_25k/iter_0025000.pt}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v3_rescue_25k_to30k}"
+SOURCE_ITERATION="${SOURCE_ITERATION:-25000}"
+GATE_STEPS="${GATE_STEPS:-5000}"
+TARGET_ITERATION="${TARGET_ITERATION:-$((SOURCE_ITERATION + GATE_STEPS))}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v3_rescue_${SOURCE_ITERATION}_to${TARGET_ITERATION}}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
@@ -15,15 +18,16 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 AUDIT_MAX_BATCHES="${AUDIT_MAX_BATCHES:-16}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
-SOURCE_ITERATION=25000
-TARGET_ITERATION=30000
-
 CONTROL_CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_dla34_unified_lane_set_v3_control_from25k_5k.yaml"
 CONTRACT_CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_dla34_unified_lane_set_v3_contract_rescue_from25k_5k.yaml"
 SCALE_CONFIG="dynlaneseq_eg/configs/culane_s0_structured_query_dla34_unified_lane_set_v3_scale_rescue_from25k_5k.yaml"
 
 if [[ ! -f "${SOURCE_CHECKPOINT}" ]]; then
-  echo "Missing 25k source checkpoint: ${SOURCE_CHECKPOINT}" >&2
+  echo "Missing source checkpoint: ${SOURCE_CHECKPOINT}" >&2
+  exit 1
+fi
+if (( GATE_STEPS != 5000 || TARGET_ITERATION - SOURCE_ITERATION != GATE_STEPS )); then
+  echo "This matched gate requires exactly 5000 steps." >&2
   exit 1
 fi
 if (( BATCH_SIZE * GRAD_ACCUM != 16 )); then
@@ -34,6 +38,7 @@ fi
 mkdir -p "${OUTPUT_ROOT}"
 
 "${PYTHON}" - "${SOURCE_CHECKPOINT}" \
+  "${SOURCE_ITERATION}" "${GATE_STEPS}" \
   "${CONTROL_CONFIG}" "${CONTRACT_CONFIG}" "${SCALE_CONFIG}" <<'PY'
 import hashlib
 import json
@@ -45,11 +50,15 @@ import torch
 from dynlaneseq_eg.config import load_config
 
 checkpoint_path = Path(sys.argv[1]).resolve()
-config_paths = [Path(value) for value in sys.argv[2:]]
+expected_iteration = int(sys.argv[2])
+gate_steps = int(sys.argv[3])
+config_paths = [Path(value) for value in sys.argv[4:]]
 payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 iteration = int(payload.get("iteration", -1))
-if iteration != 25000:
-    raise SystemExit(f"Expected a 25k source checkpoint, got iteration={iteration}")
+if iteration != expected_iteration:
+    raise SystemExit(
+        f"Expected source iteration={expected_iteration}, got iteration={iteration}"
+    )
 for key in ("model", "optimizer", "scheduler", "cfg"):
     if key not in payload:
         raise SystemExit(f"Source checkpoint misses required {key!r} state")
@@ -62,8 +71,10 @@ for name, cfg in configs.items():
         raise SystemExit(f"{name}: scheduler horizon differs from the source checkpoint")
     if int(cfg["training"]["seed"]) != int(source["training"]["seed"]):
         raise SystemExit(f"{name}: seed differs from the source checkpoint")
-    if int(cfg["training"]["max_iters"]) != 5000:
-        raise SystemExit(f"{name}: gate must contain exactly 5000 optimizer steps")
+    if int(cfg["training"]["max_iters"]) != gate_steps:
+        raise SystemExit(
+            f"{name}: config max_iters differs from the requested gate length"
+        )
     if int(cfg["training"]["checkpoint_interval"]) != 1000:
         raise SystemExit(f"{name}: gate must save every 1000 optimizer steps")
 
@@ -224,5 +235,5 @@ audit_checkpoint scale "${SCALE_CONFIG}" \
     "${OUTPUT_ROOT}/scale/iter_$(printf '%07d' "${TARGET_ITERATION}").pt" \
   --output-json "${OUTPUT_ROOT}/summary.json"
 
-echo "V3 matched 25k->30k rescue gate completed."
+echo "V3 matched ${SOURCE_ITERATION}->${TARGET_ITERATION} rescue gate completed."
 echo "summary: ${OUTPUT_ROOT}/summary.json"

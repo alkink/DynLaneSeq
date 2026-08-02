@@ -19,7 +19,7 @@ LANE_STATE_PREFIXES = ("structured_query_head.lane_state_layers.",)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare matched 25k->30k V3 collapse-rescue arms without "
+            "Compare matched 5k V3 collapse-rescue arms without "
             "selecting a test-set threshold."
         )
     )
@@ -167,10 +167,11 @@ def infer_next_step(rows: dict[str, dict[str, Any]]) -> dict[str, str]:
     scale = statuses.get("scale")
     if control is True:
         return {
-            "signal": "collapse_not_yet_visible_at_30k",
+            "signal": "collapse_not_visible_at_this_gate_endpoint",
             "action": (
-                "Continue the same three arms to 35k/40k; do not choose a "
-                "winner while the exact control remains healthy."
+                "Do not choose a winner while the exact control remains "
+                "healthy; extend all matched arms through the known collapse "
+                "interval."
             ),
         }
     if control is False and contract is True and scale is False:
