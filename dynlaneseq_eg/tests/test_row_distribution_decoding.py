@@ -8,6 +8,9 @@ from dynlaneseq_eg.tools.analyze_row_distribution_decoding import (
     decode_argmax,
     decode_local_mode_expectation,
 )
+from dynlaneseq_eg.tools.summarize_row_distribution_temperature_trajectory import (
+    summarize,
+)
 
 
 def test_argmax_decode_uses_model_bin_coordinate_contract() -> None:
@@ -72,3 +75,34 @@ def test_distribution_stats_locates_gt_bin_and_probability_mass() -> None:
     assert summary["mean_mode_abs_error_px"] == 0.0
     assert summary["mean_probability_at_nearest_gt_bin"] > 0.99
     assert summary["mean_gt_probability_mass_within_1_bins"] > 0.99
+
+
+def test_temperature_summary_separates_sharpness_from_lost_geometry() -> None:
+    payload = {
+        "checkpoint": "iter_0050000.pt",
+        "checkpoint_iteration": 50000,
+        "images": 64,
+        "final_layer": "L4",
+        "decoder_layers": {
+            "L4": {
+                "decode_metrics": {
+                    "expected_t1": {
+                        "raw_recall@0.50": 0.0,
+                        "raw_recall@0.70": 0.0,
+                        "assigned_row_mae_px": 100.0,
+                    },
+                    "expected_t4": {
+                        "raw_recall@0.50": 0.4,
+                        "raw_recall@0.70": 0.2,
+                        "assigned_row_mae_px": 40.0,
+                    },
+                }
+            }
+        },
+    }
+    result = summarize([payload])
+    assert result["rows"][0]["best_temperature_050"]["temperature"] == 4.0
+    assert (
+        result["rows"][0]["verdict"]
+        == "logit_temperature_is_a_material_bottleneck"
+    )

@@ -481,7 +481,11 @@ def main() -> None:
             previous_intermediate_supervision = bool(head.intermediate_supervision)
             head.intermediate_supervision = True
             try:
-                outputs = head(encoded["features"], inference_only=False)
+                outputs = head(
+                    encoded["features"],
+                    multi_scale_features=encoded.get("multi_scale_features"),
+                    inference_only=False,
+                )
             finally:
                 head.intermediate_supervision = previous_intermediate_supervision
 
