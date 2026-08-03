@@ -277,6 +277,20 @@ def _new_oracle_counter() -> dict[str, int]:
     return {"gt": 0, "hits": 0}
 
 
+def _average_precision(scores: list[float], labels: list[int]) -> float | None:
+    if not scores or len(scores) != len(labels) or sum(labels) == 0:
+        return None
+    order = sorted(range(len(scores)), key=lambda index: scores[index], reverse=True)
+    positives = 0
+    precision_sum = 0.0
+    for rank, index in enumerate(order, start=1):
+        if int(labels[index]) == 0:
+            continue
+        positives += 1
+        precision_sum += float(positives) / float(rank)
+    return precision_sum / float(sum(labels))
+
+
 def _update_oracle(
     counter: dict[str, int],
     iou: torch.Tensor,
@@ -399,6 +413,9 @@ def main() -> None:
     metadata = cache["metadata"]
     input_h = int(metadata["input_h"])
     input_w = int(metadata["input_w"])
+    score_mode = str(
+        metadata.get("postprocess", {}).get("score_mode", "exist")
+    )
 
     method_names = ["score_top4"]
     method_names.extend(
@@ -430,6 +447,14 @@ def main() -> None:
         }
         for threshold in thresholds
     }
+    unique_scores: dict[float, list[float]] = {
+        threshold: [] for threshold in thresholds
+    }
+    unique_labels_by_threshold: dict[float, list[int]] = {
+        threshold: [] for threshold in thresholds
+    }
+    probability_mass: list[float] = []
+    target_lane_counts: list[float] = []
 
     iterator = tqdm(
         cache["records"],
@@ -449,8 +474,14 @@ def main() -> None:
             min_valid_rows=args.min_valid_rows,
             row_visibility_thresh=args.row_visibility_thresh,
         )
-        scores = stage_scores(stage, quality_power=0.0).cpu()
+        scores = stage_scores(
+            stage,
+            quality_power=0.0,
+            score_mode=score_mode,
+        ).cpu()
         valid_ids = _valid_ids(candidate_valid)
+        probability_mass.append(float(scores[candidate_valid].sum()))
+        target_lane_counts.append(float(iou.shape[0]))
         raw_ids = sorted(
             valid_ids,
             key=lambda index: float(scores[index]),
@@ -531,6 +562,12 @@ def main() -> None:
                 threshold,
                 candidate_valid,
             )
+            unique_scores[threshold].extend(
+                float(scores[index]) for index in valid_ids
+            )
+            unique_labels_by_threshold[threshold].extend(
+                int(labels[index] == "unique_tp") for index in valid_ids
+            )
             for proposal_index, label in enumerate(labels):
                 row = candidate_pool[threshold][label]
                 row["count"] += 1
@@ -567,6 +604,22 @@ def main() -> None:
         }
         for threshold, by_label in candidate_pool.items()
     }
+    score_diagnostics = {
+        "score_mode": score_mode,
+        "mean_foreground_probability_mass": (
+            sum(probability_mass) / max(len(probability_mass), 1)
+        ),
+        "mean_target_lane_count": (
+            sum(target_lane_counts) / max(len(target_lane_counts), 1)
+        ),
+        "unique_candidate_ap": {
+            f"{threshold:.2f}": _average_precision(
+                unique_scores[threshold],
+                unique_labels_by_threshold[threshold],
+            )
+            for threshold in thresholds
+        },
+    }
     verdict = _build_verdict(
         method_summary,
         capacity_summary,
@@ -597,6 +650,7 @@ def main() -> None:
         "methods": method_summary,
         "capacity": capacity_summary,
         "candidate_pool_score_by_official_status": candidate_pool_summary,
+        "score_diagnostics": score_diagnostics,
         "verdict": verdict,
     }
     write_json(args.output_json, payload)
@@ -605,6 +659,7 @@ def main() -> None:
         "hard_diverse_20px": method_summary.get("hard_diverse_20px"),
         "capacity": capacity_summary,
         "candidate_pool": candidate_pool_summary,
+        "score_diagnostics": score_diagnostics,
         "verdict": verdict,
     }
     print(json.dumps(compact, indent=2))

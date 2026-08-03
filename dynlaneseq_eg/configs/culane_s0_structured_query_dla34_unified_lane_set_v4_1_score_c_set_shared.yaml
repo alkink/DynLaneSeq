@@ -1,0 +1,16 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_1_score_gate_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_1_score_gate/c_set_shared
+
+model:
+  structured_query:
+    set_selection:
+      candidate_interaction: transformer
+
+# Candidate-set comparison with the existing V4 ownership/quality target.
+loss:
+  set_selection_share_matcher_assignment: true
+  set_selection_positive_floor: 0.5
+  set_selection_negative_weight: 1.0
+  set_selection_rank_weight: 0.0
+  set_selection_target_margin: 0.10

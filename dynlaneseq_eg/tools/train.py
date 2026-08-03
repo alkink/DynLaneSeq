@@ -16,6 +16,7 @@ from dynlaneseq_eg.engine.checkpoint import (
     remap_optimizer_state_by_parameter,
     save_checkpoint,
 )
+from dynlaneseq_eg.engine.frozen_training import freeze_except_parameter_prefixes
 from dynlaneseq_eg.engine.logger import SmoothedLogger
 from dynlaneseq_eg.engine.train_one_epoch import train_one_epoch
 from dynlaneseq_eg.engine.visualizer import save_prediction_visuals
@@ -254,6 +255,15 @@ def main() -> None:
             except Exception:
                 pass
     model = build_model(cfg).to(device)
+    trainable_prefixes = tuple(
+        train_cfg.get("trainable_parameter_prefixes", ())
+    )
+    frozen_training_stats = None
+    if trainable_prefixes:
+        frozen_training_stats = freeze_except_parameter_prefixes(
+            model,
+            trainable_prefixes,
+        )
     train_model = model
     channels_last = bool(train_cfg.get("channels_last", False) and device.type == "cuda")
     if channels_last:
@@ -417,6 +427,7 @@ def main() -> None:
                 str(group.get("name", index)): float(group["lr"])
                 for index, group in enumerate(optimizer.param_groups)
             },
+            "frozen_training": frozen_training_stats,
         }
     )
 

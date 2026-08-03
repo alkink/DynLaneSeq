@@ -1,0 +1,17 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_1_score_gate_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_1_score_gate/d_set_unique
+
+model:
+  structured_query:
+    set_selection:
+      candidate_interaction: transformer
+
+# Complete V4.1 hypothesis: detached set comparison learns a score-independent,
+# unique official-IoU deployment target with explicit negative/ranking pressure.
+loss:
+  set_selection_share_matcher_assignment: false
+  set_selection_positive_floor: 0.0
+  set_selection_negative_weight: 2.0
+  set_selection_rank_weight: 0.25
+  set_selection_target_margin: 0.10

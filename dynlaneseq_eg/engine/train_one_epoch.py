@@ -8,6 +8,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from dynlaneseq_eg.modeling.common import nested_to_device
+from .frozen_training import set_frozen_detector_eval
 from .logger import match_stats
 
 
@@ -248,20 +249,29 @@ def train_one_epoch(
     checkpoint_saver=None,
 ) -> int:
     model.train()
-    amp = bool(cfg.get("training", {}).get("amp", False))
-    amp_dtype_name = str(cfg.get("training", {}).get("amp_dtype", "")).lower()
+    train_cfg = cfg.get("training", {})
+    trainable_modules = tuple(train_cfg.get("trainable_module_prefixes", ()))
+    if bool(train_cfg.get("frozen_detector_eval", False)):
+        if not trainable_modules:
+            raise ValueError(
+                "training.frozen_detector_eval requires "
+                "training.trainable_module_prefixes"
+            )
+        set_frozen_detector_eval(model, trainable_modules)
+    amp = bool(train_cfg.get("amp", False))
+    amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
     amp_dtype = None
     if device.type == "cuda":
         if amp_dtype_name in {"bf16", "bfloat16"}:
             amp_dtype = torch.bfloat16
         elif amp_dtype_name in {"fp16", "float16", "half"}:
             amp_dtype = torch.float16
-    channels_last = bool(cfg.get("training", {}).get("channels_last", False) and device.type == "cuda")
-    clip_norm = float(cfg.get("training", {}).get("clip_grad_norm", 1.0))
-    clip_mode = str(cfg.get("training", {}).get("clip_grad_norm_mode", "global"))
-    check_finite_grad = bool(cfg.get("training", {}).get("check_finite_grad", True))
-    accumulation_steps = max(int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)), 1)
-    log_interval = int(cfg.get("training", {}).get("log_interval", 10))
+    channels_last = bool(train_cfg.get("channels_last", False) and device.type == "cuda")
+    clip_norm = float(train_cfg.get("clip_grad_norm", 1.0))
+    clip_mode = str(train_cfg.get("clip_grad_norm_mode", "global"))
+    check_finite_grad = bool(train_cfg.get("check_finite_grad", True))
+    accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
+    log_interval = int(train_cfg.get("log_interval", 10))
     iteration = start_iter
     max_iters = max_iters or int(cfg.get("training", {}).get("max_iters", len(dataloader)))
     end_iter = start_iter + max_iters

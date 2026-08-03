@@ -669,6 +669,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         prior_prob: float = 0.05,
         detach_geometry_features: bool = True,
         use_curve_evidence: bool = False,
+        use_semantic_decision: bool = False,
+        candidate_interaction: str = "transformer",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -680,6 +682,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.prior_prob = float(prior_prob)
         self.detach_geometry_features = bool(detach_geometry_features)
         self.use_curve_evidence = bool(use_curve_evidence)
+        self.use_semantic_decision = bool(use_semantic_decision)
+        self.candidate_interaction = str(candidate_interaction).strip().lower()
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -690,11 +694,20 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("set_selection.range_temperature must be positive")
         if not 0.0 < self.prior_prob < 1.0:
             raise ValueError("set_selection.prior_prob must be between zero and one")
+        if self.candidate_interaction not in {"independent", "transformer"}:
+            raise ValueError(
+                "set_selection.candidate_interaction must be independent or "
+                "transformer"
+            )
 
         # Unified mode uses two range-masked row-state summaries and optional
         # exact final-curve P2 evidence. Legacy mode preserves the historical
         # lane-query + visible-row input and includes its base score scalar.
-        state_streams = 2 + int(self.unified_score and self.use_curve_evidence)
+        state_streams = (
+            2
+            + int(self.unified_score and self.use_curve_evidence)
+            + int(self.unified_score and self.use_semantic_decision)
+        )
         scalar_count = 10 + int(not self.unified_score)
         input_dim = (
             state_streams * self.dim
@@ -702,21 +715,39 @@ class SetAwareLaneSelectionHead(nn.Module):
             + 2 * self.curve_samples
         )
         self.input_norm = nn.LayerNorm(input_dim)
+        # Preserve the historical projection keys so old selector checkpoints
+        # remain loadable.  Only the independent diagnostic arm adds a
+        # candidate-local FFN after this shared projection.
         self.input_projection = nn.Linear(input_dim, int(hidden_dim))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=int(hidden_dim),
-            nhead=int(num_heads),
-            dim_feedforward=int(ff_dim),
-            dropout=float(dropout),
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=int(num_layers),
-            enable_nested_tensor=False,
-        )
+        if self.candidate_interaction == "transformer":
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=int(hidden_dim),
+                nhead=int(num_heads),
+                dim_feedforward=int(ff_dim),
+                dropout=float(dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=int(num_layers),
+                enable_nested_tensor=False,
+            )
+            self.independent_ffn = nn.Identity()
+        else:
+            # The independent arm deliberately shares the complete descriptor
+            # and output contract with the set arm, but has no candidate-axis
+            # communication.  This makes the 2x2 score gate a clean test of
+            # trainable set comparison rather than a feature ablation.
+            self.encoder = nn.Identity()
+            self.independent_ffn = nn.Sequential(
+                nn.LayerNorm(int(hidden_dim)),
+                nn.Linear(int(hidden_dim), int(ff_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(ff_dim), int(hidden_dim)),
+            )
         self.output_norm = nn.LayerNorm(int(hidden_dim))
         self.output = nn.Linear(int(hidden_dim), 1)
         if self.unified_score:
@@ -748,13 +779,13 @@ class SetAwareLaneSelectionHead(nn.Module):
         train only the selection transformer.  The normal forward path still
         calls this method, so the refactor does not change deployed scores.
         """
-        row_tokens = outputs["structured_row_tokens"]
-        lane_query = outputs["queries"]
         observe = (
             (lambda value: value.detach())
             if self.detach_geometry_features
             else (lambda value: value)
         )
+        row_tokens = observe(outputs["structured_row_tokens"])
+        lane_query = observe(outputs["queries"])
         ranges = sort_range_norm(observe(outputs["range_norm"]).float())
         pred_x = observe(outputs["pred_x_rows"]).float()
         row_logits = observe(outputs["row_x_logits"]).float()
@@ -870,6 +901,18 @@ class SetAwareLaneSelectionHead(nn.Module):
         ]
         if self.unified_score:
             state_parts = [visible_row_state, confidence_weighted_state]
+            if self.use_semantic_decision:
+                decision_query = outputs.get("decision_queries")
+                if not isinstance(decision_query, torch.Tensor):
+                    raise ValueError(
+                        "unified set selection with semantic decision requires "
+                        "decision_queries"
+                    )
+                # ``decision_queries`` is produced by score-only semantic
+                # adapters whose lane/FPN inputs are detached by V4.  Keeping
+                # this stream live lets score supervision train those adapters
+                # without reopening a path into geometry.
+                state_parts.append(decision_query)
             if self.use_curve_evidence:
                 curve_evidence = outputs.get("selection_curve_evidence")
                 if not isinstance(curve_evidence, torch.Tensor):
@@ -878,7 +921,7 @@ class SetAwareLaneSelectionHead(nn.Module):
                         "selection_curve_evidence"
                     )
                 curve_state = (
-                    curve_evidence
+                    observe(curve_evidence)
                     * row_weight.to(dtype=curve_evidence.dtype).unsqueeze(-1)
                 ).sum(dim=2) / denominator.to(dtype=curve_evidence.dtype)
                 state_parts.append(curve_state)
@@ -905,6 +948,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         """Score descriptors returned by :meth:`build_selection_features`."""
 
         hidden = self.input_projection(self.input_norm(features))
+        if self.candidate_interaction == "independent":
+            hidden = hidden + self.independent_ffn(hidden)
         hidden = self.encoder(hidden)
         return self.output(self.output_norm(hidden)).squeeze(-1).float()
 
@@ -1337,10 +1382,28 @@ class StructuredLaneQueryHead(nn.Module):
                 use_curve_evidence=bool(
                     self.set_selection_cfg.get("use_curve_evidence", False)
                 ),
+                use_semantic_decision=bool(
+                    self.set_selection_cfg.get("use_semantic_decision", False)
+                ),
+                candidate_interaction=str(
+                    self.set_selection_cfg.get(
+                        "candidate_interaction",
+                        "transformer",
+                    )
+                ),
             )
             if self.set_selection_enabled
             else None
         )
+        if (
+            self.set_selection_head is not None
+            and self.set_selection_head.use_semantic_decision
+            and not self.detach_score_geometry
+        ):
+            raise ValueError(
+                "set_selection.use_semantic_decision requires "
+                "lane_state.detach_score_geometry=true"
+            )
         nn.init.constant_(self.range[-1].weight, 0.0)
         with torch.no_grad():
             self.range[-1].bias.copy_(torch.tensor([-2.0, 2.0]))
@@ -1862,14 +1925,16 @@ class StructuredLaneQueryHead(nn.Module):
         if self.set_selection_head is not None:
             if self.set_selection_head.use_curve_evidence:
                 curve_x = outputs["pred_x_rows"]
+                curve_features = row_value_features
                 if self.set_selection_head.detach_geometry_features:
-                    # Score learning may update the visual evidence tower, but
-                    # it must not move the curve merely to make the sampled
-                    # descriptor easier to classify.
+                    # The score branch observes both the curve and its P2
+                    # evidence.  Neither coordinate nor feature-tower gradient
+                    # may cross back into the geometry detector.
                     curve_x = curve_x.detach()
+                    curve_features = curve_features.detach()
                 outputs["selection_curve_evidence"] = (
                     self._sample_final_curve_evidence(
-                        row_value_features,
+                        curve_features,
                         curve_x,
                     )
                 )

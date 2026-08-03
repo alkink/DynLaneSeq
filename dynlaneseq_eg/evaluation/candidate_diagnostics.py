@@ -315,13 +315,24 @@ def load_or_collect_cache(
     return payload
 
 
-def stage_scores(stage: dict[str, torch.Tensor], quality_power: float = 0.0) -> torch.Tensor:
+def stage_scores(
+    stage: dict[str, torch.Tensor],
+    quality_power: float = 0.0,
+    score_mode: str = "exist",
+) -> torch.Tensor:
     pred_x = stage["pred_x_rows"]
-    logits = stage.get("exist_logits")
-    if logits is None:
-        score = pred_x.new_ones((pred_x.shape[0],), dtype=torch.float32)
+    mode = str(score_mode).strip().lower()
+    if mode in {"selection", "set_selection", "set"}:
+        selection = stage.get("selection_logits")
+        if selection is None:
+            raise ValueError("selection score mode requires selection_logits")
+        score = torch.sigmoid(selection.float())
     else:
-        score = torch.softmax(logits.float(), dim=-1)[..., 0]
+        logits = stage.get("exist_logits")
+        if logits is None:
+            score = pred_x.new_ones((pred_x.shape[0],), dtype=torch.float32)
+        else:
+            score = torch.softmax(logits.float(), dim=-1)[..., 0]
     quality = stage.get("quality_logits")
     if quality_power > 0 and quality is not None:
         score = score * torch.sigmoid(quality.float()).clamp_min(1e-6).pow(float(quality_power))

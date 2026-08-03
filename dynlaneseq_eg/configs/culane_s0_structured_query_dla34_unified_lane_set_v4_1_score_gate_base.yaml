@@ -1,0 +1,93 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_bounded_delta_278k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_1_score_gate/base
+
+# V4.1 is a causal score-only intervention on the healthy V4 50k geometry.
+# Every detector tensor is observed through a stop-gradient boundary.  The
+# scorer sees final curve/range/confidence descriptors, curve-aligned P2
+# evidence, the trained P4/P5 decision view, and (for the set arms) all other
+# candidates.  It never consumes or multiplies the legacy existence score.
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      enabled: true
+      unified_score: true
+      prior_prob: 0.10
+      hidden_dim: 256
+      num_layers: 2
+      num_heads: 8
+      ff_dim: 512
+      dropout: 0.0
+      curve_samples: 20
+      range_temperature: 0.02
+      detach_geometry_features: true
+      use_curve_evidence: true
+      use_semantic_decision: true
+      candidate_interaction: transformer
+
+# Geometry and all historical auxiliary objectives are constants under the
+# frozen detector and are removed from the score-only backward graph.
+loss:
+  w_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_seg: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 1.0
+  w_centerline: 0.0
+  w_row_dfl: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  set_selection_line_width: 30.0
+  set_selection_min_valid_rows: 5
+  set_selection_focal_beta: 2.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: set_selection
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.
+
+scheduler:
+  name: constant
+
+postprocess:
+  score_mode: selection
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 3000
+  checkpoint_interval: 500
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

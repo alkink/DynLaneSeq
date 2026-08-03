@@ -131,6 +131,9 @@ def test_set_selection_can_backpropagate_into_decoder_state_features() -> None:
             "ff_dim": 64,
             "dropout": 0.0,
             "curve_samples": 4,
+            # This legacy test deliberately exercises the opt-in joint path.
+            # V4.1 keeps the default detached score-only contract.
+            "detach_geometry_features": False,
         },
     )
     assert head.set_selection_head is not None
@@ -146,7 +149,7 @@ def test_set_selection_can_backpropagate_into_decoder_state_features() -> None:
     assert float(head.layers[0].ffn[0].weight.grad.abs().sum()) > 0.0
 
 
-def test_unified_selection_is_independent_of_legacy_scores_and_reads_p2() -> None:
+def test_unified_selection_is_independent_of_legacy_scores_and_detaches_p2() -> None:
     torch.manual_seed(12)
     head = StructuredLaneQueryHead(
         dim=32,
@@ -194,10 +197,9 @@ def test_unified_selection_is_independent_of_legacy_scores_and_reads_p2() -> Non
     torch.testing.assert_close(original_score, changed_score)
 
     original_score.sum().backward()
-    assert features.grad is not None
-    assert float(features.grad.abs().sum()) > 0.0
-    # Detached curve coordinates prevent score loss from directly moving the
-    # row-distribution head solely to improve classification.
+    assert features.grad is None
+    # The complete score descriptor is observational: neither its curve
+    # coordinates, row states, nor sampled P2 evidence can move geometry.
     row_x_grad = head.row_x.weight.grad
     assert row_x_grad is None or float(row_x_grad.abs().sum()) == 0.0
 
