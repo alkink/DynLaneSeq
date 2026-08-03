@@ -11,6 +11,7 @@ from dynlaneseq_eg.tools.analyze_v4_selection_coverage import (
     _new_counter,
     _update_counter,
 )
+from dynlaneseq_eg.evaluation.candidate_diagnostics import trace_postprocess
 
 
 def _stage() -> dict[str, torch.Tensor]:
@@ -132,3 +133,33 @@ def test_verdict_requires_material_recovery_of_oracle_gap() -> None:
         verdict["interpretation"]
         == "duplicate_coverage_is_a_primary_selection_bottleneck"
     )
+
+
+def test_hard_diversity_uses_the_requested_selection_score() -> None:
+    stage = _stage()
+    # Existence prefers candidate zero, while the unified selector prefers its
+    # close duplicate candidate one.  Hard diversity must respect the deployed
+    # score contract instead of silently falling back to existence.
+    stage["selection_logits"] = torch.tensor([-2.0, 3.0, 1.0])
+    exist_trace = trace_postprocess(
+        stage,
+        input_h=640,
+        input_w=1600,
+        score_thresh=0.0,
+        min_valid_rows=5,
+        nms_distance_thresh_px=20.0,
+        top_k=2,
+        score_mode="exist",
+    )
+    selection_trace = trace_postprocess(
+        stage,
+        input_h=640,
+        input_w=1600,
+        score_thresh=0.0,
+        min_valid_rows=5,
+        nms_distance_thresh_px=20.0,
+        top_k=2,
+        score_mode="selection",
+    )
+    assert exist_trace["selected_ids"] == [0, 2]
+    assert selection_trace["selected_ids"] == [1, 2]

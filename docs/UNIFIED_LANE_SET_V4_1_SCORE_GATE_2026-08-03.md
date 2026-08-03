@@ -173,3 +173,11 @@ hiçbiri kazanmaz   -> frozen descriptor benzersiz seçim için yetersiz
 
 Son durumda geometry'ye score gradyanı açılmaz; descriptor ve ownership
 bilgisinin nerede kaybolduğu yeniden incelenir.
+
+## Sonuç ve devam deneyi
+
+Gerçek 2x2 sonuçta geometry bütün kollarda birebir korundu, fakat birleşik
+set+unique kolu scalar Top-4 gate'ini geçemedi. Aynı adaylar üzerinde soft
+curve-diversity (MMR) duplicate FP'leri çok büyük ölçüde kaldırdığı için devam
+teşhisi `UNIFIED_LANE_SET_V4_DIVERSITY_DIAGNOSIS_2026-08-03.md` içinde
+tanımlanan cached threshold/diversity grid'idir.

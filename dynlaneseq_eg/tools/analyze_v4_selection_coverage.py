@@ -511,6 +511,7 @@ def main() -> None:
                 top_k=args.top_k,
                 row_visibility_thresh=args.row_visibility_thresh,
                 allowed_ids=valid_ids,
+                score_mode=score_mode,
             )
             name = f"hard_diverse_{_float_tag(hard_distance)}px"
             selections[name] = [int(index) for index in trace["selected_ids"]]

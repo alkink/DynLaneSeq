@@ -534,6 +534,7 @@ def trace_postprocess(
     row_visibility_thresh: float = 0.0,
     allowed_ids: Iterable[int] | None = None,
     score_override: dict[int, float] | None = None,
+    score_mode: str = "exist",
 ) -> dict[str, Any]:
     pred_x, masks, candidate_valid = candidate_row_masks(
         stage,
@@ -542,7 +543,11 @@ def trace_postprocess(
         min_valid_rows=min_valid_rows,
         row_visibility_thresh=row_visibility_thresh,
     )
-    scores = stage_scores(stage, quality_power=quality_power)
+    scores = stage_scores(
+        stage,
+        quality_power=quality_power,
+        score_mode=score_mode,
+    )
     if score_override:
         scores = scores.clone()
         for proposal_idx, value in score_override.items():
