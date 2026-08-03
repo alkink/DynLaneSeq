@@ -107,6 +107,12 @@ for path, contract in zip(sys.argv[1:], expected):
         "structured_query_head.set_selection_head"
     ]:
         raise SystemExit(f"unexpected trainable parameter scope in {path}")
+    if cfg["training"].get("checkpoint_model_prefixes") != [
+        "structured_query_head.set_selection_head"
+    ]:
+        raise SystemExit(f"unexpected checkpoint tensor scope in {path}")
+    if cfg["training"].get("checkpoint_include_optimizer", True):
+        raise SystemExit(f"diagnostic checkpoint unnecessarily stores optimizer in {path}")
     if cfg["postprocess"].get("score_mode") != "selection":
         raise SystemExit(f"selection deployment score is disabled in {path}")
 print("[OK] V4.1 2x2 config contract")
@@ -152,6 +158,7 @@ if [[ "${RUN_TRAIN}" == "1" ]]; then
       --seg-aux-amp-dtype "${AMP_DTYPE}" \
       --init-from "${SOURCE_CHECKPOINT}" \
       --init-iteration "${SOURCE_ITERATION}" \
+      --checkpoint-base "${SOURCE_CHECKPOINT}" \
       2>&1 | tee "${output_dir}/train.log"
     actual_iteration="$(checkpoint_iteration "${checkpoint}")"
     if (( actual_iteration != END_ITERATION )); then

@@ -170,6 +170,12 @@ def test_v4_1_configs_encode_the_intended_two_by_two_gate() -> None:
         assert cfg["training"]["trainable_parameter_prefixes"] == [
             "structured_query_head.set_selection_head"
         ]
+        assert cfg["training"]["checkpoint_model_prefixes"] == [
+            "structured_query_head.set_selection_head"
+        ]
+        assert cfg["training"]["checkpoint_include_optimizer"] is False
+        assert cfg["training"]["save_last_alias"] is False
+        assert cfg["training"]["checkpoint_interval"] == 0
         assert cfg["loss"]["w_set_selection"] == 1.0
         assert cfg["loss"]["w_exist"] == 0.0
 

@@ -77,7 +77,13 @@ training:
   batch_size: 4
   gradient_accumulation_steps: 4
   max_iters: 3000
-  checkpoint_interval: 500
+  # The detector is frozen and already lives in the V4 50k base checkpoint.
+  # Persist only the small selector delta once at the end of each arm.
+  checkpoint_interval: 0
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head
+  checkpoint_include_optimizer: false
+  save_last_alias: false
   log_interval: 50
   amp: true
   amp_dtype: bfloat16

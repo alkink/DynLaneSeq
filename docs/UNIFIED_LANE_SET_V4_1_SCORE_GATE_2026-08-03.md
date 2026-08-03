@@ -100,7 +100,8 @@ Script:
 - checkpoint SHA256 değerini loglar;
 - dört config sözleşmesini fail-fast denetler;
 - bütün kolları aynı seed ve veri protokolüyle 50k→53k eğitir;
-- her 500 adımda checkpoint alır;
+- yalnız selector ağırlıklarını V4 50k tabanına bağlı kompakt ve atomik bir
+  delta checkpoint olarak kaydeder;
 - aynı uniform-256 validation örneğinde bütün kolları değerlendirir;
 - `reports/summary.json` içine faktör etkilerini ve geçiş kararını yazar.
 
@@ -108,6 +109,12 @@ Yarım kalan bir kol otomatik resume edilmez. Checkpoint DataLoader ve
 augmentation cursor taşımadığı için resume, paired-data sözleşmesini sessizce
 bozardı. Script yeniden çalıştırılırsa tamamlanmamış kol aynı 50k kaynaktan ve
 aynı seed'den başlar; tamamlanmış kollar atlanır.
+
+Kompakt checkpoint yalnız `set_selection_head.*` tensörlerini içerir. Eval
+sırasında loader önce `base_checkpoint` alanındaki V4 50k modelini, ardından
+selector delta'sını yükler. Yazma önce aynı dosya sistemindeki geçici bir
+dosyaya yapılır ve başarıdan sonra atomik olarak final ada taşınır; yarım bir
+dosya geçerli checkpoint adıyla bırakılamaz.
 
 ## Çıktılar
 

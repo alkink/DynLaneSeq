@@ -1,9 +1,126 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import shutil
 from typing import Any
 
 import torch
+
+
+def _torch_load(path: str | Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch versions before ``weights_only`` was added.
+        return torch.load(path, map_location="cpu")
+
+
+def _normalize_prefixes(values) -> tuple[str, ...]:
+    prefixes = tuple(str(value).strip().rstrip(".") for value in values or ())
+    if any(not value for value in prefixes):
+        raise ValueError("checkpoint model-state prefixes must not be empty")
+    return prefixes
+
+
+def _matches_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+
+
+def _resolve_base_checkpoint(
+    value: str | Path,
+    *,
+    delta_checkpoint: Path,
+) -> Path:
+    raw = Path(value).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.extend(
+            (
+                Path.cwd() / raw,
+                delta_checkpoint.parent / raw,
+            )
+        )
+    else:
+        # A compact selector may be copied from /workspace to a local clone.
+        # Preserve portability when the stored path contains a project-relative
+        # ``outputs/...`` suffix.
+        parts = raw.parts
+        if "outputs" in parts:
+            output_index = parts.index("outputs")
+            candidates.append(Path.cwd().joinpath(*parts[output_index:]))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    rendered = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        "compact checkpoint base model is unavailable; checked: " + rendered
+    )
+
+
+def _materialize_model_state(
+    path: str | Path,
+    *,
+    payload: dict[str, Any] | None = None,
+    visited: set[Path] | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    checkpoint_path = Path(path).expanduser().resolve()
+    seen = set() if visited is None else visited
+    if checkpoint_path in seen:
+        raise ValueError(f"cyclic compact checkpoint dependency: {checkpoint_path}")
+    seen.add(checkpoint_path)
+    loaded = _torch_load(checkpoint_path) if payload is None else payload
+    if not isinstance(loaded, dict):
+        raise TypeError(f"checkpoint payload must be a mapping: {checkpoint_path}")
+    model_state = loaded.get("model")
+    if model_state is None and loaded and all(
+        isinstance(value, torch.Tensor) for value in loaded.values()
+    ):
+        # Preserve compatibility with bare state_dict files accepted by the
+        # historical ``load_compatible_model_weights`` path.
+        return dict(loaded), {"model": loaded, "model_state_mode": "full"}
+    if not isinstance(model_state, dict):
+        raise ValueError(f"checkpoint has no model state: {checkpoint_path}")
+    mode = str(loaded.get("model_state_mode", "full")).strip().lower()
+    if mode == "full":
+        return dict(model_state), loaded
+    if mode != "delta":
+        raise ValueError(f"unsupported checkpoint model_state_mode={mode!r}")
+    base_value = loaded.get("base_checkpoint")
+    if not base_value:
+        raise ValueError(f"delta checkpoint has no base_checkpoint: {checkpoint_path}")
+    base_path = _resolve_base_checkpoint(
+        base_value,
+        delta_checkpoint=checkpoint_path,
+    )
+    base_state, _base_payload = _materialize_model_state(
+        base_path,
+        visited=seen,
+    )
+    base_state.update(model_state)
+    return base_state, loaded
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    """Write a checkpoint atomically and never leave a corrupt final path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    except Exception as exc:
+        partial_bytes = temporary.stat().st_size if temporary.exists() else 0
+        try:
+            free_bytes = shutil.disk_usage(path.parent).free
+        except OSError:
+            free_bytes = -1
+        temporary.unlink(missing_ok=True)
+        free_text = "unknown" if free_bytes < 0 else f"{free_bytes / (1024 ** 3):.2f} GiB"
+        raise RuntimeError(
+            f"checkpoint write failed for {path}; partial={partial_bytes / (1024 ** 2):.1f} MiB, "
+            f"filesystem_free={free_text}. Check df -h, df -i, quota, and filesystem health."
+        ) from exc
 
 
 def remap_optimizer_state_by_parameter(
@@ -67,22 +184,52 @@ def save_checkpoint(
     iteration: int = 0,
     cfg: dict[str, Any] | None = None,
     scheduler=None,
+    model_state_prefixes=(),
+    base_checkpoint: str | Path | None = None,
 ) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"model": model.state_dict(), "iteration": iteration, "cfg": cfg or {}}
+    prefixes = _normalize_prefixes(model_state_prefixes)
+    full_state = model.state_dict()
+    if prefixes:
+        if not base_checkpoint:
+            raise ValueError(
+                "partial checkpoint model state requires a base_checkpoint"
+            )
+        model_state = {
+            name: value
+            for name, value in full_state.items()
+            if _matches_prefix(name, prefixes)
+        }
+        if not model_state:
+            raise ValueError(
+                "checkpoint model-state prefixes matched no tensors: "
+                + ", ".join(prefixes)
+            )
+        state_mode = "delta"
+    else:
+        model_state = full_state
+        state_mode = "full"
+    payload = {
+        "model": model_state,
+        "model_state_mode": state_mode,
+        "iteration": iteration,
+        "cfg": cfg or {},
+    }
+    if prefixes:
+        payload["model_state_prefixes"] = list(prefixes)
+        payload["base_checkpoint"] = str(base_checkpoint)
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
-    torch.save(payload, path)
+    _atomic_torch_save(payload, path)
 
 
 def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, strict: bool = False, scheduler=None) -> int:
-    payload = torch.load(path, map_location="cpu")
-    model.load_state_dict(payload["model"], strict=strict)
+    model_state, payload = _materialize_model_state(path)
+    model.load_state_dict(model_state, strict=strict)
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None and "scaler" in payload:
@@ -93,9 +240,7 @@ def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, strict
 
 
 def load_compatible_model_weights(path: str | Path, model) -> dict[str, int]:
-    payload = torch.load(path, map_location="cpu")
-    source = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    source = dict(source)
+    source, _payload = _materialize_model_state(path)
     for key, value in list(source.items()):
         if key.startswith("heads.exist."):
             source.setdefault("exist_head." + key[len("heads.exist.") :], value)

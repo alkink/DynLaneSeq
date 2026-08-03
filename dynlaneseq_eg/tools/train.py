@@ -166,6 +166,14 @@ def main() -> None:
     parser.add_argument("--resume", default="")
     parser.add_argument("--init-from", default="", help="Initialize compatible model weights only; optimizer and iteration stay fresh.")
     parser.add_argument(
+        "--checkpoint-base",
+        default="",
+        help=(
+            "Base checkpoint referenced by compact model-delta checkpoints. "
+            "Requires training.checkpoint_model_prefixes."
+        ),
+    )
+    parser.add_argument(
         "--init-iteration",
         type=int,
         default=-1,
@@ -238,6 +246,32 @@ def main() -> None:
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
     train_cfg = cfg.get("training", {})
+    checkpoint_model_prefixes = tuple(
+        train_cfg.get("checkpoint_model_prefixes", ())
+    )
+    checkpoint_base = str(
+        args.checkpoint_base or train_cfg.get("checkpoint_base", "")
+    ).strip()
+    checkpoint_include_optimizer = bool(
+        train_cfg.get("checkpoint_include_optimizer", True)
+    )
+    save_last_alias = bool(train_cfg.get("save_last_alias", True))
+    if checkpoint_model_prefixes and not checkpoint_base:
+        raise ValueError(
+            "training.checkpoint_model_prefixes requires --checkpoint-base "
+            "or training.checkpoint_base"
+        )
+    if checkpoint_base and not checkpoint_model_prefixes:
+        raise ValueError(
+            "--checkpoint-base requires training.checkpoint_model_prefixes"
+        )
+    if checkpoint_base and args.init_from:
+        if Path(checkpoint_base).expanduser().resolve() != Path(
+            args.init_from
+        ).expanduser().resolve():
+            raise ValueError(
+                "compact checkpoint base must be the exact --init-from model"
+            )
     amp_dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
     amp_dtype_is_bf16 = amp_dtype_name in {"bf16", "bfloat16"}
     seed_value = train_cfg.get("seed")
@@ -428,6 +462,15 @@ def main() -> None:
                 for index, group in enumerate(optimizer.param_groups)
             },
             "frozen_training": frozen_training_stats,
+            "checkpoint_policy": {
+                "model_state_mode": (
+                    "delta" if checkpoint_model_prefixes else "full"
+                ),
+                "model_state_prefixes": list(checkpoint_model_prefixes),
+                "base_checkpoint": checkpoint_base or None,
+                "include_optimizer": checkpoint_include_optimizer,
+                "save_last_alias": save_last_alias,
+            },
         }
     )
 
@@ -437,9 +480,26 @@ def main() -> None:
 
     checkpoint_interval = int(cfg.get("training", {}).get("checkpoint_interval", 0))
 
+    def save_training_checkpoint(path: Path, iteration: int) -> None:
+        include_state = checkpoint_include_optimizer
+        save_checkpoint(
+            path,
+            model,
+            optimizer if include_state else None,
+            scaler if include_state else None,
+            iteration,
+            cfg,
+            scheduler=scheduler if include_state else None,
+            model_state_prefixes=checkpoint_model_prefixes,
+            base_checkpoint=checkpoint_base or None,
+        )
+
     def save_periodic(iteration: int):
         if checkpoint_interval > 0 and iteration % checkpoint_interval == 0:
-            save_checkpoint(out_dir / f"iter_{iteration:07d}.pt", model, optimizer, scaler, iteration, cfg, scheduler=scheduler)
+            save_training_checkpoint(
+                out_dir / f"iter_{iteration:07d}.pt",
+                iteration,
+            )
 
     end_iter = train_one_epoch(
         train_model,
@@ -457,8 +517,9 @@ def main() -> None:
         visualizer=vis,
         checkpoint_saver=save_periodic,
     )
-    save_checkpoint(out_dir / "last.pt", model, optimizer, scaler, end_iter, cfg, scheduler=scheduler)
-    save_checkpoint(out_dir / f"iter_{end_iter:07d}.pt", model, optimizer, scaler, end_iter, cfg, scheduler=scheduler)
+    if save_last_alias:
+        save_training_checkpoint(out_dir / "last.pt", end_iter)
+    save_training_checkpoint(out_dir / f"iter_{end_iter:07d}.pt", end_iter)
 
 
 if __name__ == "__main__":
