@@ -195,6 +195,7 @@ scripts/run_culane_dla34_unified_lane_set_v4_bounded_delta_278k.sh
 scripts/audit_culane_dla34_unified_lane_set_v4_short.sh
 scripts/audit_culane_dla34_unified_lane_set_v4_all_checkpoints.sh
 scripts/eval_culane_dla34_unified_lane_set_v4_full_test.sh
+scripts/analyze_culane_dla34_unified_lane_set_v4_selection_coverage_50k.sh
 dynlaneseq_eg/tests/test_unified_lane_set_v4_contract.py
 ```
 
@@ -260,3 +261,34 @@ Uygulama testleri şunları doğrular:
 Bu testler mimari sözleşmenin doğru uygulandığını kanıtlar. Henüz V4'ün F1'ını
 veya 278k boyunca ampirik olarak çökmeyeceğini kanıtlamaz. Bu iddia yalnız
 5k–50k trajectory ve devamındaki gerçek eğitim sonuçlarıyla kurulabilir.
+
+## 12. 50k selection-coverage ayrıştırması
+
+V4 trajectory'sinde aday geometrisi stabil kalıp `Oracle Top-4` ile gerçek
+`score Top-4` arasında büyük fark görülürse, aynı frozen aday havuzu şu komutla
+ayrıştırılır:
+
+```bash
+DATA_ROOT=/workspace/CULane \
+MAX_BATCHES=64 \
+EVAL_BATCH_SIZE=4 \
+bash scripts/analyze_culane_dla34_unified_lane_set_v4_selection_coverage_50k.sh
+```
+
+Bu probe eğitim yapmaz ve threshold seçmez. Aynı resmî raster-IoU matrisi
+üzerinde şunları karşılaştırır:
+
+```text
+scalar score Top-4
+score-ordered hard curve diversity Top-4 (10/20/30/40/60 px)
+MMR score/curve-diversity Top-4
+maximum-cardinality Oracle Top-4
+```
+
+Rapor ayrıca her yöntemin duplicate, near-miss, background ve empty-scene
+FP'lerini; seçilen eğrilerin pairwise mesafesini; hard-diversity sonrasında
+kalan aday havuzunun Oracle kapasitesini yazar. Grid içindeki en iyi satır
+yalnız teşhis amaçlıdır ve aynı validation örneklerinde seçildiği için benchmark
+veya deployment sonucu olarak kullanılamaz. Mimari karar için sabit `20 px`
+satırı, bütün grid'in eğilimi ve Oracle boşluğunun geri kazanılan oranı birlikte
+incelenir.
