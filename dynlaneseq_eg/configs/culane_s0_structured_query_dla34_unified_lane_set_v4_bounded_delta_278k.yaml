@@ -1,0 +1,92 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v3_25k.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_unified_lane_set_v4_bounded_delta_278k
+
+# V4 keeps the image-grounded full-row acquisition, then makes every
+# recursive refinement action live in the same local coordinate frame as the
+# evidence it observed.  Seventeen P2 samples give a 12-pixel local evidence
+# grid; the action distribution uses 33 bins at 6-pixel resolution over the
+# exact [-96,+96] trust region.  Keeping evidence and action resolution
+# separate avoids a roughly 4.7x local-profile memory increase on 16-GiB GPUs.
+# Each decoder layer owns a separate non-affine normalization and bias-free
+# delta head.
+model:
+  structured_query:
+    row_reference:
+      enabled: true
+      prediction_mode: bounded_delta
+      detach_between_layers: true
+      offsets_px: [-96.0, -84.0, -72.0, -60.0, -48.0, -36.0, -24.0, -12.0, 0.0, 12.0, 24.0, 36.0, 48.0, 60.0, 72.0, 84.0, 96.0]
+      delta_offsets_px: [-96.0, -90.0, -84.0, -78.0, -72.0, -66.0, -60.0, -54.0, -48.0, -42.0, -36.0, -30.0, -24.0, -18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 42.0, 48.0, 54.0, 60.0, 66.0, 72.0, 78.0, 84.0, 90.0, 96.0]
+    lane_state:
+      detach_score_geometry: true
+
+# Geometry alone owns Hungarian identity.  Every auxiliary decoder layer
+# trains that same final identity, so a shared candidate is never taught four
+# mutually inconsistent permutations.
+matcher:
+  lambda_obj: 0.0
+  reuse_final_assignment_for_intermediate: true
+
+# Intermediate blocks learn geometry only.  The final deployable foreground
+# logit learns a detached range-aware 30-pixel IoU target.  There is no second
+# quality head in the deployment score, no differentiable count shortcut, and
+# no binary margin coupled to the current Hungarian winner.
+loss:
+  w_intermediate_exist: 0.0
+  exist_target_mode: iou_aware
+  exist_quality_floor: 0.5
+  exist_quality_beta: 2.0
+  exist_quality_line_width: 30.0
+  exist_quality_min_valid_rows: 5
+  w_quality: 0.0
+  w_set_selection: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+
+# The old V3 placed the complete structured decoder at 2e-4.  V4 separates
+# the recurrent lane state, coordinate action, and immutable identity from the
+# 1e-4 visual/evidence path.  Custom prefixes override the legacy evidence
+# group without overlap.
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.00001
+  parameter_groups:
+    - name: lane_state
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.lane_state_layers.
+    - name: coordinate
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.row_delta_heads.
+        - structured_query_head.reference_
+    - name: lane_identity
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.instance_tokens.
+        - structured_query_head.row_tokens.
+        - structured_query_head.x_tokens.
+
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+postprocess:
+  score_mode: exist
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 278000
+  checkpoint_interval: 5000
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

@@ -1003,6 +1003,19 @@ class StructuredLaneQueryHead(nn.Module):
         self.inference_group_index = None if inference_group_index is None else int(inference_group_index)
         self.row_reference_cfg = dict(row_reference or {})
         self.row_reference_enabled = bool(self.row_reference_cfg.get("enabled", False))
+        self.row_reference_prediction_mode = str(
+            self.row_reference_cfg.get("prediction_mode", "absolute")
+        ).strip().lower()
+        if self.row_reference_prediction_mode not in {"absolute", "bounded_delta"}:
+            raise ValueError(
+                "structured_query.row_reference.prediction_mode must be "
+                "absolute or bounded_delta"
+            )
+        if (
+            self.row_reference_prediction_mode == "bounded_delta"
+            and not self.row_reference_enabled
+        ):
+            raise ValueError("bounded_delta prediction requires row_reference.enabled=true")
         self.detach_reference_between_layers = bool(
             self.row_reference_cfg.get("detach_between_layers", False)
         )
@@ -1026,6 +1039,9 @@ class StructuredLaneQueryHead(nn.Module):
             )
         self.single_logit_score = bool(
             self.lane_state_cfg.get("single_logit_score", False)
+        )
+        self.detach_score_geometry = bool(
+            self.lane_state_cfg.get("detach_score_geometry", False)
         )
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
@@ -1220,9 +1236,69 @@ class StructuredLaneQueryHead(nn.Module):
             if self.lane_state_enabled
             else []
         )
-        self.row_norm = nn.LayerNorm(self.dim)
+        if self.row_reference_prediction_mode == "bounded_delta":
+            raw_delta_offsets = self.row_reference_cfg.get(
+                "delta_offsets_px",
+                self.row_reference_cfg.get(
+                    "offsets_px",
+                    [-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0],
+                ),
+            )
+            delta_offsets = tuple(float(value) for value in raw_delta_offsets)
+            if len(delta_offsets) < 2:
+                raise ValueError("bounded_delta requires at least two delta offsets")
+            if any(
+                right <= left
+                for left, right in zip(delta_offsets[:-1], delta_offsets[1:])
+            ):
+                raise ValueError("bounded_delta offsets must be strictly increasing")
+            if delta_offsets[0] >= 0.0 or delta_offsets[-1] <= 0.0:
+                raise ValueError("bounded_delta offsets must span negative and positive motion")
+            if abs(sum(delta_offsets) / float(len(delta_offsets))) > 1e-6:
+                raise ValueError(
+                    "bounded_delta offsets must have zero mean for identity initialization"
+                )
+            self.row_delta_norms = nn.ModuleList(
+                [
+                    nn.LayerNorm(self.dim, elementwise_affine=False)
+                    for _ in range(int(num_layers))
+                ]
+            )
+            self.row_delta_heads = nn.ModuleList(
+                [
+                    nn.Linear(self.dim, len(delta_offsets), bias=False)
+                    for _ in range(int(num_layers))
+                ]
+            )
+            for head in self.row_delta_heads:
+                # The image-grounded full-row acquisition is a safe initial
+                # curve.  Zero logits make every local block start as an exact
+                # identity update while preserving non-zero DFL gradients for
+                # learning the required direction.
+                nn.init.zeros_(head.weight)
+            self.register_buffer(
+                "row_delta_offsets_px",
+                torch.tensor(delta_offsets, dtype=torch.float32),
+            )
+            self.row_delta_min_px = float(delta_offsets[0])
+            self.row_delta_max_px = float(delta_offsets[-1])
+            self.row_norm = None
+            self.row_x = None
+        else:
+            self.row_delta_norms = nn.ModuleList()
+            self.row_delta_heads = nn.ModuleList()
+            self.register_buffer(
+                "row_delta_offsets_px",
+                torch.empty(0, dtype=torch.float32),
+            )
+            self.row_delta_min_px = 0.0
+            self.row_delta_max_px = 0.0
+            self.row_norm = nn.LayerNorm(self.dim)
+            self.row_x = nn.Linear(self.dim, self.x_bins)
         self.lane_norm = nn.LayerNorm(self.dim)
-        self.row_x = nn.Linear(self.dim, self.x_bins)
+        self.decision_norm = (
+            nn.LayerNorm(self.dim) if self.detach_score_geometry else None
+        )
         self.exist = nn.Sequential(
             nn.Linear(self.dim, self.dim),
             nn.GELU(),
@@ -1459,6 +1535,30 @@ class StructuredLaneQueryHead(nn.Module):
         row_tokens = row_tokens + self.reference_context(context) + coordinate
         return row_tokens, reference_x
 
+    def _score_only_decision_inputs(
+        self,
+        lane_state: torch.Tensor,
+        multi_scale_features: dict[str, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Detach the score view from every geometry-producing tensor path.
+
+        Semantic attention and the foreground head remain trainable.  Only
+        their inputs are detached, so foreground supervision cannot move the
+        lane state, the P2/P4/P5 feature hierarchy, or the coordinate heads.
+        """
+
+        if not self.detach_score_geometry:
+            return lane_state, multi_scale_features
+        detached_features = (
+            None
+            if multi_scale_features is None
+            else {
+                name: value.detach()
+                for name, value in multi_scale_features.items()
+            }
+        )
+        return lane_state.detach(), detached_features
+
     def forward(
         self,
         features: torch.Tensor,
@@ -1516,6 +1616,8 @@ class StructuredLaneQueryHead(nn.Module):
         row_value_features, row_key_features = self._row_features(features)
 
         intermediate_outputs: list[dict[str, torch.Tensor]] = []
+        bounded_delta_max_abs_by_layer: list[torch.Tensor] = []
+        bounded_delta_mean_abs_by_layer: list[torch.Tensor] = []
         if self.row_reference_enabled:
             if self.reference_anchor_logits is None:
                 raise RuntimeError("row-reference anchors were not initialized")
@@ -1563,23 +1665,37 @@ class StructuredLaneQueryHead(nn.Module):
                 )
                 if isinstance(lane_layer, UnifiedLaneSetLayer):
                     lane_state = lane_layer.collect(lane_state, row_tokens)
+                    score_lane_state, score_features = (
+                        self._score_only_decision_inputs(
+                            lane_state,
+                            multi_scale_features,
+                        )
+                    )
                     decision_lane_state = lane_layer.decision(
-                        lane_state,
-                        multi_scale_features=multi_scale_features,
+                        score_lane_state,
+                        multi_scale_features=score_features,
                     )
                 elif lane_layer is not None:
                     lane_state = lane_layer(
                         lane_state,
                         row_tokens,
                     )
-                    decision_lane_state = lane_state
+                    decision_lane_state = (
+                        lane_state.detach()
+                        if self.detach_score_geometry
+                        else lane_state
+                    )
                 else:
                     decision_lane_state = None
-                row_logit_bias = self._reference_prior_logits(
-                    reference_x,
-                    x_bins=self.x_bins,
-                    sigma_px=self.output_prior_sigma_px,
-                    strength=self.output_prior_strength,
+                row_logit_bias = (
+                    self._reference_prior_logits(
+                        reference_x,
+                        x_bins=self.x_bins,
+                        sigma_px=self.output_prior_sigma_px,
+                        strength=self.output_prior_strength,
+                    )
+                    if self.row_reference_prediction_mode == "absolute"
+                    else None
                 )
                 layer_outputs = self._predict_from_row_tokens(
                     row_tokens,
@@ -1589,7 +1705,16 @@ class StructuredLaneQueryHead(nn.Module):
                     input_reference_x_rows=reference_x,
                     lane_state=lane_state,
                     decision_lane_state=decision_lane_state,
+                    layer_index=layer_index,
                 )
+                if self.row_reference_prediction_mode == "bounded_delta":
+                    delta_abs = layer_outputs["pred_delta_x_rows"].detach().abs()
+                    bounded_delta_max_abs_by_layer.append(
+                        delta_abs.amax(dim=(1, 2))
+                    )
+                    bounded_delta_mean_abs_by_layer.append(
+                        delta_abs.mean(dim=(1, 2))
+                    )
                 predicted_reference = layer_outputs["pred_x_rows"]
                 reference_x = (
                     predicted_reference.detach()
@@ -1606,6 +1731,15 @@ class StructuredLaneQueryHead(nn.Module):
                 outputs = layer_outputs
             if outputs is None:
                 raise ValueError("row-reference decoder requires at least one decoder layer")
+            if bounded_delta_max_abs_by_layer:
+                outputs["bounded_delta_max_abs_by_layer"] = torch.stack(
+                    bounded_delta_max_abs_by_layer,
+                    dim=-1,
+                )
+                outputs["bounded_delta_mean_abs_by_layer"] = torch.stack(
+                    bounded_delta_mean_abs_by_layer,
+                    dim=-1,
+                )
         else:
             intermediate_states: list[
                 tuple[
@@ -1635,16 +1769,26 @@ class StructuredLaneQueryHead(nn.Module):
                 )
                 if isinstance(lane_layer, UnifiedLaneSetLayer):
                     lane_state = lane_layer.collect(lane_state, row_tokens)
+                    score_lane_state, score_features = (
+                        self._score_only_decision_inputs(
+                            lane_state,
+                            multi_scale_features,
+                        )
+                    )
                     decision_lane_state = lane_layer.decision(
-                        lane_state,
-                        multi_scale_features=multi_scale_features,
+                        score_lane_state,
+                        multi_scale_features=score_features,
                     )
                 elif lane_layer is not None:
                     lane_state = lane_layer(
                         lane_state,
                         row_tokens,
                     )
-                    decision_lane_state = lane_state
+                    decision_lane_state = (
+                        lane_state.detach()
+                        if self.detach_score_geometry
+                        else lane_state
+                    )
                 else:
                     decision_lane_state = None
                 if (
@@ -1746,6 +1890,12 @@ class StructuredLaneQueryHead(nn.Module):
             }
             if "selection_logits" in outputs:
                 inference_outputs["selection_logits"] = outputs["selection_logits"]
+            for name in (
+                "bounded_delta_max_abs_by_layer",
+                "bounded_delta_mean_abs_by_layer",
+            ):
+                if name in outputs:
+                    inference_outputs[name] = outputs[name]
             return inference_outputs
         # Keep the public debug container without running reductions that are
         # not consumed by training, evaluation, or model outputs.  In
@@ -1785,17 +1935,24 @@ class StructuredLaneQueryHead(nn.Module):
         input_reference_x_rows: torch.Tensor | None = None,
         lane_state: torch.Tensor | None = None,
         decision_lane_state: torch.Tensor | None = None,
+        layer_index: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Apply the shared lane heads to one decoder-layer state.
-
-        Sharing these heads across layers isolates deep supervision from an
-        increase in prediction-head capacity.  Auxiliary layers intentionally
-        omit quality calibration; quality remains a final-layer decision.
-        """
+        """Apply lane heads while respecting the configured coordinate frame."""
         b = int(row_tokens.shape[0])
-        row_tokens = self.row_norm(row_tokens)
+        if self.row_reference_prediction_mode == "bounded_delta":
+            if input_reference_x_rows is None or layer_index is None:
+                raise ValueError(
+                    "bounded_delta prediction requires a layer index and input reference"
+                )
+            if not 0 <= int(layer_index) < len(self.row_delta_heads):
+                raise IndexError(f"invalid bounded-delta layer index: {layer_index}")
+            normalized_rows = self.row_delta_norms[int(layer_index)](row_tokens)
+        else:
+            if self.row_norm is None:
+                raise RuntimeError("absolute row normalization was not initialized")
+            normalized_rows = self.row_norm(row_tokens)
         if lane_state is not None:
-            if lane_state.shape != (b, int(row_tokens.shape[1]), self.dim):
+            if lane_state.shape != (b, int(normalized_rows.shape[1]), self.dim):
                 raise ValueError("lane_state shape does not match row tokens")
             lane_query = self.lane_norm(lane_state)
             if decision_lane_state is None:
@@ -1805,23 +1962,58 @@ class StructuredLaneQueryHead(nn.Module):
                     raise ValueError(
                         "decision_lane_state shape does not match lane state"
                     )
-                decision_query = self.lane_norm(decision_lane_state)
+                decision_query = (
+                    self.decision_norm(decision_lane_state)
+                    if self.decision_norm is not None
+                    else self.lane_norm(decision_lane_state)
+                )
         else:
             instance_residual = instance.unsqueeze(0).expand(b, -1, -1)
-            lane_summary = row_tokens.mean(dim=2)
+            lane_summary = normalized_rows.mean(dim=2)
             if self.lane_pooling == "mean_max":
-                lane_summary = lane_summary + row_tokens.amax(dim=2)
+                lane_summary = lane_summary + normalized_rows.amax(dim=2)
             lane_query = self.lane_norm(lane_summary + instance_residual)
-            decision_query = lane_query
-        row_x_logits = self.row_x(row_tokens)
-        if row_x_logit_bias is not None:
-            if row_x_logit_bias.shape != row_x_logits.shape:
-                raise ValueError(
-                    "row_x_logit_bias shape must match row logits: "
-                    f"{tuple(row_x_logit_bias.shape)} vs {tuple(row_x_logits.shape)}"
+            if self.detach_score_geometry:
+                assert self.decision_norm is not None
+                decision_query = self.decision_norm(
+                    (lane_summary + instance_residual).detach()
                 )
-            row_x_logits = row_x_logits + row_x_logit_bias.to(dtype=row_x_logits.dtype)
-        pred_x_rows = soft_expected_x(row_x_logits, input_w=self.input_w, x_bins=self.x_bins)
+            else:
+                decision_query = lane_query
+        if self.row_reference_prediction_mode == "bounded_delta":
+            row_x_logits = self.row_delta_heads[int(layer_index)](normalized_rows)
+            offsets = self.row_delta_offsets_px.to(
+                device=row_x_logits.device,
+                dtype=row_x_logits.dtype,
+            )
+            probability = torch.softmax(row_x_logits, dim=-1)
+            delta_x_rows = (probability * offsets).sum(dim=-1)
+            delta_x_rows = delta_x_rows.clamp(
+                min=self.row_delta_min_px,
+                max=self.row_delta_max_px,
+            )
+            pred_x_rows = (
+                input_reference_x_rows.to(dtype=delta_x_rows.dtype)
+                + delta_x_rows
+            ).clamp(0.0, float(max(self.input_w - 1, 0)))
+        else:
+            if self.row_x is None:
+                raise RuntimeError("absolute row projection was not initialized")
+            row_x_logits = self.row_x(normalized_rows)
+            if row_x_logit_bias is not None:
+                if row_x_logit_bias.shape != row_x_logits.shape:
+                    raise ValueError(
+                        "row_x_logit_bias shape must match row logits: "
+                        f"{tuple(row_x_logit_bias.shape)} vs {tuple(row_x_logits.shape)}"
+                    )
+                row_x_logits = row_x_logits + row_x_logit_bias.to(
+                    dtype=row_x_logits.dtype
+                )
+            pred_x_rows = soft_expected_x(
+                row_x_logits,
+                input_w=self.input_w,
+                x_bins=self.x_bins,
+            )
         range_raw = self.range(lane_query)
         range_norm = sort_range_norm(torch.sigmoid(range_raw))
         raw_exist = self.exist(decision_query)
@@ -1841,8 +2033,11 @@ class StructuredLaneQueryHead(nn.Module):
             "range_raw": range_raw,
             "queries": lane_query,
             "decision_queries": decision_query,
-            "structured_row_tokens": row_tokens,
+            "structured_row_tokens": normalized_rows,
         }
+        if self.row_reference_prediction_mode == "bounded_delta":
+            outputs["row_x_offsets_px"] = self.row_delta_offsets_px
+            outputs["pred_delta_x_rows"] = delta_x_rows
         if self.single_logit_score:
             # One scalar is now used by matching, foreground supervision and
             # deployment.  The legacy two-logit tensor above is only an exact

@@ -124,6 +124,7 @@ GROUP_RULES = {
     "row_readout": _prefixes(
         "structured_query_head.row_norm.",
         "structured_query_head.row_x.",
+        "structured_query_head.row_delta_heads.",
     ),
     "lane_state_core": _prefixes("structured_query_head.lane_state_layers."),
     "exist_head": _prefixes("structured_query_head.exist."),
@@ -144,6 +145,10 @@ TRACKED_TENSORS = (
     "structured_query_head.row_norm.bias",
     "structured_query_head.row_x.weight",
     "structured_query_head.row_x.bias",
+    "structured_query_head.row_delta_heads.0.weight",
+    "structured_query_head.row_delta_heads.1.weight",
+    "structured_query_head.row_delta_heads.2.weight",
+    "structured_query_head.row_delta_heads.3.weight",
     "structured_query_head.reference_logit_scale",
 )
 

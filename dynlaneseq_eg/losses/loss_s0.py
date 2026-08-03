@@ -22,6 +22,11 @@ class LossConfig:
     input_h: int = 288
     no_lane_weight: float = 1.0
     exist_loss_type: str = "ce"
+    exist_target_mode: str = "binary"
+    exist_quality_floor: float = 0.5
+    exist_quality_beta: float = 2.0
+    exist_quality_line_width: float = 30.0
+    exist_quality_min_valid_rows: int = 5
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     smoothness_contiguous: bool = True
@@ -92,6 +97,17 @@ class S0Criterion(nn.Module):
             raise ValueError(
                 "set_selection_positive_floor must be in [0, 1)"
             )
+        exist_target_mode = str(self.cfg.exist_target_mode).strip().lower()
+        if exist_target_mode not in {"binary", "iou_aware"}:
+            raise ValueError("exist_target_mode must be binary or iou_aware")
+        if not 0.0 <= float(self.cfg.exist_quality_floor) < 1.0:
+            raise ValueError("exist_quality_floor must be in [0, 1)")
+        if float(self.cfg.exist_quality_beta) < 0.0:
+            raise ValueError("exist_quality_beta must be non-negative")
+        if float(self.cfg.exist_quality_line_width) <= 0.0:
+            raise ValueError("exist_quality_line_width must be positive")
+        if int(self.cfg.exist_quality_min_valid_rows) < 1:
+            raise ValueError("exist_quality_min_valid_rows must be positive")
 
     def lane_balanced_geometry(self) -> bool:
         return str(self.cfg.geometry_reduction).strip().lower() in {
@@ -126,7 +142,11 @@ class S0Criterion(nn.Module):
         elif "stage2" in outputs:
             outputs = outputs["stage2"]
         zero = self._zero_anchor(raw_outputs).sum() * 0.0
-        loss_exist = self.compute_exist_loss(outputs, matches) if self.cfg.w_exist != 0 else zero
+        loss_exist = (
+            self.compute_exist_loss(outputs, matches, targets)
+            if self.cfg.w_exist != 0
+            else zero
+        )
         loss_point = self.compute_point_loss(outputs, targets, matches) if self.cfg.w_point != 0 else zero
         loss_range = self.compute_range_loss(outputs, targets, matches) if self.cfg.w_range != 0 else zero
         loss_smooth = self.compute_smoothness_loss(outputs, targets, matches) if self.cfg.w_smooth != 0 else zero
@@ -214,7 +234,11 @@ class S0Criterion(nn.Module):
         }
         if self.cfg.lambda_coarse > 0 and isinstance(raw_outputs.get("coarse"), dict):
             coarse = raw_outputs["coarse"]
-            coarse_exist = self.compute_exist_loss(coarse, matches) if self.cfg.w_exist != 0 else zero
+            coarse_exist = (
+                self.compute_exist_loss(coarse, matches, targets)
+                if self.cfg.w_exist != 0
+                else zero
+            )
             coarse_point = self.compute_point_loss(coarse, targets, matches) if self.cfg.w_point != 0 else zero
             coarse_range = self.compute_range_loss(coarse, targets, matches) if self.cfg.w_range != 0 else zero
             coarse_smooth = self.compute_smoothness_loss(coarse, targets, matches) if self.cfg.w_smooth != 0 else zero
@@ -284,7 +308,7 @@ class S0Criterion(nn.Module):
         zero = self._zero_anchor(auxiliary).sum() * 0.0
         row_dfl_weight = self.row_dfl_weight()
         aux_exist = (
-            self.compute_exist_loss(auxiliary, auxiliary_matches)
+            self.compute_exist_loss(auxiliary, auxiliary_matches, targets)
             if self.cfg.w_exist != 0
             else zero
         )
@@ -367,7 +391,7 @@ class S0Criterion(nn.Module):
                 layer_zero = self._zero_anchor(layer).sum() * 0.0
                 intermediate_exist_weight = self.intermediate_exist_weight()
                 layer_exist = (
-                    self.compute_exist_loss(layer, layer_matches)
+                    self.compute_exist_loss(layer, layer_matches, targets)
                     if intermediate_exist_weight != 0.0
                     else layer_zero
                 )
@@ -487,7 +511,7 @@ class S0Criterion(nn.Module):
                 raise TypeError("every auxiliary decoder output must be a dictionary")
             zero = self._zero_anchor(aux).sum() * 0.0
             aux_exist = (
-                self.compute_exist_loss(aux, aux_matches)
+                self.compute_exist_loss(aux, aux_matches, targets)
                 if intermediate_exist_weight != 0.0
                 else zero
             )
@@ -543,7 +567,11 @@ class S0Criterion(nn.Module):
             return losses
         draft = outputs["s0_geometry_draft"]
         zero = self._zero_anchor(draft).sum() * 0.0
-        draft_exist = self.compute_exist_loss(draft, matches) if self.cfg.w_exist != 0 else zero
+        draft_exist = (
+            self.compute_exist_loss(draft, matches, targets)
+            if self.cfg.w_exist != 0
+            else zero
+        )
         draft_point = self.compute_point_loss(draft, targets, matches) if self.cfg.w_point != 0 else zero
         draft_range = self.compute_range_loss(draft, targets, matches) if self.cfg.w_range != 0 else zero
         draft_smooth = self.compute_smoothness_loss(draft, targets, matches) if self.cfg.w_smooth != 0 else zero
@@ -576,9 +604,78 @@ class S0Criterion(nn.Module):
         )
         return losses
 
-    def compute_exist_loss(self, outputs: dict[str, torch.Tensor], matches: list[dict[str, torch.Tensor]]) -> torch.Tensor:
+    @torch.no_grad()
+    def compute_exist_quality_targets(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Build detached localization-aware targets for the one deployable score."""
+
+        pred_x = outputs["pred_x_rows"].detach().float()
+        ranges = outputs["range_norm"].detach().float()
+        batch, candidates, _rows = pred_x.shape
+        if len(targets) != batch or len(matches) != batch:
+            raise ValueError("exist quality targets require one target/match per image")
+        score_target = pred_x.new_zeros((batch, candidates))
+        floor = float(self.cfg.exist_quality_floor)
+        for batch_index, (target, match) in enumerate(zip(targets, matches)):
+            pred_indices = match["pred_indices"].to(pred_x.device)
+            gt_indices = match["gt_indices"].to(pred_x.device)
+            if pred_indices.numel() == 0:
+                continue
+            gt_x = target["x_rows"].to(
+                device=pred_x.device,
+                dtype=pred_x.dtype,
+            )
+            gt_valid = target["valid_mask"].to(pred_x.device).bool()
+            quality, _candidate_valid, _valid_gt = (
+                pairwise_range_aware_row_strip_iou(
+                    pred_x[batch_index],
+                    ranges[batch_index],
+                    gt_x,
+                    gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.exist_quality_line_width),
+                    min_valid_rows=int(self.cfg.exist_quality_min_valid_rows),
+                )
+            )
+            matched_quality = quality[pred_indices, gt_indices].clamp(0.0, 1.0)
+            score_target[batch_index, pred_indices] = floor + (
+                1.0 - floor
+            ) * matched_quality
+        return score_target
+
+    def compute_exist_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        matches: list[dict[str, torch.Tensor]],
+        targets: list[dict[str, torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
         logits = outputs["exist_logits"]
         b, n, _ = logits.shape
+        if str(self.cfg.exist_target_mode).strip().lower() == "iou_aware":
+            if targets is None:
+                raise ValueError("iou_aware existence supervision requires targets")
+            lane_target = self.compute_exist_quality_targets(
+                outputs,
+                targets,
+                matches,
+            ).to(device=logits.device, dtype=torch.float32)
+            lane_logit = (logits[..., 0] - logits[..., 1]).float()
+            probability = torch.sigmoid(lane_logit)
+            modulation = (lane_target - probability).abs().pow(
+                float(self.cfg.exist_quality_beta)
+            )
+            return (
+                modulation
+                * F.binary_cross_entropy_with_logits(
+                    lane_logit,
+                    lane_target,
+                    reduction="none",
+                )
+            ).mean()
         target = torch.ones((b, n), dtype=torch.long, device=logits.device)
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(logits.device)
@@ -733,6 +830,22 @@ class S0Criterion(nn.Module):
         count = total.new_tensor(0.0)
         lane_balanced = self.lane_balanced_geometry()
         bin_width = float(self.cfg.input_w) / float(x_bins)
+        delta_offsets = outputs.get("row_x_offsets_px")
+        input_reference = outputs.get("input_reference_x_rows")
+        local_delta_mode = isinstance(delta_offsets, torch.Tensor)
+        if local_delta_mode:
+            if not isinstance(input_reference, torch.Tensor):
+                raise ValueError(
+                    "local delta DFL requires input_reference_x_rows"
+                )
+            delta_offsets = delta_offsets.to(
+                device=logits.device,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if int(delta_offsets.numel()) != int(x_bins):
+                raise ValueError(
+                    "row_x_offsets_px count must match local row logits"
+                )
         for bi, match in enumerate(matches):
             pred_idx = match["pred_indices"].to(logits.device)
             gt_idx = match["gt_indices"].to(logits.device)
@@ -754,14 +867,36 @@ class S0Criterion(nn.Module):
             # many times per optimizer step.  Invalid values are made safe
             # before indexing and remain exactly zero-weighted below.
             safe_gt_x = torch.where(valid, gt_x, torch.zeros_like(gt_x))
-            target_bin = (safe_gt_x / bin_width).clamp(0.0, float(x_bins - 1))
-            left = target_bin.floor().long()
-            right = (left + 1).clamp(max=x_bins - 1)
-            right_w = target_bin - left.to(dtype=target_bin.dtype)
-            left_w = 1.0 - right_w
-            same = right == left
-            left_w = torch.where(same, torch.ones_like(left_w), left_w)
-            right_w = torch.where(same, torch.zeros_like(right_w), right_w)
+            if local_delta_mode:
+                reference = input_reference[bi, pred_idx, :row_count].detach().float()
+                target_delta = torch.minimum(
+                    torch.maximum(safe_gt_x - reference, delta_offsets[0]),
+                    delta_offsets[-1],
+                )
+                right = torch.searchsorted(
+                    delta_offsets,
+                    target_delta.contiguous(),
+                ).clamp(min=1, max=x_bins - 1)
+                left = right - 1
+                left_offset = delta_offsets[left]
+                right_offset = delta_offsets[right]
+                right_w = (target_delta - left_offset) / (
+                    right_offset - left_offset
+                ).clamp_min(1e-6)
+                right_w = right_w.clamp(0.0, 1.0)
+                left_w = 1.0 - right_w
+            else:
+                target_bin = (safe_gt_x / bin_width).clamp(
+                    0.0,
+                    float(x_bins - 1),
+                )
+                left = target_bin.floor().long()
+                right = (left + 1).clamp(max=x_bins - 1)
+                right_w = target_bin - left.to(dtype=target_bin.dtype)
+                left_w = 1.0 - right_w
+                same = right == left
+                left_w = torch.where(same, torch.ones_like(left_w), left_w)
+                right_w = torch.where(same, torch.zeros_like(right_w), right_w)
 
             log_probs = F.log_softmax(pred_logits, dim=-1)
             left_lp = log_probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)

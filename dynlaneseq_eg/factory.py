@@ -68,6 +68,15 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         input_h=int(model.get("input_h", 288)),
         no_lane_weight=float(loss.get("no_lane_weight", 1.0)),
         exist_loss_type=str(loss.get("exist_loss_type", "ce")),
+        exist_target_mode=str(loss.get("exist_target_mode", "binary")),
+        exist_quality_floor=float(loss.get("exist_quality_floor", 0.5)),
+        exist_quality_beta=float(loss.get("exist_quality_beta", 2.0)),
+        exist_quality_line_width=float(
+            loss.get("exist_quality_line_width", 30.0)
+        ),
+        exist_quality_min_valid_rows=int(
+            loss.get("exist_quality_min_valid_rows", 5)
+        ),
         focal_alpha=float(loss.get("focal_alpha", 0.25)),
         focal_gamma=float(loss.get("focal_gamma", 2.0)),
         w_line_iou=float(loss.get("w_line_iou", 0.0)),

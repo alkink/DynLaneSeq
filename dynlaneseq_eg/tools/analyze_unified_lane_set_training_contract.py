@@ -231,6 +231,8 @@ def _stage_for_image(
         "range_norm",
         "exist_logits",
         "quality_logits",
+        "bounded_delta_max_abs_by_layer",
+        "bounded_delta_mean_abs_by_layer",
     )
     return {
         name: outputs[name][image_index].detach().float().cpu()
@@ -288,10 +290,14 @@ def _parameter_groups(
                 if any(marker in name for marker in semantic_markers)
                 else "unified_lane_state_core"
             )
-        elif name.startswith("structured_query_head.exist."):
+        elif name.startswith("structured_query_head.exist.") or name.startswith(
+            "structured_query_head.decision_norm."
+        ):
             group = "foreground_score_head"
-        elif name.startswith("structured_query_head.row_x.") or name.startswith(
-            "structured_query_head.range."
+        elif (
+            name.startswith("structured_query_head.row_x.")
+            or name.startswith("structured_query_head.row_delta_heads.")
+            or name.startswith("structured_query_head.range.")
         ):
             group = "geometry_prediction_heads"
         elif (
@@ -505,6 +511,24 @@ def main() -> None:
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
     )
+    row_reference_cfg = (
+        cfg.get("model", {})
+        .get("structured_query", {})
+        .get("row_reference", {})
+    )
+    bounded_delta_enabled = (
+        str(row_reference_cfg.get("prediction_mode", "absolute")).strip().lower()
+        == "bounded_delta"
+    )
+    configured_delta_offsets = tuple(
+        float(value)
+        for value in row_reference_cfg.get("delta_offsets_px", ())
+    )
+    bounded_delta_radius_px = (
+        max(abs(value) for value in configured_delta_offsets)
+        if configured_delta_offsets
+        else None
+    )
     model = build_model(cfg)
     checkpoint_iteration = int(
         load_checkpoint(args.checkpoint, model, strict=False)
@@ -572,6 +596,10 @@ def main() -> None:
     predicted_probability_counts: list[float] = []
     training_target_counts: list[float] = []
     official_target_counts: list[float] = []
+    bounded_delta_maxima: list[list[float]] = []
+    bounded_delta_means: list[list[float]] = []
+    bounded_delta_violations = 0
+    bounded_delta_observations = 0
     images_seen = 0
     gradient_images_seen = 0
 
@@ -602,6 +630,28 @@ def main() -> None:
             zip(targets_cpu, metas, metric_matches)
         ):
             stage = _stage_for_image(metric_outputs, image_index)
+            layer_maxima = stage.get("bounded_delta_max_abs_by_layer")
+            layer_means = stage.get("bounded_delta_mean_abs_by_layer")
+            if isinstance(layer_maxima, torch.Tensor):
+                maxima = layer_maxima.reshape(-1).tolist()
+                means = (
+                    layer_means.reshape(-1).tolist()
+                    if isinstance(layer_means, torch.Tensor)
+                    else [float("nan")] * len(maxima)
+                )
+                while len(bounded_delta_maxima) < len(maxima):
+                    bounded_delta_maxima.append([])
+                    bounded_delta_means.append([])
+                for layer_index, (maximum, mean) in enumerate(zip(maxima, means)):
+                    maximum = float(maximum)
+                    bounded_delta_maxima[layer_index].append(maximum)
+                    bounded_delta_means[layer_index].append(float(mean))
+                    bounded_delta_observations += 1
+                    if (
+                        bounded_delta_radius_px is not None
+                        and maximum > bounded_delta_radius_px + 1e-4
+                    ):
+                        bounded_delta_violations += 1
             record = {"stages": {"main": stage}, "meta": meta}
             official_iou, candidate_valid = official_proposal_gt_iou_matrix(
                 record,
@@ -848,6 +898,29 @@ def main() -> None:
     gradient_summary = {
         name: stats.summary() for name, stats in gradient_stats.items()
     }
+    bounded_delta_contract = {
+        "enabled": bool(bounded_delta_enabled),
+        "configured_offsets_px": list(configured_delta_offsets),
+        "configured_radius_px": bounded_delta_radius_px,
+        "observed_max_abs_px_by_layer": [
+            max(values) if values else None for values in bounded_delta_maxima
+        ],
+        "observed_mean_abs_px_by_layer": [
+            _mean(values) for values in bounded_delta_means
+        ],
+        "observed_global_max_abs_px": (
+            max(max(values) for values in bounded_delta_maxima if values)
+            if any(bounded_delta_maxima)
+            else None
+        ),
+        "observations": int(bounded_delta_observations),
+        "trust_region_violations": int(bounded_delta_violations),
+        "trust_region_satisfied": bool(
+            bounded_delta_enabled
+            and bounded_delta_observations > 0
+            and bounded_delta_violations == 0
+        ),
+    }
     payload = {
         "diagnostic_only": True,
         "config": args.config,
@@ -886,6 +959,7 @@ def main() -> None:
         "count_calibration": count_calibration,
         "capacity": capacity,
         "deployed_operating_points": deployed,
+        "bounded_delta_contract": bounded_delta_contract,
     }
     payload["verdict"] = _build_verdict(
         gradient_summary,
