@@ -10,6 +10,7 @@ SOURCE_CONFIG="${SOURCE_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query
 SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-outputs/culane_s0_structured_query_dla34_unified_lane_set_v4_bounded_delta_278k/iter_0050000.pt}"
 SOURCE_ITERATION="${SOURCE_ITERATION:-50000}"
 TRAIN_STEPS="${TRAIN_STEPS:-10000}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1000}"
 SEEDS="${SEEDS:-3407}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
@@ -23,7 +24,7 @@ RUN_TRAIN="${RUN_TRAIN:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_TRAJECTORY_EVAL="${RUN_TRAJECTORY_EVAL:-1}"
 RUN_GRAD_AUDIT="${RUN_GRAD_AUDIT:-1}"
-MIN_FREE_GB="${MIN_FREE_GB:-4}"
+MIN_FREE_GB="${MIN_FREE_GB:-2.5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v4_2_relation_gate_50k}"
 CACHE_ROOT="${CACHE_ROOT:-outputs/diagnostic_cache/unified_lane_set_v4_2_relation_gate_50k}"
 
@@ -44,8 +45,12 @@ if [[ ! -f "${SOURCE_CONFIG}" || ! -f "${SOURCE_CHECKPOINT}" ]]; then
   echo "Missing V4 source config/checkpoint" >&2
   exit 1
 fi
-if (( TRAIN_STEPS < 500 || TRAIN_STEPS % 500 != 0 )); then
-  echo "TRAIN_STEPS must be a positive multiple of 500" >&2
+if (( CHECKPOINT_INTERVAL < 500 || CHECKPOINT_INTERVAL % 500 != 0 )); then
+  echo "CHECKPOINT_INTERVAL must be a positive multiple of 500" >&2
+  exit 1
+fi
+if (( TRAIN_STEPS < CHECKPOINT_INTERVAL || TRAIN_STEPS % CHECKPOINT_INTERVAL != 0 )); then
+  echo "TRAIN_STEPS must be a positive multiple of CHECKPOINT_INTERVAL" >&2
   exit 1
 fi
 
@@ -102,8 +107,8 @@ for index, (path, expected) in enumerate(zip(sys.argv[1:], expected_interactions
         raise SystemExit(f"candidate interaction mismatch in {path}")
     if not selection.get("detach_geometry_features", False):
         raise SystemExit(f"geometry detach disabled in {path}")
-    if training.get("checkpoint_interval") != 500:
-        raise SystemExit(f"500-step trajectory disabled in {path}")
+    if int(training.get("checkpoint_interval", 0)) <= 0:
+        raise SystemExit(f"periodic trajectory disabled in {path}")
     if not training.get("checkpoint_include_optimizer", False):
         raise SystemExit(f"optimizer trajectory disabled in {path}")
     prefixes = training.get("trainable_parameter_prefixes", [])
@@ -129,6 +134,7 @@ echo "V4.2 frozen-geometry relation gate"
 echo "source: ${SOURCE_CHECKPOINT}"
 echo "source SHA256: $(sha256sum "${SOURCE_CHECKPOINT}" | awk '{print $1}')"
 echo "logical iterations: ${SOURCE_ITERATION} -> ${END_ITERATION}"
+echo "checkpoint interval: ${CHECKPOINT_INTERVAL}"
 echo "seeds: ${SEEDS}"
 echo "R0 longer-control; R1 +semantic; R2 +relations; R3 +set losses"
 
@@ -180,6 +186,7 @@ for seed in ${SEEDS}; do
         --device "${DEVICE}" \
         --output-dir "${output_dir}" \
         --max-iters "${TRAIN_STEPS}" \
+        --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
         --seed "${seed}" \
         --batch-size "${BATCH_SIZE}" \
         --grad-accum "${GRAD_ACCUM}" \
@@ -251,7 +258,7 @@ for seed in ${SEEDS}; do
       config="${arm_configs[$index]}"
       trajectory_dir="${result_dir}/trajectory/${name}"
       mkdir -p "${trajectory_dir}"
-      for ((iteration=SOURCE_ITERATION+500; iteration<=END_ITERATION; iteration+=500)); do
+      for ((iteration=SOURCE_ITERATION+CHECKPOINT_INTERVAL; iteration<=END_ITERATION; iteration+=CHECKPOINT_INTERVAL)); do
         tag="$(printf '%07d' "${iteration}")"
         checkpoint="${seed_root}/${name}/iter_${tag}.pt"
         report="${trajectory_dir}/iter_${tag}.json"

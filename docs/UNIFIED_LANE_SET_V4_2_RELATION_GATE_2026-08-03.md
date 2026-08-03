@@ -130,8 +130,9 @@ R3  R2 + coverage/duplicate/winner/count losses
     -> set-level supervision'ın ek etkisi
 ```
 
-Bütün kollar aynı V4-50k checkpoint'inden, aynı veri/seed ile başlar. Her 500
-adımda compact delta checkpoint ve optimizer state kaydedilir. Source geometry
+Bütün kollar aynı V4-50k checkpoint'inden, aynı veri/seed ile başlar. Varsayılan
+olarak her 1000 adımda compact delta checkpoint ve optimizer state kaydedilir;
+disk alanı uygunsa `CHECKPOINT_INTERVAL=500` ile daha sık izlenebilir. Source geometry
 yeniden yazılmaz; böylece disk dolduğunda yarım 500-MB checkpoint bırakma riski
 azalır ve atomic checkpoint writer korunur.
 
@@ -148,6 +149,13 @@ GRAD_ACCUM=4 \
 EVAL_BATCH_SIZE=4 \
 NUM_WORKERS=8 \
 AMP_DTYPE=bfloat16 \
+bash scripts/run_culane_dla34_unified_lane_set_v4_2_relation_gate_50k.sh
+```
+
+500-adımlık checkpoint trajectory istenirse yaklaşık 4 GiB boş alanla:
+
+```bash
+CHECKPOINT_INTERVAL=500 MIN_FREE_GB=4 ... \
 bash scripts/run_culane_dla34_unified_lane_set_v4_2_relation_gate_50k.sh
 ```
 
@@ -207,4 +215,3 @@ R2/R3 10k sonunda hâlâ MMR'den 10-20 F1 gerideyse scalar scoring sözleşmesi
 yetersiz kabul edilecek. O durumda sonraki adım relation özelliklerini tekrar
 yamamak değil; `NO-LANE/STOP` içeren dört adımlı differentiable MMR veya
 pointer-style subset selector olacaktır.
-
