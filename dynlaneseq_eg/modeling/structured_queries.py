@@ -642,6 +642,138 @@ class PersistentLaneStateLayer(nn.Module):
         return state.reshape(b, n, c).contiguous()
 
 
+class RelationAwareCandidateBlock(nn.Module):
+    """Candidate self-attention with an explicit per-pair curve bias.
+
+    A generic set transformer must infer geometric duplication indirectly from
+    compressed unary descriptors.  This block instead receives a detached
+    ``[B, N, N, C_rel]`` relation tensor and maps it to one additive bias per
+    attention head.  Values remain candidate states, so the relation tensor
+    informs set comparison without becoming a second deployment score.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+        relation_dim: int,
+        relation_hidden_dim: int,
+    ) -> None:
+        super().__init__()
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError("relation attention hidden_dim must divide num_heads")
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.hidden_dim // self.num_heads
+        self.norm_attention = nn.LayerNorm(self.hidden_dim)
+        self.qkv = nn.Linear(self.hidden_dim, 3 * self.hidden_dim)
+        self.relation_bias = nn.Sequential(
+            nn.LayerNorm(int(relation_dim)),
+            nn.Linear(int(relation_dim), int(relation_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(relation_hidden_dim), self.num_heads),
+        )
+        self.attention_output = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.attention_dropout = nn.Dropout(float(dropout))
+        self.norm_ffn = nn.LayerNorm(self.hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+        self.ffn_dropout = nn.Dropout(float(dropout))
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        relations: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden.ndim != 3 or relations.ndim != 4:
+            raise ValueError(
+                "relation attention expects [B,N,C] states and [B,N,N,C_rel] relations"
+            )
+        batch, candidates, channels = hidden.shape
+        if int(channels) != self.hidden_dim:
+            raise ValueError("candidate hidden dimension does not match relation block")
+        if relations.shape[:3] != (batch, candidates, candidates):
+            raise ValueError("pairwise relation axes do not match candidate states")
+
+        normalized = self.norm_attention(hidden)
+        qkv = self.qkv(normalized).view(
+            batch,
+            candidates,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        query, key, value = qkv.unbind(dim=2)
+        query = query.permute(0, 2, 1, 3)
+        key = key.permute(0, 2, 1, 3)
+        value = value.permute(0, 2, 1, 3)
+        content_logits = torch.matmul(
+            query.float(),
+            key.float().transpose(-2, -1),
+        ) / math.sqrt(float(self.head_dim))
+        relation_logits = self.relation_bias(relations.float()).permute(
+            0, 3, 1, 2
+        )
+        attention = torch.softmax(content_logits + relation_logits, dim=-1).to(
+            dtype=value.dtype
+        )
+        attended = torch.matmul(attention, value)
+        attended = attended.permute(0, 2, 1, 3).reshape(
+            batch,
+            candidates,
+            self.hidden_dim,
+        )
+        hidden = hidden + self.attention_dropout(
+            self.attention_output(attended)
+        )
+        hidden = hidden + self.ffn_dropout(self.ffn(self.norm_ffn(hidden)))
+        return hidden
+
+
+class RelationAwareCandidateEncoder(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        num_layers: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+        relation_dim: int,
+        relation_hidden_dim: int,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                RelationAwareCandidateBlock(
+                    hidden_dim,
+                    num_heads=num_heads,
+                    ff_dim=ff_dim,
+                    dropout=dropout,
+                    relation_dim=relation_dim,
+                    relation_hidden_dim=relation_hidden_dim,
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        relations: torch.Tensor,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            hidden = layer(hidden, relations)
+        return hidden
+
+
 class SetAwareLaneSelectionHead(nn.Module):
     """Permutation-equivariant scorer over the complete lane proposal set.
 
@@ -671,6 +803,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         use_curve_evidence: bool = False,
         use_semantic_decision: bool = False,
         candidate_interaction: str = "transformer",
+        relation_sigma_px: float = 20.0,
+        relation_hidden_dim: int = 32,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -684,6 +818,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.use_curve_evidence = bool(use_curve_evidence)
         self.use_semantic_decision = bool(use_semantic_decision)
         self.candidate_interaction = str(candidate_interaction).strip().lower()
+        self.relation_sigma_px = float(relation_sigma_px)
+        self.relation_dim = 6
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -694,10 +830,16 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("set_selection.range_temperature must be positive")
         if not 0.0 < self.prior_prob < 1.0:
             raise ValueError("set_selection.prior_prob must be between zero and one")
-        if self.candidate_interaction not in {"independent", "transformer"}:
+        if self.relation_sigma_px <= 0.0:
+            raise ValueError("set_selection.relation_sigma_px must be positive")
+        if self.candidate_interaction not in {
+            "independent",
+            "transformer",
+            "relation_transformer",
+        }:
             raise ValueError(
-                "set_selection.candidate_interaction must be independent or "
-                "transformer"
+                "set_selection.candidate_interaction must be independent, "
+                "transformer, or relation_transformer"
             )
 
         # Unified mode uses two range-masked row-state summaries and optional
@@ -733,6 +875,17 @@ class SetAwareLaneSelectionHead(nn.Module):
                 encoder_layer,
                 num_layers=int(num_layers),
                 enable_nested_tensor=False,
+            )
+            self.independent_ffn = nn.Identity()
+        elif self.candidate_interaction == "relation_transformer":
+            self.encoder = RelationAwareCandidateEncoder(
+                int(hidden_dim),
+                num_layers=int(num_layers),
+                num_heads=int(num_heads),
+                ff_dim=int(ff_dim),
+                dropout=float(dropout),
+                relation_dim=self.relation_dim,
+                relation_hidden_dim=int(relation_hidden_dim),
             )
             self.independent_ffn = nn.Identity()
         else:
@@ -944,13 +1097,105 @@ class SetAwareLaneSelectionHead(nn.Module):
             )
         return features
 
-    def score_selection_features(self, features: torch.Tensor) -> torch.Tensor:
+    def build_pairwise_relations(
+        self,
+        outputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Build detached, symmetric curve relations for every candidate pair.
+
+        Channels are mean/top/bottom normalized curve distance, common visible
+        row overlap, range IoU, and a soft strip-similarity term.  These are
+        precisely the geometric facts used by the successful cached MMR
+        counterfactual, but remain soft and learnable inside attention.
+        """
+
+        pred_x = outputs["pred_x_rows"].detach().float()
+        ranges = sort_range_norm(outputs["range_norm"].detach().float())
+        if pred_x.ndim != 3 or ranges.shape != pred_x.shape[:2] + (2,):
+            raise ValueError("selection curve/range tensors have incompatible shapes")
+        _batch, _candidates, rows = pred_x.shape
+        y_norm = torch.linspace(
+            0.0,
+            1.0,
+            rows,
+            device=pred_x.device,
+            dtype=pred_x.dtype,
+        ).view(1, 1, rows)
+        temperature = max(self.range_temperature, 1e-4)
+        visible = torch.sigmoid((y_norm - ranges[..., :1]) / temperature)
+        visible = visible * torch.sigmoid(
+            (ranges[..., 1:] - y_norm) / temperature
+        )
+
+        visible_i = visible.unsqueeze(2)
+        visible_k = visible.unsqueeze(1)
+        common = visible_i * visible_k
+        common_count = common.sum(dim=-1).clamp_min(1e-4)
+        union = visible_i + visible_k - common
+        visible_overlap = common.sum(dim=-1) / union.sum(dim=-1).clamp_min(1e-4)
+
+        distance_px = (
+            pred_x.unsqueeze(2) - pred_x.unsqueeze(1)
+        ).abs()
+        distance_norm = distance_px / float(max(self.input_w - 1, 1))
+        mean_distance = (distance_norm * common).sum(dim=-1) / common_count
+        top_weight = common * (1.0 - y_norm.view(1, 1, 1, rows))
+        bottom_weight = common * y_norm.view(1, 1, 1, rows)
+        top_distance = (distance_norm * top_weight).sum(dim=-1) / top_weight.sum(
+            dim=-1
+        ).clamp_min(1e-4)
+        bottom_distance = (
+            distance_norm * bottom_weight
+        ).sum(dim=-1) / bottom_weight.sum(dim=-1).clamp_min(1e-4)
+
+        range_start = torch.maximum(
+            ranges[..., 0].unsqueeze(2),
+            ranges[..., 0].unsqueeze(1),
+        )
+        range_end = torch.minimum(
+            ranges[..., 1].unsqueeze(2),
+            ranges[..., 1].unsqueeze(1),
+        )
+        range_intersection = (range_end - range_start).clamp_min(0.0)
+        range_union = torch.maximum(
+            ranges[..., 1].unsqueeze(2),
+            ranges[..., 1].unsqueeze(1),
+        ) - torch.minimum(
+            ranges[..., 0].unsqueeze(2),
+            ranges[..., 0].unsqueeze(1),
+        )
+        range_iou = range_intersection / range_union.clamp_min(1e-4)
+        strip_similarity = (
+            torch.exp(-distance_px / self.relation_sigma_px) * common
+        ).sum(dim=-1) / common_count
+        return torch.stack(
+            (
+                mean_distance,
+                top_distance,
+                bottom_distance,
+                visible_overlap,
+                range_iou,
+                strip_similarity,
+            ),
+            dim=-1,
+        ).detach()
+
+    def score_selection_features(
+        self,
+        features: torch.Tensor,
+        relations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Score descriptors returned by :meth:`build_selection_features`."""
 
         hidden = self.input_projection(self.input_norm(features))
         if self.candidate_interaction == "independent":
             hidden = hidden + self.independent_ffn(hidden)
-        hidden = self.encoder(hidden)
+        if self.candidate_interaction == "relation_transformer":
+            if relations is None:
+                raise ValueError("relation_transformer requires pairwise relations")
+            hidden = self.encoder(hidden, relations)
+        else:
+            hidden = self.encoder(hidden)
         return self.output(self.output_norm(hidden)).squeeze(-1).float()
 
     def forward(
@@ -958,7 +1203,12 @@ class SetAwareLaneSelectionHead(nn.Module):
         outputs: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.build_selection_features(outputs)
-        raw_logits = self.score_selection_features(features)
+        relations = (
+            self.build_pairwise_relations(outputs)
+            if self.candidate_interaction == "relation_transformer"
+            else None
+        )
+        raw_logits = self.score_selection_features(features, relations)
         if self.unified_score:
             # Keep the legacy diagnostic key in the output contract, but make
             # its value explicit: unified mode has no residual/delta path.
@@ -1390,6 +1640,12 @@ class StructuredLaneQueryHead(nn.Module):
                         "candidate_interaction",
                         "transformer",
                     )
+                ),
+                relation_sigma_px=float(
+                    self.set_selection_cfg.get("relation_sigma_px", 20.0)
+                ),
+                relation_hidden_dim=int(
+                    self.set_selection_cfg.get("relation_hidden_dim", 32)
                 ),
             )
             if self.set_selection_enabled

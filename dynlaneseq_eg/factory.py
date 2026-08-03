@@ -116,6 +116,24 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         set_selection_positive_floor=float(
             loss.get("set_selection_positive_floor", 0.0)
         ),
+        set_selection_coverage_weight=float(
+            loss.get("set_selection_coverage_weight", 0.0)
+        ),
+        set_selection_duplicate_weight=float(
+            loss.get("set_selection_duplicate_weight", 0.0)
+        ),
+        set_selection_winner_weight=float(
+            loss.get("set_selection_winner_weight", 0.0)
+        ),
+        set_selection_count_weight=float(
+            loss.get("set_selection_count_weight", 0.0)
+        ),
+        set_selection_duplicate_quality_min=float(
+            loss.get("set_selection_duplicate_quality_min", 0.30)
+        ),
+        set_selection_winner_quality_min=float(
+            loss.get("set_selection_winner_quality_min", 0.30)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

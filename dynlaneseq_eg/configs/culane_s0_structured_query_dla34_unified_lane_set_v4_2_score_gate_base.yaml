@@ -1,0 +1,27 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_1_score_d_set_unique.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_2_relation_gate/base
+
+# V4.2 is still a frozen-geometry experiment.  It keeps the successful V4
+# curves immutable and asks only whether explicit candidate relations and set
+# coverage supervision can internalize the MMR counterfactual.
+model:
+  structured_query:
+    set_selection:
+      relation_sigma_px: 20.0
+      relation_hidden_dim: 32
+
+loss:
+  set_selection_coverage_weight: 0.0
+  set_selection_duplicate_weight: 0.0
+  set_selection_winner_weight: 0.0
+  set_selection_count_weight: 0.0
+  set_selection_duplicate_quality_min: 0.30
+  set_selection_winner_quality_min: 0.30
+
+training:
+  max_iters: 10000
+  checkpoint_interval: 500
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+

@@ -1,0 +1,51 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_2_score_r0_generic_frozen.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_2_relation_gate/r1_generic_semantic
+
+# Fix the V4.1 code/config mismatch: the final P4/P5 score-only adapters are
+# trainable, but their lane/FPN inputs remain detached from geometry.
+optimizer:
+  parameter_groups:
+    - name: set_selection
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.
+    - name: final_semantic_score
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.lane_state_layers.3.semantic_attention.
+        - structured_query_head.lane_state_layers.3.semantic_router.
+        - structured_query_head.lane_state_layers.3.semantic_scale_embedding
+        - structured_query_head.lane_state_layers.3.norm_semantic_query.
+        - structured_query_head.lane_state_layers.3.norm_semantic_ffn.
+        - structured_query_head.lane_state_layers.3.semantic_ffn.
+        - structured_query_head.decision_norm.
+
+training:
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head
+    - structured_query_head.lane_state_layers.3.semantic_attention
+    - structured_query_head.lane_state_layers.3.semantic_router
+    - structured_query_head.lane_state_layers.3.semantic_scale_embedding
+    - structured_query_head.lane_state_layers.3.norm_semantic_query
+    - structured_query_head.lane_state_layers.3.norm_semantic_ffn
+    - structured_query_head.lane_state_layers.3.semantic_ffn
+    - structured_query_head.decision_norm
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head
+    - structured_query_head.lane_state_layers.3.semantic_attention
+    - structured_query_head.lane_state_layers.3.semantic_router
+    - structured_query_head.lane_state_layers.3.semantic_scale_embedding
+    - structured_query_head.lane_state_layers.3.norm_semantic_query
+    - structured_query_head.lane_state_layers.3.norm_semantic_ffn
+    - structured_query_head.lane_state_layers.3.semantic_ffn
+    - structured_query_head.decision_norm
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head
+    - structured_query_head.lane_state_layers.3.semantic_attention
+    - structured_query_head.lane_state_layers.3.semantic_router
+    - structured_query_head.lane_state_layers.3.norm_semantic_query
+    - structured_query_head.lane_state_layers.3.norm_semantic_ffn
+    - structured_query_head.lane_state_layers.3.semantic_ffn
+    - structured_query_head.decision_norm
+

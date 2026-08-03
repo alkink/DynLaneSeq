@@ -49,6 +49,12 @@ class LossConfig:
     set_selection_share_matcher_assignment: bool = False
     set_selection_negative_weight: float = 1.0
     set_selection_positive_floor: float = 0.0
+    set_selection_coverage_weight: float = 0.0
+    set_selection_duplicate_weight: float = 0.0
+    set_selection_winner_weight: float = 0.0
+    set_selection_count_weight: float = 0.0
+    set_selection_duplicate_quality_min: float = 0.30
+    set_selection_winner_quality_min: float = 0.30
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -97,6 +103,21 @@ class S0Criterion(nn.Module):
             raise ValueError(
                 "set_selection_positive_floor must be in [0, 1)"
             )
+        for field_name in (
+            "set_selection_coverage_weight",
+            "set_selection_duplicate_weight",
+            "set_selection_winner_weight",
+            "set_selection_count_weight",
+        ):
+            if float(getattr(self.cfg, field_name)) < 0.0:
+                raise ValueError(f"{field_name} must be non-negative")
+        for field_name in (
+            "set_selection_duplicate_quality_min",
+            "set_selection_winner_quality_min",
+        ):
+            value = float(getattr(self.cfg, field_name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be in [0, 1]")
         exist_target_mode = str(self.cfg.exist_target_mode).strip().lower()
         if exist_target_mode not in {"binary", "iou_aware"}:
             raise ValueError("exist_target_mode must be binary or iou_aware")
@@ -174,6 +195,10 @@ class S0Criterion(nn.Module):
                 "total": zero,
                 "quality": zero,
                 "ranking": zero,
+                "coverage": zero,
+                "duplicate": zero,
+                "winner": zero,
+                "count": zero,
                 "target_mean": zero,
                 "target_positive_fraction": zero,
                 "delta_abs": zero,
@@ -220,6 +245,10 @@ class S0Criterion(nn.Module):
             "loss_set_selection": set_selection["total"],
             "loss_set_selection_quality": set_selection["quality"],
             "loss_set_selection_ranking": set_selection["ranking"],
+            "loss_set_selection_coverage": set_selection["coverage"],
+            "loss_set_selection_duplicate": set_selection["duplicate"],
+            "loss_set_selection_winner": set_selection["winner"],
+            "loss_set_selection_count": set_selection["count"],
             "set_selection_target_mean": set_selection["target_mean"],
             "set_selection_target_positive_fraction": set_selection[
                 "target_positive_fraction"
@@ -986,23 +1015,15 @@ class S0Criterion(nn.Module):
         return F.binary_cross_entropy_with_logits(quality_logits, target_quality)
 
     @torch.no_grad()
-    def compute_set_selection_targets(
+    def compute_set_selection_pairwise_quality(
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
-        matches: list[dict[str, torch.Tensor]] | None = None,
-    ) -> torch.Tensor:
-        """Build one unique continuous-quality target per ground-truth lane.
-
-        The target is a range-aware row-strip IoU surrogate aligned with the
-        30-pixel CULane raster metric.  Assignment deliberately ignores the
-        current proposal score: the selection objective must teach which
-        geometry is useful instead of reproducing the existing ranking.
-        """
-
+    ) -> list[torch.Tensor]:
+        """Keep the complete candidate-to-GT quality matrix for set losses."""
         pred_x = outputs["pred_x_rows"].detach().float()
         ranges = outputs["range_norm"].detach().float()
-        batch, candidates, _rows = pred_x.shape
+        _batch, candidates, _rows = pred_x.shape
         line_width = float(self.cfg.set_selection_line_width)
         min_valid_rows = int(self.cfg.set_selection_min_valid_rows)
         pairwise_rows: list[torch.Tensor] = []
@@ -1027,6 +1048,33 @@ class S0Criterion(nn.Module):
                 )
             )
             pairwise_rows.append(quality)
+        return pairwise_rows
+
+    @torch.no_grad()
+    def compute_set_selection_targets(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]] | None = None,
+        pairwise_quality: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Build one unique continuous-quality target per ground-truth lane.
+
+        The target is a range-aware row-strip IoU surrogate aligned with the
+        30-pixel CULane raster metric.  Assignment deliberately ignores the
+        current proposal score: the selection objective must teach which
+        geometry is useful instead of reproducing the existing ranking.
+        """
+
+        pred_x = outputs["pred_x_rows"].detach().float()
+        batch, candidates, _rows = pred_x.shape
+        pairwise_rows = (
+            self.compute_set_selection_pairwise_quality(outputs, targets)
+            if pairwise_quality is None
+            else pairwise_quality
+        )
+        if len(pairwise_rows) != batch:
+            raise ValueError("set-selection pairwise quality batch mismatch")
 
         if bool(self.cfg.set_selection_share_matcher_assignment):
             if matches is None or len(matches) != batch:
@@ -1084,6 +1132,118 @@ class S0Criterion(nn.Module):
                 ]
         return target_cpu.to(device=pred_x.device)
 
+    def _compute_relation_set_losses(
+        self,
+        selection_logits: torch.Tensor,
+        pairwise_quality: list[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Coverage, duplicate suppression, representative quality, and count.
+
+        All quality matrices are detached geometry observations.  Gradients
+        therefore update only the scalar set scorer while explicitly teaching
+        it to cover distinct GT lanes and select the best localized member of
+        each duplicate cluster.
+        """
+
+        probability = torch.sigmoid(selection_logits)
+        zero = selection_logits.sum() * 0.0
+        coverage_rows: list[torch.Tensor] = []
+        duplicate_rows: list[torch.Tensor] = []
+        winner_rows: list[torch.Tensor] = []
+        gt_counts: list[float] = []
+        duplicate_min = float(self.cfg.set_selection_duplicate_quality_min)
+        winner_min = float(self.cfg.set_selection_winner_quality_min)
+
+        for batch_index, raw_quality in enumerate(pairwise_quality):
+            quality = raw_quality.detach().to(
+                device=selection_logits.device,
+                dtype=selection_logits.dtype,
+            )
+            candidate_probability = probability[batch_index]
+            candidates = int(candidate_probability.numel())
+            gt_count = int(quality.shape[1])
+            gt_counts.append(float(gt_count))
+            if gt_count == 0:
+                duplicate_rows.append(zero)
+                winner_rows.append(zero)
+                continue
+
+            # Probability that at least one selected candidate covers GT j.
+            activation = (
+                candidate_probability.unsqueeze(-1) * quality
+            ).clamp(min=0.0, max=1.0 - 1e-6)
+            log_missing = torch.log1p(-activation).sum(dim=0)
+            coverage = (1.0 - torch.exp(log_missing)).clamp_min(1e-6)
+            coverage_rows.append(-torch.log(coverage).mean())
+
+            # Candidates have duplicate affinity when they both explain the
+            # same GT.  Only the upper triangle is counted once.
+            duplicate_affinity = torch.minimum(
+                quality.unsqueeze(1),
+                quality.unsqueeze(0),
+            ).amax(dim=-1)
+            duplicate_affinity = torch.where(
+                duplicate_affinity >= duplicate_min,
+                duplicate_affinity,
+                torch.zeros_like(duplicate_affinity),
+            )
+            upper = torch.triu(
+                torch.ones(
+                    (candidates, candidates),
+                    device=selection_logits.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            duplicate_weight = duplicate_affinity * upper.to(
+                dtype=duplicate_affinity.dtype
+            )
+            coactivation = (
+                candidate_probability.unsqueeze(1)
+                * candidate_probability.unsqueeze(0)
+            )
+            duplicate_rows.append(
+                (coactivation * duplicate_weight).sum()
+                / duplicate_weight.sum().clamp_min(1e-6)
+            )
+
+            # Within every GT cluster, rank the strict-IoU winner above worse
+            # but still plausible duplicate representatives.
+            best_quality, best_index = quality.max(dim=0)
+            best_logit = selection_logits[batch_index, best_index]
+            quality_gap = (best_quality.unsqueeze(0) - quality).clamp_min(0.0)
+            eligible = (quality >= winner_min) & (
+                best_quality.unsqueeze(0) >= winner_min
+            )
+            winner_weight = quality_gap * eligible.to(dtype=quality.dtype)
+            winner_penalty = F.softplus(
+                selection_logits[batch_index].unsqueeze(-1)
+                - best_logit.unsqueeze(0)
+            )
+            winner_rows.append(
+                (winner_penalty * winner_weight).sum()
+                / winner_weight.sum().clamp_min(1e-6)
+            )
+
+        coverage_loss = (
+            torch.stack(coverage_rows).mean() if coverage_rows else zero
+        )
+        duplicate_loss = (
+            torch.stack(duplicate_rows).mean() if duplicate_rows else zero
+        )
+        winner_loss = torch.stack(winner_rows).mean() if winner_rows else zero
+        count_target = selection_logits.new_tensor(gt_counts)
+        count_loss = F.smooth_l1_loss(
+            probability.sum(dim=-1),
+            count_target,
+        )
+        return {
+            "coverage": coverage_loss,
+            "duplicate": duplicate_loss,
+            "winner": winner_loss,
+            "count": count_loss,
+        }
+
     def compute_set_selection_loss(
         self,
         outputs: dict[str, torch.Tensor],
@@ -1097,8 +1257,15 @@ class S0Criterion(nn.Module):
                 "set_selection.enabled=true"
             )
         selection_logits = logits.float()
+        pairwise_quality = self.compute_set_selection_pairwise_quality(
+            outputs,
+            targets,
+        )
         selection_targets = self.compute_set_selection_targets(
-            outputs, targets, matches
+            outputs,
+            targets,
+            matches,
+            pairwise_quality=pairwise_quality,
         ).to(dtype=selection_logits.dtype)
         probability = torch.sigmoid(selection_logits)
         modulation = (
@@ -1138,9 +1305,24 @@ class S0Criterion(nn.Module):
         ranking_loss = (
             F.softplus(-logit_delta) * pair_weight.detach()
         ).sum() / pair_weight.sum().clamp_min(1e-6)
+        relation_losses = self._compute_relation_set_losses(
+            selection_logits,
+            pairwise_quality,
+        )
         total = quality_loss + float(
             self.cfg.set_selection_rank_weight
         ) * ranking_loss
+        total = (
+            total
+            + float(self.cfg.set_selection_coverage_weight)
+            * relation_losses["coverage"]
+            + float(self.cfg.set_selection_duplicate_weight)
+            * relation_losses["duplicate"]
+            + float(self.cfg.set_selection_winner_weight)
+            * relation_losses["winner"]
+            + float(self.cfg.set_selection_count_weight)
+            * relation_losses["count"]
+        )
         delta = outputs.get("selection_delta_logits")
         delta_abs = (
             delta.detach().float().abs().mean()
@@ -1151,6 +1333,10 @@ class S0Criterion(nn.Module):
             "total": total,
             "quality": quality_loss,
             "ranking": ranking_loss,
+            "coverage": relation_losses["coverage"],
+            "duplicate": relation_losses["duplicate"],
+            "winner": relation_losses["winner"],
+            "count": relation_losses["count"],
             "target_mean": selection_targets.detach().mean(),
             "target_positive_fraction": (
                 selection_targets.detach() > 0.0

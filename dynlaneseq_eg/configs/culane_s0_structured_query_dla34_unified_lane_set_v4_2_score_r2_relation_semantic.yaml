@@ -1,0 +1,11 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_2_score_r1_generic_semantic.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_2_relation_gate/r2_relation_semantic
+
+# Architecture-only intervention: give each attention head an explicit soft,
+# range-aware curve relation while keeping the V4.1 unique scalar loss.
+model:
+  structured_query:
+    set_selection:
+      candidate_interaction: relation_transformer
+

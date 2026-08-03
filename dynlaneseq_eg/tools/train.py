@@ -184,6 +184,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--max-iters", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=-1,
+        help="Override training.seed for paired or multi-seed experiments.",
+    )
     parser.add_argument("--output-dir", default="", help="Override cfg.output_dir.")
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
@@ -245,6 +251,8 @@ def main() -> None:
         cfg.setdefault("model", {}).setdefault("seg_aux", {})["amp_dtype"] = args.seg_aux_amp_dtype
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
+    if args.seed >= 0:
+        cfg.setdefault("training", {})["seed"] = int(args.seed)
     train_cfg = cfg.get("training", {})
     checkpoint_model_prefixes = tuple(
         train_cfg.get("checkpoint_model_prefixes", ())

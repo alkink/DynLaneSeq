@@ -1,0 +1,14 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_2_score_r2_relation_semantic.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_2_relation_gate/r3_relation_setloss
+
+# Complete intervention.  Quality remains the main scalar objective; modest
+# set terms teach distinct GT coverage, suppress simultaneous duplicate
+# activation, rank the strict-IoU representative, and calibrate empty/count
+# cases.  Count is deliberately weak so it cannot dominate identity.
+loss:
+  set_selection_coverage_weight: 0.50
+  set_selection_duplicate_weight: 1.00
+  set_selection_winner_weight: 0.25
+  set_selection_count_weight: 0.10
+

@@ -1,0 +1,11 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_2_score_gate_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_2_relation_gate/r0_generic_frozen
+
+# Duration-matched control: the V4.1-D generic set Transformer and unique
+# scalar target are simply trained longer.  Semantic adapters remain frozen.
+model:
+  structured_query:
+    set_selection:
+      candidate_interaction: transformer
+
