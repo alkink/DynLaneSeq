@@ -9,7 +9,10 @@ from typing import Any
 import torch
 
 from dynlaneseq_eg.config import load_config
-from dynlaneseq_eg.engine.checkpoint import load_compatible_model_weights
+from dynlaneseq_eg.engine.checkpoint import (
+    _materialize_model_state,
+    load_compatible_model_weights,
+)
 from dynlaneseq_eg.engine.frozen_training import (
     freeze_except_parameter_prefixes,
     set_frozen_detector_eval,
@@ -99,6 +102,24 @@ def main() -> None:
 
     model = build_model(cfg).to(device)
     load_stats = load_compatible_model_weights(checkpoint_path, model)
+    source_state, source_payload = _materialize_model_state(checkpoint_path)
+    target_state = model.state_dict()
+    missing_detector_tensors = []
+    shape_mismatched_detector_tensors = []
+    for name, target_tensor in target_state.items():
+        if name.startswith("structured_query_head.set_selection_head."):
+            continue
+        source_tensor = source_state.get(name)
+        if source_tensor is None:
+            missing_detector_tensors.append(name)
+        elif tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            shape_mismatched_detector_tensors.append(
+                {
+                    "name": name,
+                    "source_shape": list(source_tensor.shape),
+                    "target_shape": list(target_tensor.shape),
+                }
+            )
     prefixes = tuple(cfg["training"]["trainable_parameter_prefixes"])
     freeze_stats = freeze_except_parameter_prefixes(model, prefixes)
     set_frozen_detector_eval(
@@ -137,6 +158,13 @@ def main() -> None:
     gradients = _gradient_summary(model)
     semantic_expected = any("semantic_" in prefix for prefix in prefixes)
     checks = {
+        "source_checkpoint_iteration_is_50000": (
+            int(source_payload.get("iteration", -1)) == 50000
+        ),
+        "all_non_selector_detector_tensors_loaded": (
+            not missing_detector_tensors
+            and not shape_mismatched_detector_tensors
+        ),
         "finite_loss": bool(torch.isfinite(loss.detach()).cpu()),
         "selector_gradient_positive": gradients["selector"]["gradient_norm"] > 0.0,
         "semantic_gradient_contract": (
@@ -154,6 +182,13 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": _sha256(checkpoint_path),
         "load_stats": load_stats,
+        "checkpoint_contract": {
+            "internal_iteration": int(source_payload.get("iteration", -1)),
+            "missing_non_selector_tensors": missing_detector_tensors,
+            "shape_mismatched_non_selector_tensors": (
+                shape_mismatched_detector_tensors
+            ),
+        },
         "freeze_stats": freeze_stats,
         "losses": {
             key: float(value.detach().float().cpu())
@@ -175,4 +210,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
