@@ -228,7 +228,6 @@ for seed in ${SEEDS}; do
         --num-workers "${NUM_WORKERS}" \
         --metric-workers "${METRIC_WORKERS}" \
         --sample-strategy uniform \
-        --amp-dtype "${AMP_DTYPE}" \
         --stage main \
         --top-k 4 \
         --iou-thresholds 0.50 0.75 \
@@ -282,7 +281,6 @@ for seed in ${SEEDS}; do
           --num-workers "${NUM_WORKERS}" \
           --metric-workers "${METRIC_WORKERS}" \
           --sample-strategy uniform \
-          --amp-dtype "${AMP_DTYPE}" \
           --stage main \
           --top-k 4 \
           --iou-thresholds 0.50 0.75 \
