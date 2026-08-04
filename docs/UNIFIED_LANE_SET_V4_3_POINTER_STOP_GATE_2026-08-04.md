@@ -291,6 +291,35 @@ Primary output:
 outputs/diagnostics/unified_lane_set_v4_3_pointer_full_val_forensics.json
 ```
 
+The full-validation forensic result localizes the remaining error decisively:
+
+| IoU | Pointer-to-oracle gap | Representative / ordering | STOP / cardinality |
+| --- | ---: | ---: | ---: |
+| 0.50 | 5,296 TP | **4,699 (88.73%)** | 597 (11.27%) |
+| 0.75 | 7,746 TP | **7,432 (95.95%)** | 314 (4.05%) |
+
+Only 30.24% of pointer-assigned GT lanes use the official-IoU top-1
+candidate, and the mean chosen rank is 2.60.  Long geometry training is
+therefore not the next intervention.  The remaining causal question is
+whether the row-strip IoU training target chooses a different representative
+from official raster IoU, or whether the pointer fails to learn its existing
+target.
+
+The original uniform-256 cache already contains both tensors.  The following
+cache-only audit performs that decomposition without inference or training:
+
+```bash
+DATA_ROOT=/workspace/CULane \
+CKPT=outputs/diagnostics/unified_lane_set_v4_3_pointer_stop_gate_50k/seed_3407/pointer_stop/iter_0065000.pt \
+bash scripts/analyze_culane_dla34_unified_lane_set_v4_3_pointer_target_alignment.sh
+```
+
+Output:
+
+```text
+outputs/diagnostics/unified_lane_set_v4_3_pointer_target_alignment_uniform256.json
+```
+
 ## Full test command after a validation pass
 
 ```bash
