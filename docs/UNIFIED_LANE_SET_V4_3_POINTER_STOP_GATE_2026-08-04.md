@@ -232,6 +232,32 @@ A pass authorizes full validation.  It does not yet authorize a 278k run or a
 benchmark claim.  A failure means the pointer contract, not V4 geometry, must
 be redesigned before more long training.
 
+## First seed-3407 gate result
+
+The first 15k scorer-only run produced the following uniform-256 result:
+
+| Metric | Source V4 | V4.3 pointer |
+| --- | ---: | ---: |
+| F1@0.50 | 47.20% | **80.44%** |
+| Precision@0.50 | -- | **81.24%** |
+| Recall@0.50 | 51.38% | **79.66%** |
+| F1@0.75 | -- | **59.43%** |
+| Recall@0.75 | -- | **58.85%** |
+| Mean emitted lanes | forced Top-4 | **3.332** |
+| Duplicate fraction among FP@0.50 | high | **0.0%** |
+| All-32 oracle recall@0.50 | 95.29% | 95.29% |
+| All-32 oracle recall@0.75 | 82.30% | 82.30% |
+
+The structural hypothesis therefore succeeded: duplicate coverage, explicit
+cardinality, and geometry isolation all work.  The predeclared gate remains a
+formal **FAIL** because recall@0.75 was 58.85% rather than 60%.  This is about
+ten strict-IoU true positives on the 870-lane subset; the threshold must not
+be relaxed after observing the result.
+
+The next action is full CULane validation, not a new training run and not a
+278k continuation.  Full validation tests whether the large 0.50 result and
+the small 0.75 shortfall generalize beyond this diagnostic subset.
+
 ## Full test command after a validation pass
 
 ```bash
