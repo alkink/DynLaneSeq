@@ -8,7 +8,10 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from dynlaneseq_eg.modeling.common import nested_to_device
-from dynlaneseq_eg.losses.loss_s0 import build_pointer_sequence_targets
+from dynlaneseq_eg.losses.loss_s0 import (
+    build_pointer_cluster_soft_targets,
+    build_pointer_sequence_targets,
+)
 from .frozen_training import set_frozen_detector_eval
 from .logger import match_stats
 
@@ -71,7 +74,15 @@ def _sampler_beta(cfg: dict[str, Any], iteration: int) -> float:
     return beta_end
 
 
-def _apply_pointer_teacher_forcing(model, outputs, targets, cfg) -> None:
+def _apply_pointer_teacher_forcing(
+    model,
+    outputs,
+    targets,
+    cfg,
+    *,
+    iteration: int = 0,
+    teacher_visit: int = 0,
+) -> None:
     if not isinstance(outputs, dict):
         return
     root_model = getattr(model, "_orig_mod", model)
@@ -84,6 +95,38 @@ def _apply_pointer_teacher_forcing(model, outputs, targets, cfg) -> None:
     ) != "sequential_pointer":
         return
     loss_cfg = cfg.get("loss", {})
+    selection_cfg = (
+        cfg.get("model", {})
+        .get("structured_query", {})
+        .get("set_selection", {})
+    )
+    if getattr(selector, "pointer_teacher_mode", "") == "cluster_soft_randomized":
+        teacher = build_pointer_cluster_soft_targets(
+            outputs,
+            targets,
+            max_selections=int(selector.pointer_max_selections),
+            input_h=int(
+                loss_cfg.get("input_h", cfg.get("model", {}).get("input_h", 288))
+            ),
+            line_width=float(loss_cfg.get("set_selection_line_width", 30.0)),
+            min_valid_rows=int(
+                loss_cfg.get("set_selection_min_valid_rows", 5)
+            ),
+            representable_min=float(
+                selection_cfg.get("pointer_cluster_representable_min", 0.20)
+            ),
+            support_quality_delta=float(
+                selection_cfg.get("pointer_cluster_quality_delta", 0.10)
+            ),
+            temperature=float(
+                selection_cfg.get("pointer_cluster_temperature", 0.03)
+            ),
+            base_seed=int(cfg.get("training", {}).get("seed", 0)),
+            iteration=int(iteration),
+            visit=int(teacher_visit),
+        )
+        selector.reroll_pointer_with_cluster_teacher(outputs, teacher)
+        return
     teacher = build_pointer_sequence_targets(
         outputs,
         targets,
@@ -95,13 +138,28 @@ def _apply_pointer_teacher_forcing(model, outputs, targets, cfg) -> None:
     selector.reroll_pointer_with_teacher(outputs, teacher)
 
 
-def forward_with_matches(model, images, targets, matcher, cfg, iteration):
+def forward_with_matches(
+    model,
+    images,
+    targets,
+    matcher,
+    cfg,
+    iteration,
+    pointer_teacher_visit: int = 0,
+):
     name = cfg.get("model", {}).get("name", "DynLaneSeqS0")
     if name in {"DynLaneSeqS2", "DynLaneSeqS3"}:
         probe = model(images, sampler_alpha=0.0)
         matches = matcher(probe["coarse"], targets)
         outputs = model(images, targets=targets, matches=matches, sampler_alpha=_sampler_alpha(cfg, iteration))
-        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
+        _apply_pointer_teacher_forcing(
+            model,
+            outputs,
+            targets,
+            cfg,
+            iteration=iteration,
+            teacher_visit=pointer_teacher_visit,
+        )
         return outputs, matches
     if name == "DynLaneSeqS4":
         probe = model(images, sampler_alpha=0.0, sampler_beta=0.0)
@@ -113,7 +171,14 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             sampler_alpha=_sampler_alpha(cfg, iteration),
             sampler_beta=_sampler_beta(cfg, iteration),
         )
-        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
+        _apply_pointer_teacher_forcing(
+            model,
+            outputs,
+            targets,
+            cfg,
+            iteration=iteration,
+            teacher_visit=pointer_teacher_visit,
+        )
         return outputs, matches
     outputs = model(images)
     aux_outputs = outputs.get("aux_outputs") if isinstance(outputs, dict) else None
@@ -195,7 +260,14 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             outputs["_training_auxiliary_aux_matches"] = all_matches[
                 main_count + 1 :
             ]
-        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
+        _apply_pointer_teacher_forcing(
+            model,
+            outputs,
+            targets,
+            cfg,
+            iteration=iteration,
+            teacher_visit=pointer_teacher_visit,
+        )
         return outputs, matches
     if (
         isinstance(aux_outputs, (list, tuple))
@@ -213,7 +285,14 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             outputs["_aux_matches"] = all_matches[1:]
     else:
         matches = matcher(outputs, targets)
-    _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
+    _apply_pointer_teacher_forcing(
+        model,
+        outputs,
+        targets,
+        cfg,
+        iteration=iteration,
+        teacher_visit=pointer_teacher_visit,
+    )
     return outputs, matches
 
 
@@ -326,7 +405,15 @@ def train_one_epoch(
             if amp_dtype is not None:
                 autocast_kwargs["dtype"] = amp_dtype
             with torch.autocast(**autocast_kwargs):
-                outputs, matches = forward_with_matches(model, images, targets, matcher, cfg, iteration)
+                outputs, matches = forward_with_matches(
+                    model,
+                    images,
+                    targets,
+                    matcher,
+                    cfg,
+                    iteration,
+                    pointer_teacher_visit=micro_in_step,
+                )
                 if hasattr(criterion, "set_iteration"):
                     criterion.set_iteration(iteration)
                 loss_dict = criterion(outputs, targets, matches)

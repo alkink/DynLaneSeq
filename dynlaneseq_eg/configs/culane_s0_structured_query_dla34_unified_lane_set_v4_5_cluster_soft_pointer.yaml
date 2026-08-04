@@ -1,0 +1,28 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_4_set_oracle_pointer.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_5_cluster_soft_pointer_gate/cluster_soft_pointer
+
+# V4.5 keeps the successful V4 geometry and V4.3 sequential pointer intact.
+# It changes only the teacher contract: retain detached candidate/GT quality
+# until the pointer step, train near-best representatives with a soft target,
+# and resample both GT order and the discrete GRU teacher reproducibly on each
+# image visit.  No model/free rollout enters this gate.
+model:
+  structured_query:
+    set_selection:
+      pointer_teacher_mode: cluster_soft_randomized
+      pointer_cluster_representable_min: 0.20
+      pointer_cluster_quality_delta: 0.10
+      pointer_cluster_temperature: 0.03
+      row_grid_mode: fixed_rows
+
+loss:
+  pointer_unary_target_mode: max_quality
+  pointer_quality_weight: 0.10
+  set_selection_focal_beta: 0.0
+
+training:
+  max_iters: 15000
+  checkpoint_interval: 2500
+  checkpoint_include_optimizer: true
+  save_last_alias: false

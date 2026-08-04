@@ -809,6 +809,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         pointer_min_valid_rows: int = 5,
         pointer_similarity_prior: float = 0.5,
         pointer_teacher_mode: str = "fixed_sequence",
+        row_grid_mode: str = "legacy_linspace",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -828,6 +829,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.pointer_min_valid_rows = int(pointer_min_valid_rows)
         self.pointer_similarity_prior = float(pointer_similarity_prior)
         self.pointer_teacher_mode = str(pointer_teacher_mode).strip().lower()
+        self.row_grid_mode = str(row_grid_mode).strip().lower()
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -849,10 +851,15 @@ class SetAwareLaneSelectionHead(nn.Module):
         if self.pointer_teacher_mode not in {
             "fixed_sequence",
             "permutation_invariant_set",
+            "cluster_soft_randomized",
         }:
             raise ValueError(
                 "set_selection.pointer_teacher_mode must be fixed_sequence "
-                "or permutation_invariant_set"
+                "or permutation_invariant_set, or cluster_soft_randomized"
+            )
+        if self.row_grid_mode not in {"legacy_linspace", "fixed_rows"}:
+            raise ValueError(
+                "set_selection.row_grid_mode must be legacy_linspace or fixed_rows"
             )
         if self.candidate_interaction not in {
             "independent",
@@ -996,6 +1003,19 @@ class SetAwareLaneSelectionHead(nn.Module):
             exist = exist * quality.pow(self.base_quality_power)
         return exist.clamp(1e-6, 1.0 - 1e-6)
 
+    def _lane_row_grid(
+        self,
+        rows: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the normalized lane-row coordinates used by range masks."""
+
+        if self.row_grid_mode == "fixed_rows":
+            return torch.arange(rows, device=device, dtype=dtype) / float(rows)
+        return torch.linspace(0.0, 1.0, rows, device=device, dtype=dtype)
+
     def build_selection_features(
         self,
         outputs: dict[str, torch.Tensor],
@@ -1019,9 +1039,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         row_logits = observe(outputs["row_x_logits"]).float()
         batch, candidates, rows, _channels = row_tokens.shape
 
-        y_norm = torch.linspace(
-            0.0,
-            1.0,
+        y_norm = self._lane_row_grid(
             rows,
             device=row_tokens.device,
             dtype=torch.float32,
@@ -1189,9 +1207,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         if pred_x.ndim != 3 or ranges.shape != pred_x.shape[:2] + (2,):
             raise ValueError("selection curve/range tensors have incompatible shapes")
         _batch, _candidates, rows = pred_x.shape
-        y_norm = torch.linspace(
-            0.0,
-            1.0,
+        y_norm = self._lane_row_grid(
             rows,
             device=pred_x.device,
             dtype=pred_x.dtype,
@@ -1614,6 +1630,79 @@ class SetAwareLaneSelectionHead(nn.Module):
         outputs["selection_pointer_teacher_relation_bias"] = rollout[
             "selection_pointer_relation_bias"
         ]
+
+    def reroll_pointer_with_cluster_teacher(
+        self,
+        outputs: dict[str, torch.Tensor],
+        teacher: dict[str, torch.Tensor],
+    ) -> None:
+        """Run the V4.5 soft-cluster policy on sampled teacher prefixes."""
+
+        if self.pointer_teacher_mode != "cluster_soft_randomized":
+            raise ValueError(
+                "cluster-soft teacher requires pointer_teacher_mode="
+                "cluster_soft_randomized"
+            )
+        indices = teacher.get("indices")
+        probabilities = teacher.get("probabilities")
+        active = teacher.get("active")
+        if not isinstance(indices, torch.Tensor):
+            raise ValueError("cluster teacher indices are missing")
+        if not isinstance(probabilities, torch.Tensor):
+            raise ValueError("cluster teacher probabilities are missing")
+        if not isinstance(active, torch.Tensor):
+            raise ValueError("cluster teacher active mask is missing")
+        candidates = int(outputs["_selection_pointer_hidden"].shape[1])
+        expected = (
+            indices.shape[0],
+            self.pointer_max_selections,
+            candidates + 1,
+        )
+        if probabilities.shape != expected:
+            raise ValueError("cluster teacher probability shape mismatch")
+        if active.shape != indices.shape:
+            raise ValueError("cluster teacher active-mask shape mismatch")
+        candidate_valid = outputs["_selection_pointer_candidate_valid"].bool()
+        for row in range(int(indices.shape[0])):
+            emitted = indices[row][
+                (indices[row] >= 0) & (indices[row] < candidates)
+            ]
+            if emitted.numel() != emitted.unique().numel():
+                raise ValueError("cluster teacher repeats a candidate")
+            if emitted.numel() > 0 and not bool(
+                candidate_valid[row, emitted].all()
+            ):
+                raise ValueError("cluster teacher contains an invalid candidate")
+
+        self.reroll_pointer_with_teacher(outputs, indices)
+        outputs["selection_pointer_teacher_probabilities"] = probabilities.to(
+            device=outputs["selection_pointer_logits"].device,
+            dtype=outputs["selection_pointer_logits"].dtype,
+        )
+        outputs["selection_pointer_teacher_active"] = active.to(
+            device=outputs["selection_pointer_logits"].device,
+            dtype=torch.bool,
+        )
+        for source_name, output_name in (
+            ("candidate_steps", "selection_pointer_teacher_candidate_steps"),
+            ("support_sizes", "selection_pointer_teacher_support_sizes"),
+            ("target_entropy", "selection_pointer_teacher_target_entropy"),
+            ("target_quality", "selection_pointer_teacher_target_quality"),
+            (
+                "representable_count",
+                "selection_pointer_teacher_representable_count",
+            ),
+            ("fallback_count", "selection_pointer_teacher_fallback_count"),
+            (
+                "reservation_exclusion_count",
+                "selection_pointer_teacher_reservation_exclusion_count",
+            ),
+        ):
+            value = teacher.get(source_name)
+            if isinstance(value, torch.Tensor):
+                outputs[output_name] = value.to(
+                    device=outputs["selection_pointer_logits"].device
+                )
 
     def forward(
         self,
@@ -2114,6 +2203,12 @@ class StructuredLaneQueryHead(nn.Module):
                     self.set_selection_cfg.get(
                         "pointer_teacher_mode",
                         "fixed_sequence",
+                    )
+                ),
+                row_grid_mode=str(
+                    self.set_selection_cfg.get(
+                        "row_grid_mode",
+                        "legacy_linspace",
                     )
                 ),
             )

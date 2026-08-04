@@ -11,6 +11,7 @@ SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-outputs/culane_s0_structured_query_dla34
 POINTER_CONFIG="${POINTER_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_unified_lane_set_v4_3_pointer_stop.yaml}"
 SOURCE_ITERATION="${SOURCE_ITERATION:-50000}"
 TRAIN_STEPS="${TRAIN_STEPS:-15000}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-0}"
 SEEDS="${SEEDS:-3407}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
@@ -55,10 +56,11 @@ if (( actual_source_iteration != SOURCE_ITERATION )); then
   exit 1
 fi
 
-"${PYTHON}" - "${POINTER_CONFIG}" <<'PY'
+"${PYTHON}" - "${POINTER_CONFIG}" "${CHECKPOINT_INTERVAL}" <<'PY'
 import sys
 from dynlaneseq_eg.config import load_config
 cfg = load_config(sys.argv[1])
+checkpoint_interval = int(sys.argv[2])
 selection = cfg["model"]["structured_query"]["set_selection"]
 loss = cfg["loss"]
 training = cfg["training"]
@@ -68,7 +70,12 @@ checks = {
     "four_decisions": int(selection.get("pointer_max_selections", 0)) == 4,
     "pointer_loss_only": float(loss.get("w_pointer_selection", 0.0)) > 0.0 and float(loss.get("w_set_selection", 0.0)) == 0.0,
     "pointer_deployment": cfg["postprocess"].get("score_mode") == "pointer",
-    "compact_final_only": int(training.get("checkpoint_interval", -1)) == 0 and not bool(training.get("checkpoint_include_optimizer", True)),
+    "checkpoint_interval_matches": int(training.get("checkpoint_interval", -1)) == checkpoint_interval,
+    "checkpoint_state_policy": (
+        bool(training.get("checkpoint_include_optimizer", True))
+        if checkpoint_interval > 0
+        else not bool(training.get("checkpoint_include_optimizer", True))
+    ),
     "selector_trainable": "structured_query_head.set_selection_head" in training.get("trainable_parameter_prefixes", []),
 }
 print(checks)
@@ -88,7 +95,7 @@ minimum = float(sys.argv[2]) * 1024 ** 3
 print({"checkpoint_filesystem_free_gib": round(free / 1024 ** 3, 2)})
 if free < minimum:
     raise SystemExit(
-        f"only {free / 1024 ** 3:.2f} GiB free; V4.3 compact final requires "
+        f"only {free / 1024 ** 3:.2f} GiB free; pointer checkpoint policy requires "
         f"at least {minimum / 1024 ** 3:.2f} GiB"
     )
 PY
@@ -137,7 +144,7 @@ for seed in ${SEEDS}; do
         --device "${DEVICE}" \
         --output-dir "${output_dir}" \
         --max-iters "${TRAIN_STEPS}" \
-        --checkpoint-interval 0 \
+        --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
         --seed "${seed}" \
         --batch-size "${BATCH_SIZE}" \
         --grad-accum "${GRAD_ACCUM}" \

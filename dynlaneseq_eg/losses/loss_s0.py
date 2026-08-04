@@ -111,6 +111,255 @@ def build_pointer_sequence_targets(
     return sequence
 
 
+def _pointer_teacher_seed(
+    base_seed: int,
+    iteration: int,
+    visit: int,
+    batch_index: int,
+) -> int:
+    """Return a stable per-visit seed without Python's randomized ``hash``."""
+
+    mask = (1 << 63) - 1
+    value = int(base_seed) & mask
+    for item in (iteration, visit, batch_index):
+        value ^= (
+            int(item)
+            + 0x9E3779B97F4A7C15
+            + ((value << 6) & mask)
+            + (value >> 2)
+        ) & mask
+        value &= mask
+    return value
+
+
+@torch.no_grad()
+def build_pointer_cluster_soft_targets(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    max_selections: int,
+    input_h: int,
+    line_width: float,
+    min_valid_rows: int,
+    representable_min: float,
+    support_quality_delta: float,
+    temperature: float,
+    base_seed: int,
+    iteration: int,
+    visit: int,
+) -> dict[str, torch.Tensor]:
+    """Build V4.5 GT-cluster soft targets and a discrete teacher rollout.
+
+    The detached candidate/GT quality matrix is retained until each pointer
+    step.  A cardinality-first one-to-one assignment decides only which GTs
+    can be represented jointly; it does *not* choose the supervised candidate
+    identity.  Each retained GT then supplies a near-best soft representative
+    distribution.  GT order and the discrete candidate fed to the GRU are
+    resampled reproducibly on every training visit.
+    """
+
+    pred_x = outputs["pred_x_rows"].detach().float()
+    ranges = outputs["range_norm"].detach().float()
+    batch, candidates, _rows = pred_x.shape
+    steps = int(max_selections)
+    if steps < 1:
+        raise ValueError("pointer max_selections must be positive")
+    if not 0.0 <= float(representable_min) < 1.0:
+        raise ValueError("pointer representable_min must be in [0, 1)")
+    if float(support_quality_delta) < 0.0:
+        raise ValueError("pointer support_quality_delta must be non-negative")
+    if float(temperature) <= 0.0:
+        raise ValueError("pointer cluster temperature must be positive")
+
+    device = pred_x.device
+    stop_class = candidates
+    teacher_indices = torch.full(
+        (batch, steps),
+        -100,
+        dtype=torch.long,
+        device=device,
+    )
+    probabilities = pred_x.new_zeros((batch, steps, candidates + 1))
+    active = torch.zeros((batch, steps), dtype=torch.bool, device=device)
+    support_sizes = pred_x.new_zeros((batch, steps))
+    target_entropy = pred_x.new_zeros((batch, steps))
+    target_quality = pred_x.new_zeros((batch, steps))
+    candidate_steps = torch.zeros((batch, steps), dtype=torch.bool, device=device)
+    representable_count = pred_x.new_zeros((batch,))
+    fallback_count = pred_x.new_zeros((batch,))
+    reservation_exclusion_count = pred_x.new_zeros((batch,))
+
+    for batch_index, target in enumerate(targets):
+        gt_x = target["x_rows"].to(device=device, dtype=pred_x.dtype)
+        gt_valid = target["valid_mask"].to(device).bool()
+        quality, candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
+            pred_x[batch_index],
+            ranges[batch_index],
+            gt_x,
+            gt_valid,
+            input_h=int(input_h),
+            line_width=float(line_width),
+            min_valid_rows=int(min_valid_rows),
+        )
+        valid_candidate_ids = torch.nonzero(
+            candidate_valid,
+            as_tuple=False,
+        ).flatten()
+        valid_gt_ids = torch.nonzero(valid_gt, as_tuple=False).flatten()
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            _pointer_teacher_seed(
+                base_seed,
+                iteration,
+                visit,
+                batch_index,
+            )
+        )
+
+        if valid_candidate_ids.numel() == 0 or valid_gt_ids.numel() == 0:
+            teacher_indices[batch_index, 0] = stop_class
+            probabilities[batch_index, 0, stop_class] = 1.0
+            active[batch_index, 0] = True
+            continue
+
+        local_quality = quality[valid_candidate_ids][:, valid_gt_ids]
+        qualified = local_quality > float(representable_min)
+        assignment_size = min(
+            int(local_quality.shape[0]),
+            int(local_quality.shape[1]),
+        )
+        reward = (
+            qualified.to(local_quality.dtype) * float(assignment_size + 1)
+            + local_quality
+        )
+        local_candidate_assignment, local_gt_assignment = (
+            HungarianMatcherS0._linear_sum_assignment(-reward.detach().cpu())
+        )
+        joint_pairs: list[tuple[int, int, float]] = []
+        for local_candidate, local_gt in zip(
+            local_candidate_assignment.tolist(),
+            local_gt_assignment.tolist(),
+        ):
+            if not bool(qualified[local_candidate, local_gt]):
+                continue
+            joint_pairs.append(
+                (
+                    int(valid_gt_ids[local_gt]),
+                    int(valid_candidate_ids[local_candidate]),
+                    float(local_quality[local_candidate, local_gt]),
+                )
+            )
+        if len(joint_pairs) > steps:
+            joint_pairs.sort(key=lambda item: item[2], reverse=True)
+            joint_pairs = joint_pairs[:steps]
+
+        if not joint_pairs:
+            teacher_indices[batch_index, 0] = stop_class
+            probabilities[batch_index, 0, stop_class] = 1.0
+            active[batch_index, 0] = True
+            continue
+
+        permutation = torch.randperm(len(joint_pairs), generator=generator).tolist()
+        ordered_pairs = [joint_pairs[index] for index in permutation]
+        representable_count[batch_index] = float(len(ordered_pairs))
+        available = candidate_valid.detach().cpu().bool().clone()
+        quality_cpu = quality.detach().cpu().float()
+
+        for step, (gt_index, fallback_candidate, _assigned_quality) in enumerate(
+            ordered_pairs
+        ):
+            q = quality_cpu[:, gt_index]
+            valid_q = q[available]
+            if valid_q.numel() == 0:
+                raise RuntimeError("V4.5 teacher exhausted all valid candidates")
+            q_best = float(valid_q.max())
+            cutoff = max(
+                float(representable_min),
+                q_best - float(support_quality_delta),
+            )
+            # The evaluator and representability gate use a strict boundary.
+            # Keep exactly-threshold candidates out even though the near-best
+            # cutoff itself is inclusive.
+            support = (
+                available
+                & (q > float(representable_min))
+                & (q >= cutoff)
+            )
+            # Preserve the unique cardinality-first representative reserved
+            # for every future GT.  This is a collision-safe guard for train
+            # augmentations even though the calibrated validation preflight
+            # observed zero cross-GT support overlap.
+            future_fallbacks = [
+                int(pair[1]) for pair in ordered_pairs[step + 1 :]
+            ]
+            if future_fallbacks:
+                future_ids = torch.tensor(future_fallbacks, dtype=torch.long)
+                reservation_exclusion_count[batch_index] += float(
+                    support[future_ids].sum()
+                )
+                support[future_ids] = False
+            if not bool(support.any()):
+                # Joint matching guarantees a qualified unique fallback.  The
+                # branch is defensive for future datasets where supports may
+                # overlap after earlier sampled representatives are removed.
+                if not bool(available[fallback_candidate]):
+                    raise RuntimeError(
+                        "V4.5 collision guard lost a reserved representative"
+                    )
+                support[fallback_candidate] = True
+                fallback_count[batch_index] += 1.0
+            support_ids = torch.nonzero(support, as_tuple=False).flatten()
+            distribution = torch.softmax(
+                q[support_ids] / float(temperature),
+                dim=0,
+            )
+            sampled_local = int(
+                torch.multinomial(
+                    distribution,
+                    num_samples=1,
+                    replacement=False,
+                    generator=generator,
+                )
+            )
+            sampled_candidate = int(support_ids[sampled_local])
+
+            probabilities[
+                batch_index,
+                step,
+                support_ids.to(device=device),
+            ] = distribution.to(device=device, dtype=probabilities.dtype)
+            teacher_indices[batch_index, step] = sampled_candidate
+            active[batch_index, step] = True
+            candidate_steps[batch_index, step] = True
+            support_sizes[batch_index, step] = float(support_ids.numel())
+            target_entropy[batch_index, step] = float(
+                -(distribution * distribution.clamp_min(1e-12).log()).sum()
+            )
+            target_quality[batch_index, step] = float(
+                (distribution * q[support_ids]).sum()
+            )
+            available[sampled_candidate] = False
+
+        count = len(ordered_pairs)
+        if count < steps:
+            teacher_indices[batch_index, count] = stop_class
+            probabilities[batch_index, count, stop_class] = 1.0
+            active[batch_index, count] = True
+
+    return {
+        "indices": teacher_indices,
+        "probabilities": probabilities,
+        "active": active,
+        "candidate_steps": candidate_steps,
+        "support_sizes": support_sizes,
+        "target_entropy": target_entropy,
+        "target_quality": target_quality,
+        "representable_count": representable_count,
+        "fallback_count": fallback_count,
+        "reservation_exclusion_count": reservation_exclusion_count,
+    }
+
+
 @dataclass
 class LossConfig:
     w_exist: float = 2.0
@@ -334,6 +583,12 @@ class S0Criterion(nn.Module):
                 "quality": zero,
                 "mean_emitted_target": zero,
                 "mean_stop_probability": zero,
+                "mean_cluster_support": zero,
+                "mean_cluster_entropy": zero,
+                "mean_cluster_quality": zero,
+                "mean_representable_count": zero,
+                "teacher_fallback_count": zero,
+                "teacher_reservation_exclusion_count": zero,
             }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
@@ -395,6 +650,24 @@ class S0Criterion(nn.Module):
             ],
             "pointer_target_stop_probability": pointer_selection[
                 "mean_stop_probability"
+            ],
+            "pointer_target_mean_cluster_support": pointer_selection[
+                "mean_cluster_support"
+            ],
+            "pointer_target_mean_cluster_entropy": pointer_selection[
+                "mean_cluster_entropy"
+            ],
+            "pointer_target_mean_cluster_quality": pointer_selection[
+                "mean_cluster_quality"
+            ],
+            "pointer_target_mean_representable_count": pointer_selection[
+                "mean_representable_count"
+            ],
+            "pointer_teacher_fallback_count": pointer_selection[
+                "teacher_fallback_count"
+            ],
+            "pointer_teacher_reservation_exclusion_count": pointer_selection[
+                "teacher_reservation_exclusion_count"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -1524,9 +1797,44 @@ class S0Criterion(nn.Module):
         candidates = classes - 1
         if teacher.shape != (batch, steps):
             raise ValueError("pointer teacher/logit shape mismatch")
+        teacher_probabilities = outputs.get(
+            "selection_pointer_teacher_probabilities"
+        )
         teacher_class_mask = outputs.get("selection_pointer_teacher_class_mask")
         teacher_active = outputs.get("selection_pointer_teacher_active")
-        if isinstance(teacher_class_mask, torch.Tensor):
+        if isinstance(teacher_probabilities, torch.Tensor):
+            if teacher_probabilities.shape != pointer_logits.shape:
+                raise ValueError("pointer soft-target/logit shape mismatch")
+            if not isinstance(teacher_active, torch.Tensor) or teacher_active.shape != (
+                batch,
+                steps,
+            ):
+                raise ValueError("pointer soft-target active-mask shape mismatch")
+            target_probability = teacher_probabilities.to(
+                device=pointer_logits.device,
+                dtype=pointer_logits.dtype,
+            )
+            active = teacher_active.to(
+                device=pointer_logits.device,
+                dtype=torch.bool,
+            )
+            if bool((target_probability < 0.0).any()):
+                raise ValueError("pointer soft targets must be non-negative")
+            target_sum = target_probability.sum(dim=-1)
+            if not torch.allclose(
+                target_sum[active],
+                torch.ones_like(target_sum[active]),
+                atol=1e-5,
+                rtol=1e-5,
+            ):
+                raise ValueError("active pointer soft targets must sum to one")
+            if bool((target_sum[~active].abs() > 1e-6).any()):
+                raise ValueError("inactive pointer soft targets must be zero")
+            log_probability = F.log_softmax(pointer_logits, dim=-1)
+            per_step = -(target_probability * log_probability).sum(dim=-1)
+            per_step = torch.where(active, per_step, torch.zeros_like(per_step))
+            stop_target = (target_probability[..., candidates] > 0.5) & active
+        elif isinstance(teacher_class_mask, torch.Tensor):
             if teacher_class_mask.shape != pointer_logits.shape:
                 raise ValueError("pointer set-target mask/logit shape mismatch")
             if not isinstance(teacher_active, torch.Tensor) or teacher_active.shape != (
@@ -1658,12 +1966,70 @@ class S0Criterion(nn.Module):
         else:
             stop_probability = total.detach() * 0.0
         emitted = ((teacher >= 0) & (teacher < candidates)).sum(dim=-1)
+
+        candidate_steps_value = outputs.get(
+            "selection_pointer_teacher_candidate_steps"
+        )
+        candidate_steps = (
+            candidate_steps_value.to(device=pointer_logits.device, dtype=torch.bool)
+            if isinstance(candidate_steps_value, torch.Tensor)
+            else ((teacher >= 0) & (teacher < candidates))
+        )
+
+        def candidate_step_mean(name: str) -> torch.Tensor:
+            value = outputs.get(name)
+            if not isinstance(value, torch.Tensor) or value.shape != (
+                batch,
+                steps,
+            ):
+                return total.detach() * 0.0
+            selected = value.to(
+                device=pointer_logits.device,
+                dtype=torch.float32,
+            )[candidate_steps]
+            return (
+                selected.mean().detach()
+                if selected.numel() > 0
+                else total.detach() * 0.0
+            )
+
+        representable_value = outputs.get(
+            "selection_pointer_teacher_representable_count"
+        )
+        fallback_value = outputs.get("selection_pointer_teacher_fallback_count")
+        reservation_value = outputs.get(
+            "selection_pointer_teacher_reservation_exclusion_count"
+        )
         return {
             "total": total,
             "sequence": sequence_loss,
             "quality": quality_loss,
             "mean_emitted_target": emitted.float().mean().detach(),
             "mean_stop_probability": stop_probability.detach(),
+            "mean_cluster_support": candidate_step_mean(
+                "selection_pointer_teacher_support_sizes"
+            ),
+            "mean_cluster_entropy": candidate_step_mean(
+                "selection_pointer_teacher_target_entropy"
+            ),
+            "mean_cluster_quality": candidate_step_mean(
+                "selection_pointer_teacher_target_quality"
+            ),
+            "mean_representable_count": (
+                representable_value.float().mean().detach()
+                if isinstance(representable_value, torch.Tensor)
+                else emitted.float().mean().detach()
+            ),
+            "teacher_fallback_count": (
+                fallback_value.float().sum().detach()
+                if isinstance(fallback_value, torch.Tensor)
+                else total.detach() * 0.0
+            ),
+            "teacher_reservation_exclusion_count": (
+                reservation_value.float().sum().detach()
+                if isinstance(reservation_value, torch.Tensor)
+                else total.detach() * 0.0
+            ),
         }
 
     def compute_seg_loss(
