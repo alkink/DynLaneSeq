@@ -1,0 +1,11 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_5_1_q1_quality_policy_split.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_5_1_quality_policy_gate/q2_quality_policy_listwise
+
+# Q2 changes exactly one factor relative to Q1: the candidate-local quality
+# branch must reproduce the same per-GT near-best distribution already used
+# by the V4.5 cluster-soft teacher.  Reusing that tensor avoids a second,
+# potentially inconsistent candidate/GT assignment.
+loss:
+  pointer_cluster_listwise_weight: 0.25
+  pointer_cluster_listwise_logit_temperature: 1.0

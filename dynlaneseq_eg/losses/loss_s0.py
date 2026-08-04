@@ -406,6 +406,8 @@ class LossConfig:
     set_selection_winner_quality_min: float = 0.30
     w_pointer_selection: float = 0.0
     pointer_quality_weight: float = 0.5
+    pointer_cluster_listwise_weight: float = 0.0
+    pointer_cluster_listwise_logit_temperature: float = 1.0
     pointer_stop_weight: float = 1.0
     pointer_unary_target_mode: str = "max_quality"
     w_centerline: float = 0.0
@@ -466,11 +468,16 @@ class S0Criterion(nn.Module):
             "set_selection_count_weight",
             "w_pointer_selection",
             "pointer_quality_weight",
+            "pointer_cluster_listwise_weight",
         ):
             if float(getattr(self.cfg, field_name)) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative")
         if float(self.cfg.pointer_stop_weight) <= 0.0:
             raise ValueError("pointer_stop_weight must be positive")
+        if float(self.cfg.pointer_cluster_listwise_logit_temperature) <= 0.0:
+            raise ValueError(
+                "pointer_cluster_listwise_logit_temperature must be positive"
+            )
         if self.cfg.pointer_unary_target_mode not in {
             "max_quality",
             "unique_representative",
@@ -581,6 +588,7 @@ class S0Criterion(nn.Module):
                 "total": zero,
                 "sequence": zero,
                 "quality": zero,
+                "listwise": zero,
                 "mean_emitted_target": zero,
                 "mean_stop_probability": zero,
                 "mean_cluster_support": zero,
@@ -645,6 +653,7 @@ class S0Criterion(nn.Module):
             "loss_pointer_selection": pointer_selection["total"],
             "loss_pointer_sequence": pointer_selection["sequence"],
             "loss_pointer_quality": pointer_selection["quality"],
+            "loss_pointer_listwise": pointer_selection["listwise"],
             "pointer_target_mean_emitted": pointer_selection[
                 "mean_emitted_target"
             ],
@@ -1952,9 +1961,38 @@ class S0Criterion(nn.Module):
             quality_loss = torch.stack(image_losses).mean()
         else:
             quality_loss = per_candidate_quality.mean()
-        total = sequence_loss + float(
-            self.cfg.pointer_quality_weight
-        ) * quality_loss
+        listwise_loss = unary_logits.sum() * 0.0
+        listwise_weight = float(self.cfg.pointer_cluster_listwise_weight)
+        if listwise_weight > 0.0:
+            if not isinstance(teacher_probabilities, torch.Tensor):
+                raise ValueError(
+                    "pointer cluster-listwise supervision requires soft "
+                    "cluster teacher probabilities"
+                )
+            candidate_target = target_probability[..., :candidates]
+            candidate_step = active & (candidate_target.sum(dim=-1) > 0.5)
+            support = candidate_target > 0.0
+            temperature = float(
+                self.cfg.pointer_cluster_listwise_logit_temperature
+            )
+            listwise_logits = (
+                unary_logits.unsqueeze(1).expand(-1, steps, -1) / temperature
+            )
+            listwise_log_probability = F.log_softmax(
+                listwise_logits.masked_fill(~support, -1e4),
+                dim=-1,
+            )
+            per_cluster = -(
+                candidate_target * listwise_log_probability
+            ).sum(dim=-1)
+            listwise_loss = (
+                per_cluster * candidate_step.to(per_cluster.dtype)
+            ).sum() / candidate_step.sum().clamp_min(1).to(per_cluster.dtype)
+        total = (
+            sequence_loss
+            + float(self.cfg.pointer_quality_weight) * quality_loss
+            + listwise_weight * listwise_loss
+        )
 
         stop_rows = torch.nonzero(stop_target, as_tuple=False)
         if stop_rows.numel() > 0:
@@ -2004,6 +2042,7 @@ class S0Criterion(nn.Module):
             "total": total,
             "sequence": sequence_loss,
             "quality": quality_loss,
+            "listwise": listwise_loss,
             "mean_emitted_target": emitted.float().mean().detach(),
             "mean_stop_probability": stop_probability.detach(),
             "mean_cluster_support": candidate_step_mean(

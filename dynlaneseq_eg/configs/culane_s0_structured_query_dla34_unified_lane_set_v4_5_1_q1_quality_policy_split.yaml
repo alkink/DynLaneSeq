@@ -1,0 +1,23 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_5_cluster_soft_pointer.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_5_1_quality_policy_gate/q1_quality_policy_split
+
+# Q1 is a behavior-preserving intervention at initialization.  The V4.5
+# unary logits become a detached, bounded localization-quality prior.  A new
+# zero-initialized policy bias and the existing pointer content/relation paths
+# receive sequence gradients; the quality head receives only quality losses.
+model:
+  structured_query:
+    set_selection:
+      pointer_quality_policy_mode: decoupled
+      pointer_quality_prior_max_scale: 2.0
+
+loss:
+  pointer_cluster_listwise_weight: 0.0
+  pointer_cluster_listwise_logit_temperature: 1.0
+
+training:
+  max_iters: 5000
+  checkpoint_interval: 2500
+  checkpoint_include_optimizer: true
+  save_last_alias: false

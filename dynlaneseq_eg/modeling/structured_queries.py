@@ -810,6 +810,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         pointer_similarity_prior: float = 0.5,
         pointer_teacher_mode: str = "fixed_sequence",
         row_grid_mode: str = "legacy_linspace",
+        pointer_quality_policy_mode: str = "shared",
+        pointer_quality_prior_max_scale: float = 2.0,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -830,6 +832,12 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.pointer_similarity_prior = float(pointer_similarity_prior)
         self.pointer_teacher_mode = str(pointer_teacher_mode).strip().lower()
         self.row_grid_mode = str(row_grid_mode).strip().lower()
+        self.pointer_quality_policy_mode = str(
+            pointer_quality_policy_mode
+        ).strip().lower()
+        self.pointer_quality_prior_max_scale = float(
+            pointer_quality_prior_max_scale
+        )
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -861,6 +869,15 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError(
                 "set_selection.row_grid_mode must be legacy_linspace or fixed_rows"
             )
+        if self.pointer_quality_policy_mode not in {"shared", "decoupled"}:
+            raise ValueError(
+                "set_selection.pointer_quality_policy_mode must be shared "
+                "or decoupled"
+            )
+        if self.pointer_quality_prior_max_scale <= 0.0:
+            raise ValueError(
+                "set_selection.pointer_quality_prior_max_scale must be positive"
+            )
         if self.candidate_interaction not in {
             "independent",
             "transformer",
@@ -870,6 +887,14 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError(
                 "set_selection.candidate_interaction must be independent, "
                 "transformer, relation_transformer, or sequential_pointer"
+            )
+        if (
+            self.pointer_quality_policy_mode == "decoupled"
+            and self.candidate_interaction != "sequential_pointer"
+        ):
+            raise ValueError(
+                "decoupled pointer quality/policy requires "
+                "candidate_interaction=sequential_pointer"
             )
 
         # Unified mode uses two range-masked row-state summaries and optional
@@ -938,6 +963,34 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.output = nn.Linear(int(hidden_dim), 1)
         if self.candidate_interaction == "sequential_pointer":
             pointer_dim = int(hidden_dim)
+            if self.pointer_quality_policy_mode == "decoupled":
+                # V4.5.1 separates candidate-local localization quality from
+                # the selected-set policy.  The residual quality adapter is
+                # initialized as an exact identity so a V4.5 checkpoint can
+                # enter this contract without changing its deployed logits.
+                self.pointer_quality_adapter = nn.Sequential(
+                    nn.LayerNorm(pointer_dim),
+                    nn.Linear(pointer_dim, pointer_dim),
+                    nn.GELU(),
+                    nn.Linear(pointer_dim, pointer_dim),
+                )
+                self.pointer_policy_output_norm = nn.LayerNorm(pointer_dim)
+                self.pointer_policy_output = nn.Linear(pointer_dim, 1)
+                self.pointer_quality_scale_raw = nn.Parameter(
+                    torch.full(
+                        (self.pointer_max_selections,),
+                        self._quality_scale_raw(1.0),
+                    )
+                )
+                nn.init.zeros_(self.pointer_quality_adapter[-1].weight)
+                nn.init.zeros_(self.pointer_quality_adapter[-1].bias)
+                nn.init.zeros_(self.pointer_policy_output.weight)
+                nn.init.zeros_(self.pointer_policy_output.bias)
+            else:
+                self.pointer_quality_adapter = None
+                self.pointer_policy_output_norm = None
+                self.pointer_policy_output = None
+                self.register_parameter("pointer_quality_scale_raw", None)
             self.pointer_key = nn.Linear(pointer_dim, pointer_dim, bias=False)
             self.pointer_context = nn.Linear(pointer_dim, pointer_dim)
             self.pointer_step_embedding = nn.Embedding(
@@ -975,6 +1028,10 @@ class SetAwareLaneSelectionHead(nn.Module):
             # A new selector should acquire lanes before learning to stop.
             nn.init.constant_(self.pointer_stop[-1].bias, -2.0)
         else:
+            self.pointer_quality_adapter = None
+            self.pointer_policy_output_norm = None
+            self.pointer_policy_output = None
+            self.register_parameter("pointer_quality_scale_raw", None)
             self.pointer_key = None
             self.pointer_context = None
             self.pointer_step_embedding = None
@@ -994,6 +1051,22 @@ class SetAwareLaneSelectionHead(nn.Module):
         else:
             nn.init.zeros_(self.output.weight)
             nn.init.zeros_(self.output.bias)
+
+    def _quality_scale_raw(self, scale: float) -> float:
+        """Map a bounded positive quality scale to its unconstrained value."""
+
+        ratio = float(scale) / self.pointer_quality_prior_max_scale
+        ratio = min(max(ratio, 1e-6), 1.0 - 1e-6)
+        return math.log(ratio / (1.0 - ratio))
+
+    def pointer_quality_scale(self) -> torch.Tensor:
+        """Return the bounded per-step localization-quality prior scale."""
+
+        if self.pointer_quality_scale_raw is None:
+            return self.output.weight.new_ones((self.pointer_max_selections,))
+        return self.pointer_quality_prior_max_scale * torch.sigmoid(
+            self.pointer_quality_scale_raw
+        )
 
     def _base_probability(self, outputs: dict[str, torch.Tensor]) -> torch.Tensor:
         exist = torch.softmax(outputs["exist_logits"].float(), dim=-1)[..., 0]
@@ -1302,6 +1375,11 @@ class SetAwareLaneSelectionHead(nn.Module):
         """Score descriptors returned by :meth:`build_selection_features`."""
 
         hidden = self.encode_selection_features(features, relations)
+        if self.pointer_quality_policy_mode == "decoupled":
+            if self.pointer_quality_adapter is None:
+                raise RuntimeError("decoupled quality adapter was not initialized")
+            quality_input = hidden.detach()
+            hidden = quality_input + self.pointer_quality_adapter(quality_input)
         return self.output(self.output_norm(hidden)).squeeze(-1).float()
 
     def build_pointer_candidate_valid(
@@ -1335,6 +1413,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         unary_logits: torch.Tensor,
         candidate_valid: torch.Tensor,
         *,
+        policy_logits: torch.Tensor | None = None,
         teacher_indices: torch.Tensor | None = None,
         teacher_candidate_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -1366,6 +1445,16 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("pointer relation axes do not match candidates")
         if unary_logits.shape != (batch, candidates):
             raise ValueError("pointer unary-logit shape mismatch")
+        if policy_logits is not None and policy_logits.shape != (
+            batch,
+            candidates,
+        ):
+            raise ValueError("pointer policy-logit shape mismatch")
+        if (
+            self.pointer_quality_policy_mode == "decoupled"
+            and policy_logits is None
+        ):
+            raise ValueError("decoupled pointer requires policy logits")
         if candidate_valid.shape != (batch, candidates):
             raise ValueError("pointer validity-mask shape mismatch")
         if teacher_indices is not None and teacher_indices.shape != (
@@ -1407,6 +1496,10 @@ class SetAwareLaneSelectionHead(nn.Module):
         selected_by_step: list[torch.Tensor] = []
         selected_probability_by_step: list[torch.Tensor] = []
         relation_bias_by_step: list[torch.Tensor] = []
+        unary_component_by_step: list[torch.Tensor] = []
+        policy_component_by_step: list[torch.Tensor] = []
+        content_by_step: list[torch.Tensor] = []
+        stop_logit_by_step: list[torch.Tensor] = []
         teacher_class_masks_by_step: list[torch.Tensor] = []
         teacher_active_by_step: list[torch.Tensor] = []
 
@@ -1448,7 +1541,16 @@ class SetAwareLaneSelectionHead(nn.Module):
                 relation_bias,
                 torch.zeros_like(relation_bias),
             )
-            candidate_logits = unary_logits.float() + content + relation_bias
+            if self.pointer_quality_policy_mode == "decoupled":
+                quality_scale = self.pointer_quality_scale()[step].float()
+                unary_component = quality_scale * unary_logits.detach().float()
+                policy_component = policy_logits.float()
+            else:
+                unary_component = unary_logits.float()
+                policy_component = torch.zeros_like(unary_component)
+            candidate_logits = (
+                unary_component + policy_component + content + relation_bias
+            )
             candidate_logits = candidate_logits.masked_fill(~available, -1e4)
             stop_input = torch.cat((state, context, step_token), dim=-1)
             stop_logit = self.pointer_stop(stop_input).squeeze(-1).float()
@@ -1458,6 +1560,10 @@ class SetAwareLaneSelectionHead(nn.Module):
             )
             logits_by_step.append(step_logits)
             relation_bias_by_step.append(relation_bias)
+            unary_component_by_step.append(unary_component)
+            policy_component_by_step.append(policy_component)
+            content_by_step.append(content)
+            stop_logit_by_step.append(stop_logit)
 
             if remaining_teacher is not None:
                 teacher_active = ~teacher_stopped
@@ -1553,6 +1659,23 @@ class SetAwareLaneSelectionHead(nn.Module):
                 relation_bias_by_step,
                 dim=1,
             ),
+            "selection_pointer_unary_component": torch.stack(
+                unary_component_by_step,
+                dim=1,
+            ),
+            "selection_pointer_policy_component": torch.stack(
+                policy_component_by_step,
+                dim=1,
+            ),
+            "selection_pointer_content_component": torch.stack(
+                content_by_step,
+                dim=1,
+            ),
+            "selection_pointer_stop_component": torch.stack(
+                stop_logit_by_step,
+                dim=1,
+            ),
+            "selection_pointer_quality_scale": self.pointer_quality_scale(),
         }
         if teacher_class_masks_by_step:
             result["selection_pointer_teacher_class_mask"] = torch.stack(
@@ -1578,6 +1701,8 @@ class SetAwareLaneSelectionHead(nn.Module):
             "_selection_pointer_unary_logits",
             "_selection_pointer_candidate_valid",
         )
+        if self.pointer_quality_policy_mode == "decoupled":
+            required = (*required, "_selection_pointer_policy_logits")
         missing = [name for name in required if name not in outputs]
         if missing:
             raise ValueError(
@@ -1604,6 +1729,7 @@ class SetAwareLaneSelectionHead(nn.Module):
                 outputs["_selection_pointer_relations"],
                 outputs["_selection_pointer_unary_logits"],
                 outputs["_selection_pointer_candidate_valid"],
+                policy_logits=outputs.get("_selection_pointer_policy_logits"),
                 teacher_candidate_mask=target_mask,
             )
             outputs["selection_pointer_unique_target_mask"] = target_mask
@@ -1619,6 +1745,7 @@ class SetAwareLaneSelectionHead(nn.Module):
                 outputs["_selection_pointer_relations"],
                 outputs["_selection_pointer_unary_logits"],
                 outputs["_selection_pointer_candidate_valid"],
+                policy_logits=outputs.get("_selection_pointer_policy_logits"),
                 teacher_indices=teacher,
             )
         # Keep greedy indices/scores from the original forward for diagnostics;
@@ -1630,6 +1757,14 @@ class SetAwareLaneSelectionHead(nn.Module):
         outputs["selection_pointer_teacher_relation_bias"] = rollout[
             "selection_pointer_relation_bias"
         ]
+        for name in (
+            "selection_pointer_unary_component",
+            "selection_pointer_policy_component",
+            "selection_pointer_content_component",
+            "selection_pointer_stop_component",
+            "selection_pointer_quality_scale",
+        ):
+            outputs[name] = rollout[name]
 
     def reroll_pointer_with_cluster_teacher(
         self,
@@ -1718,7 +1853,26 @@ class SetAwareLaneSelectionHead(nn.Module):
             else None
         )
         hidden = self.encode_selection_features(features, relations)
-        raw_logits = self.output(self.output_norm(hidden)).squeeze(-1).float()
+        if self.pointer_quality_policy_mode == "decoupled":
+            if (
+                self.pointer_quality_adapter is None
+                or self.pointer_policy_output_norm is None
+                or self.pointer_policy_output is None
+            ):
+                raise RuntimeError("decoupled pointer branches were not initialized")
+            quality_input = hidden.detach()
+            quality_hidden = quality_input + self.pointer_quality_adapter(
+                quality_input
+            )
+            raw_logits = self.output(
+                self.output_norm(quality_hidden)
+            ).squeeze(-1).float()
+            policy_logits = self.pointer_policy_output(
+                self.pointer_policy_output_norm(hidden)
+            ).squeeze(-1).float()
+        else:
+            raw_logits = self.output(self.output_norm(hidden)).squeeze(-1).float()
+            policy_logits = None
         if self.candidate_interaction == "sequential_pointer":
             if relations is None:
                 raise RuntimeError("sequential pointer has no relation tensor")
@@ -1735,6 +1889,7 @@ class SetAwareLaneSelectionHead(nn.Module):
                     relations,
                     raw_logits,
                     candidate_valid,
+                    policy_logits=policy_logits,
                 )
             )
             return {
@@ -1747,6 +1902,11 @@ class SetAwareLaneSelectionHead(nn.Module):
                 "_selection_pointer_hidden": hidden,
                 "_selection_pointer_relations": relations,
                 "_selection_pointer_unary_logits": raw_logits,
+                **(
+                    {"_selection_pointer_policy_logits": policy_logits}
+                    if policy_logits is not None
+                    else {}
+                ),
                 "_selection_pointer_candidate_valid": candidate_valid,
             }
         if self.unified_score:
@@ -2209,6 +2369,18 @@ class StructuredLaneQueryHead(nn.Module):
                     self.set_selection_cfg.get(
                         "row_grid_mode",
                         "legacy_linspace",
+                    )
+                ),
+                pointer_quality_policy_mode=str(
+                    self.set_selection_cfg.get(
+                        "pointer_quality_policy_mode",
+                        "shared",
+                    )
+                ),
+                pointer_quality_prior_max_scale=float(
+                    self.set_selection_cfg.get(
+                        "pointer_quality_prior_max_scale",
+                        2.0,
                     )
                 ),
             )

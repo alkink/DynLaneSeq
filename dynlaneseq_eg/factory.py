@@ -138,6 +138,12 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         pointer_quality_weight=float(
             loss.get("pointer_quality_weight", 0.5)
         ),
+        pointer_cluster_listwise_weight=float(
+            loss.get("pointer_cluster_listwise_weight", 0.0)
+        ),
+        pointer_cluster_listwise_logit_temperature=float(
+            loss.get("pointer_cluster_listwise_logit_temperature", 1.0)
+        ),
         pointer_stop_weight=float(loss.get("pointer_stop_weight", 1.0)),
         pointer_unary_target_mode=str(
             loss.get("pointer_unary_target_mode", "max_quality")
