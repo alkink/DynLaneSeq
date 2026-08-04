@@ -60,12 +60,213 @@ def _pearson(left: list[float], right: list[float]) -> float:
     return float((x * y).sum() / denominator)
 
 
+def analyze_pointer_rollout_image(
+    pointer_indices: torch.Tensor,
+    pointer_logits: torch.Tensor,
+    training_target_indices: torch.Tensor,
+    *,
+    candidate_count: int,
+) -> dict[str, Any]:
+    """Separate arbitrary target ordering from genuine rollout divergence.
+
+    V4.3 supervises one left-to-right sequence even though deployment consumes
+    an unordered set.  A greedy prediction can therefore be wrong under the
+    fixed sequence while still selecting a valid remaining target.  Tracking
+    both prefixes also localizes errors that happen before exposure to an
+    incorrect model-generated state.
+    """
+
+    predicted = pointer_indices.detach().cpu().long().flatten()
+    logits = pointer_logits.detach().cpu().float()
+    teacher = training_target_indices.detach().cpu().long().flatten()
+    if logits.ndim != 2 or int(logits.shape[1]) != int(candidate_count) + 1:
+        raise ValueError("pointer logits must have shape [steps, candidates + 1]")
+    if not (len(predicted) == int(logits.shape[0]) == len(teacher)):
+        raise ValueError("pointer prediction/logit/teacher step mismatch")
+
+    target_set = {
+        int(value)
+        for value in teacher.tolist()
+        if 0 <= int(value) < int(candidate_count)
+    }
+    remaining = set(target_set)
+    exact_prefix = True
+    unordered_prefix = True
+    first_exact_error: int | None = None
+    first_unordered_error: int | None = None
+    steps: list[dict[str, Any]] = []
+    for step, target_value in enumerate(teacher.tolist()):
+        target_class = int(target_value)
+        if target_class == -100:
+            break
+        if not 0 <= target_class <= int(candidate_count):
+            raise ValueError(f"invalid active pointer target: {target_class}")
+        predicted_index = int(predicted[step])
+        predicted_class = (
+            predicted_index if predicted_index >= 0 else int(candidate_count)
+        )
+        if not 0 <= predicted_class <= int(candidate_count):
+            raise ValueError(f"invalid pointer prediction: {predicted_class}")
+
+        exact = predicted_class == target_class
+        if remaining:
+            unordered_valid = predicted_class in remaining
+        else:
+            unordered_valid = predicted_class == int(candidate_count)
+        target_logit = logits[step, target_class]
+        target_rank = 1 + int((logits[step] > target_logit).sum())
+        target_probability = float(
+            torch.softmax(logits[step], dim=-1)[target_class]
+        )
+        other = logits[step].clone()
+        other[target_class] = -torch.inf
+        target_margin = float(target_logit - other.max())
+        steps.append(
+            {
+                "step": step + 1,
+                "target_count": len(target_set),
+                "target_is_stop": target_class == int(candidate_count),
+                "exact_prefix_before": exact_prefix,
+                "unordered_prefix_before": unordered_prefix,
+                "exact_target_class": exact,
+                "valid_remaining_target_or_stop": unordered_valid,
+                "target_rank": target_rank,
+                "target_probability": target_probability,
+                "target_margin": target_margin,
+            }
+        )
+        if not exact and first_exact_error is None:
+            first_exact_error = step + 1
+        if not unordered_valid and first_unordered_error is None:
+            first_unordered_error = step + 1
+        if predicted_class in remaining:
+            remaining.remove(predicted_class)
+        exact_prefix = exact_prefix and exact
+        unordered_prefix = unordered_prefix and unordered_valid
+
+    return {
+        "target_count": len(target_set),
+        "steps": steps,
+        "exact_sequence": first_exact_error is None,
+        "unordered_target_trajectory": first_unordered_error is None,
+        "first_exact_error": first_exact_error,
+        "first_unordered_error": first_unordered_error,
+    }
+
+
+def summarize_pointer_rollouts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rollout_rows = [row["rollout"] for row in rows]
+    exact_sequences = sum(bool(row["exact_sequence"]) for row in rollout_rows)
+    unordered_sequences = sum(
+        bool(row["unordered_target_trajectory"]) for row in rollout_rows
+    )
+    step_numbers = sorted(
+        {
+            int(step["step"])
+            for row in rollout_rows
+            for step in row["steps"]
+        }
+    )
+    per_step: dict[str, Any] = {}
+    for step_number in step_numbers:
+        values = [
+            step
+            for row in rollout_rows
+            for step in row["steps"]
+            if int(step["step"]) == step_number
+        ]
+        exact_prefix = [step for step in values if step["exact_prefix_before"]]
+        unordered_prefix = [
+            step for step in values if step["unordered_prefix_before"]
+        ]
+        per_step[str(step_number)] = {
+            "active_images": len(values),
+            "fixed_target_top1_rate_all": sum(
+                bool(step["exact_target_class"]) for step in values
+            )
+            / float(max(len(values), 1)),
+            "any_remaining_target_or_stop_rate_all": sum(
+                bool(step["valid_remaining_target_or_stop"]) for step in values
+            )
+            / float(max(len(values), 1)),
+            "fixed_target_rate_given_exact_prefix": sum(
+                bool(step["exact_target_class"]) for step in exact_prefix
+            )
+            / float(max(len(exact_prefix), 1)),
+            "valid_set_action_rate_given_unordered_prefix": sum(
+                bool(step["valid_remaining_target_or_stop"])
+                for step in unordered_prefix
+            )
+            / float(max(len(unordered_prefix), 1)),
+            "exact_prefix_images": len(exact_prefix),
+            "unordered_prefix_images": len(unordered_prefix),
+            "target_rank_given_exact_prefix": _value_summary(
+                [float(step["target_rank"]) for step in exact_prefix]
+            ),
+            "target_probability_given_exact_prefix": _value_summary(
+                [float(step["target_probability"]) for step in exact_prefix]
+            ),
+            "target_margin_given_exact_prefix": _value_summary(
+                [float(step["target_margin"]) for step in exact_prefix]
+            ),
+        }
+
+    def error_histogram(name: str) -> dict[str, int]:
+        histogram: dict[str, int] = {}
+        for row in rollout_rows:
+            value = row[name]
+            key = "none" if value is None else str(int(value))
+            histogram[key] = histogram.get(key, 0) + 1
+        return histogram
+
+    lane_first_steps = [
+        row["steps"][0]
+        for row in rollout_rows
+        if int(row["target_count"]) > 0 and row["steps"]
+    ]
+    fixed_first = sum(
+        bool(step["exact_target_class"]) for step in lane_first_steps
+    ) / float(max(len(lane_first_steps), 1))
+    unordered_first = sum(
+        bool(step["valid_remaining_target_or_stop"]) for step in lane_first_steps
+    ) / float(max(len(lane_first_steps), 1))
+    unordered_error_images = sum(
+        row["first_unordered_error"] is not None for row in rollout_rows
+    )
+    first_step_unordered_errors = sum(
+        row["first_unordered_error"] == 1 for row in rollout_rows
+    )
+    return {
+        "images": len(rollout_rows),
+        "exact_left_to_right_sequence_rate": float(exact_sequences)
+        / float(max(len(rollout_rows), 1)),
+        "unordered_exact_target_trajectory_rate": float(unordered_sequences)
+        / float(max(len(rollout_rows), 1)),
+        "lane_images_first_step": {
+            "images": len(lane_first_steps),
+            "fixed_leftmost_target_rate": fixed_first,
+            "any_target_representative_rate": unordered_first,
+            "ordering_penalty_signal": unordered_first - fixed_first,
+        },
+        "first_exact_error_histogram": error_histogram("first_exact_error"),
+        "first_unordered_error_histogram": error_histogram(
+            "first_unordered_error"
+        ),
+        "fraction_of_unordered_failures_starting_at_step1": (
+            float(first_step_unordered_errors)
+            / float(max(unordered_error_images, 1))
+        ),
+        "per_step": per_step,
+    }
+
+
 def compare_target_alignment_image(
     row_iou: torch.Tensor,
     official_iou: torch.Tensor,
     candidate_valid: torch.Tensor,
     pointer_indices: torch.Tensor,
     training_target_indices: torch.Tensor,
+    pointer_logits: torch.Tensor | None = None,
     *,
     thresholds: tuple[float, ...] = (0.50, 0.75),
     top_k: int = 4,
@@ -150,7 +351,7 @@ def compare_target_alignment_image(
     pointer_set = set(pointer_ids)
     target_set = set(target_ids)
     union = pointer_set | target_set
-    return {
+    result = {
         "gt_count": int(row.shape[0]),
         "pointer_count": len(pointer_ids),
         "training_target_count": len(target_ids),
@@ -164,6 +365,14 @@ def compare_target_alignment_image(
         "row_best_official_values": row_best_official_values,
         "row_official_pairs": row_official_pairs,
     }
+    if pointer_logits is not None:
+        result["rollout"] = analyze_pointer_rollout_image(
+            pointer_indices,
+            pointer_logits,
+            training_target_indices,
+            candidate_count=candidate_count,
+        )
+    return result
 
 
 def summarize_alignment(
@@ -233,7 +442,7 @@ def summarize_alignment(
     else:
         verdict = "pointer_learning_or_exposure_is_primary"
         next_action = "strengthen_cluster_winner_learning_and_pointer_rollout"
-    return {
+    report = {
         "images": len(rows),
         "gt_lanes": gt,
         "pointer_predictions": pointer_count,
@@ -255,6 +464,9 @@ def summarize_alignment(
         "verdict": verdict,
         "next_action": next_action,
     }
+    if rows and all("rollout" in row for row in rows):
+        report["pointer_rollout_dynamics"] = summarize_pointer_rollouts(rows)
+    return report
 
 
 def main() -> None:
@@ -320,6 +532,7 @@ def main() -> None:
                 candidate_valid,
                 stage["selection_pointer_indices"],
                 teacher,
+                stage.get("selection_pointer_logits"),
                 thresholds=thresholds,
                 top_k=int(args.top_k),
             )

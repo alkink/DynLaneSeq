@@ -306,7 +306,11 @@ from official raster IoU, or whether the pointer fails to learn its existing
 target.
 
 The original uniform-256 cache already contains both tensors.  The following
-cache-only audit performs that decomposition without inference or training:
+cache-only audit performs that decomposition without inference or training.
+It also compares the fixed left-to-right teacher sequence with an unordered
+target-set trajectory and localizes the first greedy divergence, separating
+arbitrary ordering from pre-exposure representative failure and later rollout
+error:
 
 ```bash
 DATA_ROOT=/workspace/CULane \
