@@ -11,6 +11,96 @@ from .matcher_s0 import HungarianMatcherS0
 from .range_aware_iou import pairwise_range_aware_row_strip_iou
 
 
+@torch.no_grad()
+def build_pointer_sequence_targets(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    max_selections: int,
+    input_h: int,
+    line_width: float,
+    min_valid_rows: int,
+) -> torch.Tensor:
+    """Build score-independent left-to-right lane targets followed by STOP.
+
+    Candidate ownership is obtained from the complete detached range-aware IoU
+    matrix, not from the deployment score.  Hungarian assignment makes the
+    representatives unique; ordering the matched GT lanes left-to-right makes
+    the autoregressive contract deterministic under candidate permutations.
+    ``num_candidates`` is the STOP class and positions after STOP are ignored.
+    """
+
+    pred_x = outputs["pred_x_rows"].detach().float()
+    ranges = outputs["range_norm"].detach().float()
+    batch, candidates, _rows = pred_x.shape
+    steps = int(max_selections)
+    if steps < 1:
+        raise ValueError("pointer max_selections must be positive")
+    sequence = torch.full(
+        (batch, steps),
+        -100,
+        dtype=torch.long,
+        device=pred_x.device,
+    )
+    for batch_index, target in enumerate(targets):
+        gt_x = target["x_rows"].to(
+            device=pred_x.device,
+            dtype=pred_x.dtype,
+        )
+        gt_valid = target["valid_mask"].to(pred_x.device).bool()
+        quality, _candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
+            pred_x[batch_index],
+            ranges[batch_index],
+            gt_x,
+            gt_valid,
+            input_h=int(input_h),
+            line_width=float(line_width),
+            min_valid_rows=int(min_valid_rows),
+        )
+        gt_ids = torch.nonzero(valid_gt, as_tuple=False).flatten()
+        if gt_ids.numel() == 0:
+            sequence[batch_index, 0] = candidates
+            continue
+        quality = quality[:, gt_ids]
+        if int(gt_ids.numel()) > steps:
+            # CULane normally has at most four lanes.  If an annotation exceeds
+            # deployment cardinality, retain the lanes the frozen pool can
+            # represent best instead of introducing an arbitrary file-order cut.
+            keep = quality.amax(dim=0).topk(k=steps).indices
+            quality = quality[:, keep]
+            gt_ids = gt_ids[keep]
+        pred_ids, local_gt_ids = HungarianMatcherS0._linear_sum_assignment(
+            1.0 - quality.detach().cpu()
+        )
+        pairs: list[tuple[float, int]] = []
+        for pred_value, local_gt_value in zip(
+            pred_ids.tolist(),
+            local_gt_ids.tolist(),
+        ):
+            gt_index = int(gt_ids[int(local_gt_value)])
+            visible_ids = torch.nonzero(
+                gt_valid[gt_index] & torch.isfinite(gt_x[gt_index]),
+                as_tuple=False,
+            ).flatten()
+            if visible_ids.numel() == 0:
+                bottom_x = float(gt_x[gt_index].nan_to_num().median())
+            else:
+                tail = visible_ids[-min(5, int(visible_ids.numel())) :]
+                bottom_x = float(gt_x[gt_index, tail].median())
+            pairs.append((bottom_x, int(pred_value)))
+        pairs.sort(key=lambda row: row[0])
+        count = min(len(pairs), steps)
+        if count > 0:
+            sequence[batch_index, :count] = torch.tensor(
+                [candidate for _x, candidate in pairs[:count]],
+                device=sequence.device,
+                dtype=torch.long,
+            )
+        if count < steps:
+            sequence[batch_index, count] = candidates
+    return sequence
+
+
 @dataclass
 class LossConfig:
     w_exist: float = 2.0
@@ -55,6 +145,9 @@ class LossConfig:
     set_selection_count_weight: float = 0.0
     set_selection_duplicate_quality_min: float = 0.30
     set_selection_winner_quality_min: float = 0.30
+    w_pointer_selection: float = 0.0
+    pointer_quality_weight: float = 0.5
+    pointer_stop_weight: float = 1.0
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -108,9 +201,13 @@ class S0Criterion(nn.Module):
             "set_selection_duplicate_weight",
             "set_selection_winner_weight",
             "set_selection_count_weight",
+            "w_pointer_selection",
+            "pointer_quality_weight",
         ):
             if float(getattr(self.cfg, field_name)) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative")
+        if float(self.cfg.pointer_stop_weight) <= 0.0:
+            raise ValueError("pointer_stop_weight must be positive")
         for field_name in (
             "set_selection_duplicate_quality_min",
             "set_selection_winner_quality_min",
@@ -203,6 +300,19 @@ class S0Criterion(nn.Module):
                 "target_positive_fraction": zero,
                 "delta_abs": zero,
             }
+        if self.cfg.w_pointer_selection != 0:
+            pointer_selection = self.compute_pointer_selection_loss(
+                outputs,
+                targets,
+            )
+        else:
+            pointer_selection = {
+                "total": zero,
+                "sequence": zero,
+                "quality": zero,
+                "mean_emitted_target": zero,
+                "mean_stop_probability": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
@@ -225,6 +335,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_cardinality * loss_cardinality
             + self.cfg.w_score_margin * loss_score_margin
             + self.cfg.w_set_selection * set_selection["total"]
+            + self.cfg.w_pointer_selection * pointer_selection["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -254,6 +365,15 @@ class S0Criterion(nn.Module):
                 "target_positive_fraction"
             ],
             "set_selection_delta_abs": set_selection["delta_abs"],
+            "loss_pointer_selection": pointer_selection["total"],
+            "loss_pointer_sequence": pointer_selection["sequence"],
+            "loss_pointer_quality": pointer_selection["quality"],
+            "pointer_target_mean_emitted": pointer_selection[
+                "mean_emitted_target"
+            ],
+            "pointer_target_stop_probability": pointer_selection[
+                "mean_stop_probability"
+            ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
             "weight_row_dfl": zero.new_tensor(row_dfl_weight),
@@ -1342,6 +1462,107 @@ class S0Criterion(nn.Module):
                 selection_targets.detach() > 0.0
             ).float().mean(),
             "delta_abs": delta_abs,
+        }
+
+    def compute_pointer_selection_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Train the sequential candidate/STOP policy and its unary quality.
+
+        The sequence logits come from a teacher-forced state rollout created
+        after the score-independent geometry assignment is known.  A separate
+        continuous max-IoU target teaches which representative is best inside
+        a duplicate cluster; the recurrent pointer then learns coverage and
+        conditional suppression without reopening gradients into geometry.
+        """
+
+        logits_value = outputs.get("selection_pointer_logits")
+        teacher_value = outputs.get("selection_pointer_teacher_indices")
+        unary_value = outputs.get("selection_logits")
+        if not isinstance(logits_value, torch.Tensor):
+            raise ValueError(
+                "w_pointer_selection > 0 requires sequential pointer logits"
+            )
+        if not isinstance(teacher_value, torch.Tensor):
+            raise ValueError(
+                "pointer training requires teacher targets from forward_with_matches"
+            )
+        if not isinstance(unary_value, torch.Tensor):
+            raise ValueError("pointer training requires unary selection_logits")
+        pointer_logits = logits_value.float()
+        teacher = teacher_value.to(
+            device=pointer_logits.device,
+            dtype=torch.long,
+        )
+        batch, steps, classes = pointer_logits.shape
+        candidates = classes - 1
+        if teacher.shape != (batch, steps):
+            raise ValueError("pointer teacher/logit shape mismatch")
+        per_step = F.cross_entropy(
+            pointer_logits.reshape(batch * steps, classes),
+            teacher.reshape(batch * steps),
+            ignore_index=-100,
+            reduction="none",
+        ).view(batch, steps)
+        active = teacher >= 0
+        stop_target = teacher == candidates
+        step_weight = torch.where(
+            stop_target,
+            torch.full_like(per_step, float(self.cfg.pointer_stop_weight)),
+            torch.ones_like(per_step),
+        )
+        sequence_loss = (
+            per_step * step_weight * active.to(per_step.dtype)
+        ).sum() / (
+            step_weight * active.to(step_weight.dtype)
+        ).sum().clamp_min(1.0)
+
+        pairwise_quality = self.compute_set_selection_pairwise_quality(
+            outputs,
+            targets,
+        )
+        quality_target = unary_value.new_zeros((batch, candidates)).float()
+        for batch_index, quality in enumerate(pairwise_quality):
+            if quality.numel() > 0:
+                quality_target[batch_index] = quality.amax(dim=-1).to(
+                    device=quality_target.device,
+                    dtype=quality_target.dtype,
+                )
+        unary_logits = unary_value.float()
+        probability = torch.sigmoid(unary_logits)
+        modulation = (quality_target - probability).abs().pow(
+            float(self.cfg.set_selection_focal_beta)
+        )
+        quality_loss = (
+            modulation
+            * F.binary_cross_entropy_with_logits(
+                unary_logits,
+                quality_target,
+                reduction="none",
+            )
+        ).mean()
+        total = sequence_loss + float(
+            self.cfg.pointer_quality_weight
+        ) * quality_loss
+
+        stop_rows = torch.nonzero(stop_target, as_tuple=False)
+        if stop_rows.numel() > 0:
+            stop_probability = torch.softmax(pointer_logits, dim=-1)[
+                stop_rows[:, 0],
+                stop_rows[:, 1],
+                candidates,
+            ].mean()
+        else:
+            stop_probability = total.detach() * 0.0
+        emitted = ((teacher >= 0) & (teacher < candidates)).sum(dim=-1)
+        return {
+            "total": total,
+            "sequence": sequence_loss,
+            "quality": quality_loss,
+            "mean_emitted_target": emitted.float().mean().detach(),
+            "mean_stop_probability": stop_probability.detach(),
         }
 
     def compute_seg_loss(

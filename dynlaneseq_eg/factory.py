@@ -134,6 +134,11 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         set_selection_winner_quality_min=float(
             loss.get("set_selection_winner_quality_min", 0.30)
         ),
+        w_pointer_selection=float(loss.get("w_pointer_selection", 0.0)),
+        pointer_quality_weight=float(
+            loss.get("pointer_quality_weight", 0.5)
+        ),
+        pointer_stop_weight=float(loss.get("pointer_stop_weight", 1.0)),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

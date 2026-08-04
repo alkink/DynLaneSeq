@@ -67,6 +67,8 @@ def predictions_to_lanes(
         else None
     )
     score_mode = str(score_mode).strip().lower()
+    pointer_indices = None
+    pointer_scores = None
     if score_mode in {"exist", "existence"}:
         p_lane = exist_score
     elif score_mode in {"quality", "iou"}:
@@ -85,6 +87,48 @@ def predictions_to_lanes(
                 "postprocess score_mode='selection' requires selection_logits"
             )
         p_lane = torch.sigmoid(selection_logits.float())
+    elif score_mode in {"pointer", "sequential_pointer", "pointer_stop"}:
+        pointer_indices = outputs.get("selection_pointer_indices")
+        pointer_scores = outputs.get("selection_pointer_scores")
+        if not isinstance(pointer_indices, torch.Tensor):
+            raise ValueError(
+                "postprocess score_mode='pointer' requires "
+                "selection_pointer_indices"
+            )
+        if pointer_indices.ndim != 2 or pointer_indices.shape[0] != outputs[
+            "pred_x_rows"
+        ].shape[0]:
+            raise ValueError("selection_pointer_indices must have shape [B,K]")
+        if pointer_scores is not None and (
+            not isinstance(pointer_scores, torch.Tensor)
+            or pointer_scores.shape != pointer_indices.shape
+        ):
+            raise ValueError("selection_pointer_scores must match pointer indices")
+        p_lane = outputs["pred_x_rows"].new_zeros(
+            outputs["pred_x_rows"].shape[:2],
+            dtype=torch.float32,
+        )
+        safe_indices = pointer_indices.clamp(
+            min=0,
+            max=max(int(p_lane.shape[1]) - 1, 0),
+        )
+        valid_pointer = pointer_indices >= 0
+        selected_score = (
+            pointer_scores.float()
+            if isinstance(pointer_scores, torch.Tensor)
+            else torch.ones_like(pointer_indices, dtype=torch.float32)
+        )
+        p_lane.scatter_reduce_(
+            1,
+            safe_indices,
+            torch.where(
+                valid_pointer,
+                selected_score,
+                torch.zeros_like(selected_score),
+            ),
+            reduce="amax",
+            include_self=True,
+        )
     else:
         raise ValueError(f"Unsupported postprocess score_mode: {score_mode!r}")
     pred_x = outputs["pred_x_rows"].clamp(0, input_w - 1)
@@ -100,6 +144,16 @@ def predictions_to_lanes(
     ranges_cpu = ranges.detach().cpu()
     y_rows_cpu = y_rows.detach().cpu()
     row_visibility_cpu = row_visibility.detach().cpu() if row_visibility is not None else None
+    pointer_indices_cpu = (
+        pointer_indices.detach().cpu()
+        if isinstance(pointer_indices, torch.Tensor)
+        else None
+    )
+    pointer_scores_cpu = (
+        pointer_scores.detach().float().cpu()
+        if isinstance(pointer_scores, torch.Tensor)
+        else None
+    )
     batch_lanes: list[list[list[tuple[float, float]]]] = []
     for b in range(pred_x.shape[0]):
         p_lane_b = p_lane_cpu[b]
@@ -107,8 +161,25 @@ def predictions_to_lanes(
         ranges_b = ranges_cpu[b]
         row_visibility_b = row_visibility_cpu[b] if row_visibility_cpu is not None else None
         candidates: list[tuple[float, list[tuple[float, float]]]] = []
-        for n in range(pred_x.shape[1]):
-            score = float(p_lane_b[n])
+        if pointer_indices_cpu is None:
+            candidate_rows = [
+                (n, float(p_lane_b[n])) for n in range(pred_x.shape[1])
+            ]
+        else:
+            candidate_rows = []
+            for step, candidate_value in enumerate(
+                pointer_indices_cpu[b].tolist()
+            ):
+                candidate_index = int(candidate_value)
+                if candidate_index < 0:
+                    break
+                score = (
+                    float(pointer_scores_cpu[b, step])
+                    if pointer_scores_cpu is not None
+                    else 1.0
+                )
+                candidate_rows.append((candidate_index, score))
+        for n, score in candidate_rows:
             if score < score_thresh:
                 continue
             y_min = float(ranges_b[n, 0] * input_h)

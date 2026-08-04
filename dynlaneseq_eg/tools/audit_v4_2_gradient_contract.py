@@ -193,7 +193,7 @@ def main() -> None:
         "losses": {
             key: float(value.detach().float().cpu())
             for key, value in loss_dict.items()
-            if key.startswith("loss_set_selection")
+            if key.startswith(("loss_set_selection", "loss_pointer"))
         },
         "gradients": gradients,
         "checks": checks,

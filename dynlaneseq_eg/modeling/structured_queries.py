@@ -805,6 +805,9 @@ class SetAwareLaneSelectionHead(nn.Module):
         candidate_interaction: str = "transformer",
         relation_sigma_px: float = 20.0,
         relation_hidden_dim: int = 32,
+        pointer_max_selections: int = 4,
+        pointer_min_valid_rows: int = 5,
+        pointer_similarity_prior: float = 0.5,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -820,6 +823,9 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.candidate_interaction = str(candidate_interaction).strip().lower()
         self.relation_sigma_px = float(relation_sigma_px)
         self.relation_dim = 6
+        self.pointer_max_selections = int(pointer_max_selections)
+        self.pointer_min_valid_rows = int(pointer_min_valid_rows)
+        self.pointer_similarity_prior = float(pointer_similarity_prior)
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -832,14 +838,21 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("set_selection.prior_prob must be between zero and one")
         if self.relation_sigma_px <= 0.0:
             raise ValueError("set_selection.relation_sigma_px must be positive")
+        if self.pointer_max_selections < 1:
+            raise ValueError("set_selection.pointer_max_selections must be positive")
+        if self.pointer_min_valid_rows < 1:
+            raise ValueError("set_selection.pointer_min_valid_rows must be positive")
+        if self.pointer_similarity_prior < 0.0:
+            raise ValueError("set_selection.pointer_similarity_prior must be non-negative")
         if self.candidate_interaction not in {
             "independent",
             "transformer",
             "relation_transformer",
+            "sequential_pointer",
         }:
             raise ValueError(
                 "set_selection.candidate_interaction must be independent, "
-                "transformer, or relation_transformer"
+                "transformer, relation_transformer, or sequential_pointer"
             )
 
         # Unified mode uses two range-masked row-state summaries and optional
@@ -877,7 +890,10 @@ class SetAwareLaneSelectionHead(nn.Module):
                 enable_nested_tensor=False,
             )
             self.independent_ffn = nn.Identity()
-        elif self.candidate_interaction == "relation_transformer":
+        elif self.candidate_interaction in {
+            "relation_transformer",
+            "sequential_pointer",
+        }:
             self.encoder = RelationAwareCandidateEncoder(
                 int(hidden_dim),
                 num_layers=int(num_layers),
@@ -903,6 +919,55 @@ class SetAwareLaneSelectionHead(nn.Module):
             )
         self.output_norm = nn.LayerNorm(int(hidden_dim))
         self.output = nn.Linear(int(hidden_dim), 1)
+        if self.candidate_interaction == "sequential_pointer":
+            pointer_dim = int(hidden_dim)
+            self.pointer_key = nn.Linear(pointer_dim, pointer_dim, bias=False)
+            self.pointer_context = nn.Linear(pointer_dim, pointer_dim)
+            self.pointer_step_embedding = nn.Embedding(
+                self.pointer_max_selections,
+                pointer_dim,
+            )
+            self.pointer_query = nn.Linear(2 * pointer_dim, pointer_dim)
+            self.pointer_state_update = nn.GRUCell(pointer_dim, pointer_dim)
+            self.pointer_stop_embedding = nn.Parameter(
+                torch.randn(pointer_dim) * 0.02
+            )
+            self.pointer_stop = nn.Sequential(
+                nn.LayerNorm(3 * pointer_dim),
+                nn.Linear(3 * pointer_dim, pointer_dim),
+                nn.GELU(),
+                nn.Linear(pointer_dim, 1),
+            )
+            self.pointer_relation_bias = nn.Sequential(
+                nn.LayerNorm(self.relation_dim),
+                nn.Linear(self.relation_dim, int(relation_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(relation_hidden_dim), 1),
+            )
+            self.pointer_similarity_scale_raw = nn.Parameter(
+                torch.log(
+                    torch.expm1(
+                        torch.tensor(max(self.pointer_similarity_prior, 1e-4))
+                    )
+                )
+            )
+            self.pointer_scale = float(pointer_dim) ** -0.5
+            nn.init.zeros_(self.pointer_relation_bias[-1].weight)
+            nn.init.zeros_(self.pointer_relation_bias[-1].bias)
+            nn.init.zeros_(self.pointer_stop[-1].weight)
+            # A new selector should acquire lanes before learning to stop.
+            nn.init.constant_(self.pointer_stop[-1].bias, -2.0)
+        else:
+            self.pointer_key = None
+            self.pointer_context = None
+            self.pointer_step_embedding = None
+            self.pointer_query = None
+            self.pointer_state_update = None
+            self.register_parameter("pointer_stop_embedding", None)
+            self.pointer_stop = None
+            self.pointer_relation_bias = None
+            self.register_parameter("pointer_similarity_scale_raw", None)
+            self.pointer_scale = 1.0
         if self.unified_score:
             nn.init.normal_(self.output.weight, std=0.01)
             nn.init.constant_(
@@ -1180,6 +1245,29 @@ class SetAwareLaneSelectionHead(nn.Module):
             dim=-1,
         ).detach()
 
+    def encode_selection_features(
+        self,
+        features: torch.Tensor,
+        relations: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode detached proposal descriptors before deployment decisions."""
+
+        hidden = self.input_projection(self.input_norm(features))
+        if self.candidate_interaction == "independent":
+            hidden = hidden + self.independent_ffn(hidden)
+        if self.candidate_interaction in {
+            "relation_transformer",
+            "sequential_pointer",
+        }:
+            if relations is None:
+                raise ValueError(
+                    f"{self.candidate_interaction} requires pairwise relations"
+                )
+            hidden = self.encoder(hidden, relations)
+        else:
+            hidden = self.encoder(hidden)
+        return hidden
+
     def score_selection_features(
         self,
         features: torch.Tensor,
@@ -1187,28 +1275,287 @@ class SetAwareLaneSelectionHead(nn.Module):
     ) -> torch.Tensor:
         """Score descriptors returned by :meth:`build_selection_features`."""
 
-        hidden = self.input_projection(self.input_norm(features))
-        if self.candidate_interaction == "independent":
-            hidden = hidden + self.independent_ffn(hidden)
-        if self.candidate_interaction == "relation_transformer":
-            if relations is None:
-                raise ValueError("relation_transformer requires pairwise relations")
-            hidden = self.encoder(hidden, relations)
-        else:
-            hidden = self.encoder(hidden)
+        hidden = self.encode_selection_features(features, relations)
         return self.output(self.output_norm(hidden)).squeeze(-1).float()
+
+    def build_pointer_candidate_valid(
+        self,
+        outputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        pred_x = outputs["pred_x_rows"].detach()
+        ranges = sort_range_norm(outputs["range_norm"].detach().float())
+        rows = int(pred_x.shape[-1])
+        y_norm = torch.linspace(
+            0.0,
+            1.0,
+            rows,
+            device=pred_x.device,
+            dtype=ranges.dtype,
+        ).view(1, 1, rows)
+        visible = (
+            (y_norm >= ranges[..., :1])
+            & (y_norm <= ranges[..., 1:])
+            & torch.isfinite(pred_x)
+        )
+        return visible.sum(dim=-1) >= self.pointer_min_valid_rows
+
+    def decode_pointer(
+        self,
+        candidate_hidden: torch.Tensor,
+        relations: torch.Tensor,
+        unary_logits: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        *,
+        teacher_indices: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Autoregressively select lanes without replacement, or emit STOP.
+
+        Candidate geometry and relations have already crossed a stop-gradient
+        boundary.  Each decision observes the candidates selected by previous
+        steps, which gives the learned selector the conditional suppression
+        behavior that parallel scalar Top-K cannot represent.
+        """
+
+        if self.candidate_interaction != "sequential_pointer":
+            raise RuntimeError("pointer decoding requires sequential_pointer mode")
+        if any(
+            module is None
+            for module in (
+                self.pointer_key,
+                self.pointer_context,
+                self.pointer_step_embedding,
+                self.pointer_query,
+                self.pointer_state_update,
+                self.pointer_stop,
+                self.pointer_relation_bias,
+            )
+        ):
+            raise RuntimeError("pointer modules were not initialized")
+        batch, candidates, hidden_dim = candidate_hidden.shape
+        if relations.shape[:3] != (batch, candidates, candidates):
+            raise ValueError("pointer relation axes do not match candidates")
+        if unary_logits.shape != (batch, candidates):
+            raise ValueError("pointer unary-logit shape mismatch")
+        if candidate_valid.shape != (batch, candidates):
+            raise ValueError("pointer validity-mask shape mismatch")
+        if teacher_indices is not None and teacher_indices.shape != (
+            batch,
+            self.pointer_max_selections,
+        ):
+            raise ValueError("pointer teacher target shape mismatch")
+
+        valid_float = candidate_valid.to(candidate_hidden.dtype).unsqueeze(-1)
+        context = (candidate_hidden * valid_float).sum(dim=1)
+        context = context / valid_float.sum(dim=1).clamp_min(1.0)
+        state = torch.tanh(self.pointer_context(context))
+        keys = self.pointer_key(candidate_hidden)
+        available = candidate_valid.bool().clone()
+        selected_mask = torch.zeros_like(candidate_valid, dtype=torch.bool)
+        stopped = torch.zeros(batch, dtype=torch.bool, device=candidate_hidden.device)
+        batch_ids = torch.arange(batch, device=candidate_hidden.device)
+        logits_by_step: list[torch.Tensor] = []
+        selected_by_step: list[torch.Tensor] = []
+        selected_probability_by_step: list[torch.Tensor] = []
+        relation_bias_by_step: list[torch.Tensor] = []
+
+        for step in range(self.pointer_max_selections):
+            step_token = self.pointer_step_embedding.weight[step].view(
+                1,
+                hidden_dim,
+            ).expand(batch, -1)
+            query = self.pointer_query(torch.cat((state, step_token), dim=-1))
+            content = torch.einsum("bh,bnh->bn", query, keys)
+            content = content.float() * self.pointer_scale
+
+            selected_float = selected_mask.to(relations.dtype)
+            selected_count = selected_float.sum(dim=-1, keepdim=True)
+            relation_summary = torch.einsum(
+                "bikc,bk->bic",
+                relations,
+                selected_float,
+            ) / selected_count.clamp_min(1.0).unsqueeze(-1)
+            learned_relation_bias = self.pointer_relation_bias(
+                relation_summary
+            ).squeeze(-1).float()
+            # The sixth relation channel is the same soft strip similarity
+            # that made the frozen MMR counterfactual succeed.  Its positive,
+            # learnable scale supplies a structural duplicate penalty from
+            # the first update rather than asking a dot-product attention
+            # layer to rediscover curve distance from scratch.
+            selected_similarity = torch.einsum(
+                "bik,bk->bi",
+                relations[..., 5],
+                selected_float,
+            ) / selected_count.clamp_min(1.0)
+            similarity_scale = F.softplus(self.pointer_similarity_scale_raw)
+            relation_bias = learned_relation_bias - (
+                similarity_scale.float() * selected_similarity.float()
+            )
+            relation_bias = torch.where(
+                selected_count > 0,
+                relation_bias,
+                torch.zeros_like(relation_bias),
+            )
+            candidate_logits = unary_logits.float() + content + relation_bias
+            candidate_logits = candidate_logits.masked_fill(~available, -1e4)
+            stop_input = torch.cat((state, context, step_token), dim=-1)
+            stop_logit = self.pointer_stop(stop_input).squeeze(-1).float()
+            step_logits = torch.cat(
+                (candidate_logits, stop_logit.unsqueeze(-1)),
+                dim=-1,
+            )
+            logits_by_step.append(step_logits)
+            relation_bias_by_step.append(relation_bias)
+
+            if teacher_indices is None:
+                chosen = step_logits.argmax(dim=-1)
+                chosen = torch.where(
+                    stopped,
+                    torch.full_like(chosen, candidates),
+                    chosen,
+                )
+            else:
+                target = teacher_indices[:, step]
+                # Ignored positions occur only after the supervised STOP.
+                chosen = torch.where(
+                    target >= 0,
+                    target,
+                    torch.full_like(target, candidates),
+                )
+            chose_stop = chosen == candidates
+            chose_candidate = (chosen >= 0) & (chosen < candidates) & ~stopped
+            safe_candidate = chosen.clamp(min=0, max=max(candidates - 1, 0))
+            chosen_state = candidate_hidden[batch_ids, safe_candidate]
+            update_input = torch.where(
+                chose_candidate.unsqueeze(-1),
+                chosen_state,
+                self.pointer_stop_embedding.view(1, -1),
+            )
+            updated_state = self.pointer_state_update(update_input, state)
+            state = torch.where(stopped.unsqueeze(-1), state, updated_state)
+
+            chosen_probability = torch.softmax(step_logits, dim=-1).gather(
+                1,
+                chosen.clamp(min=0, max=candidates).unsqueeze(-1),
+            ).squeeze(-1)
+            emitted = torch.where(
+                chose_candidate,
+                chosen,
+                torch.full_like(chosen, -1),
+            )
+            selected_by_step.append(emitted)
+            selected_probability_by_step.append(
+                torch.where(
+                    chose_candidate,
+                    chosen_probability,
+                    torch.zeros_like(chosen_probability),
+                )
+            )
+            if bool(chose_candidate.any()):
+                rows = torch.nonzero(chose_candidate, as_tuple=False).flatten()
+                ids = safe_candidate[rows]
+                selected_mask[rows, ids] = True
+                available[rows, ids] = False
+            stopped = stopped | chose_stop
+
+        return {
+            "selection_pointer_logits": torch.stack(logits_by_step, dim=1),
+            "selection_pointer_indices": torch.stack(selected_by_step, dim=1),
+            "selection_pointer_scores": torch.stack(
+                selected_probability_by_step,
+                dim=1,
+            ),
+            "selection_pointer_relation_bias": torch.stack(
+                relation_bias_by_step,
+                dim=1,
+            ),
+        }
+
+    def reroll_pointer_with_teacher(
+        self,
+        outputs: dict[str, torch.Tensor],
+        teacher_indices: torch.Tensor,
+    ) -> None:
+        """Replace training pointer logits with a teacher-forced rollout."""
+
+        required = (
+            "_selection_pointer_hidden",
+            "_selection_pointer_relations",
+            "_selection_pointer_unary_logits",
+            "_selection_pointer_candidate_valid",
+        )
+        missing = [name for name in required if name not in outputs]
+        if missing:
+            raise ValueError(
+                "pointer teacher forcing is missing forward tensors: "
+                + ", ".join(missing)
+            )
+        teacher = teacher_indices.to(
+            device=outputs["_selection_pointer_hidden"].device,
+            dtype=torch.long,
+        )
+        rollout = self.decode_pointer(
+            outputs["_selection_pointer_hidden"],
+            outputs["_selection_pointer_relations"],
+            outputs["_selection_pointer_unary_logits"],
+            outputs["_selection_pointer_candidate_valid"],
+            teacher_indices=teacher,
+        )
+        # Keep greedy indices/scores from the original forward for diagnostics;
+        # only the differentiable step logits must follow the training target.
+        outputs["selection_pointer_logits"] = rollout[
+            "selection_pointer_logits"
+        ]
+        outputs["selection_pointer_teacher_indices"] = teacher
+        outputs["selection_pointer_teacher_relation_bias"] = rollout[
+            "selection_pointer_relation_bias"
+        ]
 
     def forward(
         self,
         outputs: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | dict[str, torch.Tensor]:
         features = self.build_selection_features(outputs)
         relations = (
             self.build_pairwise_relations(outputs)
-            if self.candidate_interaction == "relation_transformer"
+            if self.candidate_interaction in {
+                "relation_transformer",
+                "sequential_pointer",
+            }
             else None
         )
-        raw_logits = self.score_selection_features(features, relations)
+        hidden = self.encode_selection_features(features, relations)
+        raw_logits = self.output(self.output_norm(hidden)).squeeze(-1).float()
+        if self.candidate_interaction == "sequential_pointer":
+            if relations is None:
+                raise RuntimeError("sequential pointer has no relation tensor")
+            candidate_valid = self.build_pointer_candidate_valid(outputs)
+            # Training targets depend on the frozen final curves.  Defer the
+            # lightweight rollout until forward_with_matches has constructed
+            # those targets; otherwise we would retain an unused greedy graph
+            # and then build a second teacher-forced graph for every batch.
+            pointer = (
+                {}
+                if self.training
+                else self.decode_pointer(
+                    hidden,
+                    relations,
+                    raw_logits,
+                    candidate_valid,
+                )
+            )
+            return {
+                "selection_logits": raw_logits,
+                "selection_delta_logits": torch.zeros_like(raw_logits),
+                **pointer,
+                # Private differentiable transport used only to rerun the
+                # lightweight pointer decoder after geometry-only targets are
+                # known.  These tensors are removed from inference outputs.
+                "_selection_pointer_hidden": hidden,
+                "_selection_pointer_relations": relations,
+                "_selection_pointer_unary_logits": raw_logits,
+                "_selection_pointer_candidate_valid": candidate_valid,
+            }
         if self.unified_score:
             # Keep the legacy diagnostic key in the output contract, but make
             # its value explicit: unified mode has no residual/delta path.
@@ -1646,6 +1993,18 @@ class StructuredLaneQueryHead(nn.Module):
                 ),
                 relation_hidden_dim=int(
                     self.set_selection_cfg.get("relation_hidden_dim", 32)
+                ),
+                pointer_max_selections=int(
+                    self.set_selection_cfg.get("pointer_max_selections", 4)
+                ),
+                pointer_min_valid_rows=int(
+                    self.set_selection_cfg.get("pointer_min_valid_rows", 5)
+                ),
+                pointer_similarity_prior=float(
+                    self.set_selection_cfg.get(
+                        "pointer_similarity_prior",
+                        0.5,
+                    )
                 ),
             )
             if self.set_selection_enabled
@@ -2194,9 +2553,13 @@ class StructuredLaneQueryHead(nn.Module):
                         curve_x,
                     )
                 )
-            selection_logits, selection_delta_logits = self.set_selection_head(outputs)
-            outputs["selection_logits"] = selection_logits
-            outputs["selection_delta_logits"] = selection_delta_logits
+            selection_result = self.set_selection_head(outputs)
+            if isinstance(selection_result, dict):
+                outputs.update(selection_result)
+            else:
+                selection_logits, selection_delta_logits = selection_result
+                outputs["selection_logits"] = selection_logits
+                outputs["selection_delta_logits"] = selection_delta_logits
         row_tokens = outputs["structured_row_tokens"]
         if not isinstance(row_tokens, torch.Tensor):
             raise TypeError("structured_row_tokens must be a tensor")
@@ -2211,6 +2574,14 @@ class StructuredLaneQueryHead(nn.Module):
             }
             if "selection_logits" in outputs:
                 inference_outputs["selection_logits"] = outputs["selection_logits"]
+            for name in (
+                "selection_pointer_logits",
+                "selection_pointer_indices",
+                "selection_pointer_scores",
+                "selection_pointer_relation_bias",
+            ):
+                if name in outputs:
+                    inference_outputs[name] = outputs[name]
             for name in (
                 "bounded_delta_max_abs_by_layer",
                 "bounded_delta_mean_abs_by_layer",

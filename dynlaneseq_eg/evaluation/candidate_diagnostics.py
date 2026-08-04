@@ -22,12 +22,15 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 STAGE_TENSOR_FIELDS = (
     "pred_x_rows",
     "exist_logits",
     "quality_logits",
     "selection_logits",
+    "selection_pointer_logits",
+    "selection_pointer_indices",
+    "selection_pointer_scores",
     "range_norm",
     "row_visibility_logits",
 )
@@ -327,6 +330,26 @@ def stage_scores(
         if selection is None:
             raise ValueError("selection score mode requires selection_logits")
         score = torch.sigmoid(selection.float())
+    elif mode in {"pointer", "sequential_pointer", "pointer_stop"}:
+        indices = stage.get("selection_pointer_indices")
+        pointer_scores = stage.get("selection_pointer_scores")
+        if not isinstance(indices, torch.Tensor):
+            raise ValueError("pointer score mode requires selection_pointer_indices")
+        score = pred_x.new_zeros((pred_x.shape[0],), dtype=torch.float32)
+        safe = indices.clamp(min=0, max=max(int(pred_x.shape[0]) - 1, 0))
+        valid = indices >= 0
+        values = (
+            pointer_scores.float()
+            if isinstance(pointer_scores, torch.Tensor)
+            else torch.ones_like(indices, dtype=torch.float32)
+        )
+        score.scatter_reduce_(
+            0,
+            safe,
+            torch.where(valid, values, torch.zeros_like(values)),
+            reduce="amax",
+            include_self=True,
+        )
     else:
         logits = stage.get("exist_logits")
         if logits is None:

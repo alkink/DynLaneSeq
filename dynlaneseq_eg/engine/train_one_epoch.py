@@ -8,6 +8,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from dynlaneseq_eg.modeling.common import nested_to_device
+from dynlaneseq_eg.losses.loss_s0 import build_pointer_sequence_targets
 from .frozen_training import set_frozen_detector_eval
 from .logger import match_stats
 
@@ -70,12 +71,37 @@ def _sampler_beta(cfg: dict[str, Any], iteration: int) -> float:
     return beta_end
 
 
+def _apply_pointer_teacher_forcing(model, outputs, targets, cfg) -> None:
+    if not isinstance(outputs, dict):
+        return
+    root_model = getattr(model, "_orig_mod", model)
+    structured = getattr(root_model, "structured_query_head", None)
+    selector = getattr(structured, "set_selection_head", None)
+    if selector is None or getattr(
+        selector,
+        "candidate_interaction",
+        "",
+    ) != "sequential_pointer":
+        return
+    loss_cfg = cfg.get("loss", {})
+    teacher = build_pointer_sequence_targets(
+        outputs,
+        targets,
+        max_selections=int(selector.pointer_max_selections),
+        input_h=int(loss_cfg.get("input_h", cfg.get("model", {}).get("input_h", 288))),
+        line_width=float(loss_cfg.get("set_selection_line_width", 30.0)),
+        min_valid_rows=int(loss_cfg.get("set_selection_min_valid_rows", 5)),
+    )
+    selector.reroll_pointer_with_teacher(outputs, teacher)
+
+
 def forward_with_matches(model, images, targets, matcher, cfg, iteration):
     name = cfg.get("model", {}).get("name", "DynLaneSeqS0")
     if name in {"DynLaneSeqS2", "DynLaneSeqS3"}:
         probe = model(images, sampler_alpha=0.0)
         matches = matcher(probe["coarse"], targets)
         outputs = model(images, targets=targets, matches=matches, sampler_alpha=_sampler_alpha(cfg, iteration))
+        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
         return outputs, matches
     if name == "DynLaneSeqS4":
         probe = model(images, sampler_alpha=0.0, sampler_beta=0.0)
@@ -87,6 +113,7 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             sampler_alpha=_sampler_alpha(cfg, iteration),
             sampler_beta=_sampler_beta(cfg, iteration),
         )
+        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
         return outputs, matches
     outputs = model(images)
     aux_outputs = outputs.get("aux_outputs") if isinstance(outputs, dict) else None
@@ -168,6 +195,7 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             outputs["_training_auxiliary_aux_matches"] = all_matches[
                 main_count + 1 :
             ]
+        _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
         return outputs, matches
     if (
         isinstance(aux_outputs, (list, tuple))
@@ -185,6 +213,7 @@ def forward_with_matches(model, images, targets, matcher, cfg, iteration):
             outputs["_aux_matches"] = all_matches[1:]
     else:
         matches = matcher(outputs, targets)
+    _apply_pointer_teacher_forcing(model, outputs, targets, cfg)
     return outputs, matches
 
 

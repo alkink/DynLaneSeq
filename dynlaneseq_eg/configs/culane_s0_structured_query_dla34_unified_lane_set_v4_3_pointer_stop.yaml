@@ -1,0 +1,38 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_2_score_r1_generic_semantic.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_3_pointer_stop_gate/pointer_stop
+
+# V4.3 keeps the successful V4 geometry immutable.  Unlike V4.1/V4.2, the
+# deployment decision is not 32 parallel scalar scores followed by Top-K.
+# It is a stateful, without-replacement policy: after every emitted lane the
+# next decision observes its explicit curve relation to all remaining lanes,
+# and any step may emit STOP/no-lane.
+model:
+  structured_query:
+    set_selection:
+      candidate_interaction: sequential_pointer
+      pointer_max_selections: 4
+      pointer_min_valid_rows: 5
+      pointer_similarity_prior: 0.50
+      relation_sigma_px: 20.0
+      relation_hidden_dim: 32
+
+loss:
+  w_set_selection: 0.0
+  w_pointer_selection: 1.0
+  pointer_quality_weight: 0.50
+  pointer_stop_weight: 1.0
+
+postprocess:
+  score_mode: pointer
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  max_iters: 15000
+  # Only one compact final delta is written.  This avoids the trajectory disk
+  # failure encountered by V4.1/V4.2 while retaining a resumable final scorer.
+  checkpoint_interval: 0
+  checkpoint_include_optimizer: false
+  save_last_alias: false

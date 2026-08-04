@@ -418,6 +418,13 @@ def main() -> None:
     )
 
     method_names = ["score_top4"]
+    pointer_mode = score_mode in {
+        "pointer",
+        "sequential_pointer",
+        "pointer_stop",
+    }
+    if pointer_mode:
+        method_names.append("pointer_greedy")
     method_names.extend(
         f"hard_diverse_{_float_tag(distance)}px"
         for distance in args.hard_diversity_distances
@@ -474,11 +481,17 @@ def main() -> None:
             min_valid_rows=args.min_valid_rows,
             row_visibility_thresh=args.row_visibility_thresh,
         )
-        scores = stage_scores(
-            stage,
-            quality_power=0.0,
-            score_mode=score_mode,
-        ).cpu()
+        if pointer_mode:
+            unary_logits = stage.get("selection_logits")
+            if not isinstance(unary_logits, torch.Tensor):
+                raise ValueError("pointer diagnostics require selection_logits")
+            scores = torch.sigmoid(unary_logits.float()).cpu()
+        else:
+            scores = stage_scores(
+                stage,
+                quality_power=0.0,
+                score_mode=score_mode,
+            ).cpu()
         valid_ids = _valid_ids(candidate_valid)
         probability_mass.append(float(scores[candidate_valid].sum()))
         target_lane_counts.append(float(iou.shape[0]))
@@ -496,6 +509,23 @@ def main() -> None:
             min_overlap_points=args.nms_min_overlap_points,
         )
         selections: dict[str, list[int]] = {"score_top4": raw_ids}
+        if pointer_mode:
+            pointer_indices = stage.get("selection_pointer_indices")
+            if not isinstance(pointer_indices, torch.Tensor):
+                raise ValueError(
+                    "pointer diagnostics require selection_pointer_indices"
+                )
+            pointer_ids: list[int] = []
+            valid_id_set = set(valid_ids)
+            for value in pointer_indices.tolist():
+                candidate = int(value)
+                if candidate < 0:
+                    break
+                if candidate in valid_id_set and candidate not in pointer_ids:
+                    pointer_ids.append(candidate)
+                if len(pointer_ids) >= int(args.top_k):
+                    break
+            selections["pointer_greedy"] = pointer_ids
         hard_pools: dict[float, list[int]] = {}
         for hard_distance in args.hard_diversity_distances:
             hard_distance = float(hard_distance)
@@ -511,7 +541,7 @@ def main() -> None:
                 top_k=args.top_k,
                 row_visibility_thresh=args.row_visibility_thresh,
                 allowed_ids=valid_ids,
-                score_mode=score_mode,
+                score_mode="selection" if pointer_mode else score_mode,
             )
             name = f"hard_diverse_{_float_tag(hard_distance)}px"
             selections[name] = [int(index) for index in trace["selected_ids"]]
@@ -633,9 +663,10 @@ def main() -> None:
             "the best diversity grid row are not deployable benchmark results."
         ),
         "selection_rule": (
-            "Threshold-free Top-4 on identical candidates: scalar score, "
-            "score-ordered hard curve diversity, MMR curve diversity, and "
-            "maximum-cardinality official-IoU Oracle Top-4."
+            "Identical frozen candidates: unary scalar Top-4, optional learned "
+            "sequential pointer with explicit STOP, score-ordered hard curve "
+            "diversity, MMR curve diversity, and maximum-cardinality official-"
+            "IoU Oracle Top-4."
         ),
         "metadata": metadata_for_json(
             cache,
