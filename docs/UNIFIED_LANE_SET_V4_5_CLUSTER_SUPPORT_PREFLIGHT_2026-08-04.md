@@ -15,11 +15,14 @@ The audit answers four contract questions:
    how high-quality is the representative target distribution?
 4. Do two GT clusters share candidate support, making independent categorical
    teacher sampling unsafe?
+5. Which row-strip representability threshold best retains the official CULane
+   IoU `0.50` candidate oracle without teaching avoidable false positives?
 
-The preflight deliberately compares `support_min=0.45` and `0.50`. Because the
-CULane evaluator counts a TP only for IoU strictly greater than `0.50`, the
-report explicitly measures probability mass assigned to candidates at or below
-that boundary.
+The runner scans row-strip representability thresholds from `0.00` through
+`0.50`, ties each cluster support floor to the scanned threshold, and evaluates
+the resulting ideal teacher set with official raster IoU at `0.50` and `0.75`.
+This calibration is necessary because a numeric `0.50` in the differentiable
+row-strip surrogate is not assumed to equal an official raster IoU of `0.50`.
 
 Run:
 
@@ -36,7 +39,8 @@ outputs/diagnostics/unified_lane_set_v4_5_cluster_support_preflight.json
 
 This command does not train. It reuses its candidate cache when present;
 otherwise it performs one frozen V4-50k inference pass over the uniform-256
-diagnostic subset.
+diagnostic subset. Official raster IoU is computed on CPU and stored back into
+the same cache.
 
 Do not launch V4.5 training merely because the report contains a mechanically
 eligible row. First inspect joint-support coverage, sub-threshold target mass,

@@ -14,6 +14,8 @@ from scipy.optimize import linear_sum_assignment
 
 from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     cardinality_oracle_assignment,
+    diagnostic_iou_matrix,
+    ensure_official_iou_cache,
     evaluator_hungarian_assignment,
     load_or_collect_cache,
     proposal_gt_iou_matrix,
@@ -38,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batches", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--metric-workers", type=int, default=8)
     parser.add_argument(
         "--sample-strategy",
         choices=("uniform", "sequential"),
@@ -50,6 +53,9 @@ def parse_args() -> argparse.Namespace:
         "--representable-thresholds", type=float, nargs="+", default=[0.50]
     )
     parser.add_argument(
+        "--official-thresholds", type=float, nargs="+", default=[0.50, 0.75]
+    )
+    parser.add_argument(
         "--support-mins", type=float, nargs="+", default=[0.45, 0.50]
     )
     parser.add_argument(
@@ -57,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--temperatures", type=float, nargs="+", default=[0.03, 0.05, 0.10]
+    )
+    parser.add_argument(
+        "--support-min-mode",
+        choices=("grid", "representable"),
+        default="grid",
+        help=(
+            "Use the explicit --support-mins grid, or tie each support floor "
+            "to its row-surrogate representability threshold."
+        ),
     )
     parser.add_argument("--output-json", required=True)
     return parser.parse_args()
@@ -192,6 +207,7 @@ def analyze_cluster_support_image(
     quality_deltas: tuple[float, ...],
     temperatures: tuple[float, ...],
     top_k: int,
+    tie_support_min_to_representable: bool = False,
 ) -> dict[str, Any]:
     q = quality.detach().cpu().float()
     valid = candidate_valid.detach().cpu().bool()
@@ -255,7 +271,10 @@ def analyze_cluster_support_image(
             if joint_gt_ids
             else q.new_zeros((0, int(q.shape[1])))
         )
-        for support_min in support_mins:
+        effective_support_mins = (
+            (threshold,) if tie_support_min_to_representable else support_mins
+        )
+        for support_min in effective_support_mins:
             for quality_delta in quality_deltas:
                 for temperature in temperatures:
                     key = _grid_key(
@@ -378,6 +397,340 @@ def analyze_cluster_support_image(
                     }
         result["thresholds"][f"{threshold:.3f}"] = threshold_result
     return result
+
+
+def _maximum_sum_target_pairs(
+    quality: torch.Tensor,
+    candidate_valid: torch.Tensor,
+    *,
+    top_k: int,
+) -> tuple[tuple[int, int], ...]:
+    """Replicate the current pointer teacher's ungated max-IoU assignment."""
+
+    q = quality.detach().cpu().float()
+    valid = candidate_valid.detach().cpu().bool()
+    if q.ndim != 2 or valid.ndim != 1 or int(q.shape[1]) != int(valid.numel()):
+        raise ValueError("quality must be [GT,N] and candidate_valid must be [N]")
+    valid_ids = torch.nonzero(valid, as_tuple=False).flatten().tolist()
+    if int(q.shape[0]) == 0 or not valid_ids or int(top_k) <= 0:
+        return ()
+    gt_ids_to_assign = list(range(int(q.shape[0])))
+    if len(gt_ids_to_assign) > int(top_k):
+        # Match build_pointer_sequence_targets: before Hungarian assignment,
+        # retain the K GT lanes with the strongest individually available row
+        # surrogate. CULane normally has no more than four annotated lanes, but
+        # preserving this edge-case contract keeps the calibration exact.
+        best_per_gt = q[:, valid].amax(dim=1)
+        gt_ids_to_assign = best_per_gt.topk(k=int(top_k)).indices.tolist()
+    selected = q[gt_ids_to_assign][:, valid_ids].numpy().astype(np.float64)
+    gt_ids, local_candidate_ids = linear_sum_assignment(1.0 - selected)
+    pairs = [
+        (int(gt_ids_to_assign[gt_id]), int(valid_ids[local_id]))
+        for gt_id, local_id in zip(gt_ids.tolist(), local_candidate_ids.tolist())
+    ]
+    return tuple(pairs)
+
+
+def _selection_metric(
+    official_iou: torch.Tensor,
+    pairs: tuple[tuple[int, int], ...],
+    *,
+    official_thresholds: tuple[float, ...],
+) -> dict[str, Any]:
+    candidate_ids = tuple(candidate_id for _gt_id, candidate_id in pairs)
+    direct_pair_quality = [
+        float(official_iou[gt_id, candidate_id])
+        for gt_id, candidate_id in pairs
+    ]
+    return {
+        "emitted": len(candidate_ids),
+        "direct_pair_official_quality": direct_pair_quality,
+        "direct_pairs_above_official_threshold": {
+            f"{threshold:.3f}": sum(
+                int(value > float(threshold)) for value in direct_pair_quality
+            )
+            for threshold in official_thresholds
+        },
+        "official_hits": {
+            f"{threshold:.3f}": evaluator_hungarian_assignment(
+                official_iou,
+                candidate_ids,
+                threshold=float(threshold),
+            ).hit_count
+            for threshold in official_thresholds
+        },
+    }
+
+
+def analyze_representability_calibration_image(
+    row_iou: torch.Tensor,
+    official_iou: torch.Tensor,
+    candidate_valid: torch.Tensor,
+    *,
+    surrogate_thresholds: tuple[float, ...],
+    official_thresholds: tuple[float, ...],
+    top_k: int,
+) -> dict[str, Any]:
+    """Calibrate a row-surrogate representability gate against official IoU."""
+
+    row = row_iou.detach().cpu().float()
+    official = official_iou.detach().cpu().float()
+    valid = candidate_valid.detach().cpu().bool()
+    if row.shape != official.shape:
+        raise ValueError(
+            "row/official IoU shape mismatch: "
+            f"{tuple(row.shape)} vs {tuple(official.shape)}"
+        )
+    if row.ndim != 2 or valid.shape != (int(row.shape[1]),):
+        raise ValueError("invalid row/official/candidate-valid calibration shapes")
+
+    official_oracles = {
+        f"{threshold:.3f}": cardinality_oracle_assignment(
+            official,
+            threshold=float(threshold),
+            top_k=int(top_k),
+            candidate_valid=valid,
+        ).hit_count
+        for threshold in official_thresholds
+    }
+    baseline_pairs = _maximum_sum_target_pairs(row, valid, top_k=int(top_k))
+    result: dict[str, Any] = {
+        "gt_count": int(row.shape[0]),
+        "official_oracle_hits": official_oracles,
+        "current_ungated_max_sum_teacher": _selection_metric(
+            official,
+            baseline_pairs,
+            official_thresholds=official_thresholds,
+        ),
+        "surrogate_thresholds": {},
+    }
+    valid_ids = torch.nonzero(valid, as_tuple=False).flatten()
+    row_best = (
+        row[:, valid_ids].max(dim=1).values
+        if row.shape[0] and valid_ids.numel()
+        else row.new_zeros((int(row.shape[0]),))
+    )
+    official_best = (
+        official[:, valid_ids].max(dim=1).values
+        if official.shape[0] and valid_ids.numel()
+        else official.new_zeros((int(official.shape[0]),))
+    )
+    for surrogate_threshold in surrogate_thresholds:
+        threshold = float(surrogate_threshold)
+        assignment = cardinality_oracle_assignment(
+            row,
+            threshold=threshold,
+            top_k=int(top_k),
+            candidate_valid=valid,
+        )
+        metric = _selection_metric(
+            official,
+            assignment.pairs,
+            official_thresholds=official_thresholds,
+        )
+        metric["row_assignment_quality"] = [
+            float(row[gt_id, candidate_id])
+            for gt_id, candidate_id in assignment.pairs
+        ]
+        metric["individual_gt_gate_confusion"] = {}
+        row_positive = row_best > threshold
+        for official_threshold in official_thresholds:
+            official_positive = official_best > float(official_threshold)
+            metric["individual_gt_gate_confusion"][f"{official_threshold:.3f}"] = {
+                "true_positive": int((row_positive & official_positive).sum()),
+                "false_positive": int((row_positive & ~official_positive).sum()),
+                "false_negative": int((~row_positive & official_positive).sum()),
+                "true_negative": int((~row_positive & ~official_positive).sum()),
+            }
+        result["surrogate_thresholds"][f"{threshold:.3f}"] = metric
+    return result
+
+
+def _precision_recall_f1(
+    hits: int,
+    predictions: int,
+    gt_lanes: int,
+) -> dict[str, float | int]:
+    precision = _safe_ratio(hits, predictions)
+    recall = _safe_ratio(hits, gt_lanes)
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if precision + recall > 0.0
+        else 0.0
+    )
+    return {
+        "hits": int(hits),
+        "predictions": int(predictions),
+        "gt_lanes": int(gt_lanes),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def summarize_representability_calibration(
+    rows: list[dict[str, Any]],
+    *,
+    surrogate_thresholds: tuple[float, ...],
+    official_thresholds: tuple[float, ...],
+) -> dict[str, Any]:
+    gt_lanes = sum(int(row["gt_count"]) for row in rows)
+    official_oracles = {
+        f"{threshold:.3f}": sum(
+            int(row["official_oracle_hits"][f"{threshold:.3f}"])
+            for row in rows
+        )
+        for threshold in official_thresholds
+    }
+
+    def summarize_selection(values: list[dict[str, Any]]) -> dict[str, Any]:
+        predictions = sum(int(value["emitted"]) for value in values)
+        official_metrics: dict[str, Any] = {}
+        for official_threshold in official_thresholds:
+            key = f"{official_threshold:.3f}"
+            hits = sum(int(value["official_hits"][key]) for value in values)
+            direct_hits = sum(
+                int(value["direct_pairs_above_official_threshold"][key])
+                for value in values
+            )
+            metric = _precision_recall_f1(hits, predictions, gt_lanes)
+            metric.update(
+                {
+                    "official_oracle_hits": official_oracles[key],
+                    "official_oracle_hit_retention": _safe_ratio(
+                        hits, official_oracles[key]
+                    ),
+                    "direct_identity_qualified_pairs": direct_hits,
+                }
+            )
+            official_metrics[key] = metric
+        return {
+            "predictions": predictions,
+            "official_metrics": official_metrics,
+            "direct_pair_official_quality": value_summary(
+                number
+                for value in values
+                for number in value["direct_pair_official_quality"]
+            ),
+        }
+
+    baseline_values = [row["current_ungated_max_sum_teacher"] for row in rows]
+    threshold_rows: dict[str, Any] = {}
+    for surrogate_threshold in surrogate_thresholds:
+        key = f"{float(surrogate_threshold):.3f}"
+        values = [row["surrogate_thresholds"][key] for row in rows]
+        threshold_summary = summarize_selection(values)
+        threshold_summary["row_assignment_quality"] = value_summary(
+            number for value in values for number in value["row_assignment_quality"]
+        )
+        threshold_summary["individual_gt_gate_confusion"] = {}
+        for official_threshold in official_thresholds:
+            official_key = f"{official_threshold:.3f}"
+            confusion = {
+                name: sum(
+                    int(value["individual_gt_gate_confusion"][official_key][name])
+                    for value in values
+                )
+                for name in (
+                    "true_positive",
+                    "false_positive",
+                    "false_negative",
+                    "true_negative",
+                )
+            }
+            tp = confusion["true_positive"]
+            fp = confusion["false_positive"]
+            fn = confusion["false_negative"]
+            confusion["precision"] = _safe_ratio(tp, tp + fp)
+            confusion["recall"] = _safe_ratio(tp, tp + fn)
+            threshold_summary["individual_gt_gate_confusion"][
+                official_key
+            ] = confusion
+        threshold_rows[key] = threshold_summary
+
+    primary_official_key = f"{min(official_thresholds):.3f}"
+    ranked = sorted(
+        threshold_rows.items(),
+        key=lambda item: (
+            -float(item[1]["official_metrics"][primary_official_key]["f1"]),
+            -int(item[1]["official_metrics"][primary_official_key]["hits"]),
+            int(item[1]["predictions"]),
+        ),
+    )
+    return {
+        "gt_lanes": gt_lanes,
+        "official_oracle_hits": official_oracles,
+        "current_ungated_max_sum_teacher": summarize_selection(baseline_values),
+        "surrogate_thresholds": threshold_rows,
+        "provisional_best_threshold_by_ideal_teacher_f1_at_primary_official_iou": (
+            {
+                "surrogate_threshold": float(ranked[0][0]),
+                **ranked[0][1],
+            }
+            if ranked
+            else None
+        ),
+        "warning": (
+            "This calibration chooses only which frozen GT clusters are worth "
+            "teaching. It does not measure learned pointer rollout quality."
+        ),
+    }
+
+
+def combine_teacher_contract_decision(
+    cluster_analysis: dict[str, Any],
+    calibration: dict[str, Any],
+) -> dict[str, Any]:
+    best = calibration.get(
+        "provisional_best_threshold_by_ideal_teacher_f1_at_primary_official_iou"
+    )
+    if not isinstance(best, dict):
+        return {
+            "ready_for_implementation": False,
+            "reason": "representability calibration produced no threshold",
+        }
+    threshold = float(best["surrogate_threshold"])
+    eligible = cluster_analysis.get("teacher_only_gate_screening", {}).get(
+        "eligible_configs", []
+    )
+    matching = [
+        row
+        for row in eligible
+        if abs(float(row["parameters"]["representable_threshold"]) - threshold)
+        <= 1e-9
+    ]
+    matching.sort(
+        key=lambda row: (
+            -float(row["soft_cluster_fraction"]),
+            float(row["mean_expected_regret"]),
+            float(row["expected_pair_collision_probability"]),
+        )
+    )
+    candidate = matching[0] if matching else None
+    return {
+        "ready_for_implementation": candidate is not None,
+        "row_surrogate_representability_threshold": threshold,
+        "ideal_teacher_metric_at_selected_threshold": {
+            "predictions": best["predictions"],
+            "official_metrics": best["official_metrics"],
+        },
+        "cluster_soft_target": candidate,
+        "teacher_sampling": (
+            "collision_safe_one_to_one"
+            if candidate
+            and candidate["requires_collision_safe_teacher_sampling"]
+            else "independent_reproducible_categorical"
+            if candidate
+            else None
+        ),
+        "free_model_rollout_weight": 0.0,
+        "unary_target_mode": "max_quality",
+        "unary_quality_weight": 0.10,
+        "warning": (
+            "This is still a uniform-subset training-contract decision. The "
+            "trained pointer must pass its trajectory and full-validation gates."
+        ),
+    }
 
 
 def summarize_cluster_support(
@@ -639,11 +992,16 @@ def main() -> None:
     representable_thresholds = tuple(
         sorted(set(float(value) for value in args.representable_thresholds))
     )
+    official_thresholds = tuple(
+        sorted(set(float(value) for value in args.official_thresholds))
+    )
     support_mins = tuple(sorted(set(float(value) for value in args.support_mins)))
     quality_deltas = tuple(sorted(set(float(value) for value in args.quality_deltas)))
     temperatures = tuple(sorted(set(float(value) for value in args.temperatures)))
     if not representable_thresholds:
         raise ValueError("at least one representable threshold is required")
+    if not official_thresholds:
+        raise ValueError("at least one official threshold is required")
     if not support_mins or not quality_deltas or not temperatures:
         raise ValueError("support-min, quality-delta and temperature grids are required")
     if any(value <= 0.0 for value in temperatures):
@@ -668,7 +1026,15 @@ def main() -> None:
         sample_strategy=str(args.sample_strategy),
         desc="V4.5 cluster-support preflight",
     )
+    cache = ensure_official_iou_cache(
+        cache,
+        line_width=float(args.line_width),
+        min_valid_rows=int(args.min_valid_rows),
+        row_visibility_thresh=0.0,
+        workers=int(args.metric_workers),
+    )
     rows: list[dict[str, Any]] = []
+    calibration_rows: list[dict[str, Any]] = []
     for record in cache["records"]:
         stage_name = _stage_name(record)
         stage = record["stages"][stage_name]
@@ -681,6 +1047,14 @@ def main() -> None:
             min_valid_rows=int(args.min_valid_rows),
             row_visibility_thresh=0.0,
         )
+        official, official_valid_gt, official_candidate_valid = diagnostic_iou_matrix(
+            record,
+            stage_name,
+            use_official=True,
+        )
+        if int(_valid_gt.sum()) != int(official_valid_gt.sum()):
+            raise ValueError("row-surrogate and official valid GT counts differ")
+        candidate_valid = candidate_valid.bool() & official_candidate_valid.bool()
         rows.append(
             analyze_cluster_support_image(
                 quality,
@@ -690,9 +1064,31 @@ def main() -> None:
                 quality_deltas=quality_deltas,
                 temperatures=temperatures,
                 top_k=int(args.top_k),
+                tie_support_min_to_representable=(
+                    str(args.support_min_mode) == "representable"
+                ),
+            )
+        )
+        calibration_rows.append(
+            analyze_representability_calibration_image(
+                quality,
+                official,
+                candidate_valid,
+                surrogate_thresholds=representable_thresholds,
+                official_thresholds=official_thresholds,
+                top_k=int(args.top_k),
             )
         )
 
+    cluster_analysis = summarize_cluster_support(
+        rows,
+        representable_thresholds=representable_thresholds,
+    )
+    official_calibration = summarize_representability_calibration(
+        calibration_rows,
+        surrogate_thresholds=representable_thresholds,
+        official_thresholds=official_thresholds,
+    )
     report = {
         "experiment": "V4.5 GT-cluster soft-target support preflight",
         "diagnostic_only": True,
@@ -721,7 +1117,9 @@ def main() -> None:
         },
         "contract_grid": {
             "representable_thresholds": list(representable_thresholds),
+            "official_thresholds": list(official_thresholds),
             "support_mins": list(support_mins),
+            "support_min_mode": str(args.support_min_mode),
             "quality_deltas": list(quality_deltas),
             "temperatures": list(temperatures),
             "top_k": int(args.top_k),
@@ -731,9 +1129,13 @@ def main() -> None:
                 "lexicographic maximum cardinality first, detached IoU second"
             ),
         },
-        "analysis": summarize_cluster_support(
-            rows,
-            representable_thresholds=representable_thresholds,
+        "analysis": cluster_analysis,
+        "official_representability_calibration": official_calibration,
+        "combined_teacher_contract_decision": (
+            combine_teacher_contract_decision(
+                cluster_analysis,
+                official_calibration,
+            )
         ),
         "decision_rule": (
             "Do not start V4.5 from this report alone. Prefer support with no "

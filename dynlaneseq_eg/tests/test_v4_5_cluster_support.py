@@ -9,9 +9,12 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
 )
 from dynlaneseq_eg.tools.analyze_v4_5_cluster_support import (
     analyze_cluster_support_image,
+    analyze_representability_calibration_image,
     cluster_soft_distribution,
+    combine_teacher_contract_decision,
     maximum_cardinality_support_assignment,
     summarize_cluster_support,
+    summarize_representability_calibration,
 )
 
 
@@ -129,3 +132,88 @@ def test_disjoint_clusters_need_no_collision_safe_teacher_sampler() -> None:
     preferred = report["teacher_only_gate_screening"]["provisional_preferred"]
     assert preferred is not None
     assert preferred["requires_collision_safe_teacher_sampling"] is False
+
+
+def test_official_calibration_rejects_an_over_strict_surrogate_threshold() -> None:
+    # The row surrogate preserves the correct ordering but is numerically lower
+    # than official raster IoU. A literal row threshold of .50 would therefore
+    # suppress both deployable lanes, while .30 retains them.
+    row_iou = torch.tensor([[0.40, 0.05], [0.05, 0.40]])
+    official_iou = torch.tensor([[0.90, 0.05], [0.05, 0.90]])
+    image = analyze_representability_calibration_image(
+        row_iou,
+        official_iou,
+        torch.ones(2, dtype=torch.bool),
+        surrogate_thresholds=(0.30, 0.50),
+        official_thresholds=(0.50, 0.75),
+        top_k=4,
+    )
+    report = summarize_representability_calibration(
+        [image],
+        surrogate_thresholds=(0.30, 0.50),
+        official_thresholds=(0.50, 0.75),
+    )
+    loose = report["surrogate_thresholds"]["0.300"]
+    strict = report["surrogate_thresholds"]["0.500"]
+    assert loose["official_metrics"]["0.500"]["hits"] == 2
+    assert loose["official_metrics"]["0.750"]["hits"] == 2
+    assert strict["official_metrics"]["0.500"]["hits"] == 0
+    assert report[
+        "provisional_best_threshold_by_ideal_teacher_f1_at_primary_official_iou"
+    ]["surrogate_threshold"] == pytest.approx(0.30)
+
+
+def test_representable_support_mode_ties_floor_to_each_threshold() -> None:
+    row = analyze_cluster_support_image(
+        torch.tensor([[0.40, 0.36, 0.10]]),
+        torch.ones(3, dtype=torch.bool),
+        representable_thresholds=(0.30,),
+        support_mins=(0.50,),
+        quality_deltas=(0.05,),
+        temperatures=(0.05,),
+        top_k=4,
+        tie_support_min_to_representable=True,
+    )
+    grid = next(iter(row["thresholds"]["0.300"]["grids"].values()))
+    assert grid["support_min"] == pytest.approx(0.30)
+    assert grid["support_sizes"] == [2.0]
+
+
+def test_combined_decision_uses_officially_calibrated_threshold() -> None:
+    cluster_rows = [
+        analyze_cluster_support_image(
+            torch.tensor([[0.40, 0.36, 0.10]]),
+            torch.ones(3, dtype=torch.bool),
+            representable_thresholds=(0.30, 0.50),
+            support_mins=(0.0,),
+            quality_deltas=(0.05,),
+            temperatures=(0.05,),
+            top_k=4,
+            tie_support_min_to_representable=True,
+        )
+    ]
+    cluster = summarize_cluster_support(
+        cluster_rows,
+        representable_thresholds=(0.30, 0.50),
+    )
+    calibration_image = analyze_representability_calibration_image(
+        torch.tensor([[0.40, 0.36, 0.10]]),
+        torch.tensor([[0.90, 0.80, 0.05]]),
+        torch.ones(3, dtype=torch.bool),
+        surrogate_thresholds=(0.30, 0.50),
+        official_thresholds=(0.50,),
+        top_k=4,
+    )
+    calibration = summarize_representability_calibration(
+        [calibration_image],
+        surrogate_thresholds=(0.30, 0.50),
+        official_thresholds=(0.50,),
+    )
+    decision = combine_teacher_contract_decision(cluster, calibration)
+    assert decision["ready_for_implementation"] is True
+    assert decision["row_surrogate_representability_threshold"] == pytest.approx(
+        0.30
+    )
+    assert decision["cluster_soft_target"]["parameters"][
+        "representable_threshold"
+    ] == pytest.approx(0.30)

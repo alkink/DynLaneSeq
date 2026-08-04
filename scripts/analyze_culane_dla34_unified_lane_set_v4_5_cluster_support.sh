@@ -13,6 +13,7 @@ DEVICE="${DEVICE:-cuda}"
 MAX_BATCHES="${MAX_BATCHES:-64}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+METRIC_WORKERS="${METRIC_WORKERS:-12}"
 REQUIRE_CACHE="${REQUIRE_CACHE:-0}"
 
 if [[ ! -f "${CONFIG}" ]]; then
@@ -32,7 +33,7 @@ if [[ "${REQUIRE_CACHE}" == "1" ]]; then
 fi
 
 echo "V4.5 GT-cluster soft-target support preflight"
-echo "No training will run. A single frozen-geometry cache pass runs only if needed."
+echo "No training will run. Frozen predictions are reused; official IoU runs on CPU."
 echo "checkpoint: ${CKPT}"
 echo "output: ${OUTPUT_JSON}"
 
@@ -47,12 +48,15 @@ echo "output: ${OUTPUT_JSON}"
   --max-batches "${MAX_BATCHES}" \
   --eval-batch-size "${EVAL_BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
+  --metric-workers "${METRIC_WORKERS}" \
   --sample-strategy uniform \
   --line-width 30 \
   --min-valid-rows 5 \
   --top-k 4 \
-  --representable-thresholds 0.50 \
-  --support-mins 0.45 0.50 \
+  --representable-thresholds 0.00 0.10 0.20 0.25 0.30 0.325 0.35 0.375 0.40 0.425 0.45 0.475 0.50 \
+  --official-thresholds 0.50 0.75 \
+  --support-mins 0.00 \
+  --support-min-mode representable \
   --quality-deltas 0.03 0.05 0.10 \
   --temperatures 0.03 0.05 0.10 \
   --output-json "${OUTPUT_JSON}" \
