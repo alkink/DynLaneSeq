@@ -72,7 +72,8 @@ if (( actual_source_iteration != SOURCE_ITERATION )); then
   exit 1
 fi
 
-"${PYTHON}" - "${OUTPUT_ROOT}" "${MIN_FREE_GB}" <<'PY'
+if [[ "${RUN_TRAIN}" == "1" ]]; then
+  "${PYTHON}" - "${OUTPUT_ROOT}" "${MIN_FREE_GB}" <<'PY'
 import shutil
 import sys
 from pathlib import Path
@@ -87,6 +88,10 @@ if free < minimum:
         f"need at least {minimum / 1024 ** 3:.2f} GiB"
     )
 PY
+else
+  mkdir -p "${OUTPUT_ROOT}"
+  echo "[SKIP] checkpoint free-space gate (RUN_TRAIN=0)"
+fi
 
 "${PYTHON}" - "${arm_configs[@]}" <<'PY'
 import sys
