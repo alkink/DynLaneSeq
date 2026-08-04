@@ -1295,12 +1295,15 @@ class SetAwareLaneSelectionHead(nn.Module):
         pred_x = outputs["pred_x_rows"].detach()
         ranges = sort_range_norm(outputs["range_norm"].detach().float())
         rows = int(pred_x.shape[-1])
-        y_norm = torch.linspace(
-            0.0,
-            1.0,
-            rows,
-            device=pred_x.device,
-            dtype=ranges.dtype,
+        # Keep this grid bit-for-bit consistent with
+        # pairwise_range_aware_row_strip_iou.  ``fixed_y_rows`` places row r
+        # at r * input_h / rows, hence its normalized coordinate is r / rows
+        # (the last row is *not* 1.0).  ``linspace(0, 1, rows)`` previously
+        # disagreed at range boundaries and could make a Hungarian target
+        # valid for the target builder but invalid for the pointer decoder.
+        y_norm = (
+            torch.arange(rows, device=pred_x.device, dtype=ranges.dtype)
+            / float(rows)
         ).view(1, 1, rows)
         visible = (
             (y_norm >= ranges[..., :1])

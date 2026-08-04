@@ -122,6 +122,47 @@ def test_pointer_targets_are_left_to_right_unique_then_stop() -> None:
     assert sequence.tolist() == [[1, 0, 3, -100]]
 
 
+def test_pointer_targets_never_assign_an_invalid_candidate() -> None:
+    outputs = {
+        "pred_x_rows": torch.tensor(
+            [[[10.0] * 8, [50.0] * 8]]
+        ),
+        # Candidate 0 has no row on the fixed r / R grid.  It is a tempting
+        # zero-cost tie because its x agrees with the GT, but it cannot be
+        # emitted by the pointer and therefore must not enter the teacher set.
+        "range_norm": torch.tensor([[[0.90, 1.0], [0.0, 1.0]]]),
+    }
+    targets = [
+        {
+            "x_rows": torch.tensor([[10.0] * 8]),
+            "valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        }
+    ]
+    sequence = build_pointer_sequence_targets(
+        outputs,
+        targets,
+        max_selections=4,
+        input_h=32,
+        line_width=12.0,
+        min_valid_rows=2,
+    )
+    assert sequence.tolist() == [[1, 2, -100, -100]]
+
+
+def test_pointer_validity_uses_the_same_fixed_row_grid_as_targets() -> None:
+    selector = _selector()
+    outputs = {
+        "pred_x_rows": torch.zeros(1, 2, 8),
+        # On r / 8, [0.85, 1] contains only r=7 (0.875), so it is invalid
+        # for min_valid_rows=2.  linspace(0, 1, 8) incorrectly counted both
+        # 0.857 and 1.0 and caused the production teacher-mask crash.
+        "range_norm": torch.tensor([[[0.85, 1.0], [0.74, 1.0]]]),
+    }
+    assert selector.build_pointer_candidate_valid(outputs).tolist() == [
+        [False, True]
+    ]
+
+
 def test_pointer_loss_backpropagates_through_sequence_and_unary_quality() -> None:
     pointer_logits = torch.randn(1, 4, 4, requires_grad=True)
     unary_logits = torch.randn(1, 3, requires_grad=True)

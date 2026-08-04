@@ -48,7 +48,7 @@ def build_pointer_sequence_targets(
             dtype=pred_x.dtype,
         )
         gt_valid = target["valid_mask"].to(pred_x.device).bool()
-        quality, _candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
+        quality, candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
             pred_x[batch_index],
             ranges[batch_index],
             gt_x,
@@ -61,7 +61,17 @@ def build_pointer_sequence_targets(
         if gt_ids.numel() == 0:
             sequence[batch_index, 0] = candidates
             continue
-        quality = quality[:, gt_ids]
+        candidate_ids = torch.nonzero(
+            candidate_valid,
+            as_tuple=False,
+        ).flatten()
+        if candidate_ids.numel() == 0:
+            # The frozen candidate pool has no deployable curve for this
+            # image.  Teaching an invalid ID would contradict the pointer's
+            # inference mask and used to crash the set-teacher reroll.
+            sequence[batch_index, 0] = candidates
+            continue
+        quality = quality[candidate_ids][:, gt_ids]
         if int(gt_ids.numel()) > steps:
             # CULane normally has at most four lanes.  If an annotation exceeds
             # deployment cardinality, retain the lanes the frozen pool can
@@ -87,7 +97,7 @@ def build_pointer_sequence_targets(
             else:
                 tail = visible_ids[-min(5, int(visible_ids.numel())) :]
                 bottom_x = float(gt_x[gt_index, tail].median())
-            pairs.append((bottom_x, int(pred_value)))
+            pairs.append((bottom_x, int(candidate_ids[int(pred_value)])))
         pairs.sort(key=lambda row: row[0])
         count = min(len(pairs), steps)
         if count > 0:
