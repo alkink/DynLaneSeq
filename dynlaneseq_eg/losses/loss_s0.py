@@ -148,6 +148,7 @@ class LossConfig:
     w_pointer_selection: float = 0.0
     pointer_quality_weight: float = 0.5
     pointer_stop_weight: float = 1.0
+    pointer_unary_target_mode: str = "max_quality"
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -177,6 +178,9 @@ class S0Criterion(nn.Module):
     def __init__(self, cfg: LossConfig | None = None, matcher: HungarianMatcherS0 | None = None):
         super().__init__()
         self.cfg = cfg or LossConfig()
+        self.cfg.pointer_unary_target_mode = str(
+            self.cfg.pointer_unary_target_mode
+        ).strip().lower()
         self.matcher = matcher
         self._iteration = 0
         reduction = str(self.cfg.geometry_reduction).strip().lower()
@@ -208,6 +212,14 @@ class S0Criterion(nn.Module):
                 raise ValueError(f"{field_name} must be non-negative")
         if float(self.cfg.pointer_stop_weight) <= 0.0:
             raise ValueError("pointer_stop_weight must be positive")
+        if self.cfg.pointer_unary_target_mode not in {
+            "max_quality",
+            "unique_representative",
+        }:
+            raise ValueError(
+                "pointer_unary_target_mode must be max_quality or "
+                "unique_representative"
+            )
         for field_name in (
             "set_selection_duplicate_quality_min",
             "set_selection_winner_quality_min",
@@ -1473,9 +1485,11 @@ class S0Criterion(nn.Module):
 
         The sequence logits come from a teacher-forced state rollout created
         after the score-independent geometry assignment is known.  A separate
-        continuous max-IoU target teaches which representative is best inside
-        a duplicate cluster; the recurrent pointer then learns coverage and
-        conditional suppression without reopening gradients into geometry.
+        continuous unary target supplies candidate quality in the historical
+        mode.  The V4.4 set-oracle mode instead retains quality only on the
+        unique Hungarian representatives and supervises probability mass over
+        every still-valid target ordering.  Both contracts keep geometry
+        detached from selection gradients.
         """
 
         logits_value = outputs.get("selection_pointer_logits")
@@ -1500,14 +1514,51 @@ class S0Criterion(nn.Module):
         candidates = classes - 1
         if teacher.shape != (batch, steps):
             raise ValueError("pointer teacher/logit shape mismatch")
-        per_step = F.cross_entropy(
-            pointer_logits.reshape(batch * steps, classes),
-            teacher.reshape(batch * steps),
-            ignore_index=-100,
-            reduction="none",
-        ).view(batch, steps)
-        active = teacher >= 0
-        stop_target = teacher == candidates
+        teacher_class_mask = outputs.get("selection_pointer_teacher_class_mask")
+        teacher_active = outputs.get("selection_pointer_teacher_active")
+        if isinstance(teacher_class_mask, torch.Tensor):
+            if teacher_class_mask.shape != pointer_logits.shape:
+                raise ValueError("pointer set-target mask/logit shape mismatch")
+            if not isinstance(teacher_active, torch.Tensor) or teacher_active.shape != (
+                batch,
+                steps,
+            ):
+                raise ValueError("pointer set-target active-mask shape mismatch")
+            class_mask = teacher_class_mask.to(
+                device=pointer_logits.device,
+                dtype=torch.bool,
+            )
+            active = teacher_active.to(
+                device=pointer_logits.device,
+                dtype=torch.bool,
+            )
+            if bool((active & ~class_mask.any(dim=-1)).any()):
+                raise ValueError("active pointer set target has no valid class")
+            # Inactive positions occur after the supervised STOP.  Give those
+            # rows a harmless finite STOP target before masking their loss so
+            # logsumexp never produces an unused infinity.
+            safe_class_mask = class_mask.clone()
+            safe_class_mask[..., candidates] |= ~active
+            log_probability = F.log_softmax(pointer_logits, dim=-1)
+            target_log_mass = torch.logsumexp(
+                log_probability.masked_fill(~safe_class_mask, -torch.inf),
+                dim=-1,
+            )
+            per_step = torch.where(
+                active,
+                -target_log_mass,
+                torch.zeros_like(target_log_mass),
+            )
+            stop_target = class_mask[..., candidates] & active
+        else:
+            per_step = F.cross_entropy(
+                pointer_logits.reshape(batch * steps, classes),
+                teacher.reshape(batch * steps),
+                ignore_index=-100,
+                reduction="none",
+            ).view(batch, steps)
+            active = teacher >= 0
+            stop_target = teacher == candidates
         step_weight = torch.where(
             stop_target,
             torch.full_like(per_step, float(self.cfg.pointer_stop_weight)),
@@ -1524,25 +1575,65 @@ class S0Criterion(nn.Module):
             targets,
         )
         quality_target = unary_value.new_zeros((batch, candidates)).float()
+        unique_target_value = outputs.get("selection_pointer_unique_target_mask")
+        unique_target_mask = (
+            unique_target_value.to(
+                device=quality_target.device,
+                dtype=torch.bool,
+            )
+            if isinstance(unique_target_value, torch.Tensor)
+            else None
+        )
+        if unique_target_mask is not None and unique_target_mask.shape != (
+            batch,
+            candidates,
+        ):
+            raise ValueError("pointer unique-target mask shape mismatch")
         for batch_index, quality in enumerate(pairwise_quality):
             if quality.numel() > 0:
-                quality_target[batch_index] = quality.amax(dim=-1).to(
+                candidate_quality = quality.amax(dim=-1).to(
                     device=quality_target.device,
                     dtype=quality_target.dtype,
                 )
+                if self.cfg.pointer_unary_target_mode == "unique_representative":
+                    if unique_target_mask is None:
+                        raise ValueError(
+                            "unique representative unary supervision requires "
+                            "selection_pointer_unique_target_mask"
+                        )
+                    candidate_quality = candidate_quality * unique_target_mask[
+                        batch_index
+                    ].to(candidate_quality.dtype)
+                quality_target[batch_index] = candidate_quality
         unary_logits = unary_value.float()
         probability = torch.sigmoid(unary_logits)
         modulation = (quality_target - probability).abs().pow(
             float(self.cfg.set_selection_focal_beta)
         )
-        quality_loss = (
+        per_candidate_quality = (
             modulation
             * F.binary_cross_entropy_with_logits(
                 unary_logits,
                 quality_target,
                 reduction="none",
             )
-        ).mean()
+        )
+        if self.cfg.pointer_unary_target_mode == "unique_representative":
+            if unique_target_mask is None:
+                raise ValueError("pointer unique unary target mask is missing")
+            image_losses: list[torch.Tensor] = []
+            for batch_index in range(batch):
+                positive = unique_target_mask[batch_index]
+                negative = ~positive
+                if bool(positive.any()):
+                    positive_loss = per_candidate_quality[batch_index][positive].mean()
+                    negative_loss = per_candidate_quality[batch_index][negative].mean()
+                    image_losses.append(0.5 * (positive_loss + negative_loss))
+                else:
+                    image_losses.append(per_candidate_quality[batch_index].mean())
+            quality_loss = torch.stack(image_losses).mean()
+        else:
+            quality_loss = per_candidate_quality.mean()
         total = sequence_loss + float(
             self.cfg.pointer_quality_weight
         ) * quality_loss

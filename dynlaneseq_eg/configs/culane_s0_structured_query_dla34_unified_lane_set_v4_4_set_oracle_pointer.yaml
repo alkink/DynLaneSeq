@@ -1,0 +1,25 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_3_pointer_stop.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_4_set_oracle_pointer_gate/set_oracle_pointer
+
+# V4.3's target-alignment audit proved that the Hungarian representative set
+# is official-IoU optimal, while 80.85% of failed greedy trajectories already
+# diverge at the first decision.  V4.4 therefore changes the acquisition
+# contract rather than geometry or STOP:
+#
+#   * every still-unselected member of the unique target set is valid;
+#   * the model's highest-scoring valid member is fed as the dynamic teacher;
+#   * the unary head supervises only those unique representatives, instead of
+#     incorrectly raising every high-IoU duplicate;
+#   * geometry and image features remain behind the V4 stop-gradient boundary.
+model:
+  structured_query:
+    set_selection:
+      pointer_teacher_mode: permutation_invariant_set
+
+loss:
+  pointer_unary_target_mode: unique_representative
+  # Standard BCE gives mid-confidence duplicate negatives a real gradient;
+  # QFL beta=2 was intentionally weak around p=0.2 in the V4.1 audit.
+  set_selection_focal_beta: 0.0
+  pointer_quality_weight: 0.5

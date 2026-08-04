@@ -808,6 +808,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         pointer_max_selections: int = 4,
         pointer_min_valid_rows: int = 5,
         pointer_similarity_prior: float = 0.5,
+        pointer_teacher_mode: str = "fixed_sequence",
     ):
         super().__init__()
         self.dim = int(dim)
@@ -826,6 +827,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.pointer_max_selections = int(pointer_max_selections)
         self.pointer_min_valid_rows = int(pointer_min_valid_rows)
         self.pointer_similarity_prior = float(pointer_similarity_prior)
+        self.pointer_teacher_mode = str(pointer_teacher_mode).strip().lower()
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -844,6 +846,14 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("set_selection.pointer_min_valid_rows must be positive")
         if self.pointer_similarity_prior < 0.0:
             raise ValueError("set_selection.pointer_similarity_prior must be non-negative")
+        if self.pointer_teacher_mode not in {
+            "fixed_sequence",
+            "permutation_invariant_set",
+        }:
+            raise ValueError(
+                "set_selection.pointer_teacher_mode must be fixed_sequence "
+                "or permutation_invariant_set"
+            )
         if self.candidate_interaction not in {
             "independent",
             "transformer",
@@ -1307,6 +1317,7 @@ class SetAwareLaneSelectionHead(nn.Module):
         candidate_valid: torch.Tensor,
         *,
         teacher_indices: torch.Tensor | None = None,
+        teacher_candidate_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Autoregressively select lanes without replacement, or emit STOP.
 
@@ -1343,6 +1354,17 @@ class SetAwareLaneSelectionHead(nn.Module):
             self.pointer_max_selections,
         ):
             raise ValueError("pointer teacher target shape mismatch")
+        if teacher_candidate_mask is not None and teacher_candidate_mask.shape != (
+            batch,
+            candidates,
+        ):
+            raise ValueError("pointer teacher candidate-mask shape mismatch")
+        if teacher_indices is not None and teacher_candidate_mask is not None:
+            raise ValueError("pointer accepts only one teacher contract at a time")
+        if teacher_candidate_mask is not None and bool(
+            (teacher_candidate_mask.bool() & ~candidate_valid.bool()).any()
+        ):
+            raise ValueError("pointer set teacher contains an invalid candidate")
 
         valid_float = candidate_valid.to(candidate_hidden.dtype).unsqueeze(-1)
         context = (candidate_hidden * valid_float).sum(dim=1)
@@ -1352,11 +1374,22 @@ class SetAwareLaneSelectionHead(nn.Module):
         available = candidate_valid.bool().clone()
         selected_mask = torch.zeros_like(candidate_valid, dtype=torch.bool)
         stopped = torch.zeros(batch, dtype=torch.bool, device=candidate_hidden.device)
+        remaining_teacher = (
+            teacher_candidate_mask.to(
+                device=candidate_hidden.device,
+                dtype=torch.bool,
+            ).clone()
+            if teacher_candidate_mask is not None
+            else None
+        )
+        teacher_stopped = torch.zeros_like(stopped)
         batch_ids = torch.arange(batch, device=candidate_hidden.device)
         logits_by_step: list[torch.Tensor] = []
         selected_by_step: list[torch.Tensor] = []
         selected_probability_by_step: list[torch.Tensor] = []
         relation_bias_by_step: list[torch.Tensor] = []
+        teacher_class_masks_by_step: list[torch.Tensor] = []
+        teacher_active_by_step: list[torch.Tensor] = []
 
         for step in range(self.pointer_max_selections):
             step_token = self.pointer_step_embedding.weight[step].view(
@@ -1407,7 +1440,37 @@ class SetAwareLaneSelectionHead(nn.Module):
             logits_by_step.append(step_logits)
             relation_bias_by_step.append(relation_bias)
 
-            if teacher_indices is None:
+            if remaining_teacher is not None:
+                teacher_active = ~teacher_stopped
+                has_remaining = remaining_teacher.any(dim=-1)
+                teacher_class_mask = torch.zeros(
+                    (batch, candidates + 1),
+                    dtype=torch.bool,
+                    device=step_logits.device,
+                )
+                teacher_class_mask[:, :candidates] = (
+                    remaining_teacher & teacher_active.unsqueeze(-1)
+                )
+                teacher_class_mask[:, candidates] = teacher_active & ~has_remaining
+                teacher_choice_logits = candidate_logits.masked_fill(
+                    ~remaining_teacher,
+                    -1e4,
+                )
+                chosen_candidate = teacher_choice_logits.argmax(dim=-1)
+                chosen = torch.where(
+                    has_remaining,
+                    chosen_candidate,
+                    torch.full_like(chosen_candidate, candidates),
+                )
+                chosen = torch.where(
+                    teacher_active,
+                    chosen,
+                    torch.full_like(chosen, candidates),
+                )
+                teacher_class_masks_by_step.append(teacher_class_mask)
+                teacher_active_by_step.append(teacher_active)
+                teacher_stopped = teacher_stopped | (teacher_active & ~has_remaining)
+            elif teacher_indices is None:
                 chosen = step_logits.argmax(dim=-1)
                 chosen = torch.where(
                     stopped,
@@ -1456,9 +1519,11 @@ class SetAwareLaneSelectionHead(nn.Module):
                 ids = safe_candidate[rows]
                 selected_mask[rows, ids] = True
                 available[rows, ids] = False
+                if remaining_teacher is not None:
+                    remaining_teacher[rows, ids] = False
             stopped = stopped | chose_stop
 
-        return {
+        result = {
             "selection_pointer_logits": torch.stack(logits_by_step, dim=1),
             "selection_pointer_indices": torch.stack(selected_by_step, dim=1),
             "selection_pointer_scores": torch.stack(
@@ -1470,6 +1535,16 @@ class SetAwareLaneSelectionHead(nn.Module):
                 dim=1,
             ),
         }
+        if teacher_class_masks_by_step:
+            result["selection_pointer_teacher_class_mask"] = torch.stack(
+                teacher_class_masks_by_step,
+                dim=1,
+            )
+            result["selection_pointer_teacher_active"] = torch.stack(
+                teacher_active_by_step,
+                dim=1,
+            )
+        return result
 
     def reroll_pointer_with_teacher(
         self,
@@ -1494,13 +1569,39 @@ class SetAwareLaneSelectionHead(nn.Module):
             device=outputs["_selection_pointer_hidden"].device,
             dtype=torch.long,
         )
-        rollout = self.decode_pointer(
-            outputs["_selection_pointer_hidden"],
-            outputs["_selection_pointer_relations"],
-            outputs["_selection_pointer_unary_logits"],
-            outputs["_selection_pointer_candidate_valid"],
-            teacher_indices=teacher,
-        )
+        candidates = int(outputs["_selection_pointer_hidden"].shape[1])
+        if self.pointer_teacher_mode == "permutation_invariant_set":
+            target_mask = torch.zeros(
+                (teacher.shape[0], candidates),
+                dtype=torch.bool,
+                device=teacher.device,
+            )
+            valid = (teacher >= 0) & (teacher < candidates)
+            rows, steps = torch.nonzero(valid, as_tuple=True)
+            if rows.numel() > 0:
+                target_mask[rows, teacher[rows, steps]] = True
+            rollout = self.decode_pointer(
+                outputs["_selection_pointer_hidden"],
+                outputs["_selection_pointer_relations"],
+                outputs["_selection_pointer_unary_logits"],
+                outputs["_selection_pointer_candidate_valid"],
+                teacher_candidate_mask=target_mask,
+            )
+            outputs["selection_pointer_unique_target_mask"] = target_mask
+            outputs["selection_pointer_teacher_class_mask"] = rollout[
+                "selection_pointer_teacher_class_mask"
+            ]
+            outputs["selection_pointer_teacher_active"] = rollout[
+                "selection_pointer_teacher_active"
+            ]
+        else:
+            rollout = self.decode_pointer(
+                outputs["_selection_pointer_hidden"],
+                outputs["_selection_pointer_relations"],
+                outputs["_selection_pointer_unary_logits"],
+                outputs["_selection_pointer_candidate_valid"],
+                teacher_indices=teacher,
+            )
         # Keep greedy indices/scores from the original forward for diagnostics;
         # only the differentiable step logits must follow the training target.
         outputs["selection_pointer_logits"] = rollout[
@@ -2004,6 +2105,12 @@ class StructuredLaneQueryHead(nn.Module):
                     self.set_selection_cfg.get(
                         "pointer_similarity_prior",
                         0.5,
+                    )
+                ),
+                pointer_teacher_mode=str(
+                    self.set_selection_cfg.get(
+                        "pointer_teacher_mode",
+                        "fixed_sequence",
                     )
                 ),
             )

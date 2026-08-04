@@ -15,9 +15,10 @@ METRIC_WORKERS="${METRIC_WORKERS:-12}"
 METRIC_CHUNKSIZE="${METRIC_CHUNKSIZE:-64}"
 AMP_DTYPE="${AMP_DTYPE:-none}"
 IOU_THRESHOLDS="${IOU_THRESHOLDS:-0.5 0.75}"
+MODEL_LABEL="${MODEL_LABEL:-V4.3 pointer + STOP}"
 
 if [[ ! -f "${CKPT}" ]]; then
-  echo "Missing V4.3 checkpoint: ${CKPT}" >&2
+  echo "Missing ${MODEL_LABEL} checkpoint: ${CKPT}" >&2
   exit 1
 fi
 
@@ -31,7 +32,7 @@ fi
 PRED_DIR="${PRED_DIR:-${CKPT_DIR}/val_eval_${CKPT_TAG}_pointer_stop_${MODE_TAG}}"
 mkdir -p "${PRED_DIR}"
 
-echo "V4.3 pointer + STOP full CULane validation"
+echo "${MODEL_LABEL} full CULane validation"
 echo "checkpoint: ${CKPT}"
 echo "prediction directory: ${PRED_DIR}"
 echo "deployment: learned STOP, maximum four lanes, no threshold, no NMS"

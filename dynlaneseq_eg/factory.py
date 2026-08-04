@@ -139,6 +139,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
             loss.get("pointer_quality_weight", 0.5)
         ),
         pointer_stop_weight=float(loss.get("pointer_stop_weight", 1.0)),
+        pointer_unary_target_mode=str(
+            loss.get("pointer_unary_target_mode", "max_quality")
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

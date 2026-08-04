@@ -25,6 +25,8 @@ RUN_EVAL="${RUN_EVAL:-1}"
 MIN_FREE_GB="${MIN_FREE_GB:-0.5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v4_3_pointer_stop_gate_50k}"
 CACHE_ROOT="${CACHE_ROOT:-outputs/diagnostic_cache/unified_lane_set_v4_3_pointer_stop_gate_50k}"
+ARM_NAME="${ARM_NAME:-pointer_stop}"
+EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-V4.3 sequential pointer + STOP gate}"
 
 if [[ ! -f "${SOURCE_CONFIG}" || ! -f "${SOURCE_CHECKPOINT}" || ! -f "${POINTER_CONFIG}" ]]; then
   echo "Missing V4 source or V4.3 pointer artefact" >&2
@@ -97,7 +99,7 @@ fi
 
 END_ITERATION=$((SOURCE_ITERATION + TRAIN_STEPS))
 END_TAG="$(printf '%07d' "${END_ITERATION}")"
-echo "V4.3 sequential pointer + STOP gate"
+echo "${EXPERIMENT_LABEL}"
 echo "source: ${SOURCE_CHECKPOINT}"
 echo "logical iterations: ${SOURCE_ITERATION} -> ${END_ITERATION}"
 echo "one training arm per seed; seeds: ${SEEDS}"
@@ -120,7 +122,7 @@ fi
 
 for seed in ${SEEDS}; do
   seed_root="${OUTPUT_ROOT}/seed_${seed}"
-  output_dir="${seed_root}/pointer_stop"
+  output_dir="${seed_root}/${ARM_NAME}"
   report_dir="${seed_root}/reports"
   checkpoint="${output_dir}/iter_${END_TAG}.pt"
   mkdir -p "${output_dir}" "${report_dir}"
@@ -153,7 +155,7 @@ for seed in ${SEEDS}; do
 
   if [[ "${RUN_EVAL}" == "1" ]]; then
     source_report="${report_dir}/source_v4_uniform$((EVAL_BATCH_SIZE * MAX_BATCHES)).json"
-    pointer_report="${report_dir}/pointer_stop_uniform$((EVAL_BATCH_SIZE * MAX_BATCHES)).json"
+    pointer_report="${report_dir}/${ARM_NAME}_uniform$((EVAL_BATCH_SIZE * MAX_BATCHES)).json"
     "${PYTHON}" -u -m dynlaneseq_eg.tools.analyze_v4_selection_coverage \
       --config "${SOURCE_CONFIG}" \
       --checkpoint "${SOURCE_CHECKPOINT}" \
@@ -206,4 +208,4 @@ for seed in ${SEEDS}; do
   fi
 done
 
-echo "V4.3 pointer/STOP gate completed under ${OUTPUT_ROOT}"
+echo "${EXPERIMENT_LABEL} completed under ${OUTPUT_ROOT}"

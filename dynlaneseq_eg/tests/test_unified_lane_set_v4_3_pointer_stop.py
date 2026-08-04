@@ -23,7 +23,9 @@ CONFIG = (
 )
 
 
-def _selector() -> SetAwareLaneSelectionHead:
+def _selector(
+    pointer_teacher_mode: str = "fixed_sequence",
+) -> SetAwareLaneSelectionHead:
     return SetAwareLaneSelectionHead(
         8,
         input_w=64,
@@ -40,6 +42,7 @@ def _selector() -> SetAwareLaneSelectionHead:
         pointer_max_selections=4,
         pointer_min_valid_rows=2,
         pointer_similarity_prior=0.5,
+        pointer_teacher_mode=pointer_teacher_mode,
     )
 
 
@@ -152,6 +155,141 @@ def test_pointer_loss_backpropagates_through_sequence_and_unary_quality() -> Non
     assert unary_logits.grad is not None
     assert bool(torch.isfinite(pointer_logits.grad).all())
     assert bool(torch.isfinite(unary_logits.grad).all())
+
+
+def test_set_oracle_teacher_accepts_any_remaining_target_order() -> None:
+    selector = _selector("permutation_invariant_set").eval()
+    hidden = torch.zeros(1, 3, 16)
+    relations = torch.zeros(1, 3, 3, 6)
+    # Candidate 2 is preferred before candidate 0, opposite to the historical
+    # fixed teacher sequence.  Both are members of the unique target set.
+    unary = torch.tensor([[2.0, -3.0, 4.0]])
+    rollout = selector.decode_pointer(
+        hidden,
+        relations,
+        unary,
+        torch.ones(1, 3, dtype=torch.bool),
+        teacher_candidate_mask=torch.tensor([[True, False, True]]),
+    )
+    assert rollout["selection_pointer_indices"].tolist() == [[2, 0, -1, -1]]
+    masks = rollout["selection_pointer_teacher_class_mask"][0]
+    assert masks[0].tolist() == [True, False, True, False]
+    assert masks[1].tolist() == [True, False, False, False]
+    assert masks[2].tolist() == [False, False, False, True]
+    assert rollout["selection_pointer_teacher_active"].tolist() == [
+        [True, True, True, False]
+    ]
+
+
+def test_set_oracle_loss_uses_target_mass_and_unique_unary_negatives() -> None:
+    pointer_logits = torch.tensor(
+        [
+            [
+                [2.0, 0.0, 3.0, -2.0],
+                [3.0, 0.0, -1e4, -2.0],
+                [-1e4, 0.0, -1e4, 3.0],
+                [-1e4, 0.0, -1e4, 3.0],
+            ]
+        ],
+        requires_grad=True,
+    )
+    unary_logits = torch.zeros(1, 3, requires_grad=True)
+    class_mask = torch.tensor(
+        [
+            [
+                [True, False, True, False],
+                [True, False, False, False],
+                [False, False, False, True],
+                [False, False, False, False],
+            ]
+        ]
+    )
+    outputs = {
+        "selection_pointer_logits": pointer_logits,
+        "selection_pointer_teacher_indices": torch.tensor([[0, 2, 3, -100]]),
+        "selection_pointer_teacher_class_mask": class_mask,
+        "selection_pointer_teacher_active": torch.tensor(
+            [[True, True, True, False]]
+        ),
+        "selection_pointer_unique_target_mask": torch.tensor(
+            [[True, False, True]]
+        ),
+        "selection_logits": unary_logits,
+        "pred_x_rows": torch.tensor([[[10.0] * 8, [11.0] * 8, [50.0] * 8]]),
+        "range_norm": torch.tensor([[[0.0, 1.0]] * 3]),
+    }
+    targets = [
+        {
+            "x_rows": torch.tensor([[10.0] * 8, [50.0] * 8]),
+            "valid_mask": torch.ones(2, 8, dtype=torch.bool),
+        }
+    ]
+    criterion = S0Criterion(
+        LossConfig(
+            input_h=32,
+            input_w=64,
+            set_selection_line_width=12.0,
+            set_selection_min_valid_rows=2,
+            set_selection_focal_beta=0.0,
+            w_pointer_selection=1.0,
+            pointer_quality_weight=1.0,
+            pointer_unary_target_mode="unique_representative",
+        )
+    )
+    losses = criterion.compute_pointer_selection_loss(outputs, targets)
+    losses["total"].backward()
+    assert torch.isfinite(losses["sequence"])
+    # The non-target near-duplicate (candidate 1) must be pushed down, while
+    # both unique representatives are pushed up by the balanced unary loss.
+    assert float(unary_logits.grad[0, 1]) > 0.0
+    assert float(unary_logits.grad[0, 0]) < 0.0
+    assert float(unary_logits.grad[0, 2]) < 0.0
+
+
+def test_set_oracle_reroll_and_loss_form_one_differentiable_contract() -> None:
+    torch.manual_seed(707)
+    selector = _selector("permutation_invariant_set").train()
+    hidden = torch.randn(1, 3, 16, requires_grad=True)
+    relations = torch.zeros(1, 3, 3, 6)
+    unary = torch.randn(1, 3, requires_grad=True)
+    outputs = {
+        "_selection_pointer_hidden": hidden,
+        "_selection_pointer_relations": relations,
+        "_selection_pointer_unary_logits": unary,
+        "_selection_pointer_candidate_valid": torch.ones(1, 3, dtype=torch.bool),
+        "selection_logits": unary,
+        "pred_x_rows": torch.tensor([[[10.0] * 8, [30.0] * 8, [50.0] * 8]]),
+        "range_norm": torch.tensor([[[0.0, 1.0]] * 3]),
+    }
+    teacher = torch.tensor([[0, 2, 3, -100]])
+    selector.reroll_pointer_with_teacher(outputs, teacher)
+    assert outputs["selection_pointer_unique_target_mask"].tolist() == [
+        [True, False, True]
+    ]
+    assert "selection_pointer_teacher_class_mask" in outputs
+    criterion = S0Criterion(
+        LossConfig(
+            input_h=32,
+            input_w=64,
+            set_selection_line_width=12.0,
+            set_selection_min_valid_rows=2,
+            set_selection_focal_beta=0.0,
+            w_pointer_selection=1.0,
+            pointer_quality_weight=0.5,
+            pointer_unary_target_mode="unique_representative",
+        )
+    )
+    targets = [
+        {
+            "x_rows": torch.tensor([[10.0] * 8, [50.0] * 8]),
+            "valid_mask": torch.ones(2, 8, dtype=torch.bool),
+        }
+    ]
+    criterion.compute_pointer_selection_loss(outputs, targets)["total"].backward()
+    assert hidden.grad is not None
+    assert unary.grad is not None
+    assert bool(torch.isfinite(hidden.grad).all())
+    assert bool(torch.isfinite(unary.grad).all())
 
 
 def test_pointer_postprocess_obeys_stop_instead_of_filling_top4() -> None:
