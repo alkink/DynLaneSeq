@@ -258,6 +258,39 @@ The next action is full CULane validation, not a new training run and not a
 278k continuation.  Full validation tests whether the large 0.50 result and
 the small 0.75 shortfall generalize beyond this diagnostic subset.
 
+The official full-validation result was 78.68 F1@0.50 and 57.42 F1@0.75.
+The corresponding frozen full-test result was 75.95 F1@0.50 and 56.03
+F1@0.75.  This is effectively tied with, but does not exceed, the historical
+76.13 test result.  Test is now frozen and must not be used for further
+selection or hyperparameter tuning.
+
+Before any long geometry continuation, the streaming full-validation forensic
+audit separates the remaining oracle gap into two exact counterfactuals:
+
+```text
+same-emitted-count oracle - pointer TP = representative / ordering loss
+Top-4 oracle - same-count oracle       = early STOP / cardinality loss
+```
+
+It also reports GT-count-conditioned STOP behavior, including zero-GT images,
+and writes only JSON/log output rather than a multi-gigabyte candidate cache.
+
+```bash
+DATA_ROOT=/workspace/CULane \
+CKPT=outputs/diagnostics/unified_lane_set_v4_3_pointer_stop_gate_50k/seed_3407/pointer_stop/iter_0065000.pt \
+EVAL_BATCH_SIZE=8 \
+NUM_WORKERS=8 \
+METRIC_WORKERS=8 \
+AMP_DTYPE=none \
+bash scripts/audit_culane_dla34_unified_lane_set_v4_3_pointer_full_val.sh
+```
+
+Primary output:
+
+```text
+outputs/diagnostics/unified_lane_set_v4_3_pointer_full_val_forensics.json
+```
+
 ## Full test command after a validation pass
 
 ```bash
