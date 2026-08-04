@@ -283,11 +283,16 @@ def main() -> None:
     gradient_groups["total"] = _gradient_vector_stats(names, total_gradients)
 
     pointer_logits = outputs["selection_pointer_logits"][..., :-1].float()
+    relation_component = outputs.get("selection_pointer_teacher_relation_bias")
+    if not isinstance(relation_component, torch.Tensor):
+        relation_component = outputs.get("selection_pointer_relation_bias")
+    if not isinstance(relation_component, torch.Tensor):
+        raise ValueError("pointer rollout did not expose its relation component")
     reconstructed = (
         outputs["selection_pointer_unary_component"].float()
         + outputs["selection_pointer_policy_component"].float()
         + outputs["selection_pointer_content_component"].float()
-        + outputs["selection_pointer_relation_bias"].float()
+        + relation_component.float()
     )
     available = pointer_logits > -1000.0
     component_max_abs = float(
@@ -386,7 +391,7 @@ def main() -> None:
             "content_rms": _rms(
                 outputs.get("selection_pointer_content_component")
             ),
-            "relation_rms": _rms(outputs.get("selection_pointer_relation_bias")),
+            "relation_rms": _rms(relation_component),
             "stop_rms": _rms(outputs.get("selection_pointer_stop_component")),
             "quality_scale": scale.cpu().tolist(),
             "candidate_component_sum_max_abs": component_max_abs,
