@@ -331,6 +331,7 @@ class AuditAccumulator:
         self.row_strip_only_valid = 0
         self.replacement_changed: Counter[str] = Counter()
         self.reroll_changed: Counter[str] = Counter()
+        self.teacher_prefix_by_step: dict[int, Counter[str]] = defaultdict(Counter)
 
     def update(
         self,
@@ -343,6 +344,10 @@ class AuditAccumulator:
         replacements: dict[str, list[int]],
         rerolled: dict[str, torch.Tensor],
         teacher_indices: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_probabilities: torch.Tensor,
+        teacher_active: torch.Tensor,
+        teacher_candidate_steps: torch.Tensor,
         teacher_count: int,
         support_sizes: list[float],
         target_entropies: list[float],
@@ -381,6 +386,47 @@ class AuditAccumulator:
         self.support_sizes.extend(support_sizes)
         self.target_entropies.extend(target_entropies)
         self.target_qualities.extend(target_qualities)
+        teacher_model_probability = torch.softmax(
+            teacher_logits.float().cpu(), dim=-1
+        )
+        teacher_target_probability = teacher_probabilities.float().cpu()
+        teacher_active_cpu = teacher_active.bool().cpu()
+        teacher_candidate_cpu = teacher_candidate_steps.bool().cpu()
+        teacher_indices_cpu = teacher_indices.long().cpu()
+        candidate_count = int(valid.numel())
+        for step in range(int(teacher_logits.shape[0])):
+            if not bool(teacher_active_cpu[step]):
+                continue
+            row = self.teacher_prefix_by_step[step + 1]
+            row["active"] += 1
+            model_distribution = teacher_model_probability[step]
+            model_choice = int(model_distribution.argmax())
+            if bool(teacher_candidate_cpu[step]):
+                row["candidate_targets"] += 1
+                support = teacher_target_probability[step, :candidate_count] > 0
+                row["support_hit"] += int(
+                    model_choice < candidate_count and bool(support[model_choice])
+                )
+                row["sampled_teacher_hit"] += int(
+                    model_choice == int(teacher_indices_cpu[step])
+                )
+                row["support_mass_micros"] += int(
+                    round(float(model_distribution[:candidate_count][support].sum()) * 1e6)
+                )
+                target = teacher_target_probability[step]
+                cross_entropy = -(
+                    target
+                    * model_distribution.clamp_min(1e-12).log()
+                ).sum()
+                row["soft_cross_entropy_micros"] += int(
+                    round(float(cross_entropy) * 1e6)
+                )
+            else:
+                row["stop_targets"] += 1
+                row["stop_hit"] += int(model_choice == candidate_count)
+                row["stop_probability_micros"] += int(
+                    round(float(model_distribution[candidate_count]) * 1e6)
+                )
         for name, ids in modes.items():
             self.mode_predictions[name] += len(ids)
             for threshold in self.thresholds:
@@ -574,6 +620,31 @@ class AuditAccumulator:
                 "prefix_preserving_extension_oracle_tp": oracle,
                 "recoverable_tp": oracle - greedy,
             }
+        teacher_prefix = {}
+        for step, row in sorted(self.teacher_prefix_by_step.items()):
+            candidate_targets = int(row["candidate_targets"])
+            stop_targets = int(row["stop_targets"])
+            teacher_prefix[str(step)] = {
+                "active": int(row["active"]),
+                "candidate_targets": candidate_targets,
+                "candidate_support_hit_rate": _ratio(
+                    row["support_hit"], candidate_targets
+                ),
+                "sampled_teacher_id_hit_rate": _ratio(
+                    row["sampled_teacher_hit"], candidate_targets
+                ),
+                "mean_probability_mass_on_candidate_support": _ratio(
+                    row["support_mass_micros"], candidate_targets * 1e6
+                ),
+                "mean_soft_target_cross_entropy": _ratio(
+                    row["soft_cross_entropy_micros"], candidate_targets * 1e6
+                ),
+                "stop_targets": stop_targets,
+                "stop_accuracy": _ratio(row["stop_hit"], stop_targets),
+                "mean_stop_probability": _ratio(
+                    row["stop_probability_micros"], stop_targets * 1e6
+                ),
+            }
         extra = self.mode_predictions["forced_continuation"] - self.mode_predictions["greedy"]
         actual_gain = int(self.mode_tp[f"{self.thresholds[0]:.2f}"]["forced_continuation"]) - greedy_half
         return {
@@ -625,6 +696,7 @@ class AuditAccumulator:
                 "target_entropy": _summary(self.target_entropies),
                 "target_quality": _summary(self.target_qualities),
             },
+            "teacher_prefix_policy": teacher_prefix,
             "replacement_images_changed": dict(self.replacement_changed),
             "first_divergence_reroll_images_changed": dict(self.reroll_changed),
             "official_vs_row_strip_candidate_valid_disagreements": (
@@ -761,6 +833,14 @@ def main() -> None:
                 policy_logits=outputs.get("_selection_pointer_policy_logits"),
                 force_candidate_after_stop=True,
             )
+            teacher_rollout = selector.decode_pointer(
+                outputs["_selection_pointer_hidden"],
+                outputs["_selection_pointer_relations"],
+                outputs["_selection_pointer_unary_logits"],
+                outputs["_selection_pointer_candidate_valid"],
+                policy_logits=outputs.get("_selection_pointer_policy_logits"),
+                teacher_indices=teacher["indices"],
+            )
 
             row_qualities: list[torch.Tensor] = []
             row_validities: list[torch.Tensor] = []
@@ -872,6 +952,10 @@ def main() -> None:
                         for mode, rollout in rerolls.items()
                     },
                     teacher_indices=teacher["indices"][image_index].cpu(),
+                    teacher_logits=teacher_rollout["selection_pointer_logits"][image_index].cpu(),
+                    teacher_probabilities=teacher["probabilities"][image_index].cpu(),
+                    teacher_active=teacher["active"][image_index].cpu(),
+                    teacher_candidate_steps=teacher["candidate_steps"][image_index].cpu(),
                     teacher_count=int(teacher["representable_count"][image_index]),
                     support_sizes=teacher["support_sizes"][image_index][active_candidates].cpu().tolist(),
                     target_entropies=teacher["target_entropy"][image_index][active_candidates].cpu().tolist(),
