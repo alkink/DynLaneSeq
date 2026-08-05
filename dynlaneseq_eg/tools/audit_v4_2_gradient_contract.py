@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit V4.2 score gradient isolation.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--expected-source-iteration",
+        type=int,
+        default=50000,
+        help=(
+            "Logical iteration stored in the source checkpoint. The default "
+            "preserves the original 50k score-gate contract."
+        ),
+    )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=2)
@@ -150,7 +159,7 @@ def main() -> None:
             targets,
             matcher,
             cfg,
-            50000,
+            args.expected_source_iteration,
         )
         loss_dict = criterion(outputs, targets, matches)
         loss = loss_dict["loss_total"]
@@ -158,8 +167,9 @@ def main() -> None:
     gradients = _gradient_summary(model)
     semantic_expected = any("semantic_" in prefix for prefix in prefixes)
     checks = {
-        "source_checkpoint_iteration_is_50000": (
-            int(source_payload.get("iteration", -1)) == 50000
+        "source_checkpoint_iteration_matches_expected": (
+            int(source_payload.get("iteration", -1))
+            == args.expected_source_iteration
         ),
         "all_non_selector_detector_tensors_loaded": (
             not missing_detector_tensors
@@ -181,6 +191,7 @@ def main() -> None:
         "config_sha256": _sha256(config_path),
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": _sha256(checkpoint_path),
+        "expected_source_iteration": args.expected_source_iteration,
         "load_stats": load_stats,
         "checkpoint_contract": {
             "internal_iteration": int(source_payload.get("iteration", -1)),

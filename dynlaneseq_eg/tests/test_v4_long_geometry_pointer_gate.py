@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from dynlaneseq_eg.config import load_config
+from dynlaneseq_eg.tools.audit_v4_2_gradient_contract import parse_args
 from dynlaneseq_eg.tools.summarize_v4_long_geometry_pointer_gate import summarize
 
 
@@ -48,6 +51,27 @@ def test_long_geometry_config_changes_only_checkpoint_policy() -> None:
     assert long["training"]["checkpoint_interval"] == 25000
     assert long["training"]["checkpoint_include_optimizer"] is True
     assert long["training"]["save_last_alias"] is False
+
+
+def test_gradient_audit_accepts_mature_source_iteration(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_v4_2_gradient_contract.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "iter_0100000.pt",
+            "--expected-source-iteration",
+            "100000",
+            "--dataset-root",
+            "/dataset",
+            "--output-json",
+            "audit.json",
+        ],
+    )
+    assert parse_args().expected_source_iteration == 100000
 
 
 def test_long_geometry_summary_requires_joint_pointer_improvement() -> None:

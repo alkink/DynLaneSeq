@@ -116,6 +116,7 @@ if [[ "${RUN_GRAD_AUDIT}" == "1" ]]; then
   "${PYTHON}" -u -m dynlaneseq_eg.tools.audit_v4_2_gradient_contract \
     --config "${POINTER_CONFIG}" \
     --checkpoint "${SOURCE_CHECKPOINT}" \
+    --expected-source-iteration "${SOURCE_ITERATION}" \
     --dataset-root "${DATA_ROOT}" \
     --device "${DEVICE}" \
     --batch-size 2 \
