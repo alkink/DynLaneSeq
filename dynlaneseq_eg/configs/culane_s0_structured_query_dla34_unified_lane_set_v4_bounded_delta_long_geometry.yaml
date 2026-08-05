@@ -1,0 +1,12 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_bounded_delta_278k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_long_geometry_50k_to125k/geometry
+
+# This is the exact V4 objective and 278k cosine schedule.  Only checkpoint
+# storage changes: the long 50k -> 125k continuation keeps exact AdamW and
+# scheduler state at the three predeclared milestones without writing a full
+# 280-MiB checkpoint every 5k steps.
+training:
+  checkpoint_interval: 25000
+  checkpoint_include_optimizer: true
+  save_last_alias: false
