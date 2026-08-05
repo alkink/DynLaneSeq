@@ -838,6 +838,11 @@ class SetAwareLaneSelectionHead(nn.Module):
         self.pointer_quality_prior_max_scale = float(
             pointer_quality_prior_max_scale
         )
+        # Diagnostics may opt in to the compact tensors needed to rerun only
+        # the lightweight pointer decoder while retaining the normal
+        # ``inference_only`` detector path.  This is runtime state, not a
+        # checkpointed parameter or a deployment output by default.
+        self.retain_pointer_diagnostic_tensors = False
         if self.curve_samples < 1:
             raise ValueError("set_selection.curve_samples must be positive")
         if int(hidden_dim) % int(num_heads) != 0:
@@ -1416,6 +1421,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         policy_logits: torch.Tensor | None = None,
         teacher_indices: torch.Tensor | None = None,
         teacher_candidate_mask: torch.Tensor | None = None,
+        forced_actions: torch.Tensor | None = None,
+        force_candidate_after_stop: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Autoregressively select lanes without replacement, or emit STOP.
 
@@ -1469,6 +1476,23 @@ class SetAwareLaneSelectionHead(nn.Module):
             raise ValueError("pointer teacher candidate-mask shape mismatch")
         if teacher_indices is not None and teacher_candidate_mask is not None:
             raise ValueError("pointer accepts only one teacher contract at a time")
+        if forced_actions is not None and forced_actions.shape != (
+            batch,
+            self.pointer_max_selections,
+        ):
+            raise ValueError("pointer forced-action shape mismatch")
+        if forced_actions is not None and (
+            teacher_indices is not None or teacher_candidate_mask is not None
+        ):
+            raise ValueError("pointer forced actions are inference-only")
+        if force_candidate_after_stop and (
+            teacher_indices is not None or teacher_candidate_mask is not None
+        ):
+            raise ValueError("forced STOP continuation is inference-only")
+        if forced_actions is not None and bool(
+            ((forced_actions < -1) | (forced_actions > candidates)).any()
+        ):
+            raise ValueError("pointer forced action is outside the class range")
         if teacher_candidate_mask is not None and bool(
             (teacher_candidate_mask.bool() & ~candidate_valid.bool()).any()
         ):
@@ -1500,6 +1524,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         policy_component_by_step: list[torch.Tensor] = []
         content_by_step: list[torch.Tensor] = []
         stop_logit_by_step: list[torch.Tensor] = []
+        stop_would_win_by_step: list[torch.Tensor] = []
+        stop_margin_by_step: list[torch.Tensor] = []
         teacher_class_masks_by_step: list[torch.Tensor] = []
         teacher_active_by_step: list[torch.Tensor] = []
 
@@ -1564,6 +1590,12 @@ class SetAwareLaneSelectionHead(nn.Module):
             policy_component_by_step.append(policy_component)
             content_by_step.append(content)
             stop_logit_by_step.append(stop_logit)
+            best_candidate_logit = candidate_logits.max(dim=-1).values
+            # STOP is the final class, so torch.argmax resolves an exact tie
+            # in favor of the lower-index candidate class.
+            stop_would_win = stop_logit > best_candidate_logit
+            stop_would_win_by_step.append(stop_would_win)
+            stop_margin_by_step.append(stop_logit - best_candidate_logit)
 
             if remaining_teacher is not None:
                 teacher_active = ~teacher_stopped
@@ -1597,6 +1629,34 @@ class SetAwareLaneSelectionHead(nn.Module):
                 teacher_stopped = teacher_stopped | (teacher_active & ~has_remaining)
             elif teacher_indices is None:
                 chosen = step_logits.argmax(dim=-1)
+                if force_candidate_after_stop:
+                    has_available = available.any(dim=-1)
+                    best_candidate = candidate_logits.argmax(dim=-1)
+                    chosen = torch.where(
+                        (chosen == candidates) & has_available,
+                        best_candidate,
+                        chosen,
+                    )
+                if forced_actions is not None:
+                    forced = forced_actions[:, step].to(
+                        device=chosen.device,
+                        dtype=torch.long,
+                    )
+                    force_mask = forced >= 0
+                    forced_candidate = force_mask & (forced < candidates)
+                    if bool(
+                        (
+                            forced_candidate
+                            & ~available.gather(
+                                1,
+                                forced.clamp(min=0, max=candidates - 1).unsqueeze(-1),
+                            ).squeeze(-1)
+                        ).any()
+                    ):
+                        raise ValueError(
+                            "pointer forced an unavailable or invalid candidate"
+                        )
+                    chosen = torch.where(force_mask, forced, chosen)
                 chosen = torch.where(
                     stopped,
                     torch.full_like(chosen, candidates),
@@ -1673,6 +1733,14 @@ class SetAwareLaneSelectionHead(nn.Module):
             ),
             "selection_pointer_stop_component": torch.stack(
                 stop_logit_by_step,
+                dim=1,
+            ),
+            "selection_pointer_stop_would_win": torch.stack(
+                stop_would_win_by_step,
+                dim=1,
+            ),
+            "selection_pointer_stop_margin": torch.stack(
+                stop_margin_by_step,
                 dim=1,
             ),
             "selection_pointer_quality_scale": self.pointer_quality_scale(),
@@ -2965,6 +3033,19 @@ class StructuredLaneQueryHead(nn.Module):
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]
+            if (
+                self.set_selection_head is not None
+                and self.set_selection_head.retain_pointer_diagnostic_tensors
+            ):
+                for name in (
+                    "_selection_pointer_hidden",
+                    "_selection_pointer_relations",
+                    "_selection_pointer_unary_logits",
+                    "_selection_pointer_policy_logits",
+                    "_selection_pointer_candidate_valid",
+                ):
+                    if name in outputs:
+                        inference_outputs[name] = outputs[name]
             return inference_outputs
         # Keep the public debug container without running reductions that are
         # not consumed by training, evaluation, or model outputs.  In
