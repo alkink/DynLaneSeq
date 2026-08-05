@@ -268,24 +268,26 @@ def _classify_extra_candidate(
     candidate: int,
     *,
     threshold: float,
-) -> str:
+) -> tuple[str, int]:
     if official_iou.shape[0] == 0:
-        return "empty_scene_fp"
+        return "empty_scene_fp", 0
     before = evaluator_hungarian_assignment(official_iou, before_ids, threshold)
     after = evaluator_hungarian_assignment(
         official_iou, [*before_ids, candidate], threshold
     )
     if after.hit_count > before.hit_count:
-        return "new_tp"
+        return "new_tp", int(after.hit_count - before.hit_count)
     values = official_iou[:, int(candidate)]
     best_iou = float(values.max()) if values.numel() else 0.0
     if best_iou > float(threshold):
-        return "duplicate_or_assignment_competition"
+        return "duplicate_or_assignment_competition", int(
+            after.hit_count - before.hit_count
+        )
     if float(threshold) >= 0.75 and best_iou > 0.50:
-        return "near_miss_0.50_to_0.75"
+        return "near_miss_0.50_to_0.75", int(after.hit_count - before.hit_count)
     if best_iou >= 0.30:
-        return "near_miss_0.30_to_threshold"
-    return "background"
+        return "near_miss_0.30_to_threshold", int(after.hit_count - before.hit_count)
+    return "background", int(after.hit_count - before.hit_count)
 
 
 class AuditAccumulator:
@@ -304,6 +306,9 @@ class AuditAccumulator:
         self.forced_classes: dict[str, Counter[str]] = {
             f"{value:.2f}": Counter() for value in thresholds
         }
+        self.forced_by_action: dict[str, dict[int, Counter[str]]] = {
+            f"{value:.2f}": defaultdict(Counter) for value in thresholds
+        }
         self.stop_images = 0
         self.stop_margins: list[float] = []
         self.margin_groups: dict[str, dict[str, Any]] = defaultdict(
@@ -311,6 +316,10 @@ class AuditAccumulator:
                 "images": 0,
                 "extra_predictions": 0,
                 "tp_gain": {f"{value:.2f}": 0 for value in thresholds},
+                "extra_predictions_by_action": Counter(),
+                "tp_gain_by_action": {
+                    f"{value:.2f}": Counter() for value in thresholds
+                },
             }
         )
         self.count_groups: dict[int, Counter[str]] = defaultdict(Counter)
@@ -461,13 +470,25 @@ class AuditAccumulator:
                 )
             for step in range(len(normal), len(forced)):
                 candidate = forced[step]
-                category = _classify_extra_candidate(
+                extra_action = step - len(normal) + 1
+                category, tp_delta = _classify_extra_candidate(
                     official_iou,
                     forced[:step],
                     candidate,
                     threshold=threshold,
                 )
                 self.forced_classes[key][category] += 1
+                action = self.forced_by_action[key][extra_action]
+                action["predictions"] += 1
+                action["tp_delta"] += int(tp_delta)
+                action[category] += 1
+                if stopped is not None:
+                    margin_group = self.margin_groups[_margin_bin(stopped[1])]
+                    if threshold == self.thresholds[0]:
+                        margin_group["extra_predictions_by_action"][extra_action] += 1
+                    margin_group["tp_gain_by_action"][key][extra_action] += int(
+                        tp_delta
+                    )
 
     def finish(self) -> dict[str, Any]:
         modes: dict[str, Any] = {}
@@ -498,10 +519,33 @@ class AuditAccumulator:
         for key, row in sorted(self.margin_groups.items()):
             extra = int(row["extra_predictions"])
             margin_groups[key] = {
-                **row,
+                "images": int(row["images"]),
+                "extra_predictions": extra,
+                "tp_gain": dict(row["tp_gain"]),
                 "marginal_precision": {
                     threshold: _ratio(gain, extra)
                     for threshold, gain in row["tp_gain"].items()
+                },
+                "by_extra_action_index": {
+                    str(action): {
+                        "predictions": int(predictions),
+                        "tp_gain": {
+                            threshold: int(
+                                row["tp_gain_by_action"][threshold][action]
+                            )
+                            for threshold in row["tp_gain_by_action"]
+                        },
+                        "marginal_precision": {
+                            threshold: _ratio(
+                                row["tp_gain_by_action"][threshold][action],
+                                predictions,
+                            )
+                            for threshold in row["tp_gain_by_action"]
+                        },
+                    }
+                    for action, predictions in sorted(
+                        row["extra_predictions_by_action"].items()
+                    )
                 },
             }
         count_groups = {}
@@ -559,6 +603,18 @@ class AuditAccumulator:
                 ]["f1"] / 2.0,
                 "extra_action_classes": {
                     key: dict(value) for key, value in self.forced_classes.items()
+                },
+                "by_extra_action_index": {
+                    threshold: {
+                        str(action): {
+                            **dict(values),
+                            "marginal_precision": _ratio(
+                                values["tp_delta"], values["predictions"]
+                            ),
+                        }
+                        for action, values in sorted(rows.items())
+                    }
+                    for threshold, rows in self.forced_by_action.items()
                 },
                 "by_stop_margin": margin_groups,
                 "prefix_preserving_extension_oracle": extension,
