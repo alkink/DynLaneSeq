@@ -156,6 +156,8 @@ def forward_with_matches(
     iteration,
     pointer_teacher_visit: int = 0,
 ):
+    if hasattr(matcher, "set_iteration"):
+        matcher.set_iteration(iteration)
     name = cfg.get("model", {}).get("name", "DynLaneSeqS0")
     if name in {"DynLaneSeqS2", "DynLaneSeqS3"}:
         probe = model(images, sampler_alpha=0.0)
@@ -474,6 +476,10 @@ def train_one_epoch(
                 stats = {k: v for k, v in loss_dict.items()}
                 stats.update(match_stats(outputs, matches))
                 stats.update(output_debug_stats(outputs))
+                if hasattr(matcher, "effective_lambda_obj"):
+                    stats["matcher_lambda_obj"] = (
+                        matcher.effective_lambda_obj()
+                    )
                 stats["grad_norm"] = grad_norm
                 stats["lr_model"] = optimizer.param_groups[-1]["lr"]
                 logger.update(**stats)

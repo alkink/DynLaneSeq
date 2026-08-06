@@ -1,0 +1,13 @@
+_base_: culane_s0_structured_query_dla34_v5_protected_ownership_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v5_b_protected_ownership_assignment_25k
+
+# Main V5 arm: geometry owns assignment for the first 10k steps.  The bounded
+# -p(owner) cost then ramps linearly to 0.25 by 25k.  The edge is discrete and
+# carries no ownership gradient into geometry.
+matcher:
+  lambda_obj: 0.25
+  lambda_obj_start: 0.0
+  lambda_obj_end: 0.25
+  lambda_obj_ramp_start_iter: 10000
+  lambda_obj_ramp_end_iter: 25000

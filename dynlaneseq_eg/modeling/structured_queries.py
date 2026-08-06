@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .common import soft_expected_x, sort_range_norm
-from .unified_lane_set import UnifiedLaneSetLayer
+from .unified_lane_set import ProtectedOwnershipLayer, UnifiedLaneSetLayer
 
 
 def _heterogeneous_group_attention(
@@ -2022,6 +2022,7 @@ class StructuredLaneQueryHead(nn.Module):
         training_auxiliary_group_sizes: list[int] | tuple[int, ...] | None = None,
         row_reference: dict[str, Any] | None = None,
         lane_state: dict[str, Any] | None = None,
+        ownership: dict[str, Any] | None = None,
         set_selection: dict[str, Any] | None = None,
         lane_pooling: str = "mean_max",
     ):
@@ -2115,6 +2116,32 @@ class StructuredLaneQueryHead(nn.Module):
         self.detach_score_geometry = bool(
             self.lane_state_cfg.get("detach_score_geometry", False)
         )
+        self.ownership_cfg = dict(ownership or {})
+        self.ownership_enabled = bool(self.ownership_cfg.get("enabled", False))
+        self.ownership_retain_diagnostic_tensors = bool(
+            self.ownership_cfg.get("retain_diagnostic_tensors", False)
+        )
+        if self.ownership_enabled and not self.lane_state_enabled:
+            raise ValueError(
+                "protected ownership requires a persistent geometry lane state"
+            )
+        if self.ownership_enabled and not self.detach_score_geometry:
+            raise ValueError(
+                "protected ownership requires lane_state.detach_score_geometry=true"
+            )
+        if self.ownership_enabled and not bool(
+            self.ownership_cfg.get("detach_geometry_inputs", True)
+        ):
+            raise ValueError(
+                "protected ownership does not permit differentiable geometry inputs"
+            )
+        if self.ownership_enabled and (
+            self.num_groups != 1 or self.training_auxiliary_group_sizes
+        ):
+            raise ValueError(
+                "protected ownership requires one deployable query set and "
+                "does not permit train-only query groups"
+            )
         self.set_selection_cfg = dict(set_selection or {})
         self.set_selection_enabled = bool(self.set_selection_cfg.get("enabled", False))
         self.lane_pooling = str(lane_pooling).strip().lower()
@@ -2498,6 +2525,38 @@ class StructuredLaneQueryHead(nn.Module):
         if self.training_auxiliary_instance_tokens is not None:
             nn.init.normal_(self.training_auxiliary_instance_tokens.weight, std=0.02)
 
+        # Ownership modules are intentionally initialized *after* every V4
+        # geometry/score module.  With the same global seed, enabling V5 does
+        # not consume RNG before the bounded-delta geometry is initialized;
+        # V4 and V5 therefore start from an identical geometry parameter draw.
+        self.ownership_tokens = (
+            nn.Embedding(self.primary_num_instances, self.dim)
+            if self.ownership_enabled
+            else None
+        )
+        self.ownership_layers = nn.ModuleList(
+            [
+                ProtectedOwnershipLayer(
+                    dim=self.dim,
+                    num_heads=int(
+                        self.ownership_cfg.get("num_heads", num_heads)
+                    ),
+                    ff_dim=int(self.ownership_cfg.get("ff_dim", ff_dim)),
+                    dropout=float(
+                        self.ownership_cfg.get("dropout", dropout)
+                    ),
+                    semantic_context=self.ownership_cfg.get(
+                        "semantic_context"
+                    ),
+                )
+                for _ in range(int(num_layers))
+            ]
+            if self.ownership_enabled
+            else []
+        )
+        if self.ownership_tokens is not None:
+            nn.init.normal_(self.ownership_tokens.weight, std=0.02)
+
     def _row_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.feature_proj(features)
         if feat.shape[-2:] != (self.num_rows, self.evidence_x_bins):
@@ -2744,7 +2803,20 @@ class StructuredLaneQueryHead(nn.Module):
             if self.lane_state_enabled
             else None
         )
-        decision_lane_state = lane_state
+        ownership_identity = None
+        ownership_state = None
+        if self.ownership_tokens is not None:
+            ownership_identity = self.ownership_tokens.weight[
+                instance_start:instance_end
+            ].to(device=device, dtype=dtype)
+            ownership_state = ownership_identity.unsqueeze(0).expand(
+                b,
+                -1,
+                -1,
+            ).contiguous()
+        decision_lane_state = (
+            ownership_state if ownership_state is not None else lane_state
+        )
         row_value_features, row_key_features = self._row_features(features)
 
         intermediate_outputs: list[dict[str, torch.Tensor]] = []
@@ -2797,6 +2869,26 @@ class StructuredLaneQueryHead(nn.Module):
                 )
                 if isinstance(lane_layer, UnifiedLaneSetLayer):
                     lane_state = lane_layer.collect(lane_state, row_tokens)
+                elif lane_layer is not None:
+                    lane_state = lane_layer(
+                        lane_state,
+                        row_tokens,
+                    )
+                if ownership_state is not None:
+                    if lane_state is None or ownership_identity is None:
+                        raise RuntimeError(
+                            "protected ownership lost its geometry identity"
+                        )
+                    ownership_state = self.ownership_layers[layer_index](
+                        ownership_state,
+                        ownership_identity,
+                        lane_state,
+                        row_tokens,
+                        multi_scale_features=multi_scale_features,
+                        group_sizes=active_group_sizes,
+                    )
+                    decision_lane_state = ownership_state
+                elif isinstance(lane_layer, UnifiedLaneSetLayer):
                     score_lane_state, score_features = (
                         self._score_only_decision_inputs(
                             lane_state,
@@ -2808,10 +2900,6 @@ class StructuredLaneQueryHead(nn.Module):
                         multi_scale_features=score_features,
                     )
                 elif lane_layer is not None:
-                    lane_state = lane_layer(
-                        lane_state,
-                        row_tokens,
-                    )
                     decision_lane_state = (
                         lane_state.detach()
                         if self.detach_score_geometry
@@ -2901,6 +2989,26 @@ class StructuredLaneQueryHead(nn.Module):
                 )
                 if isinstance(lane_layer, UnifiedLaneSetLayer):
                     lane_state = lane_layer.collect(lane_state, row_tokens)
+                elif lane_layer is not None:
+                    lane_state = lane_layer(
+                        lane_state,
+                        row_tokens,
+                    )
+                if ownership_state is not None:
+                    if lane_state is None or ownership_identity is None:
+                        raise RuntimeError(
+                            "protected ownership lost its geometry identity"
+                        )
+                    ownership_state = self.ownership_layers[layer_index](
+                        ownership_state,
+                        ownership_identity,
+                        lane_state,
+                        row_tokens,
+                        multi_scale_features=multi_scale_features,
+                        group_sizes=active_group_sizes,
+                    )
+                    decision_lane_state = ownership_state
+                elif isinstance(lane_layer, UnifiedLaneSetLayer):
                     score_lane_state, score_features = (
                         self._score_only_decision_inputs(
                             lane_state,
@@ -2912,10 +3020,6 @@ class StructuredLaneQueryHead(nn.Module):
                         multi_scale_features=score_features,
                     )
                 elif lane_layer is not None:
-                    lane_state = lane_layer(
-                        lane_state,
-                        row_tokens,
-                    )
                     decision_lane_state = (
                         lane_state.detach()
                         if self.detach_score_geometry
@@ -3026,6 +3130,17 @@ class StructuredLaneQueryHead(nn.Module):
                 "range_norm": outputs["range_norm"],
                 "quality_logits": outputs["quality_logits"],
             }
+            if "ownership_logits" in outputs:
+                inference_outputs["ownership_logits"] = outputs[
+                    "ownership_logits"
+                ]
+            if (
+                self.ownership_retain_diagnostic_tensors
+                and "ownership_state" in outputs
+            ):
+                inference_outputs["ownership_state"] = outputs[
+                    "ownership_state"
+                ]
             if "selection_logits" in outputs:
                 inference_outputs["selection_logits"] = outputs["selection_logits"]
             for name in (
@@ -3194,6 +3309,11 @@ class StructuredLaneQueryHead(nn.Module):
             "decision_queries": decision_query,
             "structured_row_tokens": normalized_rows,
         }
+        if self.ownership_enabled:
+            if decision_lane_state is None:
+                raise RuntimeError("protected ownership requires a decision state")
+            outputs["ownership_logits"] = exist_logits
+            outputs["ownership_state"] = decision_lane_state
         if self.row_reference_prediction_mode == "bounded_delta":
             outputs["row_x_offsets_px"] = self.row_delta_offsets_px
             outputs["pred_delta_x_rows"] = delta_x_rows
@@ -3234,6 +3354,7 @@ def build_structured_query_head(model_cfg: dict[str, Any]) -> StructuredLaneQuer
         ),
         row_reference=structured_cfg.get("row_reference"),
         lane_state=structured_cfg.get("lane_state"),
+        ownership=structured_cfg.get("ownership"),
         set_selection=structured_cfg.get("set_selection"),
         lane_pooling=str(structured_cfg.get("lane_pooling", "mean_max")),
     )

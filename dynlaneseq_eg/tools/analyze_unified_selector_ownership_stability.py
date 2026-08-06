@@ -166,6 +166,8 @@ def _collect_checkpoint(
     channels_last: bool,
 ) -> dict[str, Any]:
     iteration = load_checkpoint(checkpoint, model, strict=False)
+    if hasattr(matcher, "set_iteration"):
+        matcher.set_iteration(iteration)
     model.eval()
     base_loader = build_dataloader(cfg, split="val", training=False)
     loader, dataset_indices = select_diagnostic_loader(

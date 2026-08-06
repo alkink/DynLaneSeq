@@ -637,6 +637,8 @@ class S0Criterion(nn.Module):
 
     def set_iteration(self, iteration: int) -> None:
         self._iteration = int(iteration)
+        if self.matcher is not None and hasattr(self.matcher, "set_iteration"):
+            self.matcher.set_iteration(iteration)
 
     def row_dfl_weight(self) -> float:
         weight = float(self.cfg.w_row_dfl)

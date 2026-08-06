@@ -37,6 +37,22 @@ def build_matcher(cfg: dict[str, Any]) -> HungarianMatcherS0:
     return HungarianMatcherS0(
         MatcherConfig(
             lambda_obj=float(m.get("lambda_obj", 2.0)),
+            lambda_obj_start=(
+                None
+                if m.get("lambda_obj_start") is None
+                else float(m.get("lambda_obj_start"))
+            ),
+            lambda_obj_end=(
+                None
+                if m.get("lambda_obj_end") is None
+                else float(m.get("lambda_obj_end"))
+            ),
+            lambda_obj_ramp_start_iter=int(
+                m.get("lambda_obj_ramp_start_iter", 0)
+            ),
+            lambda_obj_ramp_end_iter=int(
+                m.get("lambda_obj_ramp_end_iter", 0)
+            ),
             lambda_point=float(m.get("lambda_point", 5.0)),
             lambda_range=float(m.get("lambda_range", 1.0)),
             lambda_line_iou=float(m.get("lambda_line_iou", 0.0)),

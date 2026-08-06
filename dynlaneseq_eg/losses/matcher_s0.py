@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations, permutations
+import math
 
 import torch
 
@@ -12,6 +13,10 @@ from .range_aware_iou import pairwise_range_aware_row_strip_iou
 @dataclass
 class MatcherConfig:
     lambda_obj: float = 2.0
+    lambda_obj_start: float | None = None
+    lambda_obj_end: float | None = None
+    lambda_obj_ramp_start_iter: int = 0
+    lambda_obj_ramp_end_iter: int = 0
     lambda_point: float = 5.0
     lambda_range: float = 1.0
     lambda_line_iou: float = 0.0
@@ -30,6 +35,52 @@ class MatcherConfig:
 class HungarianMatcherS0:
     def __init__(self, cfg: MatcherConfig | None = None):
         self.cfg = cfg or MatcherConfig()
+        self._iteration = 0
+        start = self._lambda_obj_endpoint(self.cfg.lambda_obj_start)
+        end = self._lambda_obj_endpoint(self.cfg.lambda_obj_end)
+        if not math.isfinite(start) or start < 0.0:
+            raise ValueError("matcher lambda_obj_start must be finite and non-negative")
+        if not math.isfinite(end) or end < 0.0:
+            raise ValueError("matcher lambda_obj_end must be finite and non-negative")
+        if int(self.cfg.lambda_obj_ramp_start_iter) < 0:
+            raise ValueError("matcher lambda_obj_ramp_start_iter must be non-negative")
+        if int(self.cfg.lambda_obj_ramp_end_iter) < int(
+            self.cfg.lambda_obj_ramp_start_iter
+        ):
+            raise ValueError(
+                "matcher lambda_obj_ramp_end_iter must be >= ramp_start_iter"
+            )
+
+    def _lambda_obj_endpoint(self, value: float | None) -> float:
+        return float(self.cfg.lambda_obj if value is None else value)
+
+    def set_iteration(self, iteration: int) -> None:
+        self._iteration = max(int(iteration), 0)
+
+    def effective_lambda_obj(self, iteration: int | None = None) -> float:
+        """Return the bounded ownership cost used by the current assignment.
+
+        With no explicit endpoints this is exactly the historical static
+        ``lambda_obj`` behavior.  V5-B sets both endpoints and uses a warm-up
+        followed by a linear ramp; the matcher remains non-differentiable.
+        """
+
+        start = self._lambda_obj_endpoint(self.cfg.lambda_obj_start)
+        end = self._lambda_obj_endpoint(self.cfg.lambda_obj_end)
+        ramp_start = int(self.cfg.lambda_obj_ramp_start_iter)
+        ramp_end = int(self.cfg.lambda_obj_ramp_end_iter)
+        active_iteration = self._iteration if iteration is None else max(
+            int(iteration),
+            0,
+        )
+        if active_iteration <= ramp_start:
+            return start
+        if ramp_end <= ramp_start or active_iteration >= ramp_end:
+            return end
+        fraction = float(active_iteration - ramp_start) / float(
+            ramp_end - ramp_start
+        )
+        return (1.0 - fraction) * start + fraction * end
 
     @torch.no_grad()
     def __call__(self, outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
@@ -228,6 +279,10 @@ class HungarianMatcherS0:
                 "mean_cost_point": torch.tensor(0.0, device=device),
                 "mean_cost_range": torch.tensor(0.0, device=device),
                 "mean_cost_line_iou": torch.tensor(0.0, device=device),
+                "matcher_lambda_obj": torch.tensor(
+                    self.effective_lambda_obj(),
+                    device=device,
+                ),
             }
 
         cost_type = str(self.cfg.cost_type).strip().lower()
@@ -259,6 +314,9 @@ class HungarianMatcherS0:
                 "mean_cost_point": zero,
                 "mean_cost_range": zero,
                 "mean_cost_line_iou": cost.detach().mean(),
+                "matcher_lambda_obj": zero.new_tensor(
+                    self.effective_lambda_obj()
+                ),
             }
         if cost_type not in {"composite", "legacy"}:
             raise ValueError(f"Unsupported matcher.cost_type: {self.cfg.cost_type!r}")
@@ -288,8 +346,9 @@ class HungarianMatcherS0:
             + pred_range[:, None, 1].sub(gt_range_norm[None, :, 1]).abs()
         )
         cost_line_iou = self.compute_line_iou_cost(pred_x_rows, gt_x, gt_mask)
+        lambda_obj = self.effective_lambda_obj()
         cost = (
-            self.cfg.lambda_obj * cost_obj
+            lambda_obj * cost_obj
             + self.cfg.lambda_point * cost_point
             + self.cfg.lambda_range * cost_range
             + self.cfg.lambda_line_iou * cost_line_iou
@@ -299,6 +358,7 @@ class HungarianMatcherS0:
             "mean_cost_point": cost_point.mean().detach(),
             "mean_cost_range": cost_range.mean().detach(),
             "mean_cost_line_iou": cost_line_iou.mean().detach(),
+            "matcher_lambda_obj": cost_obj.detach().new_tensor(lambda_obj),
         }
 
     def compute_line_iou_cost(

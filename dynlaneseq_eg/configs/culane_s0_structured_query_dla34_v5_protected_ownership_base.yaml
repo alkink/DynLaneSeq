@@ -1,0 +1,99 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_bounded_delta_278k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v5_protected_ownership_base
+
+# V5 preserves the complete bounded-delta geometry path.  A second persistent
+# state with the same query indices learns one-to-one lane ownership from the
+# first decoder layer onward.  Every geometry, row and shared-FPN observation
+# is detached at the ownership consumer boundary.
+model:
+  structured_query:
+    intermediate_supervision: true
+    ownership:
+      enabled: true
+      detach_geometry_inputs: true
+      retain_diagnostic_tensors: true
+      num_heads: 8
+      ff_dim: 1024
+      dropout: 0.1
+      semantic_context:
+        enabled: true
+        scales: [p4, p5]
+        pool_size: [10, 25]
+    set_selection:
+      enabled: false
+
+# Each decoder layer receives a fresh one-to-one assignment.  V5-A leaves the
+# ownership term at zero; V5-B overrides only the scheduled matcher fields.
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  lambda_obj: 0.0
+  lambda_obj_start: 0.0
+  lambda_obj_end: 0.0
+  lambda_obj_ramp_start_iter: 10000
+  lambda_obj_ramp_end_iter: 25000
+  object_cost_type: neg_probability
+  reuse_final_assignment_for_intermediate: false
+
+# Ownership is the direct deployable lane/no-lane prediction.  Every unmatched
+# query is an explicit no-lane target at the final and intermediate layers.
+# The DETR-style down-weighted no-lane class avoids letting 29 background
+# queries drown the roughly 3 foreground queries in each image.
+loss:
+  exist_loss_type: ce
+  exist_target_mode: binary
+  no_lane_weight: 0.10
+  w_exist: 2.0
+  w_intermediate_exist: 2.0
+  lambda_intermediate: 0.5
+  intermediate_layer_weights: [1.0, 2.0, 3.0]
+  w_quality: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+
+# Ownership-specific parameters use the score/evidence LR, while all V4
+# geometry groups retain their validated lower rates.
+optimizer:
+  parameter_groups:
+    - name: lane_state
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.lane_state_layers.
+    - name: coordinate
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.row_delta_heads.
+        - structured_query_head.reference_
+    - name: lane_identity
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.instance_tokens.
+        - structured_query_head.row_tokens.
+        - structured_query_head.x_tokens.
+    - name: ownership
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.ownership_tokens.
+        - structured_query_head.ownership_layers.
+        - structured_query_head.decision_norm.
+        - structured_query_head.exist.
+
+postprocess:
+  score_mode: exist
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+# This is a from-scratch causal gate on the unchanged 278k cosine horizon.
+# The run stops at 25k only to decide whether ownership information is forming.
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 25000
+  checkpoint_interval: 5000
+  checkpoint_include_optimizer: false
+  save_last_alias: false

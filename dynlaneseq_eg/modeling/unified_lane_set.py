@@ -314,3 +314,299 @@ class UnifiedLaneSetLayer(nn.Module):
         )
         state = state + self.drop(self.collect_ffn(self.norm_collect_ffn(state)))
         return state.reshape(batch, candidates, channels).contiguous()
+
+
+class ProtectedOwnershipLayer(nn.Module):
+    """Persistent query ownership without a differentiable geometry edge.
+
+    ``UnifiedLaneSetLayer`` intentionally lets one state own both geometry and
+    scoring.  That coupling is useful when it is stable, but it also lets a
+    foreground loss change the coordinate operator.  This layer implements a
+    stricter contract for the V5 experiment:
+
+    * ownership has its own persistent state and query-identity embedding;
+    * it compares all candidates as a set at every decoder layer;
+    * it observes the current lane/row geometry and semantic pyramid only
+      through stop-gradient inputs; and
+    * it never writes back into the geometry state.
+
+    Ownership can still affect which geometry query receives a target through
+    the (non-differentiable) Hungarian assignment.  That assignment-mediated
+    edge is deliberately outside this module.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        num_heads: int = 8,
+        ff_dim: int = 1024,
+        dropout: float = 0.1,
+        *,
+        semantic_context: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        if self.dim % self.num_heads:
+            raise ValueError("protected ownership dim must be divisible by num_heads")
+
+        self.set_attention = nn.MultiheadAttention(
+            self.dim,
+            self.num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm_set = nn.LayerNorm(self.dim)
+
+        # Each query reads only the geometry rows carrying the same query id.
+        # Inter-query competition is handled by ``set_attention`` above.
+        self.geometry_attention = nn.MultiheadAttention(
+            self.dim,
+            self.num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm_geometry_query = nn.LayerNorm(self.dim)
+        self.norm_geometry_lane = nn.LayerNorm(self.dim)
+        self.norm_geometry_rows = nn.LayerNorm(self.dim)
+
+        semantic_cfg = dict(semantic_context or {})
+        self.semantic_enabled = bool(semantic_cfg.get("enabled", False))
+        self.semantic_scales = tuple(
+            str(scale) for scale in semantic_cfg.get("scales", ("p4", "p5"))
+        )
+        if self.semantic_enabled and not self.semantic_scales:
+            raise ValueError("ownership semantic_context.scales must not be empty")
+        pool_size = semantic_cfg.get("pool_size", (10, 25))
+        if not isinstance(pool_size, Sequence) or len(pool_size) != 2:
+            raise ValueError(
+                "ownership semantic_context.pool_size must contain [height, width]"
+            )
+        self.semantic_pool_size = (int(pool_size[0]), int(pool_size[1]))
+        if min(self.semantic_pool_size) < 1:
+            raise ValueError("ownership semantic pool dimensions must be positive")
+
+        self.semantic_position = (
+            SinePositionEncoding2D(dim=self.dim)
+            if self.semantic_enabled
+            else None
+        )
+        # These adapters are ownership-only parameters.  Their inputs are
+        # detached shared FPN features, so semantic ownership can learn without
+        # moving the backbone/FPN representation used by bounded geometry.
+        self.semantic_adapters = (
+            nn.ModuleDict(
+                {
+                    scale: nn.Sequential(
+                        nn.Conv2d(self.dim, self.dim, kernel_size=1),
+                        nn.GroupNorm(8, self.dim),
+                        nn.GELU(),
+                    )
+                    for scale in self.semantic_scales
+                }
+            )
+            if self.semantic_enabled
+            else nn.ModuleDict()
+        )
+        self.semantic_attention = (
+            nn.ModuleDict(
+                {
+                    scale: nn.MultiheadAttention(
+                        self.dim,
+                        self.num_heads,
+                        dropout=float(dropout),
+                        batch_first=True,
+                    )
+                    for scale in self.semantic_scales
+                }
+            )
+            if self.semantic_enabled
+            else nn.ModuleDict()
+        )
+        self.semantic_scale_embedding = (
+            nn.Parameter(torch.zeros(len(self.semantic_scales), self.dim))
+            if self.semantic_enabled
+            else None
+        )
+        self.semantic_router = (
+            nn.Linear(self.dim, len(self.semantic_scales))
+            if self.semantic_enabled
+            else None
+        )
+        self.norm_semantic_query = (
+            nn.LayerNorm(self.dim) if self.semantic_enabled else None
+        )
+        if self.semantic_router is not None:
+            nn.init.zeros_(self.semantic_router.weight)
+            nn.init.zeros_(self.semantic_router.bias)
+
+        self.norm_ffn = nn.LayerNorm(self.dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(ff_dim), self.dim),
+        )
+        self.drop = nn.Dropout(float(dropout))
+
+    @staticmethod
+    def _validate_identity(
+        state: torch.Tensor,
+        query_identity: torch.Tensor,
+    ) -> torch.Tensor:
+        if state.ndim != 3:
+            raise ValueError("ownership state must have shape [B,N,C]")
+        if query_identity.ndim == 2:
+            if query_identity.shape != state.shape[1:]:
+                raise ValueError("ownership query identity must match [N,C]")
+            return query_identity.unsqueeze(0).expand(state.shape[0], -1, -1)
+        if query_identity.shape != state.shape:
+            raise ValueError("ownership query identity must match [B,N,C]")
+        return query_identity
+
+    @staticmethod
+    def _set_attention_by_group(
+        attention: nn.MultiheadAttention,
+        query: torch.Tensor,
+        value: torch.Tensor,
+        group_sizes: tuple[int, ...] | None,
+    ) -> torch.Tensor:
+        if group_sizes is None or len(group_sizes) == 1:
+            return attention(query, query, value, need_weights=False)[0]
+        normalized = tuple(int(size) for size in group_sizes)
+        if not normalized or any(size < 1 for size in normalized):
+            raise ValueError("ownership group sizes must be positive")
+        if sum(normalized) != int(query.shape[1]):
+            raise ValueError("ownership group sizes must sum to candidate count")
+        query_parts = torch.split(query, normalized, dim=1)
+        value_parts = torch.split(value, normalized, dim=1)
+        return torch.cat(
+            [
+                attention(q_part, q_part, v_part, need_weights=False)[0]
+                for q_part, v_part in zip(query_parts, value_parts)
+            ],
+            dim=1,
+        )
+
+    def _semantic_context(
+        self,
+        state: torch.Tensor,
+        identity: torch.Tensor,
+        multi_scale_features: Mapping[str, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        if not self.semantic_enabled:
+            return state.new_zeros(state.shape)
+        if multi_scale_features is None:
+            raise ValueError(
+                "protected ownership semantic context requires multi_scale_features"
+            )
+        assert self.semantic_position is not None
+        assert self.semantic_scale_embedding is not None
+        assert self.semantic_router is not None
+        assert self.norm_semantic_query is not None
+
+        query = self.norm_semantic_query(state) + identity
+        contexts: list[torch.Tensor] = []
+        for scale_index, scale in enumerate(self.semantic_scales):
+            if scale not in multi_scale_features:
+                raise KeyError(f"multi_scale_features is missing {scale!r}")
+            raw_feature = multi_scale_features[scale]
+            if raw_feature.ndim != 4 or int(raw_feature.shape[1]) != self.dim:
+                raise ValueError(
+                    f"ownership semantic feature {scale!r} must be "
+                    f"[B,{self.dim},H,W], got {tuple(raw_feature.shape)}"
+                )
+            feature = self.semantic_adapters[scale](raw_feature.detach())
+            pooled = F.adaptive_avg_pool2d(feature, self.semantic_pool_size)
+            position = self.semantic_position(pooled).to(
+                device=pooled.device,
+                dtype=pooled.dtype,
+            )
+            scale_code = self.semantic_scale_embedding[scale_index].to(
+                device=pooled.device,
+                dtype=pooled.dtype,
+            ).view(1, self.dim, 1, 1)
+            key = (pooled + position + scale_code).flatten(2).transpose(1, 2)
+            value = pooled.flatten(2).transpose(1, 2)
+            contexts.append(
+                self.semantic_attention[scale](
+                    query,
+                    key,
+                    value,
+                    need_weights=False,
+                )[0]
+            )
+        stacked = torch.stack(contexts, dim=2)
+        weights = torch.softmax(self.semantic_router(query).float(), dim=-1).to(
+            dtype=state.dtype
+        )
+        return (stacked * weights.unsqueeze(-1)).sum(dim=2)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        query_identity: torch.Tensor,
+        geometry_lane_state: torch.Tensor,
+        row_states: torch.Tensor,
+        *,
+        multi_scale_features: Mapping[str, torch.Tensor] | None = None,
+        group_sizes: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        if row_states.ndim != 4:
+            raise ValueError("ownership row states must have shape [B,N,R,C]")
+        batch, candidates, rows, channels = row_states.shape
+        if state.shape != (batch, candidates, channels):
+            raise ValueError("ownership and row-state shapes are incompatible")
+        if geometry_lane_state.shape != state.shape:
+            raise ValueError("ownership and geometry lane-state shapes are incompatible")
+        if int(channels) != self.dim:
+            raise ValueError("ownership state channel dimension is invalid")
+
+        identity = self._validate_identity(state, query_identity).to(
+            device=state.device,
+            dtype=state.dtype,
+        )
+        normalized = self.norm_set(state)
+        query_key = normalized + identity
+        state = state + self.drop(
+            self._set_attention_by_group(
+                self.set_attention,
+                query_key,
+                normalized,
+                group_sizes,
+            )
+        )
+
+        # The detach calls live at the consumer boundary.  A future config
+        # cannot accidentally reopen ownership -> geometry gradients merely by
+        # passing a non-detached tensor from the caller.
+        geometry_lane = self.norm_geometry_lane(geometry_lane_state.detach())
+        geometry_rows = self.norm_geometry_rows(row_states.detach())
+        memory = torch.cat((geometry_lane.unsqueeze(2), geometry_rows), dim=2)
+        query = (self.norm_geometry_query(state) + identity).reshape(
+            batch * candidates,
+            1,
+            channels,
+        )
+        memory = memory.reshape(batch * candidates, rows + 1, channels)
+        state_flat = state.reshape(batch * candidates, 1, channels)
+        state_flat = state_flat + self.drop(
+            self.geometry_attention(
+                query,
+                memory,
+                memory,
+                need_weights=False,
+            )[0]
+        )
+        state = state_flat.reshape(batch, candidates, channels)
+
+        if self.semantic_enabled:
+            state = state + self.drop(
+                self._semantic_context(
+                    state,
+                    identity,
+                    multi_scale_features,
+                )
+            )
+        state = state + self.drop(self.ffn(self.norm_ffn(state)))
+        return state.contiguous()

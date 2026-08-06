@@ -203,6 +203,12 @@ def main() -> None:
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=-1,
+        help="Override dataloader.num_workers; negative keeps the config value.",
+    )
+    parser.add_argument(
         "--seg-aux-amp-dtype",
         choices=("inherit", "float16", "bfloat16"),
         default="",
@@ -256,6 +262,8 @@ def main() -> None:
         cfg.setdefault("dataset", {})["root"] = args.dataset_root
     if args.batch_size > 0:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
+    if args.num_workers >= 0:
+        cfg.setdefault("dataloader", {})["num_workers"] = int(args.num_workers)
     if args.seg_aux_amp_dtype:
         cfg.setdefault("model", {}).setdefault("seg_aux", {})["amp_dtype"] = args.seg_aux_amp_dtype
     if args.grad_accum > 0:

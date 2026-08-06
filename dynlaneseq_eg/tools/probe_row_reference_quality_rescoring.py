@@ -389,6 +389,7 @@ def _frozen_outputs(
     )
     return model.structured_query_head(
         encoder_outputs["features"],
+        multi_scale_features=encoder_outputs.get("multi_scale_features"),
         inference_only=False,
     )
 
