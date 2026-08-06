@@ -1,0 +1,45 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_6_remaining_cluster_mixture_pointer.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_6_1_stable_pointer_gate_105k/stable_low_lr_cosine
+
+# V4.6.1 is an optimizer-only stability intervention.  Geometry, the
+# remaining-cluster mixture teacher, pointer architecture, losses, and greedy
+# deployment are identical to V4.6.  The source weights are loaded with a
+# fresh AdamW optimizer, so this local 10k schedule deliberately warms up from
+# zero and then decays instead of applying V4.6's constant 1e-4 LR.
+optimizer:
+  base_lr: 0.00003
+  evidence_lr: 0.00003
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  parameter_groups:
+    - name: set_selection
+      lr: 0.00003
+      prefixes:
+        - structured_query_head.set_selection_head.
+    - name: final_semantic_score
+      lr: 0.00001
+      prefixes:
+        - structured_query_head.lane_state_layers.3.semantic_attention.
+        - structured_query_head.lane_state_layers.3.semantic_router.
+        - structured_query_head.lane_state_layers.3.semantic_scale_embedding
+        - structured_query_head.lane_state_layers.3.norm_semantic_query.
+        - structured_query_head.lane_state_layers.3.norm_semantic_ffn.
+        - structured_query_head.lane_state_layers.3.semantic_ffn.
+        - structured_query_head.decision_norm.
+
+# ``--init-from`` starts a fresh scheduler at local step zero even though the
+# checkpoint's logical iteration is 105k.  Thus these values describe exactly
+# the 10k pointer adaptation, not the earlier geometry timeline.
+scheduler:
+  name: cosine
+  total_iters: 10000
+  warmup_iters: 500
+  min_lr_ratio: 0.10
+
+training:
+  max_iters: 10000
+  checkpoint_interval: 1000
+  checkpoint_include_optimizer: true
+  save_last_alias: false
