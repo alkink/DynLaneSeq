@@ -326,9 +326,13 @@ class AuditAccumulator:
         self.support_sizes: list[float] = []
         self.target_entropies: list[float] = []
         self.target_qualities: list[float] = []
-        self.validity_disagreements = 0
-        self.official_only_valid = 0
-        self.row_strip_only_valid = 0
+        self.official_row_disagreements = 0
+        self.official_pointer_disagreements = 0
+        self.pointer_row_disagreements = 0
+        self.official_only_vs_pointer = 0
+        self.pointer_only_vs_official = 0
+        self.pointer_only_vs_row = 0
+        self.row_only_vs_pointer = 0
         self.replacement_changed: Counter[str] = Counter()
         self.reroll_changed: Counter[str] = Counter()
         self.teacher_prefix_by_step: dict[int, Counter[str]] = defaultdict(Counter)
@@ -337,7 +341,9 @@ class AuditAccumulator:
         self,
         *,
         official_iou: torch.Tensor,
-        candidate_valid: torch.Tensor,
+        evaluation_candidate_valid: torch.Tensor,
+        oracle_candidate_valid: torch.Tensor,
+        pointer_candidate_valid: torch.Tensor,
         normal_indices: torch.Tensor,
         normal_logits: torch.Tensor,
         forced_indices: torch.Tensor,
@@ -352,11 +358,16 @@ class AuditAccumulator:
         support_sizes: list[float],
         target_entropies: list[float],
         target_qualities: list[float],
-        official_candidate_valid: torch.Tensor,
         row_candidate_valid: torch.Tensor,
     ) -> None:
-        valid = candidate_valid.bool().cpu()
-        official_valid = official_candidate_valid.bool().cpu()
+        # Actual prediction counts follow the official postprocess contract.
+        # Counterfactual candidate oracles additionally require decoder
+        # eligibility: a proposal must be both emit-able by the pointer and
+        # render-able by the evaluator.
+        valid = evaluation_candidate_valid.bool().cpu()
+        oracle_valid = oracle_candidate_valid.bool().cpu()
+        pointer_valid = pointer_candidate_valid.bool().cpu()
+        official_valid = valid
         row_valid = row_candidate_valid.bool().cpu()
         normal, _ = _selected_pointer_ids(normal_indices, valid, top_k=self.top_k)
         forced, _ = _selected_pointer_ids(forced_indices, valid, top_k=self.top_k)
@@ -378,11 +389,23 @@ class AuditAccumulator:
         gt_count = int(official_iou.shape[0])
         self.images += 1
         self.gt += gt_count
-        self.validity_disagreements += int(
+        self.official_row_disagreements += int(
             (official_valid != row_valid).sum()
         )
-        self.official_only_valid += int((official_valid & ~row_valid).sum())
-        self.row_strip_only_valid += int((row_valid & ~official_valid).sum())
+        self.official_pointer_disagreements += int(
+            (official_valid != pointer_valid).sum()
+        )
+        self.pointer_row_disagreements += int(
+            (pointer_valid != row_valid).sum()
+        )
+        self.official_only_vs_pointer += int(
+            (official_valid & ~pointer_valid).sum()
+        )
+        self.pointer_only_vs_official += int(
+            (pointer_valid & ~official_valid).sum()
+        )
+        self.pointer_only_vs_row += int((pointer_valid & ~row_valid).sum())
+        self.row_only_vs_pointer += int((row_valid & ~pointer_valid).sum())
         self.support_sizes.extend(support_sizes)
         self.target_entropies.extend(target_entropies)
         self.target_qualities.extend(target_qualities)
@@ -443,7 +466,7 @@ class AuditAccumulator:
 
         group = self.count_groups[gt_count]
         top4_half = cardinality_oracle_assignment(
-            official_iou, self.thresholds[0], self.top_k, valid
+            official_iou, self.thresholds[0], self.top_k, oracle_valid
         ).hit_count
         group["images"] += 1
         group["annotation_gt"] += gt_count
@@ -489,18 +512,18 @@ class AuditAccumulator:
                 official_iou,
                 threshold,
                 len(normal),
-                valid,
+                oracle_valid,
             ).hit_count
             self.top4_oracle_tp[key] += cardinality_oracle_assignment(
                 official_iou,
                 threshold,
                 self.top_k,
-                valid,
+                oracle_valid,
             ).hit_count
             self.prefix_extension_tp[key] += prefix_extension_oracle_hit_count(
                 official_iou,
                 normal,
-                valid,
+                oracle_valid,
                 threshold=threshold,
                 top_k=self.top_k,
             )
@@ -699,12 +722,20 @@ class AuditAccumulator:
             "teacher_prefix_policy": teacher_prefix,
             "replacement_images_changed": dict(self.replacement_changed),
             "first_divergence_reroll_images_changed": dict(self.reroll_changed),
-            "official_vs_row_strip_candidate_valid_disagreements": (
-                self.validity_disagreements
-            ),
-            "candidate_valid_disagreement_direction": {
-                "official_only_valid": self.official_only_valid,
-                "row_strip_pointer_only_valid": self.row_strip_only_valid,
+            "candidate_valid_contracts": {
+                "official_vs_pointer_disagreements": (
+                    self.official_pointer_disagreements
+                ),
+                "official_only_vs_pointer": self.official_only_vs_pointer,
+                "pointer_only_vs_official": self.pointer_only_vs_official,
+                "pointer_vs_teacher_row_strip_disagreements": (
+                    self.pointer_row_disagreements
+                ),
+                "pointer_only_vs_teacher_row_strip": self.pointer_only_vs_row,
+                "teacher_row_strip_only_vs_pointer": self.row_only_vs_pointer,
+                "official_vs_teacher_row_strip_disagreements": (
+                    self.official_row_disagreements
+                ),
             },
         }
 
@@ -844,6 +875,9 @@ def main() -> None:
 
             row_qualities: list[torch.Tensor] = []
             row_validities: list[torch.Tensor] = []
+            pointer_validities = outputs[
+                "_selection_pointer_candidate_valid"
+            ].detach().cpu().bool()
             for image_index, target in enumerate(targets):
                 quality, row_valid, valid_gt = pairwise_range_aware_row_strip_iou(
                     outputs["pred_x_rows"][image_index].detach().float(),
@@ -885,14 +919,14 @@ def main() -> None:
             for image_index, ((official_iou, official_valid), stage) in enumerate(
                 zip(official_rows, stages)
             ):
-                # The official raster helper clamps x before testing finiteness,
-                # while the deployed pointer validity mask tests the raw curve.
-                # Oracle selection must never use a candidate the pointer cannot
-                # emit, so eligibility is the intersection of both contracts.
-                deployable_valid = official_valid & row_validities[image_index]
+                # Actual emissions use the official postprocess mask.  Oracle
+                # replacements must additionally be reachable by the decoder;
+                # the private pointer mask is the authoritative eligibility
+                # tensor rather than a reconstructed surrogate mask.
+                oracle_valid = official_valid & pointer_validities[image_index]
                 selected, _ = _selected_pointer_ids(
                     stage["selection_pointer_indices"],
-                    deployable_valid,
+                    official_valid,
                     top_k=args.top_k,
                 )
                 image_replacements = {}
@@ -902,7 +936,7 @@ def main() -> None:
                     replacement = _replacement_sequence(
                         official_iou,
                         row_qualities[image_index],
-                        deployable_valid,
+                        oracle_valid,
                         selected,
                         stage["selection_logits"],
                         stage["selection_pointer_logits"],
@@ -939,10 +973,12 @@ def main() -> None:
                 zip(official_rows, stages)
             ):
                 active_candidates = teacher["candidate_steps"][image_index].bool()
-                deployable_valid = official_valid & row_validities[image_index]
+                oracle_valid = official_valid & pointer_validities[image_index]
                 accumulator.update(
                     official_iou=official_iou,
-                    candidate_valid=deployable_valid,
+                    evaluation_candidate_valid=official_valid,
+                    oracle_candidate_valid=oracle_valid,
+                    pointer_candidate_valid=pointer_validities[image_index],
                     normal_indices=stage["selection_pointer_indices"],
                     normal_logits=stage["selection_pointer_logits"],
                     forced_indices=forced_rollout["selection_pointer_indices"][image_index].cpu(),
@@ -960,7 +996,6 @@ def main() -> None:
                     support_sizes=teacher["support_sizes"][image_index][active_candidates].cpu().tolist(),
                     target_entropies=teacher["target_entropy"][image_index][active_candidates].cpu().tolist(),
                     target_qualities=teacher["target_quality"][image_index][active_candidates].cpu().tolist(),
-                    official_candidate_valid=official_valid,
                     row_candidate_valid=row_validities[image_index],
                 )
     finally:
@@ -994,7 +1029,7 @@ def main() -> None:
             "oracle_labeled_replacement_anchor_threshold": -1.0,
             "cardinality_shortfalls_are_count_diagnostics_not_tp_attribution": True,
             "oracle_candidate_validity": (
-                "official_raster_valid AND raw-row pointer-valid"
+                "official_raster_valid AND private decoder pointer-valid"
             ),
             "max_batches": int(args.max_batches),
         },
