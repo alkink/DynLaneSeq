@@ -14,6 +14,12 @@ class SinePositionEncoding2D(nn.Module):
         self.dim = dim
         self.temperature = temperature
 
+    # PyTorch 2.1 Inductor's BF16 value-range analysis raises an
+    # ``Invalid NaN comparison`` while lowering the tensor power used for the
+    # frequency schedule below.  Keep this tiny, parameter-free construction
+    # eager so compiling the enclosing detector preserves the exact eager
+    # positional encoding instead of changing its numerical formula.
+    @torch._dynamo.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, h, w = x.shape
         device = x.device
@@ -28,4 +34,3 @@ class SinePositionEncoding2D(nn.Module):
         out_y = yy[..., None] * omega * 2 * math.pi
         pe = torch.cat([out_y.sin(), out_y.cos(), out_x.sin(), out_x.cos()], dim=-1)
         return pe.permute(2, 0, 1).unsqueeze(0)
-
