@@ -147,8 +147,9 @@ def build_pointer_cluster_soft_targets(
     base_seed: int,
     iteration: int,
     visit: int,
+    target_mode: str = "sampled_cluster",
 ) -> dict[str, torch.Tensor]:
-    """Build V4.5 GT-cluster soft targets and a discrete teacher rollout.
+    """Build GT-cluster soft targets and a discrete teacher rollout.
 
     The detached candidate/GT quality matrix is retained until each pointer
     step.  A cardinality-first one-to-one assignment decides only which GTs
@@ -156,6 +157,13 @@ def build_pointer_cluster_soft_targets(
     identity.  Each retained GT then supplies a near-best soft representative
     distribution.  GT order and the discrete candidate fed to the GRU are
     resampled reproducibly on every training visit.
+
+    ``sampled_cluster`` is the original V4.5 contract: only the next randomly
+    ordered GT cluster supplies the step loss.  ``remaining_cluster_mixture``
+    keeps the same sampled teacher prefix but averages the normalized support
+    distributions of *all* remaining jointly representable GTs.  It therefore
+    removes false-negative gradients between still-valid lane clusters without
+    introducing a model/free rollout.
     """
 
     pred_x = outputs["pred_x_rows"].detach().float()
@@ -170,6 +178,12 @@ def build_pointer_cluster_soft_targets(
         raise ValueError("pointer support_quality_delta must be non-negative")
     if float(temperature) <= 0.0:
         raise ValueError("pointer cluster temperature must be positive")
+    target_mode = str(target_mode).strip().lower()
+    if target_mode not in {"sampled_cluster", "remaining_cluster_mixture"}:
+        raise ValueError(
+            "pointer cluster target_mode must be sampled_cluster or "
+            "remaining_cluster_mixture"
+        )
 
     device = pred_x.device
     stop_class = candidates
@@ -184,6 +198,7 @@ def build_pointer_cluster_soft_targets(
     support_sizes = pred_x.new_zeros((batch, steps))
     target_entropy = pred_x.new_zeros((batch, steps))
     target_quality = pred_x.new_zeros((batch, steps))
+    remaining_cluster_count = pred_x.new_zeros((batch, steps))
     candidate_steps = torch.zeros((batch, steps), dtype=torch.bool, device=device)
     representable_count = pred_x.new_zeros((batch,))
     fallback_count = pred_x.new_zeros((batch,))
@@ -268,51 +283,164 @@ def build_pointer_cluster_soft_targets(
         for step, (gt_index, fallback_candidate, _assigned_quality) in enumerate(
             ordered_pairs
         ):
-            q = quality_cpu[:, gt_index]
-            valid_q = q[available]
-            if valid_q.numel() == 0:
-                raise RuntimeError("V4.5 teacher exhausted all valid candidates")
-            q_best = float(valid_q.max())
-            cutoff = max(
-                float(representable_min),
-                q_best - float(support_quality_delta),
+            remaining_pairs = ordered_pairs[step:]
+            remaining_cluster_count[batch_index, step] = float(
+                len(remaining_pairs)
             )
-            # The evaluator and representability gate use a strict boundary.
-            # Keep exactly-threshold candidates out even though the near-best
-            # cutoff itself is inclusive.
-            support = (
-                available
-                & (q > float(representable_min))
-                & (q >= cutoff)
-            )
-            # Preserve the unique cardinality-first representative reserved
-            # for every future GT.  This is a collision-safe guard for train
-            # augmentations even though the calibrated validation preflight
-            # observed zero cross-GT support overlap.
-            future_fallbacks = [
-                int(pair[1]) for pair in ordered_pairs[step + 1 :]
-            ]
-            if future_fallbacks:
-                future_ids = torch.tensor(future_fallbacks, dtype=torch.long)
-                reservation_exclusion_count[batch_index] += float(
-                    support[future_ids].sum()
-                )
-                support[future_ids] = False
-            if not bool(support.any()):
-                # Joint matching guarantees a qualified unique fallback.  The
-                # branch is defensive for future datasets where supports may
-                # overlap after earlier sampled representatives are removed.
-                if not bool(available[fallback_candidate]):
+
+            if target_mode == "sampled_cluster":
+                # Preserve the calibrated V4.5 target exactly.
+                q = quality_cpu[:, gt_index]
+                valid_q = q[available]
+                if valid_q.numel() == 0:
                     raise RuntimeError(
-                        "V4.5 collision guard lost a reserved representative"
+                        "V4.5 teacher exhausted all valid candidates"
                     )
-                support[fallback_candidate] = True
-                fallback_count[batch_index] += 1.0
-            support_ids = torch.nonzero(support, as_tuple=False).flatten()
-            distribution = torch.softmax(
-                q[support_ids] / float(temperature),
-                dim=0,
-            )
+                q_best = float(valid_q.max())
+                cutoff = max(
+                    float(representable_min),
+                    q_best - float(support_quality_delta),
+                )
+                support = (
+                    available
+                    & (q > float(representable_min))
+                    & (q >= cutoff)
+                )
+                future_fallbacks = [
+                    int(pair[1]) for pair in ordered_pairs[step + 1 :]
+                ]
+                if future_fallbacks:
+                    future_ids = torch.tensor(
+                        future_fallbacks,
+                        dtype=torch.long,
+                    )
+                    reservation_exclusion_count[batch_index] += float(
+                        support[future_ids].sum()
+                    )
+                    support[future_ids] = False
+                if not bool(support.any()):
+                    if not bool(available[fallback_candidate]):
+                        raise RuntimeError(
+                            "V4.5 collision guard lost a reserved representative"
+                        )
+                    support[fallback_candidate] = True
+                    fallback_count[batch_index] += 1.0
+                support_ids = torch.nonzero(
+                    support,
+                    as_tuple=False,
+                ).flatten()
+                distribution = torch.softmax(
+                    q[support_ids] / float(temperature),
+                    dim=0,
+                )
+                probabilities[
+                    batch_index,
+                    step,
+                    support_ids.to(device=device),
+                ] = distribution.to(
+                    device=device,
+                    dtype=probabilities.dtype,
+                )
+                target_quality_value = float(
+                    (distribution * q[support_ids]).sum()
+                )
+            else:
+                # V4.6: every remaining GT contributes equal probability mass.
+                # Per-GT normalization prevents duplicate-rich clusters from
+                # dominating the target.  Other GTs' unique Hungarian fallback
+                # candidates are reserved so every target action retains a
+                # feasible continuation path.
+                cluster_targets: list[
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                ] = []
+                remaining_fallbacks = [int(pair[1]) for pair in remaining_pairs]
+                for (
+                    remaining_gt,
+                    remaining_fallback,
+                    _remaining_quality,
+                ) in remaining_pairs:
+                    q_remaining = quality_cpu[:, remaining_gt]
+                    eligible = available.clone()
+                    other_fallbacks = [
+                        value
+                        for value in remaining_fallbacks
+                        if value != int(remaining_fallback)
+                    ]
+                    if other_fallbacks:
+                        other_ids = torch.tensor(
+                            other_fallbacks,
+                            dtype=torch.long,
+                        )
+                        eligible[other_ids] = False
+                    valid_q = q_remaining[eligible]
+                    if valid_q.numel() == 0:
+                        raise RuntimeError(
+                            "V4.6 teacher exhausted all eligible candidates"
+                        )
+                    q_best = float(valid_q.max())
+                    cutoff = max(
+                        float(representable_min),
+                        q_best - float(support_quality_delta),
+                    )
+                    raw_support = (
+                        available
+                        & (q_remaining > float(representable_min))
+                        & (q_remaining >= cutoff)
+                    )
+                    reservation_exclusion_count[batch_index] += float(
+                        (raw_support & ~eligible).sum()
+                    )
+                    support = raw_support & eligible
+                    if not bool(support.any()):
+                        if not bool(available[remaining_fallback]):
+                            raise RuntimeError(
+                                "V4.6 collision guard lost a reserved "
+                                "representative"
+                            )
+                        support[remaining_fallback] = True
+                        fallback_count[batch_index] += 1.0
+                    remaining_support_ids = torch.nonzero(
+                        support,
+                        as_tuple=False,
+                    ).flatten()
+                    remaining_distribution = torch.softmax(
+                        q_remaining[remaining_support_ids]
+                        / float(temperature),
+                        dim=0,
+                    )
+                    cluster_targets.append(
+                        (
+                            q_remaining,
+                            remaining_support_ids,
+                            remaining_distribution,
+                        )
+                    )
+
+                q, support_ids, distribution = cluster_targets[0]
+                target_row = probabilities[batch_index, step, :candidates]
+                cluster_weight = 1.0 / float(len(cluster_targets))
+                expected_quality = 0.0
+                for (
+                    cluster_quality,
+                    cluster_support_ids,
+                    cluster_distribution,
+                ) in cluster_targets:
+                    target_row[cluster_support_ids.to(device=device)] += (
+                        cluster_distribution.to(
+                            device=device,
+                            dtype=target_row.dtype,
+                        )
+                        * cluster_weight
+                    )
+                    expected_quality += cluster_weight * float(
+                        (
+                            cluster_distribution
+                            * cluster_quality[cluster_support_ids]
+                        ).sum()
+                    )
+                target_row /= target_row.sum().clamp_min(1e-12)
+                target_quality_value = expected_quality
+
             sampled_local = int(
                 torch.multinomial(
                     distribution,
@@ -323,21 +451,15 @@ def build_pointer_cluster_soft_targets(
             )
             sampled_candidate = int(support_ids[sampled_local])
 
-            probabilities[
-                batch_index,
-                step,
-                support_ids.to(device=device),
-            ] = distribution.to(device=device, dtype=probabilities.dtype)
             teacher_indices[batch_index, step] = sampled_candidate
             active[batch_index, step] = True
             candidate_steps[batch_index, step] = True
-            support_sizes[batch_index, step] = float(support_ids.numel())
+            target_row = probabilities[batch_index, step, :candidates]
+            support_sizes[batch_index, step] = float((target_row > 0.0).sum())
             target_entropy[batch_index, step] = float(
-                -(distribution * distribution.clamp_min(1e-12).log()).sum()
+                -(target_row * target_row.clamp_min(1e-12).log()).sum()
             )
-            target_quality[batch_index, step] = float(
-                (distribution * q[support_ids]).sum()
-            )
+            target_quality[batch_index, step] = target_quality_value
             available[sampled_candidate] = False
 
         count = len(ordered_pairs)
@@ -354,6 +476,7 @@ def build_pointer_cluster_soft_targets(
         "support_sizes": support_sizes,
         "target_entropy": target_entropy,
         "target_quality": target_quality,
+        "remaining_cluster_count": remaining_cluster_count,
         "representable_count": representable_count,
         "fallback_count": fallback_count,
         "reservation_exclusion_count": reservation_exclusion_count,
@@ -594,6 +717,7 @@ class S0Criterion(nn.Module):
                 "mean_cluster_support": zero,
                 "mean_cluster_entropy": zero,
                 "mean_cluster_quality": zero,
+                "mean_remaining_cluster_count": zero,
                 "mean_representable_count": zero,
                 "teacher_fallback_count": zero,
                 "teacher_reservation_exclusion_count": zero,
@@ -668,6 +792,9 @@ class S0Criterion(nn.Module):
             ],
             "pointer_target_mean_cluster_quality": pointer_selection[
                 "mean_cluster_quality"
+            ],
+            "pointer_target_mean_remaining_cluster_count": pointer_selection[
+                "mean_remaining_cluster_count"
             ],
             "pointer_target_mean_representable_count": pointer_selection[
                 "mean_representable_count"
@@ -2053,6 +2180,9 @@ class S0Criterion(nn.Module):
             ),
             "mean_cluster_quality": candidate_step_mean(
                 "selection_pointer_teacher_target_quality"
+            ),
+            "mean_remaining_cluster_count": candidate_step_mean(
+                "selection_pointer_teacher_remaining_cluster_count"
             ),
             "mean_representable_count": (
                 representable_value.float().mean().detach()

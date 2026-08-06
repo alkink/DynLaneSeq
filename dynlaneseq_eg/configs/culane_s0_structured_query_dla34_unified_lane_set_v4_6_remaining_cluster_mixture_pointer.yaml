@@ -1,0 +1,29 @@
+_base_: culane_s0_structured_query_dla34_unified_lane_set_v4_5_cluster_soft_pointer.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v4_6_remaining_cluster_mixture_gate_105k/remaining_cluster_mixture
+
+# V4.6 changes one training factor relative to V4.5.  The sampled, valid
+# teacher prefix and frozen geometry contract are unchanged.  At every active
+# candidate step, however, all still-uncovered jointly representable GT
+# clusters contribute equal probability mass.  This removes the per-visit
+# false negatives created when only one randomly ordered GT supplies the loss.
+model:
+  structured_query:
+    set_selection:
+      pointer_teacher_mode: cluster_soft_remaining_mixture
+      pointer_cluster_representable_min: 0.20
+      pointer_cluster_quality_delta: 0.10
+      pointer_cluster_temperature: 0.03
+      row_grid_mode: fixed_rows
+
+loss:
+  pointer_unary_target_mode: max_quality
+  pointer_quality_weight: 0.10
+  pointer_stop_weight: 1.0
+  set_selection_focal_beta: 0.0
+
+training:
+  max_iters: 5000
+  checkpoint_interval: 2500
+  checkpoint_include_optimizer: true
+  save_last_alias: false

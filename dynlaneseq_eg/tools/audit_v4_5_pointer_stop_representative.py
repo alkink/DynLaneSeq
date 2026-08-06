@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-workers", type=int, default=8)
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument(
+        "--sample-strategy",
+        choices=("uniform", "sequential"),
+        default="sequential",
+    )
+    parser.add_argument(
         "--amp-dtype",
         choices=("none", "float16", "bfloat16"),
         default="none",
@@ -780,6 +785,14 @@ def main() -> None:
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     loader = build_dataloader(cfg, split=args.split, training=False)
+    from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
+
+    loader, sampled_indices = select_diagnostic_loader(
+        loader,
+        strategy=str(args.sample_strategy),
+        max_batches=int(args.max_batches),
+        num_workers=int(args.num_workers),
+    )
 
     selection_cfg = (
         cfg.get("model", {}).get("structured_query", {}).get("set_selection", {})
@@ -791,6 +804,12 @@ def main() -> None:
     )
     quality_delta = float(selection_cfg.get("pointer_cluster_quality_delta", 0.10))
     temperature = float(selection_cfg.get("pointer_cluster_temperature", 0.03))
+    target_mode = (
+        "remaining_cluster_mixture"
+        if str(getattr(selector, "pointer_teacher_mode", ""))
+        == "cluster_soft_remaining_mixture"
+        else "sampled_cluster"
+    )
     base_seed = int(cfg.get("training", {}).get("seed", 0))
     accumulator = AuditAccumulator(thresholds, args.top_k)
 
@@ -855,6 +874,7 @@ def main() -> None:
                 base_seed=base_seed,
                 iteration=checkpoint_iteration,
                 visit=batch_index,
+                target_mode=target_mode,
             )
             forced_rollout = selector.decode_pointer(
                 outputs["_selection_pointer_hidden"],
@@ -1003,7 +1023,10 @@ def main() -> None:
         cv2.setNumThreads(previous_cv_threads)
 
     report = {
-        "experiment": "V4.5 pointer STOP and representative counterfactual forensics",
+        "experiment": (
+            "V4.5/V4.6 pointer STOP, target-policy, and representative "
+            "counterfactual forensics"
+        ),
         "diagnostic_only": True,
         "config": str(Path(args.config)),
         "checkpoint": str(Path(args.checkpoint)),
@@ -1014,6 +1037,7 @@ def main() -> None:
             "representable_min": representable_min,
             "quality_delta": quality_delta,
             "temperature": temperature,
+            "target_mode": target_mode,
         },
         "protocol": {
             "official_culane_raster_iou": True,
@@ -1032,6 +1056,8 @@ def main() -> None:
                 "official_raster_valid AND private decoder pointer-valid"
             ),
             "max_batches": int(args.max_batches),
+            "sample_strategy": str(args.sample_strategy),
+            "sampled_dataset_indices": sampled_indices,
         },
         "audit": accumulator.finish(),
         "decision_rule": {

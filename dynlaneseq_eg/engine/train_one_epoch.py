@@ -100,7 +100,11 @@ def _apply_pointer_teacher_forcing(
         .get("structured_query", {})
         .get("set_selection", {})
     )
-    if getattr(selector, "pointer_teacher_mode", "") == "cluster_soft_randomized":
+    pointer_teacher_mode = getattr(selector, "pointer_teacher_mode", "")
+    if pointer_teacher_mode in {
+        "cluster_soft_randomized",
+        "cluster_soft_remaining_mixture",
+    }:
         teacher = build_pointer_cluster_soft_targets(
             outputs,
             targets,
@@ -124,6 +128,11 @@ def _apply_pointer_teacher_forcing(
             base_seed=int(cfg.get("training", {}).get("seed", 0)),
             iteration=int(iteration),
             visit=int(teacher_visit),
+            target_mode=(
+                "remaining_cluster_mixture"
+                if pointer_teacher_mode == "cluster_soft_remaining_mixture"
+                else "sampled_cluster"
+            ),
         )
         selector.reroll_pointer_with_cluster_teacher(outputs, teacher)
         return

@@ -865,10 +865,12 @@ class SetAwareLaneSelectionHead(nn.Module):
             "fixed_sequence",
             "permutation_invariant_set",
             "cluster_soft_randomized",
+            "cluster_soft_remaining_mixture",
         }:
             raise ValueError(
                 "set_selection.pointer_teacher_mode must be fixed_sequence "
-                "or permutation_invariant_set, or cluster_soft_randomized"
+                "or permutation_invariant_set, cluster_soft_randomized, "
+                "or cluster_soft_remaining_mixture"
             )
         if self.row_grid_mode not in {"legacy_linspace", "fixed_rows"}:
             raise ValueError(
@@ -1839,12 +1841,15 @@ class SetAwareLaneSelectionHead(nn.Module):
         outputs: dict[str, torch.Tensor],
         teacher: dict[str, torch.Tensor],
     ) -> None:
-        """Run the V4.5 soft-cluster policy on sampled teacher prefixes."""
+        """Run a soft-cluster policy on sampled, GT-valid teacher prefixes."""
 
-        if self.pointer_teacher_mode != "cluster_soft_randomized":
+        if self.pointer_teacher_mode not in {
+            "cluster_soft_randomized",
+            "cluster_soft_remaining_mixture",
+        }:
             raise ValueError(
                 "cluster-soft teacher requires pointer_teacher_mode="
-                "cluster_soft_randomized"
+                "cluster_soft_randomized or cluster_soft_remaining_mixture"
             )
         indices = teacher.get("indices")
         probabilities = teacher.get("probabilities")
@@ -1891,6 +1896,10 @@ class SetAwareLaneSelectionHead(nn.Module):
             ("support_sizes", "selection_pointer_teacher_support_sizes"),
             ("target_entropy", "selection_pointer_teacher_target_entropy"),
             ("target_quality", "selection_pointer_teacher_target_quality"),
+            (
+                "remaining_cluster_count",
+                "selection_pointer_teacher_remaining_cluster_count",
+            ),
             (
                 "representable_count",
                 "selection_pointer_teacher_representable_count",
