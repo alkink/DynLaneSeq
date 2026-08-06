@@ -2925,7 +2925,8 @@ class StructuredLaneQueryHead(nn.Module):
                     input_reference_x_rows=reference_x,
                     lane_state=lane_state,
                     decision_lane_state=decision_lane_state,
-                    layer_index=layer_index,
+                    row_delta_norm=self.row_delta_norms[layer_index],
+                    row_delta_head=self.row_delta_heads[layer_index],
                 )
                 if self.row_reference_prediction_mode == "bounded_delta":
                     delta_abs = layer_outputs["pred_delta_x_rows"].detach().abs()
@@ -3209,18 +3210,27 @@ class StructuredLaneQueryHead(nn.Module):
         input_reference_x_rows: torch.Tensor | None = None,
         lane_state: torch.Tensor | None = None,
         decision_lane_state: torch.Tensor | None = None,
-        layer_index: int | None = None,
+        row_delta_norm: nn.Module | None = None,
+        row_delta_head: nn.Module | None = None,
     ) -> dict[str, torch.Tensor]:
         """Apply lane heads while respecting the configured coordinate frame."""
         b = int(row_tokens.shape[0])
         if self.row_reference_prediction_mode == "bounded_delta":
-            if input_reference_x_rows is None or layer_index is None:
+            if (
+                input_reference_x_rows is None
+                or row_delta_norm is None
+                or row_delta_head is None
+            ):
                 raise ValueError(
-                    "bounded_delta prediction requires a layer index and input reference"
+                    "bounded_delta prediction requires an input reference and "
+                    "layer-local readout modules"
                 )
-            if not 0 <= int(layer_index) < len(self.row_delta_heads):
-                raise IndexError(f"invalid bounded-delta layer index: {layer_index}")
-            normalized_rows = self.row_delta_norms[int(layer_index)](row_tokens)
+            # The caller resolves the layer-local modules while its decoder
+            # index is a Python loop constant.  Passing the modules explicitly keeps
+            # PyTorch 2.1 Dynamo from trying to index a ModuleList with a
+            # symbolic integer inside this helper; eager semantics are
+            # unchanged.
+            normalized_rows = row_delta_norm(row_tokens)
         else:
             if self.row_norm is None:
                 raise RuntimeError("absolute row normalization was not initialized")
@@ -3255,7 +3265,8 @@ class StructuredLaneQueryHead(nn.Module):
             else:
                 decision_query = lane_query
         if self.row_reference_prediction_mode == "bounded_delta":
-            row_x_logits = self.row_delta_heads[int(layer_index)](normalized_rows)
+            assert row_delta_head is not None
+            row_x_logits = row_delta_head(normalized_rows)
             offsets = self.row_delta_offsets_px.to(
                 device=row_x_logits.device,
                 dtype=row_x_logits.dtype,
