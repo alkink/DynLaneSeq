@@ -68,7 +68,11 @@ if [[ "${RUN_TRAIN}" != "1" ]]; then
   exit 0
 fi
 
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# PyTorch 2.1 + CUDA-on-WSL can report a driver initialization error when
+# ``expandable_segments`` is requested.  A bounded split size is supported by
+# both the local RTX 3090 stack and the newer server allocator.  Callers may
+# still provide their own allocator contract explicitly.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 
 for seed in ${SEEDS}; do
   for arm in ${ARMS}; do
