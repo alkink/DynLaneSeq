@@ -14,6 +14,7 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
+COMPILE_MODEL="${COMPILE_MODEL:-config}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
 MIN_FREE_GB="${MIN_FREE_GB:-3.5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v5_protected_ownership_gate}"
@@ -31,6 +32,10 @@ if (( BATCH_SIZE * GRAD_ACCUM != 16 )); then
 fi
 if [[ "${AMP_DTYPE}" != "bfloat16" ]]; then
   echo "V5 gate is predeclared with AMP_DTYPE=bfloat16." >&2
+  exit 1
+fi
+if [[ "${COMPILE_MODEL}" != "config" && "${COMPILE_MODEL}" != "true" && "${COMPILE_MODEL}" != "false" ]]; then
+  echo "COMPILE_MODEL accepts only config, true, or false; got ${COMPILE_MODEL}." >&2
   exit 1
 fi
 for arm in ${ARMS}; do
@@ -110,6 +115,7 @@ for seed in ${SEEDS}; do
       --grad-accum "${GRAD_ACCUM}" \
       --num-workers "${NUM_WORKERS}" \
       --seg-aux-amp-dtype "${AMP_DTYPE}" \
+      --compile-model "${COMPILE_MODEL}" \
       2>&1 | tee "${output_dir}/train.log"
 
     if [[ ! -f "${final_checkpoint}" ]]; then

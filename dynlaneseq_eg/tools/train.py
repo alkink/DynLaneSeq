@@ -223,6 +223,16 @@ def main() -> None:
         help="Override training.gradient_accumulation_steps.",
     )
     parser.add_argument(
+        "--compile-model",
+        choices=("config", "true", "false"),
+        default="config",
+        help=(
+            "Override training.compile_model. 'config' preserves the YAML; "
+            "'false' is useful on local CUDA/Inductor combinations that cannot "
+            "compile the model while keeping the mathematical training contract unchanged."
+        ),
+    )
+    parser.add_argument(
         "--resume-group-lr",
         action="append",
         default=[],
@@ -268,6 +278,10 @@ def main() -> None:
         cfg.setdefault("model", {}).setdefault("seg_aux", {})["amp_dtype"] = args.seg_aux_amp_dtype
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
+    if args.compile_model != "config":
+        cfg.setdefault("training", {})["compile_model"] = (
+            args.compile_model == "true"
+        )
     if args.seed >= 0:
         cfg.setdefault("training", {})["seed"] = int(args.seed)
     if args.checkpoint_interval >= 0:
