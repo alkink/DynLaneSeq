@@ -27,12 +27,20 @@ def _parse_mapping(items: list[str]) -> dict[int, Path]:
 def _policy_row(report: dict[str, Any]) -> dict[str, Any]:
     audit = report["audit"]
     prefix = audit["teacher_prefix_policy"]
+    step_support_hit = {
+        step: float(values["candidate_support_hit_rate"])
+        for step, values in prefix.items()
+    }
     return {
         "target_mode": report["teacher_contract"].get("target_mode"),
-        "step_support_hit": {
-            step: float(values["candidate_support_hit_rate"])
-            for step, values in prefix.items()
-        },
+        "step_support_hit": step_support_hit,
+        # The remaining-cluster mixture changes steps 1--3, where more than
+        # one GT cluster can remain.  At step 4 only one cluster remains, so
+        # its target is identical to the sampled-cluster V4.5 target.
+        "early_step_support_hit_mean": sum(
+            step_support_hit[str(step)] for step in range(1, 4)
+        )
+        / 3.0,
         "step_target_mass": {
             step: float(values["mean_probability_mass_on_candidate_support"])
             for step, values in prefix.items()
@@ -83,6 +91,10 @@ def main() -> None:
         row["delta"] = {
             "f1_050": row["f1_050"] - source_metric["f1_050"],
             "f1_075": row["f1_075"] - source_metric["f1_075"],
+            "early_step_support_hit_mean": (
+                row["policy"]["early_step_support_hit_mean"]
+                - source_policy["early_step_support_hit_mean"]
+            ),
             "step4_support_hit": (
                 row["policy"]["step_support_hit"]["4"]
                 - source_policy["step_support_hit"]["4"]
@@ -99,10 +111,10 @@ def main() -> None:
             <= 1e-6,
             "f1_050_gain_at_least_0p30": row["delta"]["f1_050"] >= 0.003,
             "f1_075_not_down_more_than_0p30": row["delta"]["f1_075"] >= -0.003,
-            "step4_support_hit_gain_at_least_10pp": row["delta"][
-                "step4_support_hit"
+            "early_step_support_hit_gain_at_least_5pp": row["delta"][
+                "early_step_support_hit_mean"
             ]
-            >= 0.10,
+            >= 0.05,
             "duplicate_fp_fraction_below_25pct": row[
                 "duplicate_fp_fraction_050"
             ]

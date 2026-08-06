@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
 import torch
 
 from dynlaneseq_eg.config import load_config
@@ -197,7 +198,7 @@ def test_remaining_cluster_teacher_reroll_is_differentiable() -> None:
     )
 
 
-def test_v4_6_summary_requires_metric_and_teacher_policy_gain(
+def test_v4_6_summary_requires_metric_and_early_teacher_policy_gain(
     tmp_path, monkeypatch
 ) -> None:
     def coverage(f1_050: float, f1_075: float) -> dict:
@@ -225,7 +226,7 @@ def test_v4_6_summary_requires_metric_and_teacher_policy_gain(
             },
         }
 
-    def policy(step4_hit: float) -> dict:
+    def policy(early_hit: float, step4_hit: float) -> dict:
         return {
             "teacher_contract": {
                 "target_mode": "remaining_cluster_mixture"
@@ -234,7 +235,7 @@ def test_v4_6_summary_requires_metric_and_teacher_policy_gain(
                 "teacher_prefix_policy": {
                     str(step): {
                         "candidate_support_hit_rate": (
-                            step4_hit if step == 4 else 0.5
+                            step4_hit if step == 4 else early_hit
                         ),
                         "mean_probability_mass_on_candidate_support": 0.4,
                         "mean_soft_target_cross_entropy": 2.0,
@@ -258,10 +259,13 @@ def test_v4_6_summary_requires_metric_and_teacher_policy_gain(
     }
     payloads = {
         "source": coverage(0.820, 0.610),
-        "source_policy": policy(0.40),
+        "source_policy": policy(0.40, 0.40),
         "gradient": {"passed": True},
         "trajectory": coverage(0.824, 0.609),
-        "policy": policy(0.52),
+        # V4.6 changes the multi-cluster steps while step 4 has the same
+        # single-cluster target as V4.5.  The gate must therefore pass on an
+        # early-step gain even when step 4 is unchanged.
+        "policy": policy(0.46, 0.40),
     }
     for name, payload in payloads.items():
         paths[name].write_text(json.dumps(payload), encoding="utf-8")
@@ -289,3 +293,6 @@ def test_v4_6_summary_requires_metric_and_teacher_policy_gain(
     summary = json.loads(paths["output"].read_text(encoding="utf-8"))
     assert summary["passed"] is True
     assert summary["passing_iterations"] == [107500]
+    assert summary["trajectory"][0]["delta"][
+        "early_step_support_hit_mean"
+    ] == pytest.approx(0.06)
