@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-cache", required=True)
     parser.add_argument("--val-cache", required=True)
     parser.add_argument("--reuse-cache", action="store_true")
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Refuse detector inference when either frozen cache is missing.",
+    )
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument(
         "--amp-dtype",
@@ -80,6 +85,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--proposal-layers", type=int, default=2)
+    parser.add_argument(
+        "--matched-proposal-layers",
+        type=int,
+        default=5,
+        help=(
+            "Depth of the capacity-matched 32-query control. Five layers "
+            "is approximately parameter matched to the default slot router."
+        ),
+    )
     parser.add_argument("--slot-layers", type=int, default=2)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--ff-dim", type=int, default=512)
@@ -339,6 +353,10 @@ def _load_or_collect_cache(
                 f"cache signature mismatch for {output_path}: {mismatches}"
             )
         return cache
+    if args.cache_only:
+        raise FileNotFoundError(
+            f"required frozen cache is missing: {output_path}"
+        )
     return _collect_cache(
         model,
         cfg,
@@ -679,6 +697,7 @@ def _finish_counts(counts: dict[str, Any]) -> dict[str, Any]:
 def _evaluate(
     cache: dict[str, Any],
     proposal_probe: nn.Module,
+    matched_proposal_probe: nn.Module,
     slot_probe: FourSlotRouter,
     *,
     device: torch.device,
@@ -686,8 +705,10 @@ def _evaluate(
     num_slots: int,
 ) -> dict[str, Any]:
     proposal_probe.eval()
+    matched_proposal_probe.eval()
     slot_probe.eval()
     proposal_logits = []
+    matched_proposal_logits = []
     slot_logits = []
     for start in range(0, int(cache["features"].shape[0]), int(batch_size)):
         stop = start + int(batch_size)
@@ -696,8 +717,14 @@ def _evaluate(
         )
         valid = cache["candidate_valid"][start:stop].to(device)
         proposal_logits.append(proposal_probe(features).float().cpu())
+        matched_proposal_logits.append(
+            matched_proposal_probe(features).float().cpu()
+        )
         slot_logits.append(slot_probe(features, valid).float().cpu())
     learned_scores = torch.sigmoid(torch.cat(proposal_logits))
+    matched_learned_scores = torch.sigmoid(
+        torch.cat(matched_proposal_logits)
+    )
     routes = torch.cat(slot_logits)
     exist_logits = cache["stage"]["exist_logits"].float()
     current_scores = torch.softmax(exist_logits, dim=-1)[..., 0]
@@ -706,6 +733,8 @@ def _evaluate(
         "current_v5_top4": _new_counts(),
         "learned_32_direct": _new_counts(),
         "learned_32_top4": _new_counts(),
+        "learned_32_parameter_matched_direct": _new_counts(),
+        "learned_32_parameter_matched_top4": _new_counts(),
         "learned_4_slots": _new_counts(),
     }
     oracle = {"gt": 0, "tp_050": 0, "tp_075": 0}
@@ -714,10 +743,12 @@ def _evaluate(
         valid = cache["candidate_valid"][image_index].bool()
         current = current_scores[image_index]
         learned = learned_scores[image_index]
+        matched_learned = matched_learned_scores[image_index]
         current_positive = exist_logits[image_index, :, 0] > exist_logits[
             image_index, :, 1
         ]
         learned_positive = learned > 0.5
+        matched_learned_positive = matched_learned > 0.5
         selections = {
             "current_v5_direct": _topk(
                 current,
@@ -736,6 +767,15 @@ def _evaluate(
             ),
             "learned_32_top4": _topk(
                 learned, valid, top_k=num_slots
+            ),
+            "learned_32_parameter_matched_direct": _topk(
+                matched_learned,
+                valid,
+                top_k=num_slots,
+                positive=matched_learned_positive,
+            ),
+            "learned_32_parameter_matched_top4": _topk(
+                matched_learned, valid, top_k=num_slots
             ),
         }
         slot_selected, _slot_scores = _decode_slots(
@@ -789,6 +829,7 @@ def main() -> None:
         "probe_batch_size",
         "hidden_dim",
         "proposal_layers",
+        "matched_proposal_layers",
         "slot_layers",
         "num_heads",
         "ff_dim",
@@ -872,6 +913,14 @@ def main() -> None:
         ff_dim=int(args.ff_dim),
         dropout=float(args.dropout),
     ).to(device)
+    matched_proposal_probe = SetAwareQualityProbe(
+        feature_dim,
+        hidden_dim=int(args.hidden_dim),
+        num_layers=int(args.matched_proposal_layers),
+        num_heads=int(args.num_heads),
+        ff_dim=int(args.ff_dim),
+        dropout=float(args.dropout),
+    ).to(device)
     slot_probe = FourSlotRouter(
         feature_dim,
         hidden_dim=int(args.hidden_dim),
@@ -883,7 +932,9 @@ def main() -> None:
         dropout=float(args.dropout),
     ).to(device)
     optimizer = torch.optim.AdamW(
-        list(proposal_probe.parameters()) + list(slot_probe.parameters()),
+        list(proposal_probe.parameters())
+        + list(matched_proposal_probe.parameters())
+        + list(slot_probe.parameters()),
         lr=float(args.learning_rate),
         weight_decay=float(args.weight_decay),
     )
@@ -893,9 +944,17 @@ def main() -> None:
         steps=int(args.train_steps),
         seed=int(args.seed),
     )
-    totals = {"proposal": 0.0, "rank": 0.0, "slot": 0.0, "collision": 0.0}
+    totals = {
+        "proposal": 0.0,
+        "proposal_rank": 0.0,
+        "matched_proposal": 0.0,
+        "matched_proposal_rank": 0.0,
+        "slot": 0.0,
+        "collision": 0.0,
+    }
     running = dict(totals)
     proposal_probe.train()
+    matched_proposal_probe.train()
     slot_probe.train()
     for step_index in tqdm(
         range(int(args.train_steps)), desc="V5 32-query vs 4-slot probe", ncols=90
@@ -906,6 +965,7 @@ def main() -> None:
         )
         valid = train_cache["candidate_valid"][indices].to(device)
         proposal_logits = proposal_probe(features)
+        matched_proposal_logits = matched_proposal_probe(features)
         route_logits = slot_probe(features, valid)
         target_rows = _slot_target_batch(train_cache, indices, args=args)
         proposal_targets = _aggregate_proposal_targets(
@@ -921,6 +981,14 @@ def main() -> None:
             proposal_targets,
             target_margin=float(args.rank_target_margin),
         )
+        matched_proposal_loss = quality_focal_loss(
+            matched_proposal_logits, proposal_targets, beta=2.0
+        )
+        matched_rank_loss = pairwise_quality_ranking_loss(
+            matched_proposal_logits,
+            proposal_targets,
+            target_margin=float(args.rank_target_margin),
+        )
         slot_loss = _permutation_marginal_slot_loss(
             route_logits,
             target_rows,
@@ -930,19 +998,27 @@ def main() -> None:
         total = (
             proposal_loss
             + float(args.rank_loss_weight) * rank_loss
+            + matched_proposal_loss
+            + float(args.rank_loss_weight) * matched_rank_loss
             + slot_loss
             + float(args.collision_weight) * collision
         )
         optimizer.zero_grad(set_to_none=True)
         total.backward()
+        # Clip each independent diagnostic arm separately.  A joint norm
+        # would make one architecture's gradient magnitude change the other
+        # arms' effective learning rate and weaken the paired comparison.
+        torch.nn.utils.clip_grad_norm_(proposal_probe.parameters(), max_norm=5.0)
         torch.nn.utils.clip_grad_norm_(
-            list(proposal_probe.parameters()) + list(slot_probe.parameters()),
-            max_norm=5.0,
+            matched_proposal_probe.parameters(), max_norm=5.0
         )
+        torch.nn.utils.clip_grad_norm_(slot_probe.parameters(), max_norm=5.0)
         optimizer.step()
         values = {
             "proposal": float(proposal_loss.detach()),
-            "rank": float(rank_loss.detach()),
+            "proposal_rank": float(rank_loss.detach()),
+            "matched_proposal": float(matched_proposal_loss.detach()),
+            "matched_proposal_rank": float(matched_rank_loss.detach()),
             "slot": float(slot_loss.detach()),
             "collision": float(collision.detach()),
         }
@@ -955,6 +1031,7 @@ def main() -> None:
             tqdm.write(
                 f"step {step:05d}/{int(args.train_steps):05d} "
                 f"proposal={running['proposal']/denominator:.4f} "
+                f"matched={running['matched_proposal']/denominator:.4f} "
                 f"slot={running['slot']/denominator:.4f} "
                 f"collision={running['collision']/denominator:.4f}"
             )
@@ -962,16 +1039,26 @@ def main() -> None:
     evaluation = _evaluate(
         val_cache,
         proposal_probe,
+        matched_proposal_probe,
         slot_probe,
         device=device,
         batch_size=int(args.probe_batch_size),
         num_slots=int(args.num_slots),
     )
     rows = evaluation["strategies"]
-    baseline = max(
-        (rows["current_v5_direct"], rows["learned_32_direct"]),
-        key=lambda row: float(row["f1_050"]),
+    baseline_names = (
+        "current_v5_direct",
+        "current_v5_top4",
+        "learned_32_direct",
+        "learned_32_top4",
+        "learned_32_parameter_matched_direct",
+        "learned_32_parameter_matched_top4",
     )
+    baseline_name = max(
+        baseline_names,
+        key=lambda name: float(rows[name]["f1_050"]),
+    )
+    baseline = rows[baseline_name]
     slot = rows["learned_4_slots"]
     gain_050 = 100.0 * (float(slot["f1_050"]) - float(baseline["f1_050"]))
     gain_075 = 100.0 * (float(slot["f1_075"]) - float(baseline["f1_075"]))
@@ -1022,11 +1109,18 @@ def main() -> None:
             "proposal_set_scorer_parameters": sum(
                 parameter.numel() for parameter in proposal_probe.parameters()
             ),
+            "parameter_matched_proposal_set_scorer_parameters": sum(
+                parameter.numel()
+                for parameter in matched_proposal_probe.parameters()
+            ),
             "four_slot_router_parameters": sum(
                 parameter.numel() for parameter in slot_probe.parameters()
             ),
             "num_proposals": int(train_cache["features"].shape[1]),
             "num_final_slots": int(args.num_slots),
+            "proposal_layers": int(args.proposal_layers),
+            "matched_proposal_layers": int(args.matched_proposal_layers),
+            "slot_layers": int(args.slot_layers),
             "slot_output": "global unique proposal assignment plus learned dustbin",
             "slot_geometry_refinement": False,
         },
@@ -1041,7 +1135,8 @@ def main() -> None:
         },
         "evaluation": evaluation,
         "decision": {
-            "baseline_is_best_of_current_v5_and_learned_32_direct": True,
+            "baseline_is_best_32_query_strategy": True,
+            "best_32_query_baseline": baseline_name,
             "gain_f1_050_points": gain_050,
             "gain_f1_075_points": gain_075,
             "strong_gain_050_points": float(args.strong_gain_050_points),
@@ -1059,6 +1154,9 @@ def main() -> None:
     torch.save(
         {
             "proposal_set_scorer": proposal_probe.state_dict(),
+            "parameter_matched_proposal_set_scorer": (
+                matched_proposal_probe.state_dict()
+            ),
             "four_slot_router": slot_probe.state_dict(),
             "feature_dim": int(feature_dim),
             "args": vars(args),

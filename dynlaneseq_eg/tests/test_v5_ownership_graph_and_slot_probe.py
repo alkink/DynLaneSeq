@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
 import torch
 
 from dynlaneseq_eg.tools.audit_v5_ownership_graph import (
@@ -12,7 +16,11 @@ from dynlaneseq_eg.tools.probe_v5_four_slot_router import (
     _aggregate_proposal_targets,
     _decode_slots,
     _jointly_representable_targets,
+    _load_or_collect_cache,
     _permutation_marginal_slot_loss,
+)
+from dynlaneseq_eg.tools.summarize_v5_four_slot_confirmation import (
+    summarize_reports,
 )
 
 
@@ -123,3 +131,72 @@ def test_slot_decode_is_globally_unique_and_uses_dustbin() -> None:
     assert selected == [0, 1]
     assert len(selected) == len(set(selected))
     assert scores.shape == (3,)
+
+
+def test_cache_only_refuses_detector_fallback(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="required frozen cache"):
+        _load_or_collect_cache(
+            None,
+            {},
+            args=Namespace(reuse_cache=True, cache_only=True),
+            split="val",
+            sample_count=2,
+            signature={"cache_version": 1},
+            output_path=tmp_path / "missing.pt",
+            device=torch.device("cpu"),
+            channels_last=False,
+        )
+
+
+def _confirmation_report(seed: int, slot_f1: tuple[float, float]) -> dict:
+    baseline = {"f1_050": 0.70, "f1_075": 0.50}
+    slot = {
+        "f1_050": slot_f1[0],
+        "f1_075": slot_f1[1],
+        "pred": 800,
+        "tp_050": 675,
+        "tp_075": 490,
+    }
+    return {
+        "checkpoint_sha256": "checkpoint",
+        "caches": {
+            "train": {"list_sha256": "train"},
+            "val": {"list_sha256": "val"},
+        },
+        "training": {"seed": seed},
+        "models": {
+            "parameter_matched_proposal_set_scorer_parameters": 2_850_000,
+            "four_slot_router_parameters": 2_980_000,
+        },
+        "evaluation": {
+            "strategies": {
+                "learned_32_parameter_matched_top4": baseline,
+                "learned_4_slots": slot,
+            },
+            "slot_duplicate_candidate_assignments": 0,
+        },
+        "decision": {
+            "best_32_query_baseline": (
+                "learned_32_parameter_matched_top4"
+            )
+        },
+    }
+
+
+def test_multiseed_summary_requires_parameter_matched_repeatable_gain() -> None:
+    reports = [
+        _confirmation_report(3407, (0.81, 0.59)),
+        _confirmation_report(3408, (0.80, 0.58)),
+        _confirmation_report(3409, (0.71, 0.51)),
+    ]
+    result = summarize_reports(
+        reports,
+        ["a.json", "b.json", "c.json"],
+        min_mean_gain_050=5.0,
+        min_mean_gain_075=2.0,
+        min_positive_seeds=2,
+    )
+    assert result["aggregate"]["positive_seed_count"] == 2
+    assert result["aggregate"]["parameter_matched"] is True
+    assert result["gate"]["four_slot_structure_confirmed"] is True
+    assert result["recommendation"] == "build_v6_32_proposals_to_4_final_slots"
