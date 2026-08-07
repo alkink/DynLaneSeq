@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
+from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.evaluation.four_slot_decode import decode_four_slot_logits
 from dynlaneseq_eg.evaluation.postprocess import predictions_to_lanes
 from dynlaneseq_eg.losses.loss_s0 import (
@@ -11,7 +14,9 @@ from dynlaneseq_eg.losses.loss_s0 import (
     four_slot_permutation_loss,
 )
 from dynlaneseq_eg.modeling.four_slot_selection import (
+    FourSlotBoundedRefinement,
     FourSlotLaneSelectionHead,
+    decode_unique_four_slot_routes,
 )
 from dynlaneseq_eg.tools.audit_v6_a_target_distribution import (
     _finish_accumulator,
@@ -19,6 +24,9 @@ from dynlaneseq_eg.tools.audit_v6_a_target_distribution import (
 )
 from dynlaneseq_eg.tools.probe_v5_four_slot_router import FourSlotRouter
 from dynlaneseq_eg.tools.summarize_v6_a_probe_mismatch import _log_integer
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _head_outputs(*, batch: int = 2, candidates: int = 6, rows: int = 12):
@@ -72,6 +80,25 @@ def test_four_slot_head_matches_probe_parameter_count_and_detaches_inputs():
     assert any(parameter.grad is not None for parameter in head.parameters())
     for value in outputs.values():
         assert value.grad is None
+
+
+def test_v6_b_config_trains_only_zero_initialized_slot_refinement():
+    cfg = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v6_b_four_slot_refinement_25k_to29k.yaml"
+    )
+    selection = cfg["model"]["structured_query"]["set_selection"]
+    training = cfg["training"]
+    loss = cfg["loss"]
+    assert selection["four_slot_refinement_enabled"] is True
+    assert loss["w_four_slot_selection"] == 0.0
+    assert loss["w_four_slot_geometry"] == 1.0
+    assert training["trainable_parameter_prefixes"] == [
+        "structured_query_head.set_selection_head.slot_refinement"
+    ]
+    assert training["checkpoint_model_prefixes"] == [
+        "structured_query_head.set_selection_head.slot_refinement"
+    ]
 
 
 def test_production_four_slot_state_is_checkpoint_compatible_with_probe():
@@ -208,6 +235,71 @@ def test_global_decode_uses_private_dustbins_and_unique_proposals():
     assert int(decoded["repair_count"]) >= 1
 
 
+def test_device_unique_decoder_matches_scipy_assignment():
+    generator = torch.Generator().manual_seed(3407)
+    logits = torch.randn(8, 4, 33, generator=generator)
+    valid = torch.rand(8, 32, generator=generator) > 0.15
+    device_decode = decode_unique_four_slot_routes(logits, valid)
+    scipy_decode = decode_four_slot_logits(logits, valid)
+    assert torch.equal(device_decode["indices"], scipy_decode["indices"])
+    assert torch.allclose(
+        device_decode["scores"],
+        scipy_decode["scores"],
+        atol=1.0e-7,
+    )
+
+
+def test_bounded_slot_refinement_starts_as_exact_identity_and_detaches_inputs():
+    batch, slots, candidates, rows, dim = 1, 4, 6, 12, 16
+    refiner = FourSlotBoundedRefinement(
+        dim,
+        input_w=100,
+        slot_dim=32,
+        hidden_dim=32,
+        delta_offsets_px=(-12.0, -6.0, 0.0, 6.0, 12.0),
+    )
+    slot_states = torch.randn(batch, slots, 32, requires_grad=True)
+    row_tokens = torch.randn(
+        batch, candidates, rows, dim, requires_grad=True
+    )
+    proposal_x = (torch.rand(batch, candidates, rows) * 99.0).requires_grad_()
+    proposal_range = torch.tensor(
+        [[[0.0, 0.9]] * candidates], requires_grad=True
+    )
+    row_features = torch.randn(
+        batch, rows, 20, dim, requires_grad=True
+    )
+    route = torch.tensor([[0, 2, -1, 5]])
+    result = refiner(
+        slot_states=slot_states,
+        proposal_row_tokens=row_tokens,
+        proposal_x_rows=proposal_x,
+        proposal_range_norm=proposal_range,
+        route_indices=route,
+        row_value_features=row_features,
+    )
+    safe = route.clamp_min(0).unsqueeze(-1).expand(-1, -1, rows)
+    reference = proposal_x.detach().gather(1, safe)
+    reference[:, 2] = 0.0
+    assert torch.allclose(
+        result["selection_slot_pred_x_rows"],
+        reference,
+        atol=1.0e-6,
+    )
+    assert float(result["selection_slot_delta_max_abs"].max()) < 1.0e-6
+    result["selection_slot_pred_x_rows"].sum().backward()
+    assert refiner.delta_head.weight.grad is not None
+    assert float(refiner.delta_head.weight.grad.abs().sum()) > 0.0
+    for source in (
+        slot_states,
+        row_tokens,
+        proposal_x,
+        proposal_range,
+        row_features,
+    ):
+        assert source.grad is None
+
+
 def test_postprocess_skips_dustbin_between_active_slots():
     rows = 8
     outputs = {
@@ -243,6 +335,50 @@ def test_postprocess_skips_dustbin_between_active_slots():
     assert len(lanes[0]) == 2
 
 
+def test_postprocess_uses_refined_slot_geometry_when_available():
+    rows = 8
+    outputs = {
+        "exist_logits": torch.zeros((1, 3, 2)),
+        "quality_logits": torch.zeros((1, 3)),
+        "pred_x_rows": torch.tensor(
+            [[[10.0] * rows, [50.0] * rows, [70.0] * rows]]
+        ),
+        "range_norm": torch.tensor([[[0.0, 0.875]] * 3]),
+        "selection_slot_candidate_valid": torch.ones(
+            (1, 3), dtype=torch.bool
+        ),
+        "selection_slot_logits": torch.tensor(
+            [
+                [
+                    [9.0, 0.0, 0.0, -1.0],
+                    [0.0, 0.0, 0.0, 9.0],
+                    [0.0, 9.0, 0.0, -1.0],
+                    [0.0, 0.0, 0.0, 9.0],
+                ]
+            ]
+        ),
+        "selection_slot_indices": torch.tensor([[0, -1, 1, -1]]),
+        "selection_slot_scores": torch.ones((1, 4)),
+        "selection_slot_pred_x_rows": torch.tensor(
+            [[[90.0] * rows, [0.0] * rows, [30.0] * rows, [0.0] * rows]]
+        ),
+        "selection_slot_range_norm": torch.tensor(
+            [[[0.0, 0.875], [0.0, 0.0], [0.0, 0.875], [0.0, 0.0]]]
+        ),
+    }
+    lanes = predictions_to_lanes(
+        outputs,
+        score_mode="four_slot",
+        score_thresh=0.0,
+        min_pred_points=5,
+        input_w=100,
+        input_h=100,
+        top_k=4,
+    )[0]
+    assert len(lanes) == 2
+    assert {round(lane[0][0]) for lane in lanes} == {30, 90}
+
+
 def test_criterion_backpropagates_only_through_slot_logits():
     outputs = _geometry_outputs()
     outputs["selection_slot_logits"] = torch.randn(
@@ -263,6 +399,59 @@ def test_criterion_backpropagates_only_through_slot_logits():
     losses["loss_total"].backward()
     assert outputs["selection_slot_logits"].grad is not None
     assert torch.isfinite(outputs["selection_slot_logits"].grad).all()
+
+
+def test_slot_geometry_loss_backpropagates_through_local_delta_logits():
+    outputs = _geometry_outputs()
+    rows = int(outputs["pred_x_rows"].shape[-1])
+    reference = torch.stack(
+        (
+            torch.full((rows,), 10.0),
+            torch.full((rows,), 80.0),
+            torch.zeros(rows),
+            torch.zeros(rows),
+        )
+    ).unsqueeze(0)
+    offsets = torch.tensor([-6.0, 0.0, 6.0])
+    delta_logits = torch.zeros(
+        1,
+        4,
+        rows,
+        3,
+        requires_grad=True,
+    )
+    delta = (torch.softmax(delta_logits, dim=-1) * offsets).sum(dim=-1)
+    outputs.update(
+        {
+            "selection_slot_input_reference_x_rows": reference,
+            "selection_slot_pred_x_rows": reference + delta,
+            "selection_slot_range_norm": torch.tensor(
+                [[[0.0, 0.9], [0.0, 0.9], [0.0, 0.0], [0.0, 0.0]]]
+            ),
+            "selection_slot_active": torch.tensor(
+                [[True, True, False, False]]
+            ),
+            "selection_slot_row_delta_logits": delta_logits,
+            "selection_slot_row_delta_offsets_px": offsets,
+        }
+    )
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=100,
+            input_h=100,
+            w_exist=0.0,
+            w_point=0.0,
+            w_range=0.0,
+            w_four_slot_geometry=1.0,
+            four_slot_geometry_match_min_quality=0.2,
+        )
+    )
+    losses = criterion(outputs, _targets(), matches=[{}])
+    assert float(losses["four_slot_geometry_mean_matched"]) == 2.0
+    assert torch.isfinite(losses["loss_four_slot_geometry"])
+    losses["loss_total"].backward()
+    assert delta_logits.grad is not None
+    assert float(delta_logits.grad.abs().sum()) > 0.0
 
 
 def test_v6_target_distribution_accumulator_reports_dustbin_contract():

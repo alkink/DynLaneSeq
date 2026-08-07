@@ -1,0 +1,63 @@
+_base_: culane_s0_structured_query_dla34_v6_a_four_slot_selector_25k_to29k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v6_b_four_slot_refinement_gate_25k/slot_refinement
+
+# V6-B starts from the exact imported four-slot router that achieved 79.13
+# full-validation F1@.50.  Routing and all 32-proposal tensors stay frozen.
+# Each active slot gathers its globally unique proposal curve, samples a local
+# P2 corridor, and predicts a bounded per-row residual.  The residual head is
+# zero-initialized, so the source model is an exact identity before training.
+model:
+  structured_query:
+    set_selection:
+      four_slot_refinement_enabled: true
+      four_slot_refinement_hidden_dim: 256
+      four_slot_refinement_delta_offsets_px:
+        - -24.0
+        - -12.0
+        - -6.0
+        - 0.0
+        - 6.0
+        - 12.0
+        - 24.0
+
+# This first causal gate asks only whether slot-owned local geometry improves
+# strict localization.  The verified router is not fine-tuned and its old
+# permutation/collision objective is not a backward root.
+loss:
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 1.0
+  four_slot_geometry_point_weight: 5.0
+  four_slot_geometry_line_iou_weight: 2.0
+  four_slot_geometry_dfl_weight: 1.0
+  four_slot_geometry_match_min_quality: 0.20
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: four_slot_refinement
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.slot_refinement.
+
+scheduler:
+  name: constant
+
+training:
+  max_iters: 4000
+  checkpoint_interval: 1000
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  clip_grad_norm: 5.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

@@ -71,6 +71,9 @@ def predictions_to_lanes(
     pointer_indices = None
     pointer_scores = None
     break_on_negative_index = True
+    output_pred_x = outputs["pred_x_rows"]
+    output_ranges = outputs["range_norm"]
+    use_slot_geometry = False
     if score_mode in {"exist", "existence"}:
         p_lane = exist_score
     elif score_mode in {"quality", "iou"}:
@@ -141,16 +144,45 @@ def predictions_to_lanes(
                 "postprocess score_mode='four_slot' requires slot logits "
                 "and candidate-valid mask"
             )
-        decoded = decode_four_slot_logits(slot_logits, candidate_valid)
-        pointer_indices = decoded["indices"].to(
-            device=outputs["pred_x_rows"].device
+        routed_indices = outputs.get("selection_slot_indices")
+        routed_scores = outputs.get("selection_slot_scores")
+        if not isinstance(routed_indices, torch.Tensor) or not isinstance(
+            routed_scores,
+            torch.Tensor,
+        ):
+            decoded = decode_four_slot_logits(slot_logits, candidate_valid)
+            routed_indices = decoded["indices"].to(
+                device=outputs["pred_x_rows"].device
+            )
+            routed_scores = decoded["scores"].to(
+                device=outputs["pred_x_rows"].device
+            )
+        slot_pred_x = outputs.get("selection_slot_pred_x_rows")
+        slot_ranges = outputs.get("selection_slot_range_norm")
+        use_slot_geometry = isinstance(slot_pred_x, torch.Tensor) and isinstance(
+            slot_ranges,
+            torch.Tensor,
         )
-        pointer_scores = decoded["scores"].to(
-            device=outputs["pred_x_rows"].device
-        )
+        if use_slot_geometry:
+            if tuple(slot_pred_x.shape[:2]) != tuple(routed_indices.shape):
+                raise ValueError("refined slot geometry must match slot routes")
+            output_pred_x = slot_pred_x
+            output_ranges = slot_ranges
+            slot_ids = torch.arange(
+                int(routed_indices.shape[1]),
+                device=routed_indices.device,
+            ).view(1, -1).expand_as(routed_indices)
+            pointer_indices = torch.where(
+                routed_indices >= 0,
+                slot_ids,
+                slot_ids.new_full(slot_ids.shape, -1),
+            )
+        else:
+            pointer_indices = routed_indices
+        pointer_scores = routed_scores
         break_on_negative_index = False
-        p_lane = outputs["pred_x_rows"].new_zeros(
-            outputs["pred_x_rows"].shape[:2],
+        p_lane = output_pred_x.new_zeros(
+            output_pred_x.shape[:2],
             dtype=torch.float32,
         )
         safe_indices = pointer_indices.clamp(
@@ -171,11 +203,15 @@ def predictions_to_lanes(
         )
     else:
         raise ValueError(f"Unsupported postprocess score_mode: {score_mode!r}")
-    pred_x = outputs["pred_x_rows"].clamp(0, input_w - 1)
+    pred_x = output_pred_x.clamp(0, input_w - 1)
     row_visibility = None
-    if row_visibility_thresh > 0 and "row_visibility_logits" in outputs:
+    if (
+        not use_slot_geometry
+        and row_visibility_thresh > 0
+        and "row_visibility_logits" in outputs
+    ):
         row_visibility = torch.sigmoid(outputs["row_visibility_logits"]) >= float(row_visibility_thresh)
-    ranges = sort_range_norm(outputs["range_norm"])
+    ranges = sort_range_norm(output_ranges)
     y_rows = fixed_y_rows(pred_x.shape[-1], input_h, device=pred_x.device, dtype=pred_x.dtype)
     # Transfer each result tensor once per batch.  The previous per-sample
     # .cpu() calls introduced four CUDA synchronizations for every image.

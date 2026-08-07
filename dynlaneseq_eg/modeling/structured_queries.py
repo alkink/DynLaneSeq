@@ -2441,6 +2441,25 @@ class StructuredLaneQueryHead(nn.Module):
                 min_valid_rows=int(
                     self.set_selection_cfg.get("four_slot_min_valid_rows", 5)
                 ),
+                refinement_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_enabled",
+                        False,
+                    )
+                ),
+                refinement_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                refinement_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_refinement_delta_offsets_px",
+                        (-24.0, -12.0, -6.0, 0.0, 6.0, 12.0, 24.0),
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(
@@ -3158,7 +3177,19 @@ class StructuredLaneQueryHead(nn.Module):
                         curve_x,
                     )
                 )
-            selection_result = self.set_selection_head(outputs)
+            if bool(
+                getattr(
+                    self.set_selection_head,
+                    "requires_row_value_features",
+                    False,
+                )
+            ):
+                selection_result = self.set_selection_head(
+                    outputs,
+                    row_value_features=row_value_features.detach(),
+                )
+            else:
+                selection_result = self.set_selection_head(outputs)
             if isinstance(selection_result, dict):
                 outputs.update(selection_result)
             else:
@@ -3200,6 +3231,18 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_raw_indices",
                 "selection_slot_raw_collision_count",
                 "selection_slot_route_entropy",
+                "selection_slot_indices",
+                "selection_slot_scores",
+                "selection_slot_global_repair_count",
+                "selection_slot_pred_x_rows",
+                "selection_slot_range_norm",
+                "selection_slot_active",
+                "selection_slot_input_reference_x_rows",
+                "selection_slot_row_delta_logits",
+                "selection_slot_row_delta_offsets_px",
+                "selection_slot_delta_mean_abs",
+                "selection_slot_delta_max_abs",
+                "selection_slot_delta_boundary_mass",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

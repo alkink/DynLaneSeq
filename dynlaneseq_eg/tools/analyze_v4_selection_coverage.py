@@ -425,10 +425,20 @@ def main() -> None:
         "pointer_stop",
     }
     slot_mode = score_mode in {"four_slot", "four_slots", "slot", "slots"}
+    slot_refinement_mode = slot_mode and any(
+        isinstance(
+            stage.get("selection_slot_pred_x_rows"),
+            torch.Tensor,
+        )
+        for record in cache.get("records", [])
+        for stage in record.get("stages", {}).values()
+    )
     if pointer_mode:
         method_names.append("pointer_greedy")
     if slot_mode:
         method_names.append("four_slot_global_unique")
+    if slot_refinement_mode:
+        method_names.append("four_slot_refined")
     method_names.extend(
         f"hard_diverse_{_float_tag(distance)}px"
         for distance in args.hard_diversity_distances
@@ -473,6 +483,9 @@ def main() -> None:
     slot_semantic_duplicates = 0
     slot_active = 0
     slot_route_entropies: list[float] = []
+    slot_delta_mean_abs: list[float] = []
+    slot_delta_max_abs: list[float] = []
+    slot_delta_boundary_mass: list[float] = []
 
     iterator = tqdm(
         cache["records"],
@@ -528,6 +541,8 @@ def main() -> None:
             min_overlap_points=args.nms_min_overlap_points,
         )
         selections: dict[str, list[int]] = {"score_top4": raw_ids}
+        refined_iou = None
+        refined_distance = None
         if pointer_mode:
             pointer_indices = stage.get("selection_pointer_indices")
             if not isinstance(pointer_indices, torch.Tensor):
@@ -572,6 +587,60 @@ def main() -> None:
             entropy = stage.get("selection_slot_route_entropy")
             if isinstance(entropy, torch.Tensor):
                 slot_route_entropies.extend(float(value) for value in entropy)
+            if slot_refinement_mode:
+                refined_iou_value = stage.get("selection_slot_official_iou")
+                refined_valid = stage.get(
+                    "selection_slot_official_candidate_valid"
+                )
+                refined_x = stage.get("selection_slot_pred_x_rows")
+                refined_range = stage.get("selection_slot_range_norm")
+                if not all(
+                    isinstance(value, torch.Tensor)
+                    for value in (
+                        refined_iou_value,
+                        refined_valid,
+                        refined_x,
+                        refined_range,
+                    )
+                ):
+                    raise ValueError(
+                        "refined four-slot diagnostics require cached slot geometry"
+                    )
+                refined_iou = refined_iou_value.float()
+                active_slot_ids = [
+                    slot_index
+                    for slot_index, candidate_index in enumerate(
+                        decoded["indices"].tolist()
+                    )
+                    if int(candidate_index) >= 0
+                    and bool(refined_valid[slot_index])
+                ]
+                selections["four_slot_refined"] = active_slot_ids
+                refined_stage = {
+                    "pred_x_rows": refined_x,
+                    "range_norm": refined_range,
+                }
+                refined_distance = _curve_distance_matrix(
+                    refined_stage,
+                    input_h=input_h,
+                    input_w=input_w,
+                    min_valid_rows=args.min_valid_rows,
+                    row_visibility_thresh=0.0,
+                    min_overlap_points=args.nms_min_overlap_points,
+                )
+                for field, destination in (
+                    ("selection_slot_delta_mean_abs", slot_delta_mean_abs),
+                    ("selection_slot_delta_max_abs", slot_delta_max_abs),
+                    (
+                        "selection_slot_delta_boundary_mass",
+                        slot_delta_boundary_mass,
+                    ),
+                ):
+                    value = stage.get(field)
+                    if isinstance(value, torch.Tensor):
+                        destination.extend(
+                            float(item) for item in value.reshape(-1)
+                        )
             if int(iou.shape[0]) > 0 and slot_ids:
                 selected_quality = iou[:, slot_ids]
                 best_quality, best_gt = selected_quality.max(dim=0)
@@ -623,11 +692,23 @@ def main() -> None:
 
         for threshold in thresholds:
             for name, selected_ids in selections.items():
+                active_iou = (
+                    refined_iou
+                    if name == "four_slot_refined"
+                    and isinstance(refined_iou, torch.Tensor)
+                    else iou
+                )
+                active_distance = (
+                    refined_distance
+                    if name == "four_slot_refined"
+                    and isinstance(refined_distance, torch.Tensor)
+                    else distance
+                )
                 _update_counter(
                     counters[name][threshold],
-                    iou,
+                    active_iou,
                     selected_ids,
-                    distance,
+                    active_distance,
                     threshold=threshold,
                     near_min_iou=args.near_min_iou,
                 )
@@ -732,6 +813,20 @@ def main() -> None:
             "mean_route_entropy": (
                 sum(slot_route_entropies) / max(len(slot_route_entropies), 1)
             ),
+            "refinement": (
+                {
+                    "mean_abs_delta_px": sum(slot_delta_mean_abs)
+                    / max(len(slot_delta_mean_abs), 1),
+                    "mean_max_abs_delta_px": sum(slot_delta_max_abs)
+                    / max(len(slot_delta_max_abs), 1),
+                    "mean_boundary_probability_mass": sum(
+                        slot_delta_boundary_mass
+                    )
+                    / max(len(slot_delta_boundary_mass), 1),
+                }
+                if slot_refinement_mode
+                else None
+            ),
         }
     verdict = _build_verdict(
         method_summary,
@@ -774,6 +869,7 @@ def main() -> None:
         "four_slot_global_unique": method_summary.get(
             "four_slot_global_unique"
         ),
+        "four_slot_refined": method_summary.get("four_slot_refined"),
         "hard_diverse_20px": method_summary.get("hard_diverse_20px"),
         "capacity": capacity_summary,
         "candidate_pool": candidate_pool_summary,

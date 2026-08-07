@@ -22,7 +22,7 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 STAGE_TENSOR_FIELDS = (
     "pred_x_rows",
     "exist_logits",
@@ -36,6 +36,15 @@ STAGE_TENSOR_FIELDS = (
     "selection_slot_raw_indices",
     "selection_slot_raw_collision_count",
     "selection_slot_route_entropy",
+    "selection_slot_indices",
+    "selection_slot_scores",
+    "selection_slot_global_repair_count",
+    "selection_slot_pred_x_rows",
+    "selection_slot_range_norm",
+    "selection_slot_active",
+    "selection_slot_delta_mean_abs",
+    "selection_slot_delta_max_abs",
+    "selection_slot_delta_boundary_mass",
     "range_norm",
     "row_visibility_logits",
 )
@@ -175,6 +184,8 @@ def _upgrade_cache_paths(cache: dict[str, Any], project_root: Path, dataset_root
             for stage in record.get("stages", {}).values():
                 stage.pop("official_iou", None)
                 stage.pop("official_candidate_valid", None)
+                stage.pop("selection_slot_official_iou", None)
+                stage.pop("selection_slot_official_candidate_valid", None)
     cache.setdefault("metadata", {})["project_root"] = str(project_root)
     cache["metadata"]["dataset_root"] = str(dataset_root)
     return changed
@@ -758,23 +769,50 @@ def ensure_official_iou_cache(
     }
     if cache.get("metadata", {}).get("official_iou_cache") == signature and all(
         "official_iou" in stage
+        and (
+            "selection_slot_pred_x_rows" not in stage
+            or "selection_slot_official_iou" in stage
+        )
         for record in cache.get("records", [])
         for stage in record.get("stages", {}).values()
     ):
         return cache
     records = cache.get("records", [])
 
-    def compute(record: dict[str, Any]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        return {
-            stage_name: official_proposal_gt_iou_matrix(
+    def compute(record: dict[str, Any]) -> dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        result: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+        for stage_name, stage in record.get("stages", {}).items():
+            stage_result = {
+                "proposal": official_proposal_gt_iou_matrix(
                 record,
                 stage_name,
                 line_width=line_width,
                 min_valid_rows=min_valid_rows,
                 row_visibility_thresh=row_visibility_thresh,
             )
-            for stage_name in record.get("stages", {})
-        }
+            }
+            slot_x = stage.get("selection_slot_pred_x_rows")
+            slot_range = stage.get("selection_slot_range_norm")
+            if isinstance(slot_x, torch.Tensor) and isinstance(
+                slot_range,
+                torch.Tensor,
+            ):
+                synthetic_record = dict(record)
+                synthetic_record["stages"] = {
+                    "slot_refined": {
+                        "pred_x_rows": slot_x,
+                        "range_norm": slot_range,
+                    }
+                }
+                stage_result["slot_refined"] = official_proposal_gt_iou_matrix(
+                    synthetic_record,
+                    "slot_refined",
+                    line_width=line_width,
+                    min_valid_rows=min_valid_rows,
+                    row_visibility_thresh=0.0,
+                )
+            result[stage_name] = stage_result
+        return result
 
     worker_count = max(0, int(workers))
     if worker_count > 1:
@@ -792,18 +830,34 @@ def ensure_official_iou_cache(
                     desc="official IoU cache",
                 )
                 for record, stage_results in iterator:
-                    for stage_name, (matrix, candidate_valid) in stage_results.items():
+                    for stage_name, geometry_results in stage_results.items():
                         stage = record["stages"][stage_name]
+                        matrix, candidate_valid = geometry_results["proposal"]
                         stage["official_iou"] = matrix
                         stage["official_candidate_valid"] = candidate_valid.cpu()
+                        if "slot_refined" in geometry_results:
+                            slot_matrix, slot_valid = geometry_results[
+                                "slot_refined"
+                            ]
+                            stage["selection_slot_official_iou"] = slot_matrix
+                            stage["selection_slot_official_candidate_valid"] = (
+                                slot_valid.cpu()
+                            )
         finally:
             cv2.setNumThreads(previous_cv_threads)
     else:
         for record in tqdm(records, ncols=80, desc="official IoU cache"):
-            for stage_name, (matrix, candidate_valid) in compute(record).items():
+            for stage_name, geometry_results in compute(record).items():
                 stage = record["stages"][stage_name]
+                matrix, candidate_valid = geometry_results["proposal"]
                 stage["official_iou"] = matrix
                 stage["official_candidate_valid"] = candidate_valid.cpu()
+                if "slot_refined" in geometry_results:
+                    slot_matrix, slot_valid = geometry_results["slot_refined"]
+                    stage["selection_slot_official_iou"] = slot_matrix
+                    stage["selection_slot_official_candidate_valid"] = (
+                        slot_valid.cpu()
+                    )
     cache["metadata"]["official_iou_cache"] = signature
     cache_path = Path(cache["metadata"].get("cache_path", ""))
     if cache_path:

@@ -757,6 +757,11 @@ class LossConfig:
     four_slot_cluster_temperature: float = 0.03
     four_slot_permutation_temperature: float = 1.0
     four_slot_collision_weight: float = 0.10
+    w_four_slot_geometry: float = 0.0
+    four_slot_geometry_point_weight: float = 5.0
+    four_slot_geometry_line_iou_weight: float = 2.0
+    four_slot_geometry_dfl_weight: float = 1.0
+    four_slot_geometry_match_min_quality: float = 0.20
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -818,6 +823,10 @@ class S0Criterion(nn.Module):
             "pointer_cluster_listwise_weight",
             "w_four_slot_selection",
             "four_slot_collision_weight",
+            "w_four_slot_geometry",
+            "four_slot_geometry_point_weight",
+            "four_slot_geometry_line_iou_weight",
+            "four_slot_geometry_dfl_weight",
         ):
             if float(getattr(self.cfg, field_name)) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative")
@@ -845,6 +854,12 @@ class S0Criterion(nn.Module):
         if float(self.cfg.four_slot_permutation_temperature) <= 0.0:
             raise ValueError(
                 "four_slot_permutation_temperature must be positive"
+            )
+        if not 0.0 <= float(
+            self.cfg.four_slot_geometry_match_min_quality
+        ) <= 1.0:
+            raise ValueError(
+                "four_slot_geometry_match_min_quality must be in [0, 1]"
             )
         if self.cfg.pointer_unary_target_mode not in {
             "max_quality",
@@ -986,6 +1001,22 @@ class S0Criterion(nn.Module):
                 "mean_raw_collision_count": zero,
                 "mean_route_entropy": zero,
             }
+        if self.cfg.w_four_slot_geometry != 0:
+            four_slot_geometry = self.compute_four_slot_geometry_loss(
+                outputs,
+                targets,
+            )
+        else:
+            four_slot_geometry = {
+                "total": zero,
+                "point": zero,
+                "line_iou": zero,
+                "dfl": zero,
+                "mean_matched": zero,
+                "mean_reference_quality": zero,
+                "mean_refined_quality": zero,
+                "mean_quality_gain": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
@@ -1010,6 +1041,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_set_selection * set_selection["total"]
             + self.cfg.w_pointer_selection * pointer_selection["total"]
             + self.cfg.w_four_slot_selection * four_slot_selection["total"]
+            + self.cfg.w_four_slot_geometry * four_slot_geometry["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -1090,6 +1122,24 @@ class S0Criterion(nn.Module):
             ],
             "four_slot_mean_route_entropy": four_slot_selection[
                 "mean_route_entropy"
+            ],
+            "loss_four_slot_geometry": four_slot_geometry["total"],
+            "loss_four_slot_geometry_point": four_slot_geometry["point"],
+            "loss_four_slot_geometry_line_iou": four_slot_geometry[
+                "line_iou"
+            ],
+            "loss_four_slot_geometry_dfl": four_slot_geometry["dfl"],
+            "four_slot_geometry_mean_matched": four_slot_geometry[
+                "mean_matched"
+            ],
+            "four_slot_geometry_mean_reference_quality": four_slot_geometry[
+                "mean_reference_quality"
+            ],
+            "four_slot_geometry_mean_refined_quality": four_slot_geometry[
+                "mean_refined_quality"
+            ],
+            "four_slot_geometry_mean_quality_gain": four_slot_geometry[
+                "mean_quality_gain"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -2246,6 +2296,219 @@ class S0Criterion(nn.Module):
                 if isinstance(route_entropy, torch.Tensor)
                 else zero
             ),
+        }
+
+    @torch.no_grad()
+    def _match_four_slot_reference_geometry(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+        """Match routed *reference* curves once, before learned refinement.
+
+        Keeping assignment on the immutable routed proposal prevents the
+        refiner from changing its own target identity while it learns a local
+        bounded correction.  Costs for the whole batch cross to CPU once.
+        """
+
+        reference = outputs.get("selection_slot_input_reference_x_rows")
+        ranges = outputs.get("selection_slot_range_norm")
+        active = outputs.get("selection_slot_active")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (reference, ranges, active)
+        ):
+            raise ValueError(
+                "four-slot geometry loss requires routed reference geometry"
+            )
+        pending: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        flat_costs: list[torch.Tensor] = []
+        for batch_index, target in enumerate(targets):
+            gt_x = target["x_rows"].to(
+                device=reference.device,
+                dtype=torch.float32,
+            )
+            gt_valid = target["valid_mask"].to(reference.device).bool()
+            quality, slot_valid, gt_lane_valid = (
+                pairwise_range_aware_row_strip_iou(
+                    reference[batch_index].detach().float(),
+                    ranges[batch_index].detach().float(),
+                    gt_x,
+                    gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.four_slot_line_width),
+                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                )
+            )
+            slot_ids = torch.nonzero(
+                active[batch_index].bool() & slot_valid,
+                as_tuple=False,
+            ).flatten()
+            gt_ids = torch.nonzero(gt_lane_valid, as_tuple=False).flatten()
+            local_quality = quality[slot_ids][:, gt_ids]
+            pending.append((slot_ids, gt_ids, local_quality))
+            if local_quality.numel():
+                flat_costs.append((1.0 - local_quality).reshape(-1))
+        flat_cpu = (
+            torch.cat(flat_costs).detach().cpu()
+            if flat_costs
+            else torch.empty(0)
+        )
+        offset = 0
+        cpu_pairs: list[torch.Tensor] = []
+        pair_counts: list[int] = []
+        reference_qualities: list[float] = []
+        threshold = float(self.cfg.four_slot_geometry_match_min_quality)
+        for slot_ids, gt_ids, local_quality in pending:
+            if local_quality.numel() == 0:
+                cpu_pairs.append(torch.empty((0, 2), dtype=torch.long))
+                pair_counts.append(0)
+                continue
+            numel = int(local_quality.numel())
+            cost_cpu = flat_cpu[offset : offset + numel].view(
+                int(local_quality.shape[0]),
+                int(local_quality.shape[1]),
+            )
+            offset += numel
+            local_slot, local_gt = HungarianMatcherS0._linear_sum_assignment(
+                cost_cpu
+            )
+            kept: list[tuple[int, int]] = []
+            for slot_value, gt_value in zip(
+                local_slot.tolist(),
+                local_gt.tolist(),
+            ):
+                quality_value = 1.0 - float(
+                    cost_cpu[int(slot_value), int(gt_value)]
+                )
+                if quality_value < threshold:
+                    continue
+                kept.append(
+                    (
+                        int(slot_ids[int(slot_value)]),
+                        int(gt_ids[int(gt_value)]),
+                    )
+                )
+                reference_qualities.append(quality_value)
+            pair_tensor = (
+                torch.tensor(kept, dtype=torch.long)
+                if kept
+                else torch.empty((0, 2), dtype=torch.long)
+            )
+            cpu_pairs.append(pair_tensor)
+            pair_counts.append(int(pair_tensor.shape[0]))
+        packed = (
+            torch.cat(cpu_pairs, dim=0).to(reference.device)
+            if any(pair_counts)
+            else torch.empty((0, 2), dtype=torch.long, device=reference.device)
+        )
+        matches: list[dict[str, torch.Tensor]] = []
+        pair_offset = 0
+        for count in pair_counts:
+            pairs = packed[pair_offset : pair_offset + count]
+            pair_offset += count
+            matches.append(
+                {
+                    "pred_indices": pairs[:, 0],
+                    "gt_indices": pairs[:, 1],
+                }
+            )
+        reference_quality = reference.new_tensor(
+            reference_qualities,
+            dtype=torch.float32,
+        )
+        match_count = reference.new_tensor(pair_counts, dtype=torch.float32)
+        return matches, reference_quality, match_count
+
+    def compute_four_slot_geometry_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Train bounded slot geometry on top of frozen routed proposals."""
+
+        refined = outputs.get("selection_slot_pred_x_rows")
+        ranges = outputs.get("selection_slot_range_norm")
+        delta_logits = outputs.get("selection_slot_row_delta_logits")
+        delta_offsets = outputs.get("selection_slot_row_delta_offsets_px")
+        reference = outputs.get("selection_slot_input_reference_x_rows")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (
+                refined,
+                ranges,
+                delta_logits,
+                delta_offsets,
+                reference,
+            )
+        ):
+            raise ValueError(
+                "w_four_slot_geometry > 0 requires bounded slot refinement outputs"
+            )
+        matches, reference_quality, match_count = (
+            self._match_four_slot_reference_geometry(outputs, targets)
+        )
+        slot_outputs = {
+            "pred_x_rows": refined,
+            "range_norm": ranges,
+            "row_x_logits": delta_logits,
+            "row_x_offsets_px": delta_offsets,
+            "input_reference_x_rows": reference,
+        }
+        point = self.compute_point_loss(slot_outputs, targets, matches)
+        line_iou = self.compute_line_iou_loss(slot_outputs, targets, matches)
+        dfl = self.compute_row_dfl_loss(slot_outputs, targets, matches)
+        total = (
+            float(self.cfg.four_slot_geometry_point_weight) * point
+            + float(self.cfg.four_slot_geometry_line_iou_weight) * line_iou
+            + float(self.cfg.four_slot_geometry_dfl_weight) * dfl
+        )
+
+        refined_quality_values: list[torch.Tensor] = []
+        with torch.no_grad():
+            for batch_index, (target, match) in enumerate(zip(targets, matches)):
+                pred_ids = match["pred_indices"]
+                gt_ids = match["gt_indices"]
+                if pred_ids.numel() == 0:
+                    continue
+                quality, _slot_valid, _gt_valid = (
+                    pairwise_range_aware_row_strip_iou(
+                        refined[batch_index].detach().float(),
+                        ranges[batch_index].detach().float(),
+                        target["x_rows"].to(
+                            device=refined.device,
+                            dtype=torch.float32,
+                        ),
+                        target["valid_mask"].to(refined.device).bool(),
+                        input_h=int(self.cfg.input_h),
+                        line_width=float(self.cfg.four_slot_line_width),
+                        min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                    )
+                )
+                refined_quality_values.append(quality[pred_ids, gt_ids])
+        refined_quality = (
+            torch.cat(refined_quality_values)
+            if refined_quality_values
+            else total.detach().new_zeros((0,))
+        )
+        zero = total.detach() * 0.0
+        mean_reference = (
+            reference_quality.mean() if reference_quality.numel() else zero
+        )
+        mean_refined = (
+            refined_quality.mean() if refined_quality.numel() else zero
+        )
+        return {
+            "total": total,
+            "point": point,
+            "line_iou": line_iou,
+            "dfl": dfl,
+            "mean_matched": match_count.mean().detach(),
+            "mean_reference_quality": mean_reference.detach(),
+            "mean_refined_quality": mean_refined.detach(),
+            "mean_quality_gain": (mean_refined - mean_reference).detach(),
         }
 
     def compute_pointer_selection_loss(
