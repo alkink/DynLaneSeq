@@ -20,6 +20,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--failed-train-log", default="")
     parser.add_argument("--parity-f1-tolerance", type=float, default=0.005)
     parser.add_argument("--parity-count-tolerance", type=float, default=0.10)
+    parser.add_argument("--min-production-f1-050", type=float, default=0.795)
+    parser.add_argument("--min-production-f1-075", type=float, default=0.56)
+    parser.add_argument("--min-selected", type=float, default=3.0)
+    parser.add_argument("--max-selected", type=float, default=3.5)
+    parser.add_argument(
+        "--min-calibrated-representable-fraction",
+        type=float,
+        default=0.95,
+    )
     parser.add_argument("--output-json", required=True)
     return parser.parse_args()
 
@@ -101,6 +110,7 @@ def main() -> None:
     ]
     calibrated_clean = modes["train_clean"]["calibrated_narrow"]
     calibrated_augmented = modes["train_augmented"]["calibrated_narrow"]
+    calibrated_validation = modes["val_clean"]["calibrated_narrow"]
     literal_aug_gap = float(literal_clean["mean_representable_lanes"]) - float(
         literal_augmented["mean_representable_lanes"]
     )
@@ -128,6 +138,16 @@ def main() -> None:
         "calibrated_augmented_expected_dustbin_fraction": float(
             calibrated_augmented["expected_dustbin_fraction"]
         ),
+        "calibrated_augmented_representable_gt_fraction": float(
+            calibrated_augmented["representable_gt_fraction"]
+        ),
+        "calibrated_validation_mean_representable": float(
+            calibrated_validation["mean_representable_lanes"]
+        ),
+        "calibrated_validation_count_minus_probe_output": float(
+            calibrated_validation["mean_representable_lanes"]
+        )
+        - reference_count,
         "probe_output_mean_selected": reference_count,
     }
 
@@ -169,15 +189,36 @@ def main() -> None:
         ),
     }
 
+    imported_probe_uniform_gate = {
+        "f1_050": float(parity_050["f1"])
+        >= float(args.min_production_f1_050),
+        "f1_075": float(parity_075["f1"])
+        >= float(args.min_production_f1_075),
+        "selected_count": float(args.min_selected)
+        <= parity_count
+        <= float(args.max_selected),
+    }
+    imported_probe_uniform_passed = all(imported_probe_uniform_gate.values())
+    calibrated_target_passed = (
+        float(calibrated_augmented["representable_gt_fraction"])
+        >= float(args.min_calibrated_representable_fraction)
+    )
+
     if not parity_passed:
         next_step = "fix_production_feature_or_decode_parity_before_training"
-    elif float(calibrated_augmented["mean_representable_lanes"]) >= 3.0:
+    elif imported_probe_uniform_passed:
+        next_step = (
+            "run_full_validation_of_imported_probe_then_use_calibrated_"
+            "target_for_any_further_training"
+        )
+    elif calibrated_target_passed:
         next_step = (
             "authorize_single_v6_a1_calibrated_target_and_exposure_gate_"
             "with_augmentation"
         )
     elif (
-        float(calibrated_clean["mean_representable_lanes"]) >= 3.0
+        float(calibrated_clean["representable_gt_fraction"])
+        >= float(args.min_calibrated_representable_fraction)
         and calibrated_aug_gap >= 0.25
     ):
         next_step = "authorize_single_v6_a1_calibrated_target_gate_without_strong_augmentation"
@@ -213,6 +254,9 @@ def main() -> None:
         "parity_differences": differences,
         "parity_checks": parity_checks,
         "parity_passed": parity_passed,
+        "imported_probe_uniform_gate": imported_probe_uniform_gate,
+        "imported_probe_uniform_passed": imported_probe_uniform_passed,
+        "calibrated_target_passed": calibrated_target_passed,
         "target_findings": target_findings,
         "training_exposure": training_exposure,
         "target_distribution": modes,
@@ -222,9 +266,10 @@ def main() -> None:
         else None,
         "next_step": next_step,
         "warning": (
-            "No new training is authorized by this tool unless exact saved-"
-            "probe weights first reproduce the cached probe result through "
-            "the production model and decoder."
+            "Full validation is authorized only for an imported probe that "
+            "passes exact production parity and the declared uniform gate. "
+            "Any later training must replace the literal official-IoU-as-row-"
+            "strip threshold with the calibrated target contract."
         ),
     }
     output = Path(args.output_json)
