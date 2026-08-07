@@ -23,6 +23,7 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     unique_candidate_labels,
     write_json,
 )
+from dynlaneseq_eg.evaluation.four_slot_decode import decode_four_slot_logits
 
 
 def parse_args() -> argparse.Namespace:
@@ -423,8 +424,11 @@ def main() -> None:
         "sequential_pointer",
         "pointer_stop",
     }
+    slot_mode = score_mode in {"four_slot", "four_slots", "slot", "slots"}
     if pointer_mode:
         method_names.append("pointer_greedy")
+    if slot_mode:
+        method_names.append("four_slot_global_unique")
     method_names.extend(
         f"hard_diverse_{_float_tag(distance)}px"
         for distance in args.hard_diversity_distances
@@ -462,6 +466,13 @@ def main() -> None:
     }
     probability_mass: list[float] = []
     target_lane_counts: list[float] = []
+    slot_raw_collisions = 0
+    slot_global_repairs = 0
+    slot_dustbins = 0
+    slot_total = 0
+    slot_semantic_duplicates = 0
+    slot_active = 0
+    slot_route_entropies: list[float] = []
 
     iterator = tqdm(
         cache["records"],
@@ -486,6 +497,14 @@ def main() -> None:
             if not isinstance(unary_logits, torch.Tensor):
                 raise ValueError("pointer diagnostics require selection_logits")
             scores = torch.sigmoid(unary_logits.float()).cpu()
+        elif slot_mode:
+            # Retain the frozen V5 direct ownership score as a proposal-level
+            # control.  Slot selection itself is added separately below.
+            scores = stage_scores(
+                stage,
+                quality_power=0.0,
+                score_mode="exist",
+            ).cpu()
         else:
             scores = stage_scores(
                 stage,
@@ -526,6 +545,41 @@ def main() -> None:
                 if len(pointer_ids) >= int(args.top_k):
                     break
             selections["pointer_greedy"] = pointer_ids
+        if slot_mode:
+            slot_logits = stage.get("selection_slot_logits")
+            slot_valid = stage.get("selection_slot_candidate_valid")
+            if not isinstance(slot_logits, torch.Tensor) or not isinstance(
+                slot_valid, torch.Tensor
+            ):
+                raise ValueError(
+                    "four-slot diagnostics require slot logits and valid mask"
+                )
+            decoded = decode_four_slot_logits(
+                slot_logits,
+                slot_valid.bool() & candidate_valid.bool(),
+            )
+            slot_ids = [
+                int(value)
+                for value in decoded["indices"].tolist()
+                if int(value) >= 0
+            ]
+            selections["four_slot_global_unique"] = slot_ids
+            slot_total += int(slot_logits.shape[0])
+            slot_active += len(slot_ids)
+            slot_dustbins += int(slot_logits.shape[0]) - len(slot_ids)
+            slot_raw_collisions += int(decoded["raw_collision_count"])
+            slot_global_repairs += int(decoded["repair_count"])
+            entropy = stage.get("selection_slot_route_entropy")
+            if isinstance(entropy, torch.Tensor):
+                slot_route_entropies.extend(float(value) for value in entropy)
+            if int(iou.shape[0]) > 0 and slot_ids:
+                selected_quality = iou[:, slot_ids]
+                best_quality, best_gt = selected_quality.max(dim=0)
+                meaningful = best_quality >= float(args.near_min_iou)
+                cluster_ids = best_gt[meaningful]
+                slot_semantic_duplicates += int(cluster_ids.numel()) - int(
+                    cluster_ids.unique().numel()
+                )
         hard_pools: dict[float, list[int]] = {}
         for hard_distance in args.hard_diversity_distances:
             hard_distance = float(hard_distance)
@@ -541,7 +595,11 @@ def main() -> None:
                 top_k=args.top_k,
                 row_visibility_thresh=args.row_visibility_thresh,
                 allowed_ids=valid_ids,
-                score_mode="selection" if pointer_mode else score_mode,
+                score_mode=(
+                    "selection"
+                    if pointer_mode
+                    else ("exist" if slot_mode else score_mode)
+                ),
             )
             name = f"hard_diverse_{_float_tag(hard_distance)}px"
             selections[name] = [int(index) for index in trace["selected_ids"]]
@@ -651,6 +709,30 @@ def main() -> None:
             for threshold in thresholds
         },
     }
+    slot_diagnostics = None
+    if slot_mode:
+        slot_diagnostics = {
+            "total_slots": int(slot_total),
+            "active_slots": int(slot_active),
+            "dustbin_slots": int(slot_dustbins),
+            "dustbin_fraction": float(slot_dustbins) / max(slot_total, 1),
+            "raw_argmax_collision_count": int(slot_raw_collisions),
+            "raw_argmax_collision_per_image": float(slot_raw_collisions)
+            / max(len(cache["records"]), 1),
+            "global_assignment_repair_count": int(slot_global_repairs),
+            "global_assignment_repair_fraction": float(slot_global_repairs)
+            / max(slot_total, 1),
+            "semantic_duplicate_cluster_count": int(
+                slot_semantic_duplicates
+            ),
+            "semantic_duplicate_cluster_fraction": float(
+                slot_semantic_duplicates
+            )
+            / max(slot_active, 1),
+            "mean_route_entropy": (
+                sum(slot_route_entropies) / max(len(slot_route_entropies), 1)
+            ),
+        }
     verdict = _build_verdict(
         method_summary,
         capacity_summary,
@@ -683,15 +765,20 @@ def main() -> None:
         "capacity": capacity_summary,
         "candidate_pool_score_by_official_status": candidate_pool_summary,
         "score_diagnostics": score_diagnostics,
+        "four_slot_diagnostics": slot_diagnostics,
         "verdict": verdict,
     }
     write_json(args.output_json, payload)
     compact = {
         "score_top4": method_summary["score_top4"],
+        "four_slot_global_unique": method_summary.get(
+            "four_slot_global_unique"
+        ),
         "hard_diverse_20px": method_summary.get("hard_diverse_20px"),
         "capacity": capacity_summary,
         "candidate_pool": candidate_pool_summary,
         "score_diagnostics": score_diagnostics,
+        "four_slot_diagnostics": slot_diagnostics,
         "verdict": verdict,
     }
     print(json.dumps(compact, indent=2))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from dynlaneseq_eg.evaluation.four_slot_decode import decode_four_slot_logits
 from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 
 
@@ -69,6 +70,7 @@ def predictions_to_lanes(
     score_mode = str(score_mode).strip().lower()
     pointer_indices = None
     pointer_scores = None
+    break_on_negative_index = True
     if score_mode in {"exist", "existence"}:
         p_lane = exist_score
     elif score_mode in {"quality", "iou"}:
@@ -129,6 +131,44 @@ def predictions_to_lanes(
             reduce="amax",
             include_self=True,
         )
+    elif score_mode in {"four_slot", "four_slots", "slot", "slots"}:
+        slot_logits = outputs.get("selection_slot_logits")
+        candidate_valid = outputs.get("selection_slot_candidate_valid")
+        if not isinstance(slot_logits, torch.Tensor) or not isinstance(
+            candidate_valid, torch.Tensor
+        ):
+            raise ValueError(
+                "postprocess score_mode='four_slot' requires slot logits "
+                "and candidate-valid mask"
+            )
+        decoded = decode_four_slot_logits(slot_logits, candidate_valid)
+        pointer_indices = decoded["indices"].to(
+            device=outputs["pred_x_rows"].device
+        )
+        pointer_scores = decoded["scores"].to(
+            device=outputs["pred_x_rows"].device
+        )
+        break_on_negative_index = False
+        p_lane = outputs["pred_x_rows"].new_zeros(
+            outputs["pred_x_rows"].shape[:2],
+            dtype=torch.float32,
+        )
+        safe_indices = pointer_indices.clamp(
+            min=0,
+            max=max(int(p_lane.shape[1]) - 1, 0),
+        )
+        valid_slot = pointer_indices >= 0
+        p_lane.scatter_reduce_(
+            1,
+            safe_indices,
+            torch.where(
+                valid_slot,
+                pointer_scores.float(),
+                torch.zeros_like(pointer_scores, dtype=torch.float32),
+            ),
+            reduce="amax",
+            include_self=True,
+        )
     else:
         raise ValueError(f"Unsupported postprocess score_mode: {score_mode!r}")
     pred_x = outputs["pred_x_rows"].clamp(0, input_w - 1)
@@ -172,7 +212,9 @@ def predictions_to_lanes(
             ):
                 candidate_index = int(candidate_value)
                 if candidate_index < 0:
-                    break
+                    if break_on_negative_index:
+                        break
+                    continue
                 score = (
                     float(pointer_scores_cpu[b, step])
                     if pointer_scores_cpu is not None

@@ -116,7 +116,14 @@ def main() -> None:
     parser.add_argument("--quality-score-power", type=float, default=None)
     parser.add_argument(
         "--score-mode",
-        choices=("exist", "quality", "exist_quality", "selection", "pointer"),
+        choices=(
+            "exist",
+            "quality",
+            "exist_quality",
+            "selection",
+            "pointer",
+            "four_slot",
+        ),
         default=None,
         help="Candidate score source; default comes from postprocess.score_mode.",
     )

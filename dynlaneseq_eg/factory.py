@@ -164,6 +164,33 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         pointer_unary_target_mode=str(
             loss.get("pointer_unary_target_mode", "max_quality")
         ),
+        w_four_slot_selection=float(
+            loss.get("w_four_slot_selection", 0.0)
+        ),
+        four_slot_line_width=float(
+            loss.get("four_slot_line_width", 30.0)
+        ),
+        four_slot_min_valid_rows=int(
+            loss.get("four_slot_min_valid_rows", 5)
+        ),
+        four_slot_representable_min=float(
+            loss.get("four_slot_representable_min", 0.50)
+        ),
+        four_slot_cluster_min=float(
+            loss.get("four_slot_cluster_min", 0.30)
+        ),
+        four_slot_cluster_delta=float(
+            loss.get("four_slot_cluster_delta", 0.05)
+        ),
+        four_slot_cluster_temperature=float(
+            loss.get("four_slot_cluster_temperature", 0.03)
+        ),
+        four_slot_permutation_temperature=float(
+            loss.get("four_slot_permutation_temperature", 1.0)
+        ),
+        four_slot_collision_weight=float(
+            loss.get("four_slot_collision_weight", 0.10)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

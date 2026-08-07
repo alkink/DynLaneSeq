@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import permutations
+import math
 
 import torch
 from torch import nn
@@ -483,6 +485,219 @@ def build_pointer_cluster_soft_targets(
     }
 
 
+@torch.no_grad()
+def build_four_slot_cluster_targets(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    num_slots: int,
+    input_h: int,
+    line_width: float,
+    min_valid_rows: int,
+    representable_min: float,
+    cluster_min: float,
+    cluster_delta: float,
+    temperature: float,
+) -> dict[str, object]:
+    """Keep the GT/object axis for four-slot proposal routing.
+
+    Hungarian is used only to determine which GT lanes are jointly
+    representable by the frozen proposal pool.  It does not choose a hard
+    representative.  Every retained GT supplies a near-best soft row over
+    all candidates, plus a zero-mass dustbin class.  Slot identity is left
+    unspecified and is marginalized by :func:`four_slot_permutation_loss`.
+    """
+
+    slots = int(num_slots)
+    if slots < 1:
+        raise ValueError("four-slot num_slots must be positive")
+    if not 0.0 <= float(representable_min) <= 1.0:
+        raise ValueError("four-slot representable_min must be in [0, 1]")
+    if not 0.0 <= float(cluster_min) <= 1.0:
+        raise ValueError("four-slot cluster_min must be in [0, 1]")
+    if float(cluster_delta) < 0.0:
+        raise ValueError("four-slot cluster_delta must be non-negative")
+    if float(temperature) <= 0.0:
+        raise ValueError("four-slot cluster temperature must be positive")
+
+    pred_x = outputs["pred_x_rows"].detach().float()
+    pred_range = outputs["range_norm"].detach().float()
+    batch, candidates, _rows = pred_x.shape
+    rows_by_image: list[torch.Tensor] = []
+    support_sizes: list[torch.Tensor] = []
+    entropies: list[torch.Tensor] = []
+    target_qualities: list[torch.Tensor] = []
+    representable_counts = pred_x.new_zeros((batch,))
+
+    for batch_index, target in enumerate(targets):
+        gt_x = target["x_rows"].to(
+            device=pred_x.device,
+            dtype=pred_x.dtype,
+        )
+        gt_valid = target["valid_mask"].to(pred_x.device).bool()
+        quality, candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
+            pred_x[batch_index],
+            pred_range[batch_index],
+            gt_x,
+            gt_valid,
+            input_h=int(input_h),
+            line_width=float(line_width),
+            min_valid_rows=int(min_valid_rows),
+        )
+        candidate_ids = torch.nonzero(candidate_valid, as_tuple=False).flatten()
+        gt_ids = torch.nonzero(valid_gt, as_tuple=False).flatten()
+        empty = pred_x.new_zeros((0, candidates + 1))
+        if candidate_ids.numel() == 0 or gt_ids.numel() == 0:
+            rows_by_image.append(empty)
+            continue
+
+        local_quality = quality[candidate_ids][:, gt_ids]
+        local_candidate_ids, local_gt_ids = (
+            HungarianMatcherS0._linear_sum_assignment(
+                1.0 - local_quality.detach().cpu()
+            )
+        )
+        jointly_representable: list[tuple[int, float]] = []
+        for local_candidate, local_gt in zip(
+            local_candidate_ids.tolist(),
+            local_gt_ids.tolist(),
+        ):
+            assigned_quality = float(local_quality[local_candidate, local_gt])
+            if assigned_quality >= float(representable_min):
+                jointly_representable.append(
+                    (int(gt_ids[int(local_gt)]), assigned_quality)
+                )
+        if len(jointly_representable) > slots:
+            jointly_representable.sort(key=lambda item: item[1], reverse=True)
+            jointly_representable = jointly_representable[:slots]
+
+        image_rows: list[torch.Tensor] = []
+        for gt_index, _assigned_quality in jointly_representable:
+            gt_quality = quality[:, gt_index]
+            best = gt_quality[candidate_valid].amax()
+            cutoff = max(
+                float(cluster_min),
+                float(best) - float(cluster_delta),
+            )
+            support = candidate_valid & (gt_quality >= cutoff)
+            if not bool(support.any()):
+                continue
+            probability = torch.softmax(
+                gt_quality[support] / float(temperature),
+                dim=0,
+            )
+            row = pred_x.new_zeros((candidates + 1,))
+            row[:candidates][support] = probability
+            image_rows.append(row)
+            support_sizes.append(
+                pred_x.new_tensor(float(support.sum()))
+            )
+            entropies.append(
+                -(probability * probability.clamp_min(1.0e-12).log()).sum()
+            )
+            target_qualities.append((probability * gt_quality[support]).sum())
+        if image_rows:
+            stacked = torch.stack(image_rows)
+        else:
+            stacked = empty
+        rows_by_image.append(stacked)
+        representable_counts[batch_index] = float(stacked.shape[0])
+
+    zero = pred_x.sum() * 0.0
+
+    def mean_or_zero(values: list[torch.Tensor]) -> torch.Tensor:
+        return torch.stack(values).mean() if values else zero
+
+    return {
+        "rows": rows_by_image,
+        "representable_count": representable_counts,
+        "mean_support_size": mean_or_zero(support_sizes),
+        "mean_entropy": mean_or_zero(entropies),
+        "mean_target_quality": mean_or_zero(target_qualities),
+    }
+
+
+def four_slot_permutation_loss(
+    route_logits: torch.Tensor,
+    target_rows: list[torch.Tensor],
+    *,
+    permutation_temperature: float = 1.0,
+) -> torch.Tensor:
+    """Marginalize every valid GT-to-slot permutation (at most ``4!``)."""
+
+    if route_logits.ndim != 3:
+        raise ValueError("four-slot logits must have shape [B,S,N+1]")
+    batch, slots, classes = route_logits.shape
+    if len(target_rows) != int(batch):
+        raise ValueError("four-slot target batch size mismatch")
+    temperature = float(permutation_temperature)
+    if temperature <= 0.0:
+        raise ValueError("four-slot permutation temperature must be positive")
+    dustbin_index = int(classes) - 1
+    log_probability = F.log_softmax(route_logits.float(), dim=-1)
+    losses: list[torch.Tensor] = []
+    for batch_index, target_value in enumerate(target_rows):
+        target = target_value.to(
+            device=route_logits.device,
+            dtype=log_probability.dtype,
+        )
+        if target.ndim != 2 or int(target.shape[1]) != int(classes):
+            raise ValueError("four-slot target rows must have shape [G,N+1]")
+        gt_count = int(target.shape[0])
+        if gt_count > int(slots):
+            raise ValueError("four-slot target contains more GTs than slots")
+        dustbin_cost = -log_probability[batch_index, :, dustbin_index]
+        if gt_count == 0:
+            losses.append(dustbin_cost.sum())
+            continue
+        candidate_cost = -torch.einsum(
+            "sc,gc->sg",
+            log_probability[batch_index],
+            target,
+        )
+        path_costs: list[torch.Tensor] = []
+        for assigned_slots in permutations(range(int(slots)), gt_count):
+            assigned = set(int(value) for value in assigned_slots)
+            cost = candidate_cost.new_zeros(())
+            for gt_index, slot_index in enumerate(assigned_slots):
+                cost = cost + candidate_cost[int(slot_index), gt_index]
+            for slot_index in range(int(slots)):
+                if slot_index not in assigned:
+                    cost = cost + dustbin_cost[slot_index]
+            path_costs.append(cost)
+        stacked = torch.stack(path_costs)
+        losses.append(
+            -temperature * torch.logsumexp(-stacked / temperature, dim=0)
+            + temperature * math.log(float(len(path_costs)))
+        )
+    return torch.stack(losses).mean() / float(max(int(slots), 1))
+
+
+def four_slot_collision_loss(route_logits: torch.Tensor) -> torch.Tensor:
+    """Penalize different slots assigning probability to one proposal."""
+
+    if route_logits.ndim != 3 or int(route_logits.shape[-1]) < 2:
+        raise ValueError("four-slot logits must have shape [B,S,N+1]")
+    proposal_probability = torch.softmax(
+        route_logits.float(), dim=-1
+    )[..., :-1]
+    gram = torch.einsum(
+        "bsn,btn->bst",
+        proposal_probability,
+        proposal_probability,
+    )
+    slots = int(proposal_probability.shape[1])
+    mask = torch.triu(
+        torch.ones(
+            (slots, slots),
+            device=gram.device,
+            dtype=torch.bool,
+        ),
+        diagonal=1,
+    )
+    return gram[:, mask].mean() if bool(mask.any()) else gram.sum() * 0.0
+
+
 @dataclass
 class LossConfig:
     w_exist: float = 2.0
@@ -533,6 +748,15 @@ class LossConfig:
     pointer_cluster_listwise_logit_temperature: float = 1.0
     pointer_stop_weight: float = 1.0
     pointer_unary_target_mode: str = "max_quality"
+    w_four_slot_selection: float = 0.0
+    four_slot_line_width: float = 30.0
+    four_slot_min_valid_rows: int = 5
+    four_slot_representable_min: float = 0.50
+    four_slot_cluster_min: float = 0.30
+    four_slot_cluster_delta: float = 0.05
+    four_slot_cluster_temperature: float = 0.03
+    four_slot_permutation_temperature: float = 1.0
+    four_slot_collision_weight: float = 0.10
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -592,6 +816,8 @@ class S0Criterion(nn.Module):
             "w_pointer_selection",
             "pointer_quality_weight",
             "pointer_cluster_listwise_weight",
+            "w_four_slot_selection",
+            "four_slot_collision_weight",
         ):
             if float(getattr(self.cfg, field_name)) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative")
@@ -600,6 +826,25 @@ class S0Criterion(nn.Module):
         if float(self.cfg.pointer_cluster_listwise_logit_temperature) <= 0.0:
             raise ValueError(
                 "pointer_cluster_listwise_logit_temperature must be positive"
+            )
+        if float(self.cfg.four_slot_line_width) <= 0.0:
+            raise ValueError("four_slot_line_width must be positive")
+        if int(self.cfg.four_slot_min_valid_rows) < 1:
+            raise ValueError("four_slot_min_valid_rows must be positive")
+        for field_name in (
+            "four_slot_representable_min",
+            "four_slot_cluster_min",
+        ):
+            value = float(getattr(self.cfg, field_name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be in [0, 1]")
+        if float(self.cfg.four_slot_cluster_delta) < 0.0:
+            raise ValueError("four_slot_cluster_delta must be non-negative")
+        if float(self.cfg.four_slot_cluster_temperature) <= 0.0:
+            raise ValueError("four_slot_cluster_temperature must be positive")
+        if float(self.cfg.four_slot_permutation_temperature) <= 0.0:
+            raise ValueError(
+                "four_slot_permutation_temperature must be positive"
             )
         if self.cfg.pointer_unary_target_mode not in {
             "max_quality",
@@ -724,6 +969,23 @@ class S0Criterion(nn.Module):
                 "teacher_fallback_count": zero,
                 "teacher_reservation_exclusion_count": zero,
             }
+        if self.cfg.w_four_slot_selection != 0:
+            four_slot_selection = self.compute_four_slot_selection_loss(
+                outputs,
+                targets,
+            )
+        else:
+            four_slot_selection = {
+                "total": zero,
+                "permutation": zero,
+                "collision": zero,
+                "mean_representable_count": zero,
+                "mean_support_size": zero,
+                "mean_target_entropy": zero,
+                "mean_target_quality": zero,
+                "mean_raw_collision_count": zero,
+                "mean_route_entropy": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
@@ -747,6 +1009,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_score_margin * loss_score_margin
             + self.cfg.w_set_selection * set_selection["total"]
             + self.cfg.w_pointer_selection * pointer_selection["total"]
+            + self.cfg.w_four_slot_selection * four_slot_selection["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -806,6 +1069,27 @@ class S0Criterion(nn.Module):
             ],
             "pointer_teacher_reservation_exclusion_count": pointer_selection[
                 "teacher_reservation_exclusion_count"
+            ],
+            "loss_four_slot_selection": four_slot_selection["total"],
+            "loss_four_slot_permutation": four_slot_selection["permutation"],
+            "loss_four_slot_collision": four_slot_selection["collision"],
+            "four_slot_target_mean_representable_count": four_slot_selection[
+                "mean_representable_count"
+            ],
+            "four_slot_target_mean_support_size": four_slot_selection[
+                "mean_support_size"
+            ],
+            "four_slot_target_mean_entropy": four_slot_selection[
+                "mean_target_entropy"
+            ],
+            "four_slot_target_mean_quality": four_slot_selection[
+                "mean_target_quality"
+            ],
+            "four_slot_mean_raw_collision_count": four_slot_selection[
+                "mean_raw_collision_count"
+            ],
+            "four_slot_mean_route_entropy": four_slot_selection[
+                "mean_route_entropy"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -1895,6 +2179,73 @@ class S0Criterion(nn.Module):
                 selection_targets.detach() > 0.0
             ).float().mean(),
             "delta_abs": delta_abs,
+        }
+
+    def compute_four_slot_selection_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Train four object slots while the 32-proposal detector is frozen."""
+
+        logits_value = outputs.get("selection_slot_logits")
+        if not isinstance(logits_value, torch.Tensor):
+            raise ValueError(
+                "w_four_slot_selection > 0 requires four-slot routing logits"
+            )
+        route_logits = logits_value.float()
+        if route_logits.ndim != 3:
+            raise ValueError("selection_slot_logits must have shape [B,S,N+1]")
+        target_data = build_four_slot_cluster_targets(
+            outputs,
+            targets,
+            num_slots=int(route_logits.shape[1]),
+            input_h=int(self.cfg.input_h),
+            line_width=float(self.cfg.four_slot_line_width),
+            min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            representable_min=float(self.cfg.four_slot_representable_min),
+            cluster_min=float(self.cfg.four_slot_cluster_min),
+            cluster_delta=float(self.cfg.four_slot_cluster_delta),
+            temperature=float(self.cfg.four_slot_cluster_temperature),
+        )
+        target_rows = target_data["rows"]
+        if not isinstance(target_rows, list):
+            raise TypeError("four-slot target builder returned invalid rows")
+        permutation_loss = four_slot_permutation_loss(
+            route_logits,
+            target_rows,
+            permutation_temperature=float(
+                self.cfg.four_slot_permutation_temperature
+            ),
+        )
+        collision_loss = four_slot_collision_loss(route_logits)
+        total = permutation_loss + float(
+            self.cfg.four_slot_collision_weight
+        ) * collision_loss
+        representable = target_data["representable_count"]
+        if not isinstance(representable, torch.Tensor):
+            raise TypeError("four-slot target builder returned invalid counts")
+        raw_collision = outputs.get("selection_slot_raw_collision_count")
+        route_entropy = outputs.get("selection_slot_route_entropy")
+        zero = total.detach() * 0.0
+        return {
+            "total": total,
+            "permutation": permutation_loss,
+            "collision": collision_loss,
+            "mean_representable_count": representable.float().mean().detach(),
+            "mean_support_size": target_data["mean_support_size"],
+            "mean_target_entropy": target_data["mean_entropy"],
+            "mean_target_quality": target_data["mean_target_quality"],
+            "mean_raw_collision_count": (
+                raw_collision.float().mean().detach()
+                if isinstance(raw_collision, torch.Tensor)
+                else zero
+            ),
+            "mean_route_entropy": (
+                route_entropy.float().mean().detach()
+                if isinstance(route_entropy, torch.Tensor)
+                else zero
+            ),
         }
 
     def compute_pointer_selection_loss(

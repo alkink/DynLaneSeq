@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .common import soft_expected_x, sort_range_norm
+from .four_slot_selection import FourSlotLaneSelectionHead
 from .unified_lane_set import ProtectedOwnershipLayer, UnifiedLaneSetLayer
 
 
@@ -2405,8 +2406,44 @@ class StructuredLaneQueryHead(nn.Module):
         )
         self.range = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 2))
         self.quality = nn.Sequential(nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, 1))
-        self.set_selection_head = (
-            SetAwareLaneSelectionHead(
+        selection_interaction = str(
+            self.set_selection_cfg.get("candidate_interaction", "transformer")
+        ).strip().lower()
+        if self.set_selection_enabled and selection_interaction == "four_slot":
+            self.set_selection_head = FourSlotLaneSelectionHead(
+                self.dim,
+                input_w=self.input_w,
+                hidden_dim=int(self.set_selection_cfg.get("hidden_dim", self.dim)),
+                num_slots=int(
+                    self.set_selection_cfg.get("four_slot_num_slots", 4)
+                ),
+                proposal_layers=int(
+                    self.set_selection_cfg.get("num_layers", 2)
+                ),
+                slot_layers=int(
+                    self.set_selection_cfg.get("four_slot_num_layers", 2)
+                ),
+                num_heads=int(
+                    self.set_selection_cfg.get("num_heads", num_heads)
+                ),
+                ff_dim=int(
+                    self.set_selection_cfg.get("ff_dim", 2 * self.dim)
+                ),
+                dropout=float(
+                    self.set_selection_cfg.get("dropout", dropout)
+                ),
+                curve_samples=int(
+                    self.set_selection_cfg.get("curve_samples", 20)
+                ),
+                range_temperature=float(
+                    self.set_selection_cfg.get("range_temperature", 0.02)
+                ),
+                min_valid_rows=int(
+                    self.set_selection_cfg.get("four_slot_min_valid_rows", 5)
+                ),
+            )
+        elif self.set_selection_enabled:
+            self.set_selection_head = SetAwareLaneSelectionHead(
                 self.dim,
                 input_w=self.input_w,
                 hidden_dim=int(self.set_selection_cfg.get("hidden_dim", self.dim)),
@@ -2488,9 +2525,8 @@ class StructuredLaneQueryHead(nn.Module):
                     )
                 ),
             )
-            if self.set_selection_enabled
-            else None
-        )
+        else:
+            self.set_selection_head = None
         if (
             self.set_selection_head is not None
             and self.set_selection_head.use_semantic_decision
@@ -3159,6 +3195,11 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_pointer_indices",
                 "selection_pointer_scores",
                 "selection_pointer_relation_bias",
+                "selection_slot_logits",
+                "selection_slot_candidate_valid",
+                "selection_slot_raw_indices",
+                "selection_slot_raw_collision_count",
+                "selection_slot_route_entropy",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

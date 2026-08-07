@@ -1,0 +1,105 @@
+_base_: culane_s0_structured_query_dla34_v5_1_shared_trunk_assignment_10k_to25k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v6_a_four_slot_gate_25k/slot_selector
+
+# V6-A is deliberately selector-only.  The V5.1 assignment checkpoint remains
+# a frozen 32-proposal generator; four persistent object slots retain the GT
+# axis and route globally unique proposal curves.  Slot-owned curve refinement
+# and proposal co-adaptation are reserved for later causal gates.
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      enabled: true
+      candidate_interaction: four_slot
+      hidden_dim: 256
+      num_layers: 2
+      four_slot_num_layers: 2
+      four_slot_num_slots: 4
+      four_slot_min_valid_rows: 5
+      num_heads: 8
+      ff_dim: 512
+      dropout: 0.1
+      curve_samples: 20
+      range_temperature: 0.02
+      detach_geometry_features: true
+      use_curve_evidence: false
+      use_semantic_decision: false
+
+# All detector and V5 ownership objectives are constants.  The only backward
+# root is the permutation-marginal four-slot routing loss.
+loss:
+  w_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_seg: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_four_slot_selection: 1.0
+  w_centerline: 0.0
+  w_row_dfl: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  four_slot_line_width: 30.0
+  four_slot_min_valid_rows: 5
+  four_slot_representable_min: 0.50
+  four_slot_cluster_min: 0.30
+  four_slot_cluster_delta: 0.05
+  four_slot_cluster_temperature: 0.03
+  four_slot_permutation_temperature: 1.0
+  four_slot_collision_weight: 0.10
+
+optimizer:
+  base_lr: 0.0003
+  evidence_lr: 0.0003
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: four_slot_selector
+      lr: 0.0003
+      prefixes:
+        - structured_query_head.set_selection_head.
+
+scheduler:
+  name: constant
+
+postprocess:
+  score_mode: four_slot
+  score_thresh: 0.0
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 4000
+  checkpoint_interval: 1000
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head
+  clip_grad_norm: 5.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
