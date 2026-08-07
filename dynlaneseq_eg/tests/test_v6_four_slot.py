@@ -13,6 +13,12 @@ from dynlaneseq_eg.losses.loss_s0 import (
 from dynlaneseq_eg.modeling.four_slot_selection import (
     FourSlotLaneSelectionHead,
 )
+from dynlaneseq_eg.tools.audit_v6_a_target_distribution import (
+    _finish_accumulator,
+    _new_accumulator,
+)
+from dynlaneseq_eg.tools.probe_v5_four_slot_router import FourSlotRouter
+from dynlaneseq_eg.tools.summarize_v6_a_probe_mismatch import _log_integer
 
 
 def _head_outputs(*, batch: int = 2, candidates: int = 6, rows: int = 12):
@@ -66,6 +72,39 @@ def test_four_slot_head_matches_probe_parameter_count_and_detaches_inputs():
     assert any(parameter.grad is not None for parameter in head.parameters())
     for value in outputs.values():
         assert value.grad is None
+
+
+def test_production_four_slot_state_is_checkpoint_compatible_with_probe():
+    production = FourSlotLaneSelectionHead(
+        16,
+        input_w=100,
+        hidden_dim=32,
+        num_slots=4,
+        proposal_layers=2,
+        slot_layers=2,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.1,
+        curve_samples=8,
+        min_valid_rows=5,
+    )
+    probe = FourSlotRouter(
+        3 * 16 + 11 + 2 * 8,
+        hidden_dim=32,
+        num_slots=4,
+        proposal_layers=2,
+        slot_layers=2,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.1,
+    )
+    assert production.state_dict().keys() == probe.state_dict().keys()
+    assert {
+        name: tuple(value.shape)
+        for name, value in production.state_dict().items()
+    } == {
+        name: tuple(value.shape) for name, value in probe.state_dict().items()
+    }
 
 
 def test_four_slot_head_handles_an_all_invalid_candidate_set():
@@ -224,3 +263,43 @@ def test_criterion_backpropagates_only_through_slot_logits():
     losses["loss_total"].backward()
     assert outputs["selection_slot_logits"].grad is not None
     assert torch.isfinite(outputs["selection_slot_logits"].grad).all()
+
+
+def test_v6_target_distribution_accumulator_reports_dustbin_contract():
+    accumulator = _new_accumulator()
+    accumulator.update(
+        {
+            "images": 2,
+            "gt_lanes": 7.0,
+            "representable": 5.0,
+            "support_weighted_sum": 10.0,
+            "entropy_weighted_sum": 2.5,
+            "quality_weighted_sum": 4.0,
+        }
+    )
+    accumulator["count_histogram"].update((2, 3))
+    result = _finish_accumulator(accumulator, slots=4)
+    assert result["mean_gt_lanes"] == 3.5
+    assert result["mean_representable_lanes"] == 2.5
+    assert result["expected_dustbin_fraction"] == 0.375
+    assert result["mean_support_size"] == 2.0
+    assert result["representable_count_histogram"] == {
+        "0": 0,
+        "1": 0,
+        "2": 1,
+        "3": 1,
+        "4": 0,
+    }
+
+
+def test_v6_mismatch_summary_reads_training_exposure(tmp_path):
+    log = tmp_path / "train.log"
+    log.write_text(
+        "{'train_images': 88880, 'effective_batch_size': 16, "
+        "'iters': 4000}\n",
+        encoding="utf-8",
+    )
+    assert _log_integer(str(log), "train_images") == 88880
+    assert _log_integer(str(log), "effective_batch_size") == 16
+    assert _log_integer(str(log), "iters") == 4000
+    assert _log_integer(str(log), "missing") is None
