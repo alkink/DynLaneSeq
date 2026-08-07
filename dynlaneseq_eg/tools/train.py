@@ -435,6 +435,7 @@ def main() -> None:
                 scaler,
                 strict=False,
                 scheduler=scheduler,
+                restore_rng_state=True,
             )
         if resume_group_lr_overrides:
             if scheduler is not None:
@@ -512,6 +513,7 @@ def main() -> None:
                 "model_state_prefixes": list(checkpoint_model_prefixes),
                 "base_checkpoint": checkpoint_base or None,
                 "include_optimizer": checkpoint_include_optimizer,
+                "include_rng_state": checkpoint_include_optimizer,
                 "save_last_alias": save_last_alias,
             },
         }
@@ -535,6 +537,7 @@ def main() -> None:
             scheduler=scheduler if include_state else None,
             model_state_prefixes=checkpoint_model_prefixes,
             base_checkpoint=checkpoint_base or None,
+            include_rng_state=include_state,
         )
 
     def save_periodic(iteration: int):

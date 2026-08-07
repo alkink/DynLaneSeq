@@ -2917,6 +2917,16 @@ class StructuredLaneQueryHead(nn.Module):
                     if self.row_reference_prediction_mode == "absolute"
                     else None
                 )
+                row_delta_norm = (
+                    self.row_delta_norms[layer_index]
+                    if self.row_reference_prediction_mode == "bounded_delta"
+                    else None
+                )
+                row_delta_head = (
+                    self.row_delta_heads[layer_index]
+                    if self.row_reference_prediction_mode == "bounded_delta"
+                    else None
+                )
                 layer_outputs = self._predict_from_row_tokens(
                     row_tokens,
                     instance,
@@ -2925,8 +2935,8 @@ class StructuredLaneQueryHead(nn.Module):
                     input_reference_x_rows=reference_x,
                     lane_state=lane_state,
                     decision_lane_state=decision_lane_state,
-                    row_delta_norm=self.row_delta_norms[layer_index],
-                    row_delta_head=self.row_delta_heads[layer_index],
+                    row_delta_norm=row_delta_norm,
+                    row_delta_head=row_delta_head,
                 )
                 if self.row_reference_prediction_mode == "bounded_delta":
                     delta_abs = layer_outputs["pred_delta_x_rows"].detach().abs()

@@ -1,0 +1,11 @@
+_base_: culane_s0_structured_query_dla34_v5_b_protected_ownership_assignment_25k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v5_1_shared_trunk_gate/assignment
+
+# The matcher ownership edge is exactly zero at the shared 10k branch point,
+# then follows the predeclared 0 -> 0.25 ramp through 25k.
+training:
+  max_iters: 15000
+  checkpoint_interval: 5000
+  checkpoint_include_optimizer: false
+  save_last_alias: false

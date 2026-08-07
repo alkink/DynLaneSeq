@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import random
 import shutil
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -123,6 +125,36 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
         ) from exc
 
 
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    if not isinstance(state, dict):
+        raise TypeError("checkpoint rng_state must be a mapping")
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch_cpu" in state:
+        torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        if len(cuda_state) != torch.cuda.device_count():
+            raise ValueError(
+                "checkpoint CUDA RNG state count does not match visible devices: "
+                f"{len(cuda_state)} vs {torch.cuda.device_count()}"
+            )
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def remap_optimizer_state_by_parameter(
     source_optimizer: torch.optim.Optimizer,
     target_optimizer: torch.optim.Optimizer,
@@ -186,6 +218,7 @@ def save_checkpoint(
     scheduler=None,
     model_state_prefixes=(),
     base_checkpoint: str | Path | None = None,
+    include_rng_state: bool = False,
 ) -> None:
     path = Path(path)
     prefixes = _normalize_prefixes(model_state_prefixes)
@@ -224,10 +257,20 @@ def save_checkpoint(
         payload["scaler"] = scaler.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
+    if include_rng_state:
+        payload["rng_state"] = _capture_rng_state()
     _atomic_torch_save(payload, path)
 
 
-def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, strict: bool = False, scheduler=None) -> int:
+def load_checkpoint(
+    path: str | Path,
+    model,
+    optimizer=None,
+    scaler=None,
+    strict: bool = False,
+    scheduler=None,
+    restore_rng_state: bool = False,
+) -> int:
     model_state, payload = _materialize_model_state(path)
     model.load_state_dict(model_state, strict=strict)
     if optimizer is not None and "optimizer" in payload:
@@ -236,6 +279,8 @@ def load_checkpoint(path: str | Path, model, optimizer=None, scaler=None, strict
         scaler.load_state_dict(payload["scaler"])
     if scheduler is not None and "scheduler" in payload:
         scheduler.load_state_dict(payload["scheduler"])
+    if restore_rng_state and "rng_state" in payload:
+        _restore_rng_state(payload["rng_state"])
     return int(payload.get("iteration", 0))
 
 

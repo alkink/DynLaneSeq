@@ -1,0 +1,12 @@
+_base_: culane_s0_structured_query_dla34_v5_a_protected_ownership_sidecar_25k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v5_1_shared_trunk_gate/control
+
+# This is a 15k continuation from the exact shared 10k checkpoint.  Fork
+# checkpoints are model-only because only the shared branch point requires an
+# exact optimizer/RNG resume for this causal gate.
+training:
+  max_iters: 15000
+  checkpoint_interval: 5000
+  checkpoint_include_optimizer: false
+  save_last_alias: false

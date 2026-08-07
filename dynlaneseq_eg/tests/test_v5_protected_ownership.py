@@ -167,3 +167,34 @@ def test_v5_configs_differ_only_in_assignment_coupling() -> None:
     assert control["matcher"]["reuse_final_assignment_for_intermediate"] is False
     assert control["loss"]["exist_target_mode"] == "binary"
     assert control["loss"]["w_intermediate_exist"] == 2.0
+
+
+def test_v5_1_forks_share_one_exact_10k_training_contract() -> None:
+    trunk = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_v5_1_shared_trunk_10k.yaml"
+    )
+    control = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_"
+        "v5_1_shared_trunk_control_10k_to25k.yaml"
+    )
+    assignment = load_config(
+        "dynlaneseq_eg/configs/"
+        "culane_s0_structured_query_dla34_"
+        "v5_1_shared_trunk_assignment_10k_to25k.yaml"
+    )
+
+    assert trunk["model"] == control["model"] == assignment["model"]
+    assert trunk["loss"] == control["loss"] == assignment["loss"]
+    assert trunk["optimizer"] == control["optimizer"] == assignment["optimizer"]
+    assert trunk["scheduler"] == control["scheduler"] == assignment["scheduler"]
+    assert trunk["training"]["max_iters"] == 10000
+    assert trunk["training"]["checkpoint_include_optimizer"] is True
+    assert control["training"] == assignment["training"]
+    assert control["training"]["max_iters"] == 15000
+    assert build_matcher(trunk).effective_lambda_obj(10000) == 0.0
+    assert build_matcher(control).effective_lambda_obj(25000) == 0.0
+    assert build_matcher(assignment).effective_lambda_obj(10000) == 0.0
+    assert build_matcher(assignment).effective_lambda_obj(17500) == 0.125
+    assert build_matcher(assignment).effective_lambda_obj(25000) == 0.25
