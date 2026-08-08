@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -25,6 +26,25 @@ from dynlaneseq_eg.modeling.common import fixed_y_rows, sort_range_norm
 from dynlaneseq_eg.tools.analyze_selection_assignment_gradient_conflict import (
     _target_to_official_mapping,
 )
+
+
+def _install_numpy_pickle_compatibility() -> None:
+    """Read NumPy-2 checkpoints from the supported local NumPy-1 runtime.
+
+    NumPy 2 moved the private pickle module from ``numpy.core`` to
+    ``numpy._core``.  Torch checkpoints containing a captured NumPy RNG state
+    therefore need module aliases when audited on the project's older local
+    environment.  This does not alter arrays or checkpoint tensors.
+    """
+
+    if hasattr(np, "_core"):
+        return
+    core = np.core
+    sys.modules.setdefault("numpy._core", core)
+    for suffix in ("multiarray", "numeric", "umath", "_multiarray_umath"):
+        module = getattr(core, suffix, None)
+        if module is not None:
+            sys.modules.setdefault(f"numpy._core.{suffix}", module)
 
 
 def parse_args() -> argparse.Namespace:
@@ -603,6 +623,7 @@ def _recommendation(methods: dict[str, Any]) -> dict[str, Any]:
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
+    _install_numpy_pickle_compatibility()
     thresholds = tuple(sorted(set(float(v) for v in args.iou_thresholds)))
     cache = load_or_collect_cache(
         args.config,
