@@ -24,6 +24,15 @@ def _parse_args() -> argparse.Namespace:
         default=[],
     )
     parser.add_argument("--gradient-contract", required=True)
+    parser.add_argument(
+        "--continuation-complete",
+        action="store_true",
+        help=(
+            "Mark the pre-authorized 2k frozen-head continuation complete. "
+            "A remaining conditional signal then stops this arm instead of "
+            "requesting another extension."
+        ),
+    )
     parser.add_argument("--output-json", required=True)
     return parser.parse_args()
 
@@ -89,6 +98,8 @@ def _row(iteration: int, path: Path) -> dict[str, Any]:
 def summarize(
     specs: list[tuple[int, Path]],
     gradient_contract: dict[str, Any],
+    *,
+    continuation_complete: bool = False,
 ) -> dict[str, Any]:
     if not specs:
         raise ValueError("at least one generalization report is required")
@@ -137,8 +148,12 @@ def summarize(
         verdict = "pass"
         next_action = "run_one_full_validation"
     elif conditional_signal:
-        verdict = "conditional"
-        next_action = "extend_same_frozen_head_by_2k_without_test"
+        if continuation_complete:
+            verdict = "frozen_head_plateau"
+            next_action = "stop_frozen_head_and_test_joint_training_hypothesis"
+        else:
+            verdict = "conditional"
+            next_action = "extend_same_frozen_head_by_2k_without_test"
     else:
         verdict = "fail"
         next_action = "stop_and_audit_generalization_objective"
@@ -157,10 +172,13 @@ def summarize(
             "f1_050_min": 0.75,
             "f1_075_min": 0.55,
         },
+        "continuation_complete": bool(continuation_complete),
         "verdict": verdict,
         "next_action": next_action,
         "full_validation_authorized": strong_signal,
         "long_run_authorized": False,
+        "joint_training_status": "not_tested_by_frozen_head_gate",
+        "joint_training_ruled_out": False,
         "test_split_closed": True,
     }
 
@@ -168,7 +186,11 @@ def summarize(
 def main() -> None:
     args = _parse_args()
     gradient = _load(args.gradient_contract)
-    payload = summarize(args.report, gradient)
+    payload = summarize(
+        args.report,
+        gradient,
+        continuation_complete=bool(args.continuation_complete),
+    )
     output = Path(args.output_json)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(

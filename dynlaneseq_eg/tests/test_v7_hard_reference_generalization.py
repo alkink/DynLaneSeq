@@ -79,6 +79,28 @@ def test_conditional_signal_requests_only_short_extension(tmp_path: Path):
     assert result["full_validation_authorized"] is False
 
 
+def test_completed_continuation_stops_frozen_arm_but_not_joint_hypothesis(
+    tmp_path: Path,
+):
+    reports = [
+        (28000, _report(tmp_path / "a.json", f1_050=0.79, f1_075=0.57)),
+        (30000, _report(tmp_path / "b.json", f1_050=0.79, f1_075=0.57)),
+    ]
+    result = summarize(
+        reports,
+        {"passed": True},
+        continuation_complete=True,
+    )
+    assert result["verdict"] == "frozen_head_plateau"
+    assert (
+        result["next_action"]
+        == "stop_frozen_head_and_test_joint_training_hypothesis"
+    )
+    assert result["full_validation_authorized"] is False
+    assert result["long_run_authorized"] is False
+    assert result["joint_training_ruled_out"] is False
+
+
 def test_geometry_or_gradient_failure_blocks_gate(tmp_path: Path):
     reports = [
         (25500, _report(tmp_path / "a.json", f1_050=0.81, f1_075=0.60)),
