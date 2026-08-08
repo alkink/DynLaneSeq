@@ -33,6 +33,9 @@ loss:
   lambda_intermediate: 0.0
   lambda_training_auxiliary: 0.0
   w_four_slot_selection: 1.0
+  # Choose one DETR-style slot-to-GT ownership path. Candidate uncertainty
+  # inside that GT's near-best proposal cluster remains soft.
+  four_slot_assignment_mode: hard_min
   w_four_slot_geometry: 1.0
 
 optimizer:

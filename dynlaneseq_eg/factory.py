@@ -191,6 +191,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_permutation_temperature=float(
             loss.get("four_slot_permutation_temperature", 1.0)
         ),
+        four_slot_assignment_mode=str(
+            loss.get("four_slot_assignment_mode", "marginal")
+        ),
         four_slot_collision_weight=float(
             loss.get("four_slot_collision_weight", 0.10)
         ),

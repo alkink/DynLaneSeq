@@ -18,8 +18,9 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 METRIC_WORKERS="${METRIC_WORKERS:-12}"
 AMP_DTYPE="${AMP_DTYPE:-bfloat16}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v7_reference_architecture_gate}"
-CACHE_ROOT="${CACHE_ROOT:-outputs/diagnostic_cache/unified_lane_set_v7_reference_architecture_gate}"
+RUN_GENERALIZATION="${RUN_GENERALIZATION:-0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/unified_lane_set_v7_hard_slot_assignment_gate}"
+CACHE_ROOT="${CACHE_ROOT:-outputs/diagnostic_cache/unified_lane_set_v7_hard_slot_assignment_gate}"
 
 HARD_CONFIG=dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v7_hard_reference_gate_25k_to28k.yaml
 DIRECT_CONFIG=dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v7_direct_reference_gate_25k_to28k.yaml
@@ -51,6 +52,10 @@ if (( BATCH_SIZE * GRAD_ACCUM != 16 )); then
 fi
 if [[ "${AMP_DTYPE}" != "bfloat16" ]]; then
   echo "The V7 reference gate requires AMP_DTYPE=bfloat16." >&2
+  exit 1
+fi
+if [[ "${RUN_GENERALIZATION}" != "0" && "${RUN_GENERALIZATION}" != "1" ]]; then
+  echo "RUN_GENERALIZATION must be 0 or 1." >&2
   exit 1
 fi
 
@@ -266,10 +271,11 @@ MEMORY_HARD_CKPT="${MEMORY_HARD_DIR}/iter_${MEMORY_TAG}.pt"
 MEMORY_DIRECT_CKPT="${MEMORY_DIRECT_DIR}/iter_${MEMORY_TAG}.pt"
 MEMORY_HARD_REPORT="${OUTPUT_ROOT}/memorize64_hard_iter_${MEMORY_TAG}.json"
 MEMORY_DIRECT_REPORT="${OUTPUT_ROOT}/memorize64_direct_iter_${MEMORY_TAG}.json"
+MEMORY_SUMMARY="${OUTPUT_ROOT}/v7_hard_assignment_memorization_summary.json"
 evaluate_report "${HARD_MEMORY_CONFIG}" "${MEMORY_HARD_CKPT}" "${MEMORY_HARD_REPORT}" "${CACHE_ROOT}/memorize_hard_${MEMORY_TAG}" train "${FIXED_LIST}" 0
 evaluate_report "${DIRECT_MEMORY_CONFIG}" "${MEMORY_DIRECT_CKPT}" "${MEMORY_DIRECT_REPORT}" "${CACHE_ROOT}/memorize_direct_${MEMORY_TAG}" train "${FIXED_LIST}" 0
 
-"${PYTHON}" - "${MEMORY_HARD_REPORT}" "${MEMORY_DIRECT_REPORT}" <<'PY'
+"${PYTHON}" - "${MEMORY_HARD_REPORT}" "${MEMORY_DIRECT_REPORT}" "${MEMORY_SUMMARY}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -286,11 +292,46 @@ def passed(path):
     }
 
 rows = {"hard": passed(sys.argv[1]), "direct": passed(sys.argv[2])}
-print({"memorization_gate": rows})
-for name, row in rows.items():
-    if not (row["f1_050"] >= 0.90 and row["cardinality_exact"] >= 0.90 and row["semantic_duplicate"] <= 0.02 and row["close_pair_fraction_20px"] <= 0.02):
+thresholds = {
+    "f1_050_min": 0.90,
+    "cardinality_exact_min": 0.90,
+    "semantic_duplicate_max": 0.02,
+    "close_pair_fraction_20px_max": 0.02,
+}
+arm_pass = {
+    name: (
+        row["f1_050"] >= thresholds["f1_050_min"]
+        and row["cardinality_exact"] >= thresholds["cardinality_exact_min"]
+        and row["semantic_duplicate"] <= thresholds["semantic_duplicate_max"]
+        and row["close_pair_fraction_20px"]
+        <= thresholds["close_pair_fraction_20px_max"]
+    )
+    for name, row in rows.items()
+}
+payload = {
+    "experiment": "V7 hard slot-to-GT assignment fixed-64 gate",
+    "assignment_mode": "hard_min",
+    "candidate_target_within_gt": "soft_cluster",
+    "thresholds": thresholds,
+    "arms": rows,
+    "arm_pass": arm_pass,
+    "all_pass": all(arm_pass.values()),
+}
+Path(sys.argv[3]).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+print({"memorization_gate": payload})
+for name, did_pass in arm_pass.items():
+    if not did_pass:
         raise SystemExit(f"{name} fixed-64 memorization gate failed")
 PY
+
+if [[ "${RUN_GENERALIZATION}" != "1" ]]; then
+  echo "Fixed-64 hard-assignment gate passed; generalization remains paused."
+  echo "summary: ${MEMORY_SUMMARY}"
+  exit 0
+fi
 
 HARD_DIR="${OUTPUT_ROOT}/generalization/hard"
 DIRECT_DIR="${OUTPUT_ROOT}/generalization/direct"
@@ -336,7 +377,7 @@ DIRECT_GRADIENT="${OUTPUT_ROOT}/direct_final_gradient_contract.json"
   --amp-dtype none \
   --output-json "${DIRECT_GRADIENT}"
 
-SUMMARY="${OUTPUT_ROOT}/v7_reference_gate_summary.json"
+SUMMARY="${OUTPUT_ROOT}/v7_hard_assignment_reference_gate_summary.json"
 "${PYTHON}" -u -m dynlaneseq_eg.tools.summarize_v7_reference_gate \
   --hard-memorization "${MEMORY_HARD_REPORT}" \
   --direct-memorization "${MEMORY_DIRECT_REPORT}" \

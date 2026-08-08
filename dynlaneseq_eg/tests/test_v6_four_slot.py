@@ -144,6 +144,46 @@ def test_factorized_permutation_separates_active_and_real_route_gradients():
     assert float(route.grad.abs().sum()) > 0.0
 
 
+def test_factorized_hard_assignment_breaks_fractional_cardinality_symmetry():
+    rows = [torch.zeros((3, 4))]
+    rows[0][0, 0] = 1.0
+    rows[0][1, 1] = 1.0
+    rows[0][2, 2] = 1.0
+
+    marginal_active = torch.zeros((1, 4), requires_grad=True)
+    marginal_route = torch.zeros((1, 4, 3), requires_grad=True)
+    marginal = four_slot_factorized_permutation_loss(
+        marginal_active,
+        marginal_route,
+        rows,
+        assignment_mode="marginal",
+    )
+    marginal.backward()
+    assert marginal_active.grad is not None
+    assert torch.allclose(
+        marginal_active.grad,
+        marginal_active.grad[:, :1].expand_as(marginal_active.grad),
+        atol=1.0e-7,
+    )
+    assert bool((marginal_active.grad < 0.0).all())
+
+    hard_active = torch.zeros((1, 4), requires_grad=True)
+    hard_route = torch.zeros((1, 4, 3), requires_grad=True)
+    hard = four_slot_factorized_permutation_loss(
+        hard_active,
+        hard_route,
+        rows,
+        assignment_mode="hard_min",
+    )
+    hard.backward()
+    assert hard_active.grad is not None
+    assert bool((hard_active.grad[0, :3] < 0.0).all())
+    assert float(hard_active.grad[0, 3]) > 0.0
+    assert hard_route.grad is not None
+    assert float(hard_route.grad[0, 3].abs().sum()) == 0.0
+    assert float(hard_route.grad[0, :3].abs().sum()) > 0.0
+
+
 def test_factorized_head_geometry_does_not_backpropagate_to_active_or_trunk():
     head = FourSlotLaneSelectionHead(
         16,
@@ -344,6 +384,8 @@ def test_v7_reference_gate_arms_are_parameter_matched_except_forward_mode():
     assert direct_selection["four_slot_factorized_routing"] is True
     assert hard["loss"]["four_slot_target_mode"] == "all_gt"
     assert direct["loss"]["four_slot_target_mode"] == "all_gt"
+    assert hard["loss"]["four_slot_assignment_mode"] == "hard_min"
+    assert direct["loss"]["four_slot_assignment_mode"] == "hard_min"
     assert hard["training"]["trainable_parameter_prefixes"] == direct[
         "training"
     ]["trainable_parameter_prefixes"]

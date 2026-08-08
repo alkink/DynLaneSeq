@@ -654,8 +654,15 @@ def four_slot_permutation_loss(
     target_rows: list[torch.Tensor],
     *,
     permutation_temperature: float = 1.0,
+    assignment_mode: str = "marginal",
 ) -> torch.Tensor:
-    """Marginalize every valid GT-to-slot permutation (at most ``4!``)."""
+    """Reduce every valid GT-to-slot permutation (at most ``4!``).
+
+    ``marginal`` preserves the historical soft log-sum-exp objective.  The
+    ``hard_min`` mode selects one detached minimum-cost permutation and only
+    backpropagates through that path, matching DETR-style discrete ownership
+    while retaining the soft candidate distribution inside each GT row.
+    """
 
     if route_logits.ndim != 3:
         raise ValueError("four-slot logits must have shape [B,S,N+1]")
@@ -665,6 +672,11 @@ def four_slot_permutation_loss(
     temperature = float(permutation_temperature)
     if temperature <= 0.0:
         raise ValueError("four-slot permutation temperature must be positive")
+    mode = str(assignment_mode).strip().lower()
+    if mode not in {"marginal", "hard_min"}:
+        raise ValueError(
+            "four-slot assignment_mode must be marginal or hard_min"
+        )
     dustbin_index = int(classes) - 1
     log_probability = F.log_softmax(route_logits.float(), dim=-1)
     losses: list[torch.Tensor] = []
@@ -698,10 +710,17 @@ def four_slot_permutation_loss(
                     cost = cost + dustbin_cost[slot_index]
             path_costs.append(cost)
         stacked = torch.stack(path_costs)
-        losses.append(
-            -temperature * torch.logsumexp(-stacked / temperature, dim=0)
-            + temperature * math.log(float(len(path_costs)))
-        )
+        if mode == "hard_min":
+            best_path = stacked.detach().argmin()
+            losses.append(stacked[best_path])
+        else:
+            losses.append(
+                -temperature * torch.logsumexp(
+                    -stacked / temperature,
+                    dim=0,
+                )
+                + temperature * math.log(float(len(path_costs)))
+            )
     return torch.stack(losses).mean() / float(max(int(slots), 1))
 
 
@@ -711,6 +730,7 @@ def four_slot_factorized_permutation_loss(
     target_rows: list[torch.Tensor],
     *,
     permutation_temperature: float = 1.0,
+    assignment_mode: str = "marginal",
 ) -> torch.Tensor:
     """Permutation-marginal loss with separate cardinality and real route.
 
@@ -730,6 +750,11 @@ def four_slot_factorized_permutation_loss(
     temperature = float(permutation_temperature)
     if temperature <= 0.0:
         raise ValueError("four-slot permutation temperature must be positive")
+    mode = str(assignment_mode).strip().lower()
+    if mode not in {"marginal", "hard_min"}:
+        raise ValueError(
+            "four-slot assignment_mode must be marginal or hard_min"
+        )
 
     real_log_probability = F.log_softmax(
         real_route_logits.float(),
@@ -768,10 +793,21 @@ def four_slot_factorized_permutation_loss(
                     cost = cost + inactive_cost[batch_index, slot_index]
             path_costs.append(cost)
         stacked = torch.stack(path_costs)
-        losses.append(
-            -temperature * torch.logsumexp(-stacked / temperature, dim=0)
-            + temperature * math.log(float(len(path_costs)))
-        )
+        if mode == "hard_min":
+            # The discrete path is deliberately outside autograd.  Candidate
+            # support within its assigned GT remains soft, so this breaks only
+            # slot permutation symmetry rather than inventing a hard proposal
+            # representative target.
+            best_path = stacked.detach().argmin()
+            losses.append(stacked[best_path])
+        else:
+            losses.append(
+                -temperature * torch.logsumexp(
+                    -stacked / temperature,
+                    dim=0,
+                )
+                + temperature * math.log(float(len(path_costs)))
+            )
     return torch.stack(losses).mean() / float(max(int(slots), 1))
 
 
@@ -859,6 +895,7 @@ class LossConfig:
     four_slot_cluster_temperature: float = 0.03
     four_slot_target_mode: str = "joint_threshold"
     four_slot_permutation_temperature: float = 1.0
+    four_slot_assignment_mode: str = "marginal"
     four_slot_collision_weight: float = 0.10
     w_four_slot_geometry: float = 0.0
     four_slot_geometry_point_weight: float = 5.0
@@ -960,6 +997,16 @@ class S0Criterion(nn.Module):
         if float(self.cfg.four_slot_permutation_temperature) <= 0.0:
             raise ValueError(
                 "four_slot_permutation_temperature must be positive"
+            )
+        self.cfg.four_slot_assignment_mode = str(
+            self.cfg.four_slot_assignment_mode
+        ).strip().lower()
+        if self.cfg.four_slot_assignment_mode not in {
+            "marginal",
+            "hard_min",
+        }:
+            raise ValueError(
+                "four_slot_assignment_mode must be marginal or hard_min"
             )
         self.cfg.four_slot_target_mode = str(
             self.cfg.four_slot_target_mode
@@ -2393,6 +2440,7 @@ class S0Criterion(nn.Module):
                 permutation_temperature=float(
                     self.cfg.four_slot_permutation_temperature
                 ),
+                assignment_mode=str(self.cfg.four_slot_assignment_mode),
             )
             # Collision is a conditional real-route regularizer.  Active/no-
             # lane probability is excluded so it cannot become an escape path.
@@ -2414,6 +2462,7 @@ class S0Criterion(nn.Module):
                 permutation_temperature=float(
                     self.cfg.four_slot_permutation_temperature
                 ),
+                assignment_mode=str(self.cfg.four_slot_assignment_mode),
             )
             collision_loss = four_slot_collision_loss(route_logits)
         total = permutation_loss + float(
