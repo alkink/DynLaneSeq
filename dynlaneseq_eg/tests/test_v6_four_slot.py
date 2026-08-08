@@ -24,6 +24,9 @@ from dynlaneseq_eg.tools.audit_v6_a_target_distribution import (
 )
 from dynlaneseq_eg.tools.probe_v5_four_slot_router import FourSlotRouter
 from dynlaneseq_eg.tools.summarize_v6_a_probe_mismatch import _log_integer
+from dynlaneseq_eg.tools.summarize_v6_c_router_refiner_gate import (
+    _method as v6_c_method,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +101,28 @@ def test_v6_b_config_trains_only_zero_initialized_slot_refinement():
     ]
     assert training["checkpoint_model_prefixes"] == [
         "structured_query_head.set_selection_head.slot_refinement"
+    ]
+
+
+def test_v6_c_config_opens_only_straight_through_router_refiner_subtree():
+    cfg = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v6_c_router_refiner_cotrain_28k_to32k.yaml"
+    )
+    selection = cfg["model"]["structured_query"]["set_selection"]
+    training = cfg["training"]
+    loss = cfg["loss"]
+    assert selection["four_slot_refinement_enabled"] is True
+    assert selection["four_slot_refinement_straight_through_routing"] is True
+    assert selection["four_slot_refinement_detach_slot_states"] is False
+    assert selection["four_slot_refinement_route_temperature"] == 1.0
+    assert loss["w_four_slot_selection"] == 0.25
+    assert loss["w_four_slot_geometry"] == 1.0
+    assert training["trainable_parameter_prefixes"] == [
+        "structured_query_head.set_selection_head"
+    ]
+    assert training["checkpoint_model_prefixes"] == [
+        "structured_query_head.set_selection_head"
     ]
 
 
@@ -300,6 +325,72 @@ def test_bounded_slot_refinement_starts_as_exact_identity_and_detaches_inputs():
         assert source.grad is None
 
 
+def test_straight_through_refinement_preserves_hard_forward_and_routes_gradient():
+    batch, slots, candidates, rows, dim = 1, 4, 6, 12, 16
+    refiner = FourSlotBoundedRefinement(
+        dim,
+        input_w=100,
+        slot_dim=32,
+        hidden_dim=32,
+        delta_offsets_px=(-12.0, -6.0, 0.0, 6.0, 12.0),
+        straight_through_routing=True,
+        detach_slot_states=False,
+    )
+    torch.nn.init.normal_(refiner.delta_head.weight, std=0.01)
+    slot_states = torch.randn(batch, slots, 32, requires_grad=True)
+    row_tokens = torch.randn(
+        batch, candidates, rows, dim, requires_grad=True
+    )
+    proposal_x = (torch.rand(batch, candidates, rows) * 99.0).requires_grad_()
+    proposal_range = torch.tensor(
+        [[[0.0, 0.9]] * candidates], requires_grad=True
+    )
+    row_features = torch.randn(
+        batch, rows, 20, dim, requires_grad=True
+    )
+    route = torch.tensor([[0, 2, -1, 5]])
+    route_logits = torch.randn(
+        batch,
+        slots,
+        candidates + 1,
+        requires_grad=True,
+    )
+    candidate_valid = torch.ones((batch, candidates), dtype=torch.bool)
+
+    result = refiner(
+        slot_states=slot_states,
+        proposal_row_tokens=row_tokens,
+        proposal_x_rows=proposal_x,
+        proposal_range_norm=proposal_range,
+        route_indices=route,
+        route_logits=route_logits,
+        candidate_valid=candidate_valid,
+        row_value_features=row_features,
+    )
+    refiner.straight_through_routing = False
+    expected = refiner(
+        slot_states=slot_states.detach(),
+        proposal_row_tokens=row_tokens.detach(),
+        proposal_x_rows=proposal_x.detach(),
+        proposal_range_norm=proposal_range.detach(),
+        route_indices=route,
+        row_value_features=row_features.detach(),
+    )
+    assert torch.allclose(
+        result["selection_slot_pred_x_rows"],
+        expected["selection_slot_pred_x_rows"],
+        atol=1.0e-5,
+    )
+
+    result["selection_slot_pred_x_rows"].sum().backward()
+    assert route_logits.grad is not None
+    assert float(route_logits.grad.abs().sum()) > 0.0
+    assert slot_states.grad is not None
+    assert float(slot_states.grad.abs().sum()) > 0.0
+    for source in (row_tokens, proposal_x, proposal_range, row_features):
+        assert source.grad is None
+
+
 def test_postprocess_skips_dustbin_between_active_slots():
     rows = 8
     outputs = {
@@ -492,3 +583,8 @@ def test_v6_mismatch_summary_reads_training_exposure(tmp_path):
     assert _log_integer(str(log), "effective_batch_size") == 16
     assert _log_integer(str(log), "iters") == 4000
     assert _log_integer(str(log), "missing") is None
+
+
+def test_v6_c_summary_requires_refined_four_slot_method():
+    method = {"0.50": {"f1": 0.81}, "0.75": {"f1": 0.59}}
+    assert v6_c_method({"methods": {"four_slot_refined": method}}) is method

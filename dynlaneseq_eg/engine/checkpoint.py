@@ -4,13 +4,28 @@ import os
 from pathlib import Path
 import random
 import shutil
+import sys
 from typing import Any
 
 import numpy as np
 import torch
 
 
+def _install_numpy_pickle_compatibility() -> None:
+    """Alias NumPy 2's private pickle path on supported NumPy 1 runtimes."""
+
+    if hasattr(np, "_core"):
+        return
+    core = np.core
+    sys.modules.setdefault("numpy._core", core)
+    for suffix in ("multiarray", "numeric", "umath", "_multiarray_umath"):
+        module = getattr(core, suffix, None)
+        if module is not None:
+            sys.modules.setdefault(f"numpy._core.{suffix}", module)
+
+
 def _torch_load(path: str | Path) -> Any:
+    _install_numpy_pickle_compatibility()
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:  # PyTorch versions before ``weights_only`` was added.

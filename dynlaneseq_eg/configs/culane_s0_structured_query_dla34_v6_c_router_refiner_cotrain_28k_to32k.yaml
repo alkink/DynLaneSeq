@@ -1,0 +1,55 @@
+_base_: culane_s0_structured_query_dla34_v6_b_four_slot_refinement_25k_to29k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v6_c_router_refiner_cotrain_gate_28k/router_refiner
+
+# V6-C keeps the verified 32-proposal detector frozen, but lets slot geometry
+# supervise both the bounded refiner and the four-slot router.  Forward routing
+# remains the exact globally-unique hard assignment.  Backward routing uses a
+# straight-through soft assignment, so geometry can improve which proposal a
+# slot owns without averaging proposal curves in the deployed forward pass.
+model:
+  structured_query:
+    set_selection:
+      four_slot_refinement_straight_through_routing: true
+      four_slot_refinement_detach_slot_states: false
+      four_slot_refinement_route_temperature: 1.0
+
+loss:
+  # The raw selection gradient is ~4.4x the geometry-to-router gradient at
+  # the 28k source (cosine -0.17).  A 0.25 factor keeps dustbin/uniqueness
+  # supervision while making the new geometry edge causally material.
+  w_four_slot_selection: 0.25
+  w_four_slot_geometry: 1.0
+
+# The imported router is already useful, so this causal gate uses a conservative
+# common LR.  Both losses update only the four-slot subtree; the V5.1 proposal
+# generator, its geometry, and the shared DLA/FPN remain immutable.
+optimizer:
+  base_lr: 0.00005
+  evidence_lr: 0.00005
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: four_slot_router_refiner
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.set_selection_head.
+
+scheduler:
+  name: constant
+
+training:
+  max_iters: 4000
+  checkpoint_interval: 1000
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head
+  clip_grad_norm: 5.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

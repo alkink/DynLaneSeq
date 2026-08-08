@@ -164,9 +164,10 @@ def decode_unique_four_slot_routes(
 class FourSlotBoundedRefinement(nn.Module):
     """Locally refine routed proposal curves without touching the detector.
 
-    The discrete route and every proposal/P2 input are detached.  Dense slot
-    geometry losses can therefore train this module while the proven V5.1
-    proposal generator and the successful V6-A router remain immutable.
+    Proposal/P2 inputs are always detached.  V6-B also detaches the hard
+    route and slot state, while V6-C can preserve the exact hard forward and
+    attach a straight-through soft route so slot geometry supervises the
+    router without reaching the proposal generator.
     """
 
     def __init__(
@@ -177,6 +178,9 @@ class FourSlotBoundedRefinement(nn.Module):
         slot_dim: int,
         hidden_dim: int,
         delta_offsets_px: tuple[float, ...],
+        straight_through_routing: bool = False,
+        detach_slot_states: bool = True,
+        route_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         offsets = tuple(float(value) for value in delta_offsets_px)
@@ -193,6 +197,11 @@ class FourSlotBoundedRefinement(nn.Module):
         self.input_w = int(input_w)
         self.slot_dim = int(slot_dim)
         self.hidden_dim = int(hidden_dim)
+        self.straight_through_routing = bool(straight_through_routing)
+        self.detach_slot_states = bool(detach_slot_states)
+        self.route_temperature = float(route_temperature)
+        if self.route_temperature <= 0.0:
+            raise ValueError("slot refinement route_temperature must be positive")
         self.row_norm = nn.LayerNorm(self.dim)
         self.slot_norm = nn.LayerNorm(self.slot_dim)
         self.row_projection = nn.Linear(self.dim, self.hidden_dim)
@@ -322,26 +331,102 @@ class FourSlotBoundedRefinement(nn.Module):
         proposal_x_rows: torch.Tensor,
         proposal_range_norm: torch.Tensor,
         route_indices: torch.Tensor,
+        route_logits: torch.Tensor | None = None,
+        candidate_valid: torch.Tensor | None = None,
         row_value_features: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         batch, slots = route_indices.shape
         candidates = int(proposal_x_rows.shape[1])
         rows = int(proposal_x_rows.shape[-1])
-        safe = route_indices.clamp(min=0, max=max(candidates - 1, 0))
         active = route_indices >= 0
-        x_index = safe.unsqueeze(-1).expand(-1, -1, rows)
-        reference_x = proposal_x_rows.detach().gather(1, x_index)
-        range_index = safe.unsqueeze(-1).expand(-1, -1, 2)
-        slot_range = sort_range_norm(
-            proposal_range_norm.detach().gather(1, range_index).float()
+        proposal_x = proposal_x_rows.detach()
+        proposal_range = proposal_range_norm.detach().float()
+        proposal_rows = proposal_row_tokens.detach()
+        safe = route_indices.clamp(
+            min=0,
+            max=max(candidates - 1, 0),
         )
+        x_index = safe.unsqueeze(-1).expand(-1, -1, rows)
+        hard_reference_x = proposal_x.gather(1, x_index)
+        range_index = safe.unsqueeze(-1).expand(-1, -1, 2)
+        hard_slot_range = proposal_range.gather(1, range_index)
         token_index = safe.unsqueeze(-1).unsqueeze(-1).expand(
             -1,
             -1,
             rows,
-            int(proposal_row_tokens.shape[-1]),
+            int(proposal_rows.shape[-1]),
         )
-        routed_rows = proposal_row_tokens.detach().gather(1, token_index)
+        hard_routed_rows = proposal_rows.gather(1, token_index)
+        hard_reference_x = torch.where(
+            active.unsqueeze(-1),
+            hard_reference_x,
+            torch.zeros_like(hard_reference_x),
+        )
+        hard_slot_range = torch.where(
+            active.unsqueeze(-1),
+            hard_slot_range,
+            torch.zeros_like(hard_slot_range),
+        )
+        hard_routed_rows = torch.where(
+            active.unsqueeze(-1).unsqueeze(-1),
+            hard_routed_rows,
+            torch.zeros_like(hard_routed_rows),
+        )
+        if self.straight_through_routing:
+            if route_logits is None or candidate_valid is None:
+                raise ValueError(
+                    "straight-through slot refinement requires route logits "
+                    "and candidate validity"
+                )
+            if tuple(route_logits.shape) != (batch, slots, candidates + 1):
+                raise ValueError("slot refinement route logit shape mismatch")
+            if tuple(candidate_valid.shape) != (batch, candidates):
+                raise ValueError("slot refinement candidate-valid shape mismatch")
+            real_logits = route_logits[..., :candidates].float().masked_fill(
+                ~candidate_valid[:, None, :].bool(),
+                -1.0e4,
+            )
+            masked_logits = torch.cat(
+                (real_logits, route_logits[..., -1:].float()),
+                dim=-1,
+            )
+            soft_route = torch.softmax(
+                masked_logits / self.route_temperature,
+                dim=-1,
+            )
+            candidate_weight = soft_route[..., :candidates]
+            soft_reference_x = torch.einsum(
+                "bsn,bnr->bsr",
+                candidate_weight,
+                proposal_x.float(),
+            )
+            soft_slot_range = torch.einsum(
+                "bsn,bnd->bsd",
+                candidate_weight,
+                proposal_range,
+            )
+            soft_routed_rows = torch.einsum(
+                "bsn,bnrd->bsrd",
+                candidate_weight,
+                proposal_rows.float(),
+            )
+            # Use the exact hard gather in forward, with gradients from the
+            # soft route.  Computing a one-hot gather through GEMM changes the
+            # verified curve by several pixels when TF32 is enabled.
+            reference_x = hard_reference_x.float() + (
+                soft_reference_x - soft_reference_x.detach()
+            )
+            slot_range = hard_slot_range + (
+                soft_slot_range - soft_slot_range.detach()
+            )
+            routed_rows = hard_routed_rows.float() + (
+                soft_routed_rows - soft_routed_rows.detach()
+            )
+        else:
+            reference_x = hard_reference_x
+            slot_range = hard_slot_range
+            routed_rows = hard_routed_rows
+        slot_range = sort_range_norm(slot_range.float())
         reference_x = torch.where(
             active.unsqueeze(-1),
             reference_x,
@@ -353,9 +438,12 @@ class FourSlotBoundedRefinement(nn.Module):
             torch.zeros_like(slot_range),
         )
 
+        slot_input = (
+            slot_states.detach() if self.detach_slot_states else slot_states
+        )
         query_state = self.row_projection(self.row_norm(routed_rows.float()))
         query_state = query_state + self.slot_projection(
-            self.slot_norm(slot_states.detach().float())
+            self.slot_norm(slot_input.float())
         ).unsqueeze(2)
         query_state = self.query_norm(query_state)
         evidence = self._sample_local_evidence(
@@ -416,11 +504,11 @@ class FourSlotBoundedRefinement(nn.Module):
 class FourSlotLaneSelectionHead(nn.Module):
     """Route four persistent lane-object slots over frozen V5 proposals.
 
-    V6-A deliberately reproduces the successful frozen diagnostic contract:
-    the 32-query detector remains a proposal memory, while four explicit
-    object slots retain the lane/GT axis until the final routing decision.
-    This head only selects existing proposal geometry; bounded slot-owned
-    geometry refinement belongs to the subsequent V6-B experiment.
+    The 32-query detector remains proposal memory, while four explicit object
+    slots retain the lane/GT axis until the final routing decision.  Optional
+    V6-B/V6-C refinement then performs bounded slot-owned geometry updates;
+    V6-C additionally allows those geometry losses to train routing through
+    a straight-through path while preserving hard unique inference.
     """
 
     def __init__(
@@ -449,6 +537,9 @@ class FourSlotLaneSelectionHead(nn.Module):
             12.0,
             24.0,
         ),
+        refinement_straight_through_routing: bool = False,
+        refinement_detach_slot_states: bool = True,
+        refinement_route_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -546,6 +637,11 @@ class FourSlotLaneSelectionHead(nn.Module):
                 slot_dim=self.hidden_dim,
                 hidden_dim=int(refinement_hidden_dim or self.hidden_dim),
                 delta_offsets_px=tuple(refinement_delta_offsets_px),
+                straight_through_routing=bool(
+                    refinement_straight_through_routing
+                ),
+                detach_slot_states=bool(refinement_detach_slot_states),
+                route_temperature=float(refinement_route_temperature),
             )
             if self.refinement_enabled
             else None
@@ -787,6 +883,8 @@ class FourSlotLaneSelectionHead(nn.Module):
                     proposal_x_rows=outputs["pred_x_rows"],
                     proposal_range_norm=outputs["range_norm"],
                     route_indices=decoded["indices"],
+                    route_logits=route_logits,
+                    candidate_valid=candidate_valid,
                     row_value_features=row_value_features,
                 )
             )

@@ -2460,6 +2460,24 @@ class StructuredLaneQueryHead(nn.Module):
                         (-24.0, -12.0, -6.0, 0.0, 6.0, 12.0, 24.0),
                     )
                 ),
+                refinement_straight_through_routing=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_straight_through_routing",
+                        False,
+                    )
+                ),
+                refinement_detach_slot_states=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_detach_slot_states",
+                        True,
+                    )
+                ),
+                refinement_route_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_route_temperature",
+                        1.0,
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(
