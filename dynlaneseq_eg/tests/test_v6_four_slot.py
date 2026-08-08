@@ -365,6 +365,7 @@ def test_v7_config_is_one_from_scratch_factorized_long_schedule():
     assert selection["four_slot_refinement_reference_mode"] == "hard_st"
     assert selection["four_slot_refinement_detach_slot_states"] is True
     assert selection["four_slot_range_refinement_enabled"] is True
+    assert loss["four_slot_assignment_mode"] == "hard_min"
     assert loss["four_slot_target_mode"] == "all_gt"
     assert loss["four_slot_geometry_match_all_slots"] is True
     assert loss["w_four_slot_selection"] == 1.0
@@ -372,6 +373,24 @@ def test_v7_config_is_one_from_scratch_factorized_long_schedule():
     assert training["max_iters"] == 278000
     assert "trainable_parameter_prefixes" not in training
     assert "frozen_detector_eval" not in training
+
+
+def test_v7_joint_10k_gate_preserves_the_278k_schedule_and_full_model():
+    cfg = load_config(
+        PROJECT_ROOT
+        / (
+            "dynlaneseq_eg/configs/"
+            "culane_s0_structured_query_dla34_v7_joint_four_slot_gate_0k_to10k.yaml"
+        )
+    )
+    assert cfg["loss"]["four_slot_assignment_mode"] == "hard_min"
+    assert cfg["loss"]["four_slot_target_mode"] == "all_gt"
+    assert cfg["training"]["max_iters"] == 10000
+    assert cfg["training"]["checkpoint_interval"] == 5000
+    assert cfg["training"]["checkpoint_include_optimizer"] is True
+    assert "trainable_parameter_prefixes" not in cfg["training"]
+    assert "frozen_detector_eval" not in cfg["training"]
+    assert cfg["scheduler"]["total_iters"] == 278000
 
 
 def test_v7_reference_gate_arms_are_parameter_matched_except_forward_mode():

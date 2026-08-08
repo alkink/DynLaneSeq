@@ -83,6 +83,10 @@ loss:
   # zero.  Proposal IoU shapes the conditional route only; it can never turn a
   # weak early GT into a dustbin target.
   w_four_slot_selection: 1.0
+  # A single detached DETR-style slot-to-GT path breaks the permutation-
+  # marginal symmetry that otherwise teaches every slot the same fractional
+  # activity.  Candidate uncertainty inside the assigned GT remains soft.
+  four_slot_assignment_mode: hard_min
   four_slot_target_mode: all_gt
   four_slot_representable_min: 0.0
   four_slot_cluster_min: 0.0

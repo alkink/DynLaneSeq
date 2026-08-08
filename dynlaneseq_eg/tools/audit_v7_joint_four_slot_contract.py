@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from dynlaneseq_eg.config import load_config
+from dynlaneseq_eg.engine.checkpoint import load_checkpoint
 from dynlaneseq_eg.engine.train_one_epoch import forward_with_matches
 from dynlaneseq_eg.factory import (
     build_criterion,
@@ -88,6 +89,11 @@ def _parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="Optionally audit a trained joint checkpoint instead of step zero.",
+    )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument(
         "--device",
@@ -112,6 +118,7 @@ def _forward(
     criterion: torch.nn.Module,
     cfg: dict[str, Any],
     autocast_kwargs: dict[str, Any],
+    iteration: int,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     with torch.autocast(**autocast_kwargs):
         outputs, matches = forward_with_matches(
@@ -120,10 +127,32 @@ def _forward(
             targets,
             matcher,
             cfg,
-            0,
+            int(iteration),
         )
         losses = criterion(outputs, targets, matches)
     return outputs, losses
+
+
+def _gradient_vector(
+    model: torch.nn.Module,
+    prefixes: tuple[str, ...],
+) -> torch.Tensor:
+    parts: list[torch.Tensor] = []
+    for name, parameter in model.named_parameters():
+        if not name.startswith(prefixes):
+            continue
+        if parameter.grad is None:
+            parts.append(torch.zeros(parameter.numel(), dtype=torch.float32))
+        else:
+            parts.append(parameter.grad.detach().float().reshape(-1).cpu())
+    return torch.cat(parts) if parts else torch.empty(0)
+
+
+def _cosine(left: torch.Tensor, right: torch.Tensor) -> float:
+    denominator = float(left.norm() * right.norm())
+    if denominator <= 0.0:
+        return 0.0
+    return float(torch.dot(left, right) / denominator)
 
 
 def main() -> None:
@@ -140,10 +169,13 @@ def main() -> None:
     device = torch.device(args.device)
 
     model = build_model(cfg).to(device)
+    iteration = 0
+    if args.checkpoint:
+        iteration = int(load_checkpoint(args.checkpoint, model, strict=False))
     model.train()
     matcher = build_matcher(cfg)
     criterion = build_criterion(cfg).to(device)
-    criterion.set_iteration(0)
+    criterion.set_iteration(int(iteration))
     loader = build_dataloader(cfg, split="train", training=True)
     images, targets, _metas = next(iter(loader))
     images = images.to(device, non_blocking=True)
@@ -167,6 +199,7 @@ def main() -> None:
         criterion,
         cfg,
         autocast_kwargs,
+        int(iteration),
     )
     real_logits = outputs["selection_slot_real_route_logits"]
     candidate_valid = outputs["selection_slot_candidate_valid"]
@@ -196,9 +229,11 @@ def main() -> None:
     model.zero_grad(set_to_none=True)
     losses["loss_four_slot_geometry"].backward(retain_graph=True)
     geometry_gradients = _gradient_groups(model)
+    geometry_route_vector = _gradient_vector(model, ROUTE_PREFIXES)
     model.zero_grad(set_to_none=True)
     losses["loss_four_slot_selection"].backward(retain_graph=True)
     selection_gradients = _gradient_groups(model)
+    selection_route_vector = _gradient_vector(model, ROUTE_PREFIXES)
     model.zero_grad(set_to_none=True)
     losses["loss_total"].backward()
     total_gradients = _gradient_groups(model)
@@ -214,6 +249,9 @@ def main() -> None:
     checks = {
         "factorized_cardinality": bool(
             selection.get("four_slot_factorized_routing")
+        ),
+        "hard_slot_assignment": (
+            loss_cfg.get("four_slot_assignment_mode") == "hard_min"
         ),
         "structured_unique_backward": bool(
             selection.get("four_slot_refinement_structured_unique_routing")
@@ -281,6 +319,10 @@ def main() -> None:
         "experiment": "V7 joint from-scratch four-slot contract",
         "config": str(config_path),
         "config_sha256": _sha256(config_path),
+        "checkpoint": (
+            str(Path(args.checkpoint).resolve()) if args.checkpoint else ""
+        ),
+        "iteration": int(iteration),
         "batch_size": int(images.shape[0]),
         "expected_mean_gt_count": float(expected_gt_count.cpu()),
         "reported_mean_slot_target_count": float(
@@ -294,6 +336,14 @@ def main() -> None:
         "geometry_gradients": geometry_gradients,
         "selection_gradients": selection_gradients,
         "total_gradients": total_gradients,
+        "route_geometry_selection_cosine": _cosine(
+            geometry_route_vector,
+            selection_route_vector,
+        ),
+        "route_geometry_to_selection_norm_ratio": float(
+            geometry_route_vector.norm()
+            / selection_route_vector.norm().clamp_min(1.0e-12)
+        ),
         "losses": {
             name: float(value.detach().float().cpu())
             for name, value in losses.items()

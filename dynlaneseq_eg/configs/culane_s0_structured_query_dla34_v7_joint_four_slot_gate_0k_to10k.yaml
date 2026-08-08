@@ -1,0 +1,22 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_278k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v7_joint_four_slot_gate/joint_0k_to10k
+
+# This is the first uninterrupted segment of the intended 278k optimization,
+# not a short-horizon schedule.  The model starts with ImageNet-pretrained DLA
+# weights and freshly initialized proposal/ownership/four-slot modules.  All
+# detector and slot modules train from iteration zero under their protected
+# loss paths; no detector checkpoint or late pointer fine-tune is loaded.
+training:
+  max_iters: 10000
+  checkpoint_interval: 5000
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+
+# Keep the final 50-epoch cosine phase so an exact 10k -> 25k resume answers
+# the same long-training question.
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
