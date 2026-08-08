@@ -2478,6 +2478,43 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0,
                     )
                 ),
+                factorized_routing=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_factorized_routing",
+                        False,
+                    )
+                ),
+                active_prior_prob=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_active_prior_prob",
+                        0.80,
+                    )
+                ),
+                refinement_structured_unique_routing=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_structured_unique_routing",
+                        False,
+                    )
+                ),
+                refinement_route_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_route_gradient_scale",
+                        1.0,
+                    )
+                ),
+                range_refinement_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_range_refinement_enabled",
+                        False,
+                    )
+                ),
+                range_delta_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_range_delta_offsets_norm",
+                        (-0.10, -0.05, -0.025, 0.0, 0.025, 0.05, 0.10),
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(
@@ -3245,6 +3282,8 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_pointer_scores",
                 "selection_pointer_relation_bias",
                 "selection_slot_logits",
+                "selection_slot_active_logits",
+                "selection_slot_real_route_logits",
                 "selection_slot_candidate_valid",
                 "selection_slot_raw_indices",
                 "selection_slot_raw_collision_count",
@@ -3255,9 +3294,16 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_pred_x_rows",
                 "selection_slot_range_norm",
                 "selection_slot_active",
+                "selection_slot_geometry_valid",
+                "selection_slot_geometry_route_indices",
                 "selection_slot_input_reference_x_rows",
+                "selection_slot_input_range_norm",
                 "selection_slot_row_delta_logits",
                 "selection_slot_row_delta_offsets_px",
+                "selection_slot_range_delta",
+                "selection_slot_range_delta_logits",
+                "selection_slot_range_delta_offsets_norm",
+                "selection_slot_range_delta_boundary_mass",
                 "selection_slot_delta_mean_abs",
                 "selection_slot_delta_max_abs",
                 "selection_slot_delta_boundary_mass",

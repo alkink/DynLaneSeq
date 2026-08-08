@@ -498,6 +498,7 @@ def build_four_slot_cluster_targets(
     cluster_min: float,
     cluster_delta: float,
     temperature: float,
+    target_mode: str = "joint_threshold",
 ) -> dict[str, object]:
     """Keep the GT/object axis for four-slot proposal routing.
 
@@ -519,6 +520,11 @@ def build_four_slot_cluster_targets(
         raise ValueError("four-slot cluster_delta must be non-negative")
     if float(temperature) <= 0.0:
         raise ValueError("four-slot cluster temperature must be positive")
+    mode = str(target_mode).strip().lower()
+    if mode not in {"joint_threshold", "all_gt"}:
+        raise ValueError(
+            "four-slot target_mode must be joint_threshold or all_gt"
+        )
 
     pred_x = outputs["pred_x_rows"].detach().float()
     pred_range = outputs["range_norm"].detach().float()
@@ -557,16 +563,33 @@ def build_four_slot_cluster_targets(
                 1.0 - local_quality.detach().cpu()
             )
         )
-        jointly_representable: list[tuple[int, float]] = []
+        assignment_quality: dict[int, float] = {}
         for local_candidate, local_gt in zip(
             local_candidate_ids.tolist(),
             local_gt_ids.tolist(),
         ):
             assigned_quality = float(local_quality[local_candidate, local_gt])
-            if assigned_quality >= float(representable_min):
-                jointly_representable.append(
-                    (int(gt_ids[int(local_gt)]), assigned_quality)
+            assignment_quality[int(gt_ids[int(local_gt)])] = assigned_quality
+        if mode == "all_gt":
+            # Final slot cardinality belongs to the annotation, not to the
+            # current proposal quality.  This avoids a cold-start feedback
+            # loop where weak early proposals teach every slot to be dustbin.
+            jointly_representable = [
+                (
+                    int(gt_index),
+                    assignment_quality.get(
+                        int(gt_index),
+                        float(quality[candidate_valid, int(gt_index)].amax()),
+                    ),
                 )
+                for gt_index in gt_ids.tolist()
+            ]
+        else:
+            jointly_representable = [
+                (gt_index, assigned_quality)
+                for gt_index, assigned_quality in assignment_quality.items()
+                if assigned_quality >= float(representable_min)
+            ]
         if len(jointly_representable) > slots:
             jointly_representable.sort(key=lambda item: item[1], reverse=True)
             jointly_representable = jointly_representable[:slots]
@@ -575,10 +598,19 @@ def build_four_slot_cluster_targets(
         for gt_index, _assigned_quality in jointly_representable:
             gt_quality = quality[:, gt_index]
             best = gt_quality[candidate_valid].amax()
-            cutoff = max(
-                float(cluster_min),
-                float(best) - float(cluster_delta),
-            )
+            if mode == "all_gt":
+                # The floor may sharpen a mature proposal pool but may never
+                # delete the best early-training proposal from the target.
+                effective_floor = min(float(cluster_min), float(best))
+                cutoff = max(
+                    effective_floor,
+                    float(best) - float(cluster_delta),
+                )
+            else:
+                cutoff = max(
+                    float(cluster_min),
+                    float(best) - float(cluster_delta),
+                )
             support = candidate_valid & (gt_quality >= cutoff)
             if not bool(support.any()):
                 continue
@@ -673,6 +705,76 @@ def four_slot_permutation_loss(
     return torch.stack(losses).mean() / float(max(int(slots), 1))
 
 
+def four_slot_factorized_permutation_loss(
+    active_logits: torch.Tensor,
+    real_route_logits: torch.Tensor,
+    target_rows: list[torch.Tensor],
+    *,
+    permutation_temperature: float = 1.0,
+) -> torch.Tensor:
+    """Permutation-marginal loss with separate cardinality and real route.
+
+    An unmatched slot receives only a no-lane BCE target.  A matched slot
+    receives an active BCE target plus cross entropy over real proposals.
+    Geometry never consumes ``active_logits``; this factorization makes that
+    separation explicit instead of hiding dustbin inside route normalization.
+    """
+
+    if active_logits.ndim != 2 or real_route_logits.ndim != 3:
+        raise ValueError("factorized slot logits must be [B,S] and [B,S,N]")
+    batch, slots, candidates = real_route_logits.shape
+    if tuple(active_logits.shape) != (batch, slots):
+        raise ValueError("factorized active logit shape mismatch")
+    if len(target_rows) != int(batch):
+        raise ValueError("factorized target batch size mismatch")
+    temperature = float(permutation_temperature)
+    if temperature <= 0.0:
+        raise ValueError("four-slot permutation temperature must be positive")
+
+    real_log_probability = F.log_softmax(
+        real_route_logits.float(),
+        dim=-1,
+    )
+    active_cost = F.softplus(-active_logits.float())
+    inactive_cost = F.softplus(active_logits.float())
+    losses: list[torch.Tensor] = []
+    for batch_index, target_value in enumerate(target_rows):
+        target = target_value.to(
+            device=real_route_logits.device,
+            dtype=real_log_probability.dtype,
+        )
+        if target.ndim != 2 or int(target.shape[1]) != int(candidates) + 1:
+            raise ValueError("factorized target rows must have shape [G,N+1]")
+        gt_count = int(target.shape[0])
+        if gt_count > int(slots):
+            raise ValueError("factorized target contains more GTs than slots")
+        if gt_count == 0:
+            losses.append(inactive_cost[batch_index].sum())
+            continue
+        candidate_cost = -torch.einsum(
+            "sn,gn->sg",
+            real_log_probability[batch_index],
+            target[:, :candidates],
+        )
+        candidate_cost = candidate_cost + active_cost[batch_index].unsqueeze(-1)
+        path_costs: list[torch.Tensor] = []
+        for assigned_slots in permutations(range(int(slots)), gt_count):
+            assigned = set(int(value) for value in assigned_slots)
+            cost = candidate_cost.new_zeros(())
+            for gt_index, slot_index in enumerate(assigned_slots):
+                cost = cost + candidate_cost[int(slot_index), gt_index]
+            for slot_index in range(int(slots)):
+                if slot_index not in assigned:
+                    cost = cost + inactive_cost[batch_index, slot_index]
+            path_costs.append(cost)
+        stacked = torch.stack(path_costs)
+        losses.append(
+            -temperature * torch.logsumexp(-stacked / temperature, dim=0)
+            + temperature * math.log(float(len(path_costs)))
+        )
+    return torch.stack(losses).mean() / float(max(int(slots), 1))
+
+
 def four_slot_collision_loss(route_logits: torch.Tensor) -> torch.Tensor:
     """Penalize different slots assigning probability to one proposal."""
 
@@ -755,13 +857,16 @@ class LossConfig:
     four_slot_cluster_min: float = 0.30
     four_slot_cluster_delta: float = 0.05
     four_slot_cluster_temperature: float = 0.03
+    four_slot_target_mode: str = "joint_threshold"
     four_slot_permutation_temperature: float = 1.0
     four_slot_collision_weight: float = 0.10
     w_four_slot_geometry: float = 0.0
     four_slot_geometry_point_weight: float = 5.0
     four_slot_geometry_line_iou_weight: float = 2.0
     four_slot_geometry_dfl_weight: float = 1.0
+    four_slot_geometry_range_weight: float = 0.0
     four_slot_geometry_match_min_quality: float = 0.20
+    four_slot_geometry_match_all_slots: bool = False
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -827,6 +932,7 @@ class S0Criterion(nn.Module):
             "four_slot_geometry_point_weight",
             "four_slot_geometry_line_iou_weight",
             "four_slot_geometry_dfl_weight",
+            "four_slot_geometry_range_weight",
         ):
             if float(getattr(self.cfg, field_name)) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative")
@@ -854,6 +960,16 @@ class S0Criterion(nn.Module):
         if float(self.cfg.four_slot_permutation_temperature) <= 0.0:
             raise ValueError(
                 "four_slot_permutation_temperature must be positive"
+            )
+        self.cfg.four_slot_target_mode = str(
+            self.cfg.four_slot_target_mode
+        ).strip().lower()
+        if self.cfg.four_slot_target_mode not in {
+            "joint_threshold",
+            "all_gt",
+        }:
+            raise ValueError(
+                "four_slot_target_mode must be joint_threshold or all_gt"
             )
         if not 0.0 <= float(
             self.cfg.four_slot_geometry_match_min_quality
@@ -1010,6 +1126,7 @@ class S0Criterion(nn.Module):
             four_slot_geometry = {
                 "total": zero,
                 "point": zero,
+                "range": zero,
                 "line_iou": zero,
                 "dfl": zero,
                 "mean_matched": zero,
@@ -1125,6 +1242,7 @@ class S0Criterion(nn.Module):
             ],
             "loss_four_slot_geometry": four_slot_geometry["total"],
             "loss_four_slot_geometry_point": four_slot_geometry["point"],
+            "loss_four_slot_geometry_range": four_slot_geometry["range"],
             "loss_four_slot_geometry_line_iou": four_slot_geometry[
                 "line_iou"
             ],
@@ -2257,18 +2375,47 @@ class S0Criterion(nn.Module):
             cluster_min=float(self.cfg.four_slot_cluster_min),
             cluster_delta=float(self.cfg.four_slot_cluster_delta),
             temperature=float(self.cfg.four_slot_cluster_temperature),
+            target_mode=str(self.cfg.four_slot_target_mode),
         )
         target_rows = target_data["rows"]
         if not isinstance(target_rows, list):
             raise TypeError("four-slot target builder returned invalid rows")
-        permutation_loss = four_slot_permutation_loss(
-            route_logits,
-            target_rows,
-            permutation_temperature=float(
-                self.cfg.four_slot_permutation_temperature
-            ),
-        )
-        collision_loss = four_slot_collision_loss(route_logits)
+        active_logits = outputs.get("selection_slot_active_logits")
+        real_route_logits = outputs.get("selection_slot_real_route_logits")
+        if isinstance(active_logits, torch.Tensor) and isinstance(
+            real_route_logits,
+            torch.Tensor,
+        ):
+            permutation_loss = four_slot_factorized_permutation_loss(
+                active_logits,
+                real_route_logits,
+                target_rows,
+                permutation_temperature=float(
+                    self.cfg.four_slot_permutation_temperature
+                ),
+            )
+            # Collision is a conditional real-route regularizer.  Active/no-
+            # lane probability is excluded so it cannot become an escape path.
+            real_with_zero_dustbin = torch.cat(
+                (
+                    real_route_logits,
+                    real_route_logits.new_full(
+                        (*real_route_logits.shape[:-1], 1),
+                        -1.0e4,
+                    ),
+                ),
+                dim=-1,
+            )
+            collision_loss = four_slot_collision_loss(real_with_zero_dustbin)
+        else:
+            permutation_loss = four_slot_permutation_loss(
+                route_logits,
+                target_rows,
+                permutation_temperature=float(
+                    self.cfg.four_slot_permutation_temperature
+                ),
+            )
+            collision_loss = four_slot_collision_loss(route_logits)
         total = permutation_loss + float(
             self.cfg.four_slot_collision_weight
         ) * collision_loss
@@ -2312,8 +2459,14 @@ class S0Criterion(nn.Module):
         """
 
         reference = outputs.get("selection_slot_input_reference_x_rows")
-        ranges = outputs.get("selection_slot_range_norm")
-        active = outputs.get("selection_slot_active")
+        ranges = outputs.get("selection_slot_input_range_norm")
+        if not isinstance(ranges, torch.Tensor):
+            ranges = outputs.get("selection_slot_range_norm")
+        active = (
+            outputs.get("selection_slot_geometry_valid")
+            if bool(self.cfg.four_slot_geometry_match_all_slots)
+            else outputs.get("selection_slot_active")
+        )
         if not all(
             isinstance(value, torch.Tensor)
             for value in (reference, ranges, active)
@@ -2360,7 +2513,11 @@ class S0Criterion(nn.Module):
         cpu_pairs: list[torch.Tensor] = []
         pair_counts: list[int] = []
         reference_qualities: list[float] = []
-        threshold = float(self.cfg.four_slot_geometry_match_min_quality)
+        threshold = (
+            0.0
+            if bool(self.cfg.four_slot_geometry_match_all_slots)
+            else float(self.cfg.four_slot_geometry_match_min_quality)
+        )
         for slot_ids, gt_ids, local_quality in pending:
             if local_quality.numel() == 0:
                 cpu_pairs.append(torch.empty((0, 2), dtype=torch.long))
@@ -2458,10 +2615,12 @@ class S0Criterion(nn.Module):
             "input_reference_x_rows": reference,
         }
         point = self.compute_point_loss(slot_outputs, targets, matches)
+        range_loss = self.compute_range_loss(slot_outputs, targets, matches)
         line_iou = self.compute_line_iou_loss(slot_outputs, targets, matches)
         dfl = self.compute_row_dfl_loss(slot_outputs, targets, matches)
         total = (
             float(self.cfg.four_slot_geometry_point_weight) * point
+            + float(self.cfg.four_slot_geometry_range_weight) * range_loss
             + float(self.cfg.four_slot_geometry_line_iou_weight) * line_iou
             + float(self.cfg.four_slot_geometry_dfl_weight) * dfl
         )
@@ -2503,6 +2662,7 @@ class S0Criterion(nn.Module):
         return {
             "total": total,
             "point": point,
+            "range": range_loss,
             "line_iou": line_iou,
             "dfl": dfl,
             "mean_matched": match_count.mean().detach(),

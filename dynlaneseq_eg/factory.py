@@ -185,6 +185,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_cluster_temperature=float(
             loss.get("four_slot_cluster_temperature", 0.03)
         ),
+        four_slot_target_mode=str(
+            loss.get("four_slot_target_mode", "joint_threshold")
+        ),
         four_slot_permutation_temperature=float(
             loss.get("four_slot_permutation_temperature", 1.0)
         ),
@@ -203,8 +206,14 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_geometry_dfl_weight=float(
             loss.get("four_slot_geometry_dfl_weight", 1.0)
         ),
+        four_slot_geometry_range_weight=float(
+            loss.get("four_slot_geometry_range_weight", 0.0)
+        ),
         four_slot_geometry_match_min_quality=float(
             loss.get("four_slot_geometry_match_min_quality", 0.20)
+        ),
+        four_slot_geometry_match_all_slots=bool(
+            loss.get("four_slot_geometry_match_all_slots", False)
         ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),

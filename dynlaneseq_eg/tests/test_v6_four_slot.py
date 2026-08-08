@@ -11,12 +11,15 @@ from dynlaneseq_eg.losses.loss_s0 import (
     LossConfig,
     S0Criterion,
     build_four_slot_cluster_targets,
+    four_slot_factorized_permutation_loss,
     four_slot_permutation_loss,
 )
 from dynlaneseq_eg.modeling.four_slot_selection import (
     FourSlotBoundedRefinement,
     FourSlotLaneSelectionHead,
+    decode_unique_real_slot_routes,
     decode_unique_four_slot_routes,
+    structured_unique_route_marginals,
 )
 from dynlaneseq_eg.tools.audit_v6_a_target_distribution import (
     _finish_accumulator,
@@ -85,6 +88,117 @@ def test_four_slot_head_matches_probe_parameter_count_and_detaches_inputs():
         assert value.grad is None
 
 
+def test_structured_real_route_marginals_obey_assignment_polytope():
+    logits = torch.randn(2, 4, 9, requires_grad=True)
+    valid = torch.ones((2, 9), dtype=torch.bool)
+    valid[0, -1] = False
+    marginal = structured_unique_route_marginals(
+        logits,
+        valid,
+        temperature=0.7,
+    )
+    assert marginal.shape == logits.shape
+    assert torch.allclose(
+        marginal.sum(dim=-1),
+        torch.ones((2, 4)),
+        atol=1.0e-5,
+    )
+    assert bool((marginal.sum(dim=1) <= 1.0 + 1.0e-5).all())
+    assert float(marginal[0, :, -1].abs().max()) == 0.0
+    weighted = marginal * torch.arange(9, dtype=marginal.dtype).view(1, 1, 9)
+    weighted[:, 0].sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0.0
+
+
+def test_factorized_decode_routes_all_slots_then_applies_cardinality():
+    logits = torch.tensor(
+        [
+            [9.0, 8.0, 0.0, 0.0, 0.0],
+            [9.0, 7.0, 6.0, 0.0, 0.0],
+            [0.0, 0.0, 9.0, 8.0, 0.0],
+            [0.0, 0.0, 9.0, 7.0, 6.0],
+        ]
+    )
+    decoded = decode_unique_real_slot_routes(
+        logits,
+        torch.ones(5, dtype=torch.bool),
+    )
+    assert decoded["indices"].numel() == 4
+    assert decoded["indices"].unique().numel() == 4
+
+
+def test_factorized_permutation_separates_active_and_real_route_gradients():
+    active = torch.zeros((1, 4), requires_grad=True)
+    route = torch.randn((1, 4, 6), requires_grad=True)
+    rows = [torch.zeros((3, 7))]
+    rows[0][0, 0] = 1.0
+    rows[0][1, 2] = 1.0
+    rows[0][2, 4] = 1.0
+    loss = four_slot_factorized_permutation_loss(active, route, rows)
+    loss.backward()
+    assert active.grad is not None and torch.isfinite(active.grad).all()
+    assert route.grad is not None and torch.isfinite(route.grad).all()
+    assert float(active.grad.abs().sum()) > 0.0
+    assert float(route.grad.abs().sum()) > 0.0
+
+
+def test_factorized_head_geometry_does_not_backpropagate_to_active_or_trunk():
+    head = FourSlotLaneSelectionHead(
+        16,
+        input_w=100,
+        hidden_dim=32,
+        num_slots=4,
+        proposal_layers=1,
+        slot_layers=1,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        curve_samples=8,
+        min_valid_rows=5,
+        refinement_enabled=True,
+        refinement_hidden_dim=32,
+        refinement_delta_offsets_px=(-12.0, -6.0, 0.0, 6.0, 12.0),
+        refinement_straight_through_routing=True,
+        refinement_detach_slot_states=True,
+        factorized_routing=True,
+        refinement_structured_unique_routing=True,
+        refinement_route_gradient_scale=0.1,
+        range_refinement_enabled=True,
+    )
+    outputs = _head_outputs(batch=1)
+    row_features = torch.randn(1, 12, 20, 16, requires_grad=True)
+    result = head(outputs, row_value_features=row_features)
+    assert result["selection_slot_indices"].shape == (1, 4)
+    geometry_routes = result["selection_slot_geometry_route_indices"]
+    assert geometry_routes[0].unique().numel() == 4
+    assert result["selection_slot_range_delta_logits"].shape[:3] == (1, 4, 2)
+
+    loss = (
+        result["selection_slot_pred_x_rows"][:, 0].sum()
+        + result["selection_slot_range_norm"][:, 0].sum()
+    )
+    loss.backward()
+    assert head.active is not None
+    assert head.active.weight.grad is None
+    assert head.active.bias.grad is None
+    assert head.slot_query.weight.grad is not None
+    assert float(head.slot_query.weight.grad.abs().sum()) > 0.0
+    assert head.candidate_key.weight.grad is not None
+    assert float(head.candidate_key.weight.grad.abs().sum()) > 0.0
+    assert all(
+        parameter.grad is None
+        for parameter in head.slot_decoder.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for parameter in head.proposal_encoder.parameters()
+    )
+    for value in (*outputs.values(), row_features):
+        assert value.grad is None
+
+
 def test_v6_b_config_trains_only_zero_initialized_slot_refinement():
     cfg = load_config(
         PROJECT_ROOT
@@ -124,6 +238,27 @@ def test_v6_c_config_opens_only_straight_through_router_refiner_subtree():
     assert training["checkpoint_model_prefixes"] == [
         "structured_query_head.set_selection_head"
     ]
+
+
+def test_v7_config_is_one_from_scratch_factorized_long_schedule():
+    cfg = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v7_joint_four_slot_278k.yaml"
+    )
+    selection = cfg["model"]["structured_query"]["set_selection"]
+    loss = cfg["loss"]
+    training = cfg["training"]
+    assert selection["four_slot_factorized_routing"] is True
+    assert selection["four_slot_refinement_structured_unique_routing"] is True
+    assert selection["four_slot_refinement_detach_slot_states"] is True
+    assert selection["four_slot_range_refinement_enabled"] is True
+    assert loss["four_slot_target_mode"] == "all_gt"
+    assert loss["four_slot_geometry_match_all_slots"] is True
+    assert loss["w_four_slot_selection"] == 1.0
+    assert loss["w_four_slot_geometry"] == 1.0
+    assert training["max_iters"] == 278000
+    assert "trainable_parameter_prefixes" not in training
+    assert "frozen_detector_eval" not in training
 
 
 def test_production_four_slot_state_is_checkpoint_compatible_with_probe():
@@ -228,6 +363,28 @@ def test_four_slot_targets_preserve_two_gt_cluster_rows():
     assert torch.all(rows[:, -1] == 0.0)
     assert int((rows[0, :3] > 0).sum()) >= 1
     assert int((rows[1, :3] > 0).sum()) >= 1
+
+
+def test_all_gt_slot_targets_never_turn_weak_lanes_into_dustbin():
+    outputs = _geometry_outputs()
+    outputs["pred_x_rows"] = outputs["pred_x_rows"] + 45.0
+    built = build_four_slot_cluster_targets(
+        outputs,
+        _targets(),
+        num_slots=4,
+        input_h=100,
+        line_width=30.0,
+        min_valid_rows=5,
+        representable_min=0.95,
+        cluster_min=0.90,
+        cluster_delta=0.10,
+        temperature=0.03,
+        target_mode="all_gt",
+    )
+    rows = built["rows"][0]
+    assert rows.shape == (2, 4)
+    assert torch.allclose(rows.sum(dim=-1), torch.ones(2))
+    assert torch.all(rows[:, -1] == 0.0)
 
 
 def test_four_slot_permutation_loss_is_gt_order_invariant():

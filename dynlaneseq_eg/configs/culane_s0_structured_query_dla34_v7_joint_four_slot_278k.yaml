@@ -1,0 +1,166 @@
+_base_: culane_s0_structured_query_dla34_v5_protected_ownership_base.yaml
+
+output_dir: outputs/culane_s0_structured_query_dla34_v7_joint_four_slot_278k
+
+# V7 is one coherent detector, trained from iteration zero to the end of the
+# 50-epoch schedule.  The 32 bounded-delta queries are coverage proposals; the
+# only deployed objects are four persistent lane slots.  Proposal geometry,
+# proposal ownership, slot cardinality/routing and slot refinement therefore
+# see the same evolving candidate distribution throughout training.
+model:
+  structured_query:
+    intermediate_supervision: true
+    set_selection:
+      enabled: true
+      candidate_interaction: four_slot
+      hidden_dim: 256
+      num_layers: 2
+      four_slot_num_layers: 2
+      four_slot_num_slots: 4
+      four_slot_min_valid_rows: 5
+      num_heads: 8
+      ff_dim: 512
+      dropout: 0.1
+      curve_samples: 20
+      range_temperature: 0.02
+      detach_geometry_features: true
+      use_curve_evidence: false
+      use_semantic_decision: false
+
+      # Cardinality and real-proposal routing are separate variables.  All
+      # four slots always own a unique real geometry hypothesis; lane/no-lane
+      # merely controls whether that hypothesis is emitted.
+      four_slot_factorized_routing: true
+      four_slot_active_prior_prob: 0.80
+
+      # Slot geometry starts as the routed proposal and remains bounded.  The
+      # structured Sinkhorn marginal obeys the same row/column-capacity
+      # constraints as the hard unique forward.  Its small scale gives geometry
+      # a controlled vote on route projections without reaching dustbin or the
+      # shared slot trunk.
+      four_slot_refinement_enabled: true
+      four_slot_refinement_hidden_dim: 256
+      four_slot_refinement_delta_offsets_px:
+        [-24.0, -12.0, -6.0, 0.0, 6.0, 12.0, 24.0]
+      four_slot_refinement_straight_through_routing: true
+      four_slot_refinement_structured_unique_routing: true
+      four_slot_refinement_detach_slot_states: true
+      four_slot_refinement_route_temperature: 1.0
+      four_slot_refinement_route_gradient_scale: 0.10
+      four_slot_range_refinement_enabled: true
+      four_slot_range_delta_offsets_norm:
+        [-0.10, -0.05, -0.025, 0.0, 0.025, 0.05, 0.10]
+
+# Proposal ownership enters the proposal Hungarian only after geometry has a
+# useful signal.  This is the already verified V5.1 assignment-mediated edge;
+# the four final slots themselves never depend on proposal threshold/NMS.
+matcher:
+  assignment: hungarian
+  num_groups: 1
+  lambda_obj: 0.25
+  lambda_obj_start: 0.0
+  lambda_obj_end: 0.25
+  lambda_obj_ramp_start_iter: 10000
+  lambda_obj_ramp_end_iter: 25000
+  object_cost_type: neg_probability
+  reuse_final_assignment_for_intermediate: false
+
+loss:
+  # Keep the complete V4/V5 proposal objective as an auxiliary coverage task.
+  # Final deployment is nevertheless four-slot only.
+  w_exist: 2.0
+  w_intermediate_exist: 2.0
+  w_point: 5.0
+  w_range: 1.0
+  w_line_iou: 2.0
+  w_row_dfl: 0.5
+  w_seg: 1.0
+  w_centerline: 0.25
+  lambda_intermediate: 0.5
+
+  # Every valid annotated lane creates an active slot target from iteration
+  # zero.  Proposal IoU shapes the conditional route only; it can never turn a
+  # weak early GT into a dustbin target.
+  w_four_slot_selection: 1.0
+  four_slot_target_mode: all_gt
+  four_slot_representable_min: 0.0
+  four_slot_cluster_min: 0.0
+  four_slot_cluster_delta: 0.10
+  four_slot_cluster_temperature: 0.03
+  four_slot_permutation_temperature: 1.0
+  four_slot_collision_weight: 0.10
+  four_slot_line_width: 30.0
+  four_slot_min_valid_rows: 5
+
+  # Geometry supervises all four routed hypotheses, not only slots that the
+  # current active head already believes.  No low-quality match is discarded.
+  w_four_slot_geometry: 1.0
+  four_slot_geometry_match_all_slots: true
+  four_slot_geometry_match_min_quality: 0.0
+  four_slot_geometry_point_weight: 5.0
+  four_slot_geometry_range_weight: 1.0
+  four_slot_geometry_line_iou_weight: 2.0
+  four_slot_geometry_dfl_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.00001
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: lane_state
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.lane_state_layers.
+    - name: coordinate
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.row_delta_heads.
+        - structured_query_head.reference_
+    - name: lane_identity
+      lr: 0.00005
+      prefixes:
+        - structured_query_head.instance_tokens.
+        - structured_query_head.row_tokens.
+        - structured_query_head.x_tokens.
+    - name: proposal_ownership
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.ownership_tokens.
+        - structured_query_head.ownership_layers.
+        - structured_query_head.decision_norm.
+        - structured_query_head.exist.
+    - name: final_lane_slots
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.set_selection_head.
+
+scheduler:
+  name: cosine
+  total_iters: 278000
+  warmup_iters: 1000
+  min_lr_ratio: 0.01
+
+postprocess:
+  score_mode: four_slot
+  score_thresh: 0.0
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 278000
+  checkpoint_interval: 5000
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
