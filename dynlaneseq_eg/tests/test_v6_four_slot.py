@@ -199,6 +199,71 @@ def test_factorized_head_geometry_does_not_backpropagate_to_active_or_trunk():
         assert value.grad is None
 
 
+def test_direct_reference_uses_structured_soft_geometry_without_touching_trunk():
+    head = FourSlotLaneSelectionHead(
+        16,
+        input_w=100,
+        hidden_dim=32,
+        num_slots=4,
+        proposal_layers=1,
+        slot_layers=1,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        curve_samples=8,
+        min_valid_rows=5,
+        refinement_enabled=True,
+        refinement_hidden_dim=32,
+        refinement_delta_offsets_px=(-12.0, -6.0, 0.0, 6.0, 12.0),
+        refinement_straight_through_routing=True,
+        refinement_detach_slot_states=True,
+        factorized_routing=True,
+        refinement_structured_unique_routing=True,
+        refinement_route_gradient_scale=1.0,
+        refinement_reference_mode="soft",
+        range_refinement_enabled=True,
+    )
+    outputs = _head_outputs(batch=1)
+    row_features = torch.randn(1, 12, 20, 16, requires_grad=True)
+    result = head(outputs, row_value_features=row_features)
+    marginal = structured_unique_route_marginals(
+        result["selection_slot_real_route_logits"],
+        result["selection_slot_candidate_valid"],
+    )
+    expected_reference = torch.einsum(
+        "bsn,bnr->bsr",
+        marginal,
+        outputs["pred_x_rows"].detach().float(),
+    )
+    assert torch.allclose(
+        result["selection_slot_input_reference_x_rows"],
+        expected_reference,
+        atol=1.0e-5,
+    )
+    hard_indices = result["selection_slot_geometry_route_indices"]
+    hard_reference = outputs["pred_x_rows"].detach().gather(
+        1,
+        hard_indices.unsqueeze(-1).expand(-1, -1, 12),
+    )
+    assert not torch.allclose(expected_reference, hard_reference, atol=1.0e-4)
+
+    result["selection_slot_pred_x_rows"].sum().backward()
+    assert head.active is not None
+    assert head.active.weight.grad is None
+    assert head.slot_query.weight.grad is not None
+    assert float(head.slot_query.weight.grad.abs().sum()) > 0.0
+    assert all(
+        parameter.grad is None
+        for parameter in head.slot_decoder.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for parameter in head.proposal_encoder.parameters()
+    )
+    for value in (*outputs.values(), row_features):
+        assert value.grad is None
+
+
 def test_v6_b_config_trains_only_zero_initialized_slot_refinement():
     cfg = load_config(
         PROJECT_ROOT
@@ -250,6 +315,7 @@ def test_v7_config_is_one_from_scratch_factorized_long_schedule():
     training = cfg["training"]
     assert selection["four_slot_factorized_routing"] is True
     assert selection["four_slot_refinement_structured_unique_routing"] is True
+    assert selection["four_slot_refinement_reference_mode"] == "hard_st"
     assert selection["four_slot_refinement_detach_slot_states"] is True
     assert selection["four_slot_range_refinement_enabled"] is True
     assert loss["four_slot_target_mode"] == "all_gt"
@@ -259,6 +325,30 @@ def test_v7_config_is_one_from_scratch_factorized_long_schedule():
     assert training["max_iters"] == 278000
     assert "trainable_parameter_prefixes" not in training
     assert "frozen_detector_eval" not in training
+
+
+def test_v7_reference_gate_arms_are_parameter_matched_except_forward_mode():
+    hard = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v7_hard_reference_gate_25k_to28k.yaml"
+    )
+    direct = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v7_direct_reference_gate_25k_to28k.yaml"
+    )
+    hard_selection = hard["model"]["structured_query"]["set_selection"]
+    direct_selection = direct["model"]["structured_query"]["set_selection"]
+    assert hard_selection["four_slot_refinement_reference_mode"] == "hard_st"
+    assert direct_selection["four_slot_refinement_reference_mode"] == "soft"
+    assert hard_selection["four_slot_factorized_routing"] is True
+    assert direct_selection["four_slot_factorized_routing"] is True
+    assert hard["loss"]["four_slot_target_mode"] == "all_gt"
+    assert direct["loss"]["four_slot_target_mode"] == "all_gt"
+    assert hard["training"]["trainable_parameter_prefixes"] == direct[
+        "training"
+    ]["trainable_parameter_prefixes"]
+    assert hard["training"]["frozen_detector_eval"] is True
+    assert direct["training"]["frozen_detector_eval"] is True
 
 
 def test_production_four_slot_state_is_checkpoint_compatible_with_probe():

@@ -201,6 +201,11 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", default="", help="Override cfg.output_dir.")
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
+    parser.add_argument(
+        "--train-list",
+        default="",
+        help="Override dataset.lists.train (used by fixed-set memorization gates).",
+    )
     parser.add_argument("--batch-size", type=int, default=0, help="Override training.batch_size.")
     parser.add_argument(
         "--num-workers",
@@ -270,6 +275,10 @@ def main() -> None:
         cfg["output_dir"] = args.output_dir
     if args.dataset_root:
         cfg.setdefault("dataset", {})["root"] = args.dataset_root
+    if args.train_list:
+        cfg.setdefault("dataset", {}).setdefault("lists", {})["train"] = str(
+            Path(args.train_list).expanduser().resolve()
+        )
     if args.batch_size > 0:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
     if args.num_workers >= 0:

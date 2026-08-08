@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", default="")
     parser.add_argument("--split", default="val")
     parser.add_argument(
+        "--list-path",
+        default="",
+        help="Optional explicit list for fixed-set memorization evaluation.",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument(
@@ -393,6 +398,7 @@ def main() -> None:
         args.config,
         args.checkpoint,
         split=args.split,
+        list_path=args.list_path or None,
         dataset_root=args.dataset_root or None,
         device=args.device,
         cache_dir=args.cache_dir,
@@ -482,6 +488,10 @@ def main() -> None:
     slot_total = 0
     slot_semantic_duplicates = 0
     slot_active = 0
+    slot_count_exact = 0
+    slot_count_under = 0
+    slot_count_over = 0
+    slot_count_absolute_error = 0
     slot_route_entropies: list[float] = []
     slot_delta_mean_abs: list[float] = []
     slot_delta_max_abs: list[float] = []
@@ -569,10 +579,34 @@ def main() -> None:
                 raise ValueError(
                     "four-slot diagnostics require slot logits and valid mask"
                 )
-            decoded = decode_four_slot_logits(
-                slot_logits,
-                slot_valid.bool() & candidate_valid.bool(),
-            )
+            cached_indices = stage.get("selection_slot_indices")
+            cached_scores = stage.get("selection_slot_scores")
+            if isinstance(cached_indices, torch.Tensor) and isinstance(
+                cached_scores, torch.Tensor
+            ):
+                # Factorized V7 cardinality is intentionally independent of
+                # conditional proposal probability.  Re-decoding its
+                # compatibility logits would compare one proposal's mass with
+                # total inactive mass and incorrectly turn diffuse early
+                # routes into dustbins.  The model's exact hard decision is
+                # already part of the public output contract.
+                decoded = {
+                    "indices": cached_indices.long(),
+                    "scores": cached_scores.float(),
+                    "raw_collision_count": stage.get(
+                        "selection_slot_raw_collision_count",
+                        torch.tensor(0),
+                    ),
+                    "repair_count": stage.get(
+                        "selection_slot_global_repair_count",
+                        torch.tensor(0),
+                    ),
+                }
+            else:
+                decoded = decode_four_slot_logits(
+                    slot_logits,
+                    slot_valid.bool() & candidate_valid.bool(),
+                )
             slot_ids = [
                 int(value)
                 for value in decoded["indices"].tolist()
@@ -582,8 +616,18 @@ def main() -> None:
             slot_total += int(slot_logits.shape[0])
             slot_active += len(slot_ids)
             slot_dustbins += int(slot_logits.shape[0]) - len(slot_ids)
-            slot_raw_collisions += int(decoded["raw_collision_count"])
-            slot_global_repairs += int(decoded["repair_count"])
+            gt_count = min(int(iou.shape[0]), int(slot_logits.shape[0]))
+            count_error = len(slot_ids) - gt_count
+            slot_count_exact += int(count_error == 0)
+            slot_count_under += int(count_error < 0)
+            slot_count_over += int(count_error > 0)
+            slot_count_absolute_error += abs(count_error)
+            slot_raw_collisions += int(
+                torch.as_tensor(decoded["raw_collision_count"]).sum()
+            )
+            slot_global_repairs += int(
+                torch.as_tensor(decoded["repair_count"]).sum()
+            )
             entropy = stage.get("selection_slot_route_entropy")
             if isinstance(entropy, torch.Tensor):
                 slot_route_entropies.extend(float(value) for value in entropy)
@@ -641,8 +685,13 @@ def main() -> None:
                         destination.extend(
                             float(item) for item in value.reshape(-1)
                         )
-            if int(iou.shape[0]) > 0 and slot_ids:
-                selected_quality = iou[:, slot_ids]
+            duplicate_quality = iou
+            duplicate_ids = slot_ids
+            if isinstance(refined_iou, torch.Tensor):
+                duplicate_quality = refined_iou
+                duplicate_ids = active_slot_ids
+            if int(duplicate_quality.shape[0]) > 0 and duplicate_ids:
+                selected_quality = duplicate_quality[:, duplicate_ids]
                 best_quality, best_gt = selected_quality.max(dim=0)
                 meaningful = best_quality >= float(args.near_min_iou)
                 cluster_ids = best_gt[meaningful]
@@ -797,6 +846,19 @@ def main() -> None:
             "active_slots": int(slot_active),
             "dustbin_slots": int(slot_dustbins),
             "dustbin_fraction": float(slot_dustbins) / max(slot_total, 1),
+            "cardinality": {
+                "exact_count": int(slot_count_exact),
+                "exact_fraction": float(slot_count_exact)
+                / max(len(cache["records"]), 1),
+                "under_count": int(slot_count_under),
+                "under_fraction": float(slot_count_under)
+                / max(len(cache["records"]), 1),
+                "over_count": int(slot_count_over),
+                "over_fraction": float(slot_count_over)
+                / max(len(cache["records"]), 1),
+                "mean_absolute_error": float(slot_count_absolute_error)
+                / max(len(cache["records"]), 1),
+            },
             "raw_argmax_collision_count": int(slot_raw_collisions),
             "raw_argmax_collision_per_image": float(slot_raw_collisions)
             / max(len(cache["records"]), 1),

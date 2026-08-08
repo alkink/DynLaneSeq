@@ -1,0 +1,12 @@
+_base_: culane_s0_structured_query_dla34_v7_reference_gate_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v7_reference_gate/direct_reference
+
+model:
+  structured_query:
+    set_selection:
+      # No proposal ID is gathered into the geometry-producing forward.
+      # Slot reference, range and row memory are constrained soft combinations
+      # of real proposals; activity remains an independent scalar head.
+      four_slot_refinement_reference_mode: soft
+      four_slot_refinement_route_gradient_scale: 1.0

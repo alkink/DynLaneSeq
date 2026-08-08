@@ -44,6 +44,7 @@ model:
         [-24.0, -12.0, -6.0, 0.0, 6.0, 12.0, 24.0]
       four_slot_refinement_straight_through_routing: true
       four_slot_refinement_structured_unique_routing: true
+      four_slot_refinement_reference_mode: hard_st
       four_slot_refinement_detach_slot_states: true
       four_slot_refinement_route_temperature: 1.0
       four_slot_refinement_route_gradient_scale: 0.10

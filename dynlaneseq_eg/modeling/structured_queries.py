@@ -2502,6 +2502,12 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0,
                     )
                 ),
+                refinement_reference_mode=str(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_reference_mode",
+                        "hard_st",
+                    )
+                ),
                 range_refinement_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_range_refinement_enabled",

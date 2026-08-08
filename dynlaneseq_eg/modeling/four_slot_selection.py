@@ -371,6 +371,7 @@ class FourSlotBoundedRefinement(nn.Module):
         route_temperature: float = 1.0,
         structured_unique_routing: bool = False,
         route_gradient_scale: float = 1.0,
+        reference_mode: str = "hard_st",
         range_refinement: bool = False,
         range_delta_offsets_norm: tuple[float, ...] = (
             -0.10,
@@ -402,12 +403,17 @@ class FourSlotBoundedRefinement(nn.Module):
         self.route_temperature = float(route_temperature)
         self.structured_unique_routing = bool(structured_unique_routing)
         self.route_gradient_scale = float(route_gradient_scale)
+        self.reference_mode = str(reference_mode).strip().lower()
         self.range_refinement = bool(range_refinement)
         if self.route_temperature <= 0.0:
             raise ValueError("slot refinement route_temperature must be positive")
         if not 0.0 <= self.route_gradient_scale <= 1.0:
             raise ValueError(
                 "slot refinement route_gradient_scale must be in [0, 1]"
+            )
+        if self.reference_mode not in {"hard_st", "soft"}:
+            raise ValueError(
+                "slot refinement reference_mode must be 'hard_st' or 'soft'"
             )
         range_offsets = tuple(float(value) for value in range_delta_offsets_norm)
         if self.range_refinement:
@@ -612,11 +618,13 @@ class FourSlotBoundedRefinement(nn.Module):
             hard_routed_rows,
             torch.zeros_like(hard_routed_rows),
         )
-        if (
+        soft_forward = self.reference_mode == "soft"
+        needs_soft_route = soft_forward or (
             self.straight_through_routing
             and self.training
             and torch.is_grad_enabled()
-        ):
+        )
+        if needs_soft_route:
             if route_logits is None or candidate_valid is None:
                 raise ValueError(
                     "straight-through slot refinement requires route logits "
@@ -664,18 +672,27 @@ class FourSlotBoundedRefinement(nn.Module):
                 candidate_weight,
                 proposal_rows.float(),
             )
-            # Use the exact hard gather in forward, with gradients from the
-            # soft route.  Computing a one-hot gather through GEMM changes the
-            # verified curve by several pixels when TF32 is enabled.
-            reference_x = hard_reference_x.float() + (
-                soft_reference_x - soft_reference_x.detach()
-            ) * self.route_gradient_scale
-            slot_range = hard_slot_range + (
-                soft_slot_range - soft_slot_range.detach()
-            ) * self.route_gradient_scale
-            routed_rows = hard_routed_rows.float() + (
-                soft_routed_rows - soft_routed_rows.detach()
-            ) * self.route_gradient_scale
+            if soft_forward:
+                # Direct-slot arm: the final object state consumes the
+                # constrained real-proposal distribution itself.  There is no
+                # hard proposal identity in the geometry-producing forward,
+                # and activity/dustbin remains a separate head.
+                reference_x = soft_reference_x
+                slot_range = soft_slot_range
+                routed_rows = soft_routed_rows
+            else:
+                # Structured hard-reference arm: preserve the exact unique
+                # hard gather in forward, with only a controlled gradient from
+                # the capacity-constrained soft route.
+                reference_x = hard_reference_x.float() + (
+                    soft_reference_x - soft_reference_x.detach()
+                ) * self.route_gradient_scale
+                slot_range = hard_slot_range + (
+                    soft_slot_range - soft_slot_range.detach()
+                ) * self.route_gradient_scale
+                routed_rows = hard_routed_rows.float() + (
+                    soft_routed_rows - soft_routed_rows.detach()
+                ) * self.route_gradient_scale
         else:
             reference_x = hard_reference_x
             slot_range = hard_slot_range
@@ -842,6 +859,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         active_prior_prob: float = 0.80,
         refinement_structured_unique_routing: bool = False,
         refinement_route_gradient_scale: float = 1.0,
+        refinement_reference_mode: str = "hard_st",
         range_refinement_enabled: bool = False,
         range_delta_offsets_norm: tuple[float, ...] = (
             -0.10,
@@ -968,6 +986,7 @@ class FourSlotLaneSelectionHead(nn.Module):
                     refinement_structured_unique_routing
                 ),
                 route_gradient_scale=float(refinement_route_gradient_scale),
+                reference_mode=str(refinement_reference_mode),
                 range_refinement=bool(range_refinement_enabled),
                 range_delta_offsets_norm=tuple(range_delta_offsets_norm),
             )

@@ -1,0 +1,9 @@
+_base_: culane_s0_structured_query_dla34_v7_reference_gate_base.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v7_reference_gate/hard_reference
+
+model:
+  structured_query:
+    set_selection:
+      four_slot_refinement_reference_mode: hard_st
+      four_slot_refinement_route_gradient_scale: 0.10
