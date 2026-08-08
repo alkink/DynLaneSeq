@@ -31,8 +31,8 @@ if (( TARGET_ITERATION < 1 || TARGET_ITERATION > 278000 )); then
   echo "TARGET_ITERATION must be in [1, 278000]." >&2
   exit 1
 fi
-if (( CHECKPOINT_INTERVAL < 1 || TARGET_ITERATION % CHECKPOINT_INTERVAL != 0 )); then
-  echo "TARGET_ITERATION must be divisible by CHECKPOINT_INTERVAL." >&2
+if (( CHECKPOINT_INTERVAL < 1 )); then
+  echo "CHECKPOINT_INTERVAL must be positive." >&2
   exit 1
 fi
 if (( BATCH_SIZE * GRAD_ACCUM != 16 )); then
