@@ -89,7 +89,14 @@ def test_four_slot_head_matches_probe_parameter_count_and_detaches_inputs():
 
 
 def test_structured_real_route_marginals_obey_assignment_polytope():
-    logits = torch.randn(2, 4, 9, requires_grad=True)
+    generator = torch.Generator().manual_seed(3407)
+    logits = torch.randn(
+        2,
+        4,
+        9,
+        generator=generator,
+        requires_grad=True,
+    )
     valid = torch.ones((2, 9), dtype=torch.bool)
     valid[0, -1] = False
     marginal = structured_unique_route_marginals(
