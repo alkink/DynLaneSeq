@@ -8,9 +8,146 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from dynlaneseq_eg.modeling.common import sort_range_norm
+from dynlaneseq_eg.modeling.common import fixed_indices, sort_range_norm
 from .matcher_s0 import HungarianMatcherS0
-from .range_aware_iou import pairwise_range_aware_row_strip_iou
+from .range_aware_iou import (
+    batched_pairwise_range_aware_row_strip_iou,
+    pairwise_range_aware_row_strip_iou,
+)
+
+
+_SLOT_ASSIGNMENT_PATH_CACHE: dict[
+    tuple[int, int, str, int | None],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+
+
+@dataclass(frozen=True)
+class _MatchedLaneBatch:
+    """All Hungarian-matched lanes packed across the image batch.
+
+    The normal and three intermediate decoder outputs reuse the same five
+    geometry objectives.  Packing their tiny per-image selections once keeps
+    the exact assignment while avoiding four independent advanced-indexing
+    graphs in every objective.
+    """
+
+    pred_x: torch.Tensor
+    gt_x: torch.Tensor
+    valid: torch.Tensor
+    pred_range: torch.Tensor | None
+    gt_range: torch.Tensor | None
+    row_logits: torch.Tensor | None
+    input_reference: torch.Tensor | None
+
+
+def _padded_lane_targets(
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack variable-count lane targets for small batched IoU matrices."""
+
+    batch = len(targets)
+    max_gt = max(
+        (int(target["x_rows"].shape[0]) for target in targets),
+        default=0,
+    )
+    if max_gt == 0:
+        return (
+            torch.zeros((batch, 0, rows), device=device, dtype=dtype),
+            torch.zeros((batch, 0, rows), device=device, dtype=torch.bool),
+        )
+    padded_x: list[torch.Tensor] = []
+    padded_valid: list[torch.Tensor] = []
+    for target in targets:
+        x_rows = target["x_rows"].to(device=device, dtype=dtype)
+        valid = target["valid_mask"].to(device=device).bool()
+        if tuple(x_rows.shape) != tuple(valid.shape) or int(x_rows.shape[1]) != rows:
+            raise ValueError("lane target rows/validity shape mismatch")
+        padding = max_gt - int(x_rows.shape[0])
+        if padding:
+            x_rows = torch.cat(
+                (x_rows, x_rows.new_zeros((padding, rows))),
+                dim=0,
+            )
+            valid = torch.cat(
+                (
+                    valid,
+                    torch.zeros(
+                        (padding, rows),
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ),
+                dim=0,
+            )
+        padded_x.append(x_rows)
+        padded_valid.append(valid)
+    return torch.stack(padded_x), torch.stack(padded_valid)
+
+
+def _slot_assignment_paths(
+    slots: int,
+    gt_count: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached ordered slot paths and their inactive-slot masks."""
+
+    key = (int(slots), int(gt_count), device.type, device.index)
+    cached = _SLOT_ASSIGNMENT_PATH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path_values = tuple(permutations(range(int(slots)), int(gt_count)))
+    paths = torch.tensor(path_values, dtype=torch.long, device=device).reshape(
+        -1,
+        int(gt_count),
+    )
+    assigned = torch.zeros(
+        (int(paths.shape[0]), int(slots)),
+        dtype=torch.bool,
+        device=device,
+    )
+    if int(gt_count) > 0:
+        assigned.scatter_(1, paths, True)
+    result = (paths, ~assigned)
+    _SLOT_ASSIGNMENT_PATH_CACHE[key] = result
+    return result
+
+
+def _vectorized_slot_path_costs(
+    candidate_cost: torch.Tensor,
+    inactive_cost: torch.Tensor,
+    paths: torch.Tensor,
+    inactive_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate every GT-to-slot permutation without scalar tensor loops."""
+
+    batch, slots, gt_count = candidate_cost.shape
+    path_count = int(paths.shape[0])
+    if int(gt_count) > 0:
+        by_gt = candidate_cost.permute(0, 2, 1).unsqueeze(1).expand(
+            -1,
+            path_count,
+            -1,
+            -1,
+        )
+        gather_index = paths.view(1, path_count, int(gt_count), 1).expand(
+            batch,
+            -1,
+            -1,
+            -1,
+        )
+        selected = by_gt.gather(-1, gather_index).squeeze(-1).sum(dim=-1)
+    else:
+        selected = candidate_cost.new_zeros((batch, path_count))
+    inactive = (
+        inactive_cost.unsqueeze(1)
+        * inactive_mask.to(dtype=inactive_cost.dtype).unsqueeze(0)
+    ).sum(dim=-1)
+    return selected + inactive
 
 
 @torch.no_grad()
@@ -499,6 +636,7 @@ def build_four_slot_cluster_targets(
     cluster_delta: float,
     temperature: float,
     target_mode: str = "joint_threshold",
+    padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, object]:
     """Keep the GT/object axis for four-slot proposal routing.
 
@@ -535,55 +673,181 @@ def build_four_slot_cluster_targets(
     target_qualities: list[torch.Tensor] = []
     representable_counts = pred_x.new_zeros((batch,))
 
-    for batch_index, target in enumerate(targets):
-        gt_x = target["x_rows"].to(
+    if padded_targets is None:
+        padded_gt_x, padded_gt_valid = _padded_lane_targets(
+            targets,
             device=pred_x.device,
             dtype=pred_x.dtype,
+            rows=int(pred_x.shape[-1]),
         )
-        gt_valid = target["valid_mask"].to(pred_x.device).bool()
-        quality, candidate_valid, valid_gt = pairwise_range_aware_row_strip_iou(
-            pred_x[batch_index],
-            pred_range[batch_index],
-            gt_x,
-            gt_valid,
+    else:
+        padded_gt_x, padded_gt_valid = padded_targets
+    quality_batch, candidate_valid_batch, valid_gt_batch = (
+        batched_pairwise_range_aware_row_strip_iou(
+            pred_x,
+            pred_range,
+            padded_gt_x,
+            padded_gt_valid,
             input_h=int(input_h),
             line_width=float(line_width),
             min_valid_rows=int(min_valid_rows),
         )
-        candidate_ids = torch.nonzero(candidate_valid, as_tuple=False).flatten()
-        gt_ids = torch.nonzero(valid_gt, as_tuple=False).flatten()
+    )
+    if mode == "all_gt" and max(
+        (int(target["x_rows"].shape[0]) for target in targets),
+        default=0,
+    ) <= slots:
+        # CULane's final object set has at most four lanes.  In all-GT mode
+        # Hungarian and proposal-quality thresholding therefore cannot alter
+        # which GT rows are supervised.  Form every near-best cluster in one
+        # dense tensor instead of launching a softmax/indexing graph per GT.
+        image_has_candidate = candidate_valid_batch.any(dim=-1)
+        active_gt = valid_gt_batch & image_has_candidate.unsqueeze(-1)
+        masked_quality = quality_batch.masked_fill(
+            ~candidate_valid_batch.unsqueeze(-1),
+            float("-inf"),
+        )
+        best = masked_quality.amax(dim=1)
+        effective_floor = best.clamp(max=float(cluster_min))
+        cutoff = torch.maximum(
+            effective_floor,
+            best - float(cluster_delta),
+        )
+        support = (
+            candidate_valid_batch.unsqueeze(-1)
+            & active_gt.unsqueeze(1)
+            & (quality_batch >= cutoff.unsqueeze(1))
+        )
+        probability = torch.softmax(
+            (quality_batch / float(temperature)).masked_fill(
+                ~support,
+                float("-inf"),
+            ),
+            dim=1,
+        )
+        probability = torch.where(
+            support,
+            probability,
+            torch.zeros_like(probability),
+        )
+        dense_rows = torch.cat(
+            (
+                probability.permute(0, 2, 1),
+                probability.new_zeros((batch, int(probability.shape[2]), 1)),
+            ),
+            dim=-1,
+        )
+        rows_by_image = [
+            dense_rows[batch_index, active_gt[batch_index]]
+            for batch_index in range(batch)
+        ]
+        active_float = active_gt.to(dtype=pred_x.dtype)
+        normalizer = active_float.sum().clamp_min(1.0)
+        support_count = support.sum(dim=1).to(dtype=pred_x.dtype)
+        entropy = -(
+            probability
+            * probability.clamp_min(1.0e-12).log()
+        ).sum(dim=1)
+        expected_quality = (
+            probability * quality_batch
+        ).sum(dim=1)
+        return {
+            "rows": rows_by_image,
+            "representable_count": active_float.sum(dim=-1),
+            "mean_support_size": (
+                support_count * active_float
+            ).sum() / normalizer,
+            "mean_entropy": (entropy * active_float).sum() / normalizer,
+            "mean_target_quality": (
+                expected_quality * active_float
+            ).sum() / normalizer,
+        }
+    valid_metadata_cpu = (
+        torch.cat((candidate_valid_batch, valid_gt_batch), dim=1).cpu()
+        if mode == "all_gt"
+        else None
+    )
+
+    for batch_index, _target in enumerate(targets):
+        quality = quality_batch[batch_index]
+        candidate_valid = candidate_valid_batch[batch_index]
+        valid_gt = valid_gt_batch[batch_index]
+        if valid_metadata_cpu is not None:
+            metadata = valid_metadata_cpu[batch_index]
+            candidate_id_values = torch.nonzero(
+                metadata[:candidates],
+                as_tuple=False,
+            ).flatten().tolist()
+            gt_id_values = torch.nonzero(
+                metadata[candidates:],
+                as_tuple=False,
+            ).flatten().tolist()
+            candidate_ids = None
+            gt_ids = None
+        else:
+            candidate_ids = torch.nonzero(
+                candidate_valid,
+                as_tuple=False,
+            ).flatten()
+            gt_ids = torch.nonzero(valid_gt, as_tuple=False).flatten()
+            candidate_id_values = candidate_ids.detach().cpu().tolist()
+            gt_id_values = gt_ids.detach().cpu().tolist()
         empty = pred_x.new_zeros((0, candidates + 1))
-        if candidate_ids.numel() == 0 or gt_ids.numel() == 0:
+        if not candidate_id_values or not gt_id_values:
             rows_by_image.append(empty)
             continue
 
-        local_quality = quality[candidate_ids][:, gt_ids]
-        local_candidate_ids, local_gt_ids = (
-            HungarianMatcherS0._linear_sum_assignment(
-                1.0 - local_quality.detach().cpu()
-            )
-        )
+        # In all-GT mode the assignment quality has no effect unless the
+        # annotation contains more lanes than output slots.  CULane has at
+        # most four, so skip an otherwise unconditional GPU->CPU Hungarian
+        # round trip while producing exactly the same target rows and order.
         assignment_quality: dict[int, float] = {}
-        for local_candidate, local_gt in zip(
-            local_candidate_ids.tolist(),
-            local_gt_ids.tolist(),
-        ):
-            assigned_quality = float(local_quality[local_candidate, local_gt])
-            assignment_quality[int(gt_ids[int(local_gt)])] = assigned_quality
+        needs_joint_assignment = mode != "all_gt" or len(gt_id_values) > slots
+        if needs_joint_assignment:
+            if candidate_ids is None or gt_ids is None:
+                candidate_ids = torch.tensor(
+                    candidate_id_values,
+                    dtype=torch.long,
+                    device=pred_x.device,
+                )
+                gt_ids = torch.tensor(
+                    gt_id_values,
+                    dtype=torch.long,
+                    device=pred_x.device,
+                )
+            local_quality = quality[candidate_ids][:, gt_ids]
+            cost_cpu = (1.0 - local_quality).detach().cpu()
+            local_candidate_ids, local_gt_ids = (
+                HungarianMatcherS0._linear_sum_assignment(cost_cpu)
+            )
+            for local_candidate, local_gt in zip(
+                local_candidate_ids.tolist(),
+                local_gt_ids.tolist(),
+            ):
+                assigned_quality = 1.0 - float(
+                    cost_cpu[local_candidate, local_gt]
+                )
+                assignment_quality[int(gt_id_values[int(local_gt)])] = assigned_quality
         if mode == "all_gt":
             # Final slot cardinality belongs to the annotation, not to the
             # current proposal quality.  This avoids a cold-start feedback
             # loop where weak early proposals teach every slot to be dustbin.
-            jointly_representable = [
-                (
-                    int(gt_index),
-                    assignment_quality.get(
-                        int(gt_index),
-                        float(quality[candidate_valid, int(gt_index)].amax()),
-                    ),
-                )
-                for gt_index in gt_ids.tolist()
-            ]
+            if needs_joint_assignment:
+                jointly_representable = []
+                for gt_index in gt_id_values:
+                    gt_index = int(gt_index)
+                    assigned_quality = assignment_quality.get(gt_index)
+                    if assigned_quality is None:
+                        assigned_quality = float(
+                            quality[candidate_valid, gt_index].amax()
+                        )
+                    jointly_representable.append(
+                        (gt_index, assigned_quality)
+                    )
+            else:
+                jointly_representable = [
+                    (int(gt_index), 0.0) for gt_index in gt_id_values
+                ]
         else:
             jointly_representable = [
                 (gt_index, assigned_quality)
@@ -601,18 +865,18 @@ def build_four_slot_cluster_targets(
             if mode == "all_gt":
                 # The floor may sharpen a mature proposal pool but may never
                 # delete the best early-training proposal from the target.
-                effective_floor = min(float(cluster_min), float(best))
-                cutoff = max(
+                effective_floor = best.clamp(max=float(cluster_min))
+                cutoff = torch.maximum(
                     effective_floor,
-                    float(best) - float(cluster_delta),
+                    best - float(cluster_delta),
                 )
             else:
-                cutoff = max(
-                    float(cluster_min),
-                    float(best) - float(cluster_delta),
+                cutoff = torch.maximum(
+                    best.new_tensor(float(cluster_min)),
+                    best - float(cluster_delta),
                 )
             support = candidate_valid & (gt_quality >= cutoff)
-            if not bool(support.any()):
+            if mode != "all_gt" and not bool(support.any()):
                 continue
             probability = torch.softmax(
                 gt_quality[support] / float(temperature),
@@ -622,7 +886,7 @@ def build_four_slot_cluster_targets(
             row[:candidates][support] = probability
             image_rows.append(row)
             support_sizes.append(
-                pred_x.new_tensor(float(support.sum()))
+                support.sum().to(dtype=pred_x.dtype)
             )
             entropies.append(
                 -(probability * probability.clamp_min(1.0e-12).log()).sum()
@@ -762,78 +1026,93 @@ def four_slot_factorized_permutation_loss(
     )
     active_cost = F.softplus(-active_logits.float())
     inactive_cost = F.softplus(active_logits.float())
-    losses: list[torch.Tensor] = []
-    for batch_index, target_value in enumerate(target_rows):
-        target = target_value.to(
-            device=real_route_logits.device,
-            dtype=real_log_probability.dtype,
-        )
+    grouped: dict[int, list[int]] = {}
+    for batch_index, target in enumerate(target_rows):
         if target.ndim != 2 or int(target.shape[1]) != int(candidates) + 1:
             raise ValueError("factorized target rows must have shape [G,N+1]")
         gt_count = int(target.shape[0])
         if gt_count > int(slots):
             raise ValueError("factorized target contains more GTs than slots")
-        if gt_count == 0:
-            losses.append(inactive_cost[batch_index].sum())
-            continue
-        candidate_cost = -torch.einsum(
-            "sn,gn->sg",
-            real_log_probability[batch_index],
-            target[:, :candidates],
+        grouped.setdefault(gt_count, []).append(batch_index)
+
+    losses: list[torch.Tensor | None] = [None] * int(batch)
+    for gt_count, batch_indices in grouped.items():
+        batch_ids = torch.tensor(
+            batch_indices,
+            dtype=torch.long,
+            device=real_route_logits.device,
         )
-        candidate_cost = candidate_cost + active_cost[batch_index].unsqueeze(-1)
-        path_costs: list[torch.Tensor] = []
-        for assigned_slots in permutations(range(int(slots)), gt_count):
-            assigned = set(int(value) for value in assigned_slots)
-            cost = candidate_cost.new_zeros(())
-            for gt_index, slot_index in enumerate(assigned_slots):
-                cost = cost + candidate_cost[int(slot_index), gt_index]
-            for slot_index in range(int(slots)):
-                if slot_index not in assigned:
-                    cost = cost + inactive_cost[batch_index, slot_index]
-            path_costs.append(cost)
-        stacked = torch.stack(path_costs)
-        if mode == "hard_min":
-            # The discrete path is deliberately outside autograd.  Candidate
-            # support within its assigned GT remains soft, so this breaks only
-            # slot permutation symmetry rather than inventing a hard proposal
-            # representative target.
-            best_path = stacked.detach().argmin()
-            losses.append(stacked[best_path])
+        if gt_count == 0:
+            group_losses = inactive_cost.index_select(0, batch_ids).sum(dim=-1)
         else:
-            losses.append(
-                -temperature * torch.logsumexp(
-                    -stacked / temperature,
-                    dim=0,
-                )
-                + temperature * math.log(float(len(path_costs)))
+            target = torch.stack(
+                [target_rows[index] for index in batch_indices]
+            ).to(
+                device=real_route_logits.device,
+                dtype=real_log_probability.dtype,
             )
-    return torch.stack(losses).mean() / float(max(int(slots), 1))
+            candidate_cost = -torch.einsum(
+                "bsn,bgn->bsg",
+                real_log_probability.index_select(0, batch_ids),
+                target[..., :candidates],
+            )
+            group_active = active_cost.index_select(0, batch_ids)
+            candidate_cost = candidate_cost + group_active.unsqueeze(-1)
+            paths, inactive_mask = _slot_assignment_paths(
+                int(slots),
+                int(gt_count),
+                real_route_logits.device,
+            )
+            stacked = _vectorized_slot_path_costs(
+                candidate_cost,
+                inactive_cost.index_select(0, batch_ids),
+                paths,
+                inactive_mask,
+            )
+            if mode == "hard_min":
+                # The discrete path is deliberately outside autograd.
+                best_path = stacked.detach().argmin(dim=-1, keepdim=True)
+                group_losses = stacked.gather(-1, best_path).squeeze(-1)
+            else:
+                group_losses = (
+                    -temperature
+                    * torch.logsumexp(-stacked / temperature, dim=-1)
+                    + temperature * math.log(float(int(paths.shape[0])))
+                )
+        for local_index, batch_index in enumerate(batch_indices):
+            losses[batch_index] = group_losses[local_index]
+    if any(value is None for value in losses):
+        raise RuntimeError("missing factorized four-slot batch loss")
+    return torch.stack([value for value in losses if value is not None]).mean() / float(
+        max(int(slots), 1)
+    )
 
 
-def four_slot_collision_loss(route_logits: torch.Tensor) -> torch.Tensor:
+def four_slot_collision_loss(
+    route_logits: torch.Tensor,
+    *,
+    has_dustbin: bool = True,
+) -> torch.Tensor:
     """Penalize different slots assigning probability to one proposal."""
 
     if route_logits.ndim != 3 or int(route_logits.shape[-1]) < 2:
         raise ValueError("four-slot logits must have shape [B,S,N+1]")
-    proposal_probability = torch.softmax(
-        route_logits.float(), dim=-1
-    )[..., :-1]
+    proposal_logits = (
+        route_logits[..., :-1] if bool(has_dustbin) else route_logits
+    )
+    proposal_probability = torch.softmax(proposal_logits.float(), dim=-1)
     gram = torch.einsum(
         "bsn,btn->bst",
         proposal_probability,
         proposal_probability,
     )
     slots = int(proposal_probability.shape[1])
-    mask = torch.triu(
-        torch.ones(
-            (slots, slots),
-            device=gram.device,
-            dtype=torch.bool,
-        ),
-        diagonal=1,
+    if slots <= 1:
+        return gram.sum() * 0.0
+    pair_count = int(slots * (slots - 1) // 2)
+    return torch.triu(gram, diagonal=1).sum() / float(
+        int(gram.shape[0]) * pair_count
     )
-    return gram[:, mask].mean() if bool(mask.any()) else gram.sum() * 0.0
 
 
 @dataclass
@@ -1074,6 +1353,108 @@ class S0Criterion(nn.Module):
         value = self.cfg.w_intermediate_exist
         return float(self.cfg.w_exist if value is None else value)
 
+    @staticmethod
+    def _pack_matched_lanes(
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        matches: list[dict[str, torch.Tensor]],
+    ) -> _MatchedLaneBatch:
+        """Gather one decoder output's matched geometry exactly once."""
+
+        pred_x_all = outputs["pred_x_rows"]
+        device = pred_x_all.device
+        rows = int(pred_x_all.shape[-1])
+        batch_parts: list[torch.Tensor] = []
+        pred_parts: list[torch.Tensor] = []
+        gt_x_parts: list[torch.Tensor] = []
+        valid_parts: list[torch.Tensor] = []
+        range_norm_all = outputs.get("range_norm")
+        has_range = isinstance(range_norm_all, torch.Tensor) and all(
+            "range_y" in target for target in targets
+        )
+        gt_range_parts: list[torch.Tensor] = []
+        for batch_index, match in enumerate(matches):
+            pred_indices = match["pred_indices"].to(device=device)
+            if int(pred_indices.numel()) == 0:
+                continue
+            gt_indices = match["gt_indices"].to(device=device)
+            batch_parts.append(
+                torch.full_like(pred_indices, int(batch_index))
+            )
+            pred_parts.append(pred_indices)
+            gt_x_parts.append(
+                targets[batch_index]["x_rows"].to(device=device)[gt_indices]
+            )
+            valid_parts.append(
+                targets[batch_index]["valid_mask"]
+                .to(device=device)[gt_indices]
+                .bool()
+            )
+            if has_range:
+                gt_range_parts.append(
+                    targets[batch_index]["range_y"].to(device=device)[gt_indices]
+                )
+
+        if batch_parts:
+            batch_indices = torch.cat(batch_parts)
+            pred_indices = torch.cat(pred_parts)
+            pred_x = pred_x_all[batch_indices, pred_indices]
+            pred_range = (
+                range_norm_all[batch_indices, pred_indices]
+                if isinstance(range_norm_all, torch.Tensor)
+                else None
+            )
+            row_logits_all = outputs.get("row_x_logits")
+            row_logits = (
+                row_logits_all[batch_indices, pred_indices]
+                if isinstance(row_logits_all, torch.Tensor)
+                else None
+            )
+            input_reference_all = outputs.get("input_reference_x_rows")
+            input_reference = (
+                input_reference_all[batch_indices, pred_indices]
+                if isinstance(input_reference_all, torch.Tensor)
+                else None
+            )
+            gt_x = torch.cat(gt_x_parts)
+            valid = torch.cat(valid_parts)
+            gt_range = torch.cat(gt_range_parts) if has_range else None
+        else:
+            pred_x = pred_x_all.new_empty((0, rows))
+            pred_range = (
+                range_norm_all.new_empty((0, 2))
+                if isinstance(range_norm_all, torch.Tensor)
+                else None
+            )
+            row_logits_all = outputs.get("row_x_logits")
+            row_logits = (
+                row_logits_all.new_empty((0, rows, int(row_logits_all.shape[-1])))
+                if isinstance(row_logits_all, torch.Tensor)
+                else None
+            )
+            input_reference_all = outputs.get("input_reference_x_rows")
+            input_reference = (
+                input_reference_all.new_empty((0, rows))
+                if isinstance(input_reference_all, torch.Tensor)
+                else None
+            )
+            gt_x = pred_x_all.new_empty((0, rows))
+            valid = torch.empty((0, rows), device=device, dtype=torch.bool)
+            gt_range = (
+                range_norm_all.new_empty((0, 2))
+                if has_range and isinstance(range_norm_all, torch.Tensor)
+                else None
+            )
+        return _MatchedLaneBatch(
+            pred_x=pred_x,
+            gt_x=gt_x,
+            valid=valid,
+            pred_range=pred_range,
+            gt_range=gt_range,
+            row_logits=row_logits,
+            input_reference=input_reference,
+        )
+
     def forward(
         self,
         outputs: dict[str, torch.Tensor],
@@ -1086,15 +1467,46 @@ class S0Criterion(nn.Module):
         elif "stage2" in outputs:
             outputs = outputs["stage2"]
         zero = self._zero_anchor(raw_outputs).sum() * 0.0
+        four_slot_targets: tuple[torch.Tensor, torch.Tensor] | None = None
+        matched_lanes = (
+            self._pack_matched_lanes(outputs, targets, matches)
+            if any(
+                float(weight) != 0.0
+                for weight in (
+                    self.cfg.w_point,
+                    self.cfg.w_range,
+                    self.cfg.w_line_iou,
+                    self.cfg.w_row_dfl,
+                )
+            )
+            else None
+        )
+        if (
+            self.cfg.w_four_slot_selection != 0
+            or self.cfg.w_four_slot_geometry != 0
+        ):
+            proposal_rows = outputs.get("pred_x_rows")
+            if not isinstance(proposal_rows, torch.Tensor):
+                raise ValueError("four-slot losses require proposal row geometry")
+            # Selection targets, reference matching, and refined-quality
+            # diagnostics consume the same GT row tensors.  Prepare their
+            # padded batch once instead of repeating three device copies and
+            # stacks per micro-batch.
+            four_slot_targets = _padded_lane_targets(
+                targets,
+                device=proposal_rows.device,
+                dtype=torch.float32,
+                rows=int(proposal_rows.shape[-1]),
+            )
         loss_exist = (
             self.compute_exist_loss(outputs, matches, targets)
             if self.cfg.w_exist != 0
             else zero
         )
-        loss_point = self.compute_point_loss(outputs, targets, matches) if self.cfg.w_point != 0 else zero
-        loss_range = self.compute_range_loss(outputs, targets, matches) if self.cfg.w_range != 0 else zero
+        loss_point = self.compute_point_loss(outputs, targets, matches, matched_lanes) if self.cfg.w_point != 0 else zero
+        loss_range = self.compute_range_loss(outputs, targets, matches, matched_lanes) if self.cfg.w_range != 0 else zero
         loss_smooth = self.compute_smoothness_loss(outputs, targets, matches) if self.cfg.w_smooth != 0 else zero
-        loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches) if self.cfg.w_line_iou != 0 else zero
+        loss_line_iou = self.compute_line_iou_loss(outputs, targets, matches, matched_lanes) if self.cfg.w_line_iou != 0 else zero
         loss_seg = self.compute_seg_loss(raw_outputs, targets) if self.cfg.w_seg != 0 else zero
         loss_quality = self.compute_quality_loss(outputs, targets, matches) if self.cfg.w_quality != 0 else zero
         loss_cardinality = (
@@ -1151,6 +1563,7 @@ class S0Criterion(nn.Module):
             four_slot_selection = self.compute_four_slot_selection_loss(
                 outputs,
                 targets,
+                four_slot_targets,
             )
         else:
             four_slot_selection = {
@@ -1168,6 +1581,7 @@ class S0Criterion(nn.Module):
             four_slot_geometry = self.compute_four_slot_geometry_loss(
                 outputs,
                 targets,
+                four_slot_targets,
             )
         else:
             four_slot_geometry = {
@@ -1183,7 +1597,7 @@ class S0Criterion(nn.Module):
             }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
-        loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches) if row_dfl_weight != 0 else zero
+        loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
         if (
             self.cfg.w_dynamic_proposal_heatmap != 0
             or self.cfg.w_dynamic_proposal_x != 0
@@ -1591,20 +2005,21 @@ class S0Criterion(nn.Module):
             if not isinstance(aux, dict):
                 raise TypeError("every auxiliary decoder output must be a dictionary")
             zero = self._zero_anchor(aux).sum() * 0.0
+            packed = self._pack_matched_lanes(aux, targets, aux_matches)
             aux_exist = (
                 self.compute_exist_loss(aux, aux_matches, targets)
                 if intermediate_exist_weight != 0.0
                 else zero
             )
-            aux_point = self.compute_point_loss(aux, targets, aux_matches) if self.cfg.w_point != 0 else zero
-            aux_range = self.compute_range_loss(aux, targets, aux_matches) if self.cfg.w_range != 0 else zero
+            aux_point = self.compute_point_loss(aux, targets, aux_matches, packed) if self.cfg.w_point != 0 else zero
+            aux_range = self.compute_range_loss(aux, targets, aux_matches, packed) if self.cfg.w_range != 0 else zero
             aux_line_iou = (
-                self.compute_line_iou_loss(aux, targets, aux_matches)
+                self.compute_line_iou_loss(aux, targets, aux_matches, packed)
                 if self.cfg.w_line_iou != 0
                 else zero
             )
             aux_row_dfl = (
-                self.compute_row_dfl_loss(aux, targets, aux_matches)
+                self.compute_row_dfl_loss(aux, targets, aux_matches, packed)
                 if row_dfl_weight != 0
                 else zero
             )
@@ -1864,55 +2279,52 @@ class S0Criterion(nn.Module):
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
         matches: list[dict[str, torch.Tensor]],
+        packed: _MatchedLaneBatch | None = None,
     ) -> torch.Tensor:
-        pred_x = outputs["pred_x_rows"]
-        total = pred_x.sum() * 0.0
-        count = pred_x.new_tensor(0.0)
+        packed = packed or self._pack_matched_lanes(outputs, targets, matches)
+        if int(packed.pred_x.shape[0]) == 0:
+            return outputs["pred_x_rows"].sum() * 0.0
+        pred = packed.pred_x / float(self.cfg.input_w)
+        gt = packed.gt_x / float(self.cfg.input_w)
+        valid = packed.valid.to(dtype=pred.dtype)
+        loss = F.smooth_l1_loss(
+            pred,
+            gt,
+            beta=self.cfg.smooth_l1_beta,
+            reduction="none",
+        )
         lane_balanced = self.lane_balanced_geometry()
-        for bi, match in enumerate(matches):
-            pred_idx = match["pred_indices"].to(pred_x.device)
-            gt_idx = match["gt_indices"].to(pred_x.device)
-            if pred_idx.numel() == 0:
-                continue
-            gt_x = targets[bi]["x_rows"].to(pred_x.device)[gt_idx]
-            mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
-            pred = pred_x[bi, pred_idx] / float(self.cfg.input_w)
-            gt = gt_x / float(self.cfg.input_w)
-            valid = mask.to(dtype=pred.dtype)
-            loss = F.smooth_l1_loss(pred, gt, beta=self.cfg.smooth_l1_beta, reduction="none")
-            if lane_balanced:
-                valid_count = valid.sum(dim=-1)
-                lane_loss = (loss * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
-                valid_lane = valid_count > 0
-                total = total + (
-                    lane_loss * valid_lane.to(dtype=lane_loss.dtype)
-                ).sum()
-                count = count + valid_lane.to(dtype=count.dtype).sum()
-            else:
-                total = total + (loss * valid).sum()
-                count = count + valid.sum()
-        return total / count.clamp_min(1.0)
+        if lane_balanced:
+            valid_count = valid.sum(dim=-1)
+            lane_loss = (loss * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+            valid_lane = valid_count > 0
+            return (
+                lane_loss * valid_lane.to(dtype=lane_loss.dtype)
+            ).sum() / valid_lane.to(dtype=lane_loss.dtype).sum().clamp_min(1.0)
+        return (loss * valid).sum() / valid.sum().clamp_min(1.0)
 
     def compute_row_dfl_loss(
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
         matches: list[dict[str, torch.Tensor]],
+        packed: _MatchedLaneBatch | None = None,
     ) -> torch.Tensor:
         logits = outputs.get("row_x_logits")
         if logits is None:
             return outputs["pred_x_rows"].sum() * 0.0
-        b, n, num_rows, x_bins = logits.shape
-        del b, n
+        packed = packed or self._pack_matched_lanes(outputs, targets, matches)
+        pred_logits = packed.row_logits
+        if pred_logits is None or int(pred_logits.shape[0]) == 0:
+            return logits.sum(dtype=torch.float32) * 0.0
+        num_rows, x_bins = int(pred_logits.shape[-2]), int(pred_logits.shape[-1])
         # Preserve a differentiable zero without materializing an FP32 copy of
         # every slot/row/bin.  Only matched lane logits contribute to DFL and
         # are converted below after indexing.
-        total = logits.sum(dtype=torch.float32) * 0.0
-        count = total.new_tensor(0.0)
         lane_balanced = self.lane_balanced_geometry()
         bin_width = float(self.cfg.input_w) / float(x_bins)
         delta_offsets = outputs.get("row_x_offsets_px")
-        input_reference = outputs.get("input_reference_x_rows")
+        input_reference = packed.input_reference
         local_delta_mode = isinstance(delta_offsets, torch.Tensor)
         if local_delta_mode:
             if not isinstance(input_reference, torch.Tensor):
@@ -1927,110 +2339,96 @@ class S0Criterion(nn.Module):
                 raise ValueError(
                     "row_x_offsets_px count must match local row logits"
                 )
-        for bi, match in enumerate(matches):
-            pred_idx = match["pred_indices"].to(logits.device)
-            gt_idx = match["gt_indices"].to(logits.device)
-            if pred_idx.numel() == 0:
-                continue
-            gt_x = targets[bi]["x_rows"].to(logits.device, dtype=torch.float32)[gt_idx]
-            mask = targets[bi]["valid_mask"].to(logits.device)[gt_idx].bool()
-            row_count = min(int(gt_x.shape[-1]), int(num_rows))
-            if row_count <= 0:
-                continue
-            pred_logits = logits[bi, pred_idx, :row_count].float()
-            gt_x = gt_x[:, :row_count]
-            mask = mask[:, :row_count]
-            valid = mask & torch.isfinite(gt_x) & (gt_x >= 0.0) & (gt_x <= float(self.cfg.input_w))
+        row_count = min(int(packed.gt_x.shape[-1]), int(num_rows))
+        if row_count <= 0:
+            return logits.sum(dtype=torch.float32) * 0.0
+        pred_logits = pred_logits[:, :row_count].float()
+        gt_x = packed.gt_x[:, :row_count].float()
+        mask = packed.valid[:, :row_count]
+        valid = mask & torch.isfinite(gt_x) & (gt_x >= 0.0) & (gt_x <= float(self.cfg.input_w))
 
             # Avoid a Python boolean conversion of a CUDA tensor here.  Deep
             # supervision reaches this path once per image and decoder output;
             # the old ``if not valid.any()`` therefore serialized the stream
             # many times per optimizer step.  Invalid values are made safe
             # before indexing and remain exactly zero-weighted below.
-            safe_gt_x = torch.where(valid, gt_x, torch.zeros_like(gt_x))
-            if local_delta_mode:
-                reference = input_reference[bi, pred_idx, :row_count].detach().float()
-                target_delta = torch.minimum(
-                    torch.maximum(safe_gt_x - reference, delta_offsets[0]),
-                    delta_offsets[-1],
-                )
-                right = torch.searchsorted(
-                    delta_offsets,
-                    target_delta.contiguous(),
-                ).clamp(min=1, max=x_bins - 1)
-                left = right - 1
-                left_offset = delta_offsets[left]
-                right_offset = delta_offsets[right]
-                right_w = (target_delta - left_offset) / (
-                    right_offset - left_offset
-                ).clamp_min(1e-6)
-                right_w = right_w.clamp(0.0, 1.0)
-                left_w = 1.0 - right_w
-            else:
-                target_bin = (safe_gt_x / bin_width).clamp(
-                    0.0,
-                    float(x_bins - 1),
-                )
-                left = target_bin.floor().long()
-                right = (left + 1).clamp(max=x_bins - 1)
-                right_w = target_bin - left.to(dtype=target_bin.dtype)
-                left_w = 1.0 - right_w
-                same = right == left
-                left_w = torch.where(same, torch.ones_like(left_w), left_w)
-                right_w = torch.where(same, torch.zeros_like(right_w), right_w)
+        safe_gt_x = torch.where(valid, gt_x, torch.zeros_like(gt_x))
+        if local_delta_mode:
+            if input_reference is None:
+                raise ValueError("local delta DFL requires matched input references")
+            reference = input_reference[:, :row_count].detach().float()
+            target_delta = torch.minimum(
+                torch.maximum(safe_gt_x - reference, delta_offsets[0]),
+                delta_offsets[-1],
+            )
+            right = torch.searchsorted(
+                delta_offsets,
+                target_delta.contiguous(),
+            ).clamp(min=1, max=x_bins - 1)
+            left = right - 1
+            left_offset = delta_offsets[left]
+            right_offset = delta_offsets[right]
+            right_w = (target_delta - left_offset) / (
+                right_offset - left_offset
+            ).clamp_min(1e-6)
+            right_w = right_w.clamp(0.0, 1.0)
+            left_w = 1.0 - right_w
+        else:
+            target_bin = (safe_gt_x / bin_width).clamp(
+                0.0,
+                float(x_bins - 1),
+            )
+            left = target_bin.floor().long()
+            right = (left + 1).clamp(max=x_bins - 1)
+            right_w = target_bin - left.to(dtype=target_bin.dtype)
+            left_w = 1.0 - right_w
+            same = right == left
+            left_w = torch.where(same, torch.ones_like(left_w), left_w)
+            right_w = torch.where(same, torch.zeros_like(right_w), right_w)
 
-            log_probs = F.log_softmax(pred_logits, dim=-1)
-            left_lp = log_probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)
-            right_lp = log_probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
-            loss = -(left_w * left_lp + right_w * right_lp)
-            valid_f = valid.to(dtype=loss.dtype)
-            if lane_balanced:
-                valid_count = valid_f.sum(dim=-1)
-                lane_loss = (loss * valid_f).sum(dim=-1) / valid_count.clamp_min(1.0)
-                valid_lane = valid_count > 0
-                total = total + (
-                    lane_loss * valid_lane.to(dtype=lane_loss.dtype)
-                ).sum()
-                count = count + valid_lane.to(dtype=count.dtype).sum()
-            else:
-                total = total + (loss * valid_f).sum()
-                count = count + valid_f.sum()
-        return total / count.clamp_min(1.0)
+        log_probs = F.log_softmax(pred_logits, dim=-1)
+        left_lp = log_probs.gather(-1, left.unsqueeze(-1)).squeeze(-1)
+        right_lp = log_probs.gather(-1, right.unsqueeze(-1)).squeeze(-1)
+        loss = -(left_w * left_lp + right_w * right_lp)
+        valid_f = valid.to(dtype=loss.dtype)
+        if lane_balanced:
+            valid_count = valid_f.sum(dim=-1)
+            lane_loss = (loss * valid_f).sum(dim=-1) / valid_count.clamp_min(1.0)
+            valid_lane = valid_count > 0
+            return (
+                lane_loss * valid_lane.to(dtype=lane_loss.dtype)
+            ).sum() / valid_lane.to(dtype=lane_loss.dtype).sum().clamp_min(1.0)
+        return (loss * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
     def compute_line_iou_loss(
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
         matches: list[dict[str, torch.Tensor]],
+        packed: _MatchedLaneBatch | None = None,
     ) -> torch.Tensor:
-        pred_x = outputs["pred_x_rows"]
-        total = pred_x.sum() * 0.0
-        count = pred_x.new_tensor(0.0)
+        packed = packed or self._pack_matched_lanes(outputs, targets, matches)
+        if int(packed.pred_x.shape[0]) == 0:
+            return outputs["pred_x_rows"].sum() * 0.0
         radius = float(self.cfg.line_iou_radius)
-        for bi, match in enumerate(matches):
-            pred_idx = match["pred_indices"].to(pred_x.device)
-            gt_idx = match["gt_indices"].to(pred_x.device)
-            if pred_idx.numel() == 0:
-                continue
-            gt_x = targets[bi]["x_rows"].to(pred_x.device)[gt_idx]
-            mask = targets[bi]["valid_mask"].to(pred_x.device)[gt_idx].bool()
-            pred = pred_x[bi, pred_idx]
-            px1 = pred - radius
-            px2 = pred + radius
-            gx1 = gt_x - radius
-            gx2 = gt_x + radius
-            overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
-            union = (4.0 * radius - overlap).clamp(min=1e-6)
-            iou = overlap / union
-            enclosing = (torch.maximum(px2, gx2) - torch.minimum(px1, gx1)).clamp(min=1e-6)
-            giou = iou - (enclosing - union) / enclosing
-            valid = mask.to(dtype=pred_x.dtype)
-            valid_count = valid.sum(dim=-1)
-            lane_loss = ((1.0 - giou) * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
-            valid_lane = valid_count > 0
-            total = total + (lane_loss * valid_lane.to(dtype=lane_loss.dtype)).sum()
-            count = count + valid_lane.to(dtype=count.dtype).sum()
-        return total / count.clamp_min(1.0)
+        pred = packed.pred_x
+        gt_x = packed.gt_x
+        px1 = pred - radius
+        px2 = pred + radius
+        gx1 = gt_x - radius
+        gx2 = gt_x + radius
+        overlap = (torch.minimum(px2, gx2) - torch.maximum(px1, gx1)).clamp(min=0.0)
+        union = (4.0 * radius - overlap).clamp(min=1e-6)
+        iou = overlap / union
+        enclosing = (torch.maximum(px2, gx2) - torch.minimum(px1, gx1)).clamp(min=1e-6)
+        giou = iou - (enclosing - union) / enclosing
+        valid = packed.valid.to(dtype=pred.dtype)
+        valid_count = valid.sum(dim=-1)
+        lane_loss = ((1.0 - giou) * valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+        valid_lane = valid_count > 0
+        return (
+            lane_loss * valid_lane.to(dtype=lane_loss.dtype)
+        ).sum() / valid_lane.to(dtype=lane_loss.dtype).sum().clamp_min(1.0)
 
     def compute_quality_loss(
         self,
@@ -2400,6 +2798,7 @@ class S0Criterion(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Train four object slots while the 32-proposal detector is frozen."""
 
@@ -2423,6 +2822,7 @@ class S0Criterion(nn.Module):
             cluster_delta=float(self.cfg.four_slot_cluster_delta),
             temperature=float(self.cfg.four_slot_cluster_temperature),
             target_mode=str(self.cfg.four_slot_target_mode),
+            padded_targets=padded_targets,
         )
         target_rows = target_data["rows"]
         if not isinstance(target_rows, list):
@@ -2444,17 +2844,10 @@ class S0Criterion(nn.Module):
             )
             # Collision is a conditional real-route regularizer.  Active/no-
             # lane probability is excluded so it cannot become an escape path.
-            real_with_zero_dustbin = torch.cat(
-                (
-                    real_route_logits,
-                    real_route_logits.new_full(
-                        (*real_route_logits.shape[:-1], 1),
-                        -1.0e4,
-                    ),
-                ),
-                dim=-1,
+            collision_loss = four_slot_collision_loss(
+                real_route_logits,
+                has_dustbin=False,
             )
-            collision_loss = four_slot_collision_loss(real_with_zero_dustbin)
         else:
             permutation_loss = four_slot_permutation_loss(
                 route_logits,
@@ -2499,6 +2892,7 @@ class S0Criterion(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
         """Match routed *reference* curves once, before learned refinement.
 
@@ -2523,42 +2917,43 @@ class S0Criterion(nn.Module):
             raise ValueError(
                 "four-slot geometry loss requires routed reference geometry"
             )
-        pending: list[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
-        flat_costs: list[torch.Tensor] = []
-        for batch_index, target in enumerate(targets):
-            gt_x = target["x_rows"].to(
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
                 device=reference.device,
                 dtype=torch.float32,
+                rows=int(reference.shape[-1]),
             )
-            gt_valid = target["valid_mask"].to(reference.device).bool()
-            quality, slot_valid, gt_lane_valid = (
-                pairwise_range_aware_row_strip_iou(
-                    reference[batch_index].detach().float(),
-                    ranges[batch_index].detach().float(),
-                    gt_x,
-                    gt_valid,
-                    input_h=int(self.cfg.input_h),
-                    line_width=float(self.cfg.four_slot_line_width),
-                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
-                )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        quality_batch, slot_valid_batch, gt_lane_valid_batch = (
+            batched_pairwise_range_aware_row_strip_iou(
+                reference.detach().float(),
+                ranges.detach().float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
             )
-            slot_ids = torch.nonzero(
-                active[batch_index].bool() & slot_valid,
-                as_tuple=False,
-            ).flatten()
-            gt_ids = torch.nonzero(gt_lane_valid, as_tuple=False).flatten()
-            local_quality = quality[slot_ids][:, gt_ids]
-            pending.append((slot_ids, gt_ids, local_quality))
-            if local_quality.numel():
-                flat_costs.append((1.0 - local_quality).reshape(-1))
-        flat_cpu = (
-            torch.cat(flat_costs).detach().cpu()
-            if flat_costs
-            else torch.empty(0)
         )
-        offset = 0
+        pair_valid = (
+            active.bool() & slot_valid_batch
+        ).unsqueeze(-1) & gt_lane_valid_batch.unsqueeze(1)
+        # Transfer one fixed, tiny [B,S,G] matrix.  Encoding invalid rows and
+        # columns as infinity lets CPU recover the exact same ascending slot
+        # and GT index sets without CUDA ``nonzero`` or per-pair GPU scalar
+        # extraction.  The sliced SciPy cost matrix is bit-identical to the
+        # historical matcher input.
+        cost_cpu_batch = (1.0 - quality_batch).masked_fill(
+            ~pair_valid,
+            torch.inf,
+        ).detach().cpu()
+        if int(cost_cpu_batch.shape[-1]) == 0:
+            cost_cpu_batch = torch.empty(
+                (len(targets), int(reference.shape[1]), 0),
+                dtype=torch.float32,
+            )
         cpu_pairs: list[torch.Tensor] = []
         pair_counts: list[int] = []
         reference_qualities: list[float] = []
@@ -2567,34 +2962,34 @@ class S0Criterion(nn.Module):
             if bool(self.cfg.four_slot_geometry_match_all_slots)
             else float(self.cfg.four_slot_geometry_match_min_quality)
         )
-        for slot_ids, gt_ids, local_quality in pending:
-            if local_quality.numel() == 0:
+        for cost_cpu in cost_cpu_batch:
+            finite = torch.isfinite(cost_cpu)
+            slot_ids = torch.nonzero(finite.any(dim=1), as_tuple=False).flatten()
+            gt_ids = torch.nonzero(finite.any(dim=0), as_tuple=False).flatten()
+            if slot_ids.numel() == 0 or gt_ids.numel() == 0:
                 cpu_pairs.append(torch.empty((0, 2), dtype=torch.long))
                 pair_counts.append(0)
                 continue
-            numel = int(local_quality.numel())
-            cost_cpu = flat_cpu[offset : offset + numel].view(
-                int(local_quality.shape[0]),
-                int(local_quality.shape[1]),
-            )
-            offset += numel
+            local_cost = cost_cpu.index_select(0, slot_ids).index_select(1, gt_ids)
             local_slot, local_gt = HungarianMatcherS0._linear_sum_assignment(
-                cost_cpu
+                local_cost
             )
             kept: list[tuple[int, int]] = []
+            slot_id_values = slot_ids.tolist()
+            gt_id_values = gt_ids.tolist()
             for slot_value, gt_value in zip(
                 local_slot.tolist(),
                 local_gt.tolist(),
             ):
                 quality_value = 1.0 - float(
-                    cost_cpu[int(slot_value), int(gt_value)]
+                    local_cost[int(slot_value), int(gt_value)]
                 )
                 if quality_value < threshold:
                     continue
                 kept.append(
                     (
-                        int(slot_ids[int(slot_value)]),
-                        int(gt_ids[int(gt_value)]),
+                        int(slot_id_values[int(slot_value)]),
+                        int(gt_id_values[int(gt_value)]),
                     )
                 )
                 reference_qualities.append(quality_value)
@@ -2632,6 +3027,7 @@ class S0Criterion(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Train bounded slot geometry on top of frozen routed proposals."""
 
@@ -2654,7 +3050,11 @@ class S0Criterion(nn.Module):
                 "w_four_slot_geometry > 0 requires bounded slot refinement outputs"
             )
         matches, reference_quality, match_count = (
-            self._match_four_slot_reference_geometry(outputs, targets)
+            self._match_four_slot_reference_geometry(
+                outputs,
+                targets,
+                padded_targets,
+            )
         )
         slot_outputs = {
             "pred_x_rows": refined,
@@ -2676,26 +3076,34 @@ class S0Criterion(nn.Module):
 
         refined_quality_values: list[torch.Tensor] = []
         with torch.no_grad():
-            for batch_index, (target, match) in enumerate(zip(targets, matches)):
+            if padded_targets is None:
+                padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                    targets,
+                    device=refined.device,
+                    dtype=torch.float32,
+                    rows=int(refined.shape[-1]),
+                )
+            else:
+                padded_gt_x, padded_gt_valid = padded_targets
+            refined_quality_batch, _slot_valid, _gt_valid = (
+                batched_pairwise_range_aware_row_strip_iou(
+                    refined.detach().float(),
+                    ranges.detach().float(),
+                    padded_gt_x,
+                    padded_gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.four_slot_line_width),
+                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                )
+            )
+            for batch_index, match in enumerate(matches):
                 pred_ids = match["pred_indices"]
                 gt_ids = match["gt_indices"]
                 if pred_ids.numel() == 0:
                     continue
-                quality, _slot_valid, _gt_valid = (
-                    pairwise_range_aware_row_strip_iou(
-                        refined[batch_index].detach().float(),
-                        ranges[batch_index].detach().float(),
-                        target["x_rows"].to(
-                            device=refined.device,
-                            dtype=torch.float32,
-                        ),
-                        target["valid_mask"].to(refined.device).bool(),
-                        input_h=int(self.cfg.input_h),
-                        line_width=float(self.cfg.four_slot_line_width),
-                        min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
-                    )
+                refined_quality_values.append(
+                    refined_quality_batch[batch_index, pred_ids, gt_ids]
                 )
-                refined_quality_values.append(quality[pred_ids, gt_ids])
         refined_quality = (
             torch.cat(refined_quality_values)
             if refined_quality_values
@@ -3107,7 +3515,11 @@ class S0Criterion(nn.Module):
         device = logits.device
         dtype = logits.dtype
         target_map = torch.zeros((b, 1, num_rows, x_bins), device=device, dtype=dtype)
-        grid = torch.arange(x_bins, device=device, dtype=dtype).view(1, 1, x_bins)
+        grid = fixed_indices(
+            x_bins,
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, x_bins)
         sigma = max(float(self.cfg.centerline_sigma_bins), 1e-3)
         bin_width = float(self.cfg.input_w) / float(x_bins)
         for bi, target in enumerate(targets):
@@ -3152,7 +3564,7 @@ class S0Criterion(nn.Module):
         device = heatmap_logits.device
         dtype = heatmap_logits.dtype
         heatmap_target = torch.zeros((b, 1, feat_h, feat_w), device=device, dtype=dtype)
-        grid_x = torch.arange(feat_w, device=device, dtype=dtype)
+        grid_x = fixed_indices(feat_w, device=device, dtype=dtype)
         sigma = max(float(self.cfg.dynamic_proposal_sigma_bins), 1e-3)
         radius = max(int(self.cfg.dynamic_proposal_seed_radius_bins), 0)
         x_loss = dense_x.sum() * 0.0
@@ -3239,20 +3651,23 @@ class S0Criterion(nn.Module):
         outputs: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
         matches: list[dict[str, torch.Tensor]],
+        packed: _MatchedLaneBatch | None = None,
     ) -> torch.Tensor:
-        pred_range = sort_range_norm(outputs["range_norm"])
-        total = pred_range.sum() * 0.0
-        count = 0
-        for bi, match in enumerate(matches):
-            pred_idx = match["pred_indices"].to(pred_range.device)
-            gt_idx = match["gt_indices"].to(pred_range.device)
-            if pred_idx.numel() == 0:
-                continue
-            gt_range = targets[bi]["range_y"].to(pred_range.device)[gt_idx] / float(self.cfg.input_h)
-            pred = pred_range[bi, pred_idx]
-            total = total + F.smooth_l1_loss(pred, gt_range, beta=self.cfg.smooth_l1_beta, reduction="sum")
-            count += int(pred.numel())
-        return total / max(count, 1)
+        packed = packed or self._pack_matched_lanes(outputs, targets, matches)
+        if packed.pred_range is None:
+            raise KeyError("range_norm")
+        if packed.gt_range is None:
+            raise KeyError("range_y")
+        if int(packed.pred_range.shape[0]) == 0:
+            return outputs["range_norm"].sum() * 0.0
+        pred_range = sort_range_norm(packed.pred_range)
+        gt_range = packed.gt_range / float(self.cfg.input_h)
+        return F.smooth_l1_loss(
+            pred_range,
+            gt_range,
+            beta=self.cfg.smooth_l1_beta,
+            reduction="sum",
+        ) / float(max(int(pred_range.numel()), 1))
 
     def compute_smoothness_loss(
         self,

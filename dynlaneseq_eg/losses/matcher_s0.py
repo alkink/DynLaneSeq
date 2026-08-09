@@ -7,7 +7,10 @@ import math
 import torch
 
 from dynlaneseq_eg.modeling.common import sort_range_norm
-from .range_aware_iou import pairwise_range_aware_row_strip_iou
+from .range_aware_iou import (
+    batched_pairwise_range_aware_row_strip_iou,
+    pairwise_range_aware_row_strip_iou,
+)
 
 
 @dataclass
@@ -116,25 +119,58 @@ class HungarianMatcherS0:
             )
 
         normalized_outputs = []
-        pending_by_output = []
         for outputs in output_sequence:
             if "coarse" in outputs:
                 outputs = outputs["coarse"]
             normalized_outputs.append(outputs)
-            pending = []
-            for b, target in enumerate(targets):
-                cost, stats = self.compute_cost_for_image(
-                    outputs["exist_logits"][b],
-                    outputs["pred_x_rows"][b],
-                    outputs["range_norm"][b],
-                    target,
-                )
-                num_gt = int(target["x_rows"].shape[0])
-                pending.append((cost, stats, num_gt))
-            pending_by_output.append(pending)
 
         if not normalized_outputs:
             return []
+
+        # Outputs from ordinary deep supervision have the same candidate
+        # shape and use one batched graph.  Hybrid train-only auxiliary groups
+        # may contain fewer candidates; group only those incompatible shapes
+        # instead of falling back to a per-layer/per-image matcher.
+        shape_groups: dict[tuple[tuple[int, ...], ...], list[int]] = {}
+        for output_index, output in enumerate(normalized_outputs):
+            key = (
+                tuple(output["pred_x_rows"].shape),
+                tuple(output["exist_logits"].shape),
+                tuple(output["range_norm"].shape),
+            )
+            shape_groups.setdefault(key, []).append(output_index)
+        pending_by_output: list[
+            list[tuple[torch.Tensor, dict[str, torch.Tensor], int]] | None
+        ] = [None for _ in normalized_outputs]
+        gt_counts: tuple[int, ...] | None = None
+        for output_indices in shape_groups.values():
+            group_outputs = [normalized_outputs[index] for index in output_indices]
+            batched_cost, batched_stats, group_gt_counts = self.compute_cost_many(
+                group_outputs,
+                targets,
+            )
+            if gt_counts is None:
+                gt_counts = group_gt_counts
+            elif gt_counts != group_gt_counts:
+                raise RuntimeError("matcher target counts changed between shape groups")
+            for group_index, output_index in enumerate(output_indices):
+                pending = []
+                for batch_index, num_gt in enumerate(group_gt_counts):
+                    cost = batched_cost[
+                        group_index,
+                        batch_index,
+                        :,
+                        :num_gt,
+                    ]
+                    stats = {
+                        name: value[group_index, batch_index]
+                        for name, value in batched_stats.items()
+                    }
+                    pending.append((cost, stats, num_gt))
+                pending_by_output[output_index] = pending
+        if gt_counts is None or any(pending is None for pending in pending_by_output):
+            raise RuntimeError("matcher failed to construct every output group")
+        concrete_pending = [pending for pending in pending_by_output if pending is not None]
 
         if assignment_specs is None:
             active_assignment = self.cfg.assignment if assignment is None else str(assignment)
@@ -176,7 +212,7 @@ class HungarianMatcherS0:
         # identical per-image SciPy assignment below.
         nonempty_costs = [
             cost.reshape(-1)
-            for pending in pending_by_output
+            for pending in concrete_pending
             for cost, _, num_gt in pending
             if num_gt > 0
         ]
@@ -189,7 +225,7 @@ class HungarianMatcherS0:
         solved_by_output = []
         flat_offset = 0
         for pending, (active_assignment, active_group_sizes) in zip(
-            pending_by_output,
+            concrete_pending,
             normalized_specs,
         ):
             solved = []
@@ -258,6 +294,255 @@ class HungarianMatcherS0:
                 )
             matches_by_output.append(matches)
         return matches_by_output
+
+    def compute_cost_many(
+        self,
+        output_sequence: list[dict[str, torch.Tensor]],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> tuple[
+        torch.Tensor,
+        dict[str, torch.Tensor],
+        tuple[int, ...],
+    ]:
+        """Construct all layer/image cost matrices in one GPU graph.
+
+        V7 has four decoder outputs and a physical batch of four.  The old
+        path launched the same small point/range/LineIoU kernels sixteen
+        times before its single CPU transfer.  Padding the at-most-four GT
+        lanes keeps every real cost entry mathematically identical while
+        issuing each tensor operation once.
+        """
+
+        first = output_sequence[0]
+        pred_x = torch.stack(
+            [output["pred_x_rows"] for output in output_sequence],
+            dim=0,
+        )
+        exist_logits = torch.stack(
+            [output["exist_logits"] for output in output_sequence],
+            dim=0,
+        )
+        range_norm = torch.stack(
+            [output["range_norm"] for output in output_sequence],
+            dim=0,
+        )
+        layers, batch, candidates, rows = pred_x.shape
+        if int(first["exist_logits"].shape[0]) != batch or len(targets) != batch:
+            raise ValueError("matcher outputs and targets must share the batch axis")
+        gt_counts = tuple(int(target["x_rows"].shape[0]) for target in targets)
+        max_gt = max(gt_counts, default=0)
+        device = pred_x.device
+        if max_gt == 0:
+            empty = pred_x.new_empty((layers, batch, candidates, 0))
+            zero = pred_x.new_zeros((layers, batch), dtype=torch.float32)
+            return empty, {
+                "mean_cost_obj": zero,
+                "mean_cost_point": zero.clone(),
+                "mean_cost_range": zero.clone(),
+                "mean_cost_line_iou": zero.clone(),
+                "matcher_lambda_obj": zero.new_full(
+                    zero.shape,
+                    self.effective_lambda_obj(),
+                ),
+            }, gt_counts
+
+        padded_x: list[torch.Tensor] = []
+        padded_mask: list[torch.Tensor] = []
+        padded_range: list[torch.Tensor] = []
+        for target, count in zip(targets, gt_counts):
+            gt_x = target["x_rows"].to(device=device)
+            gt_mask = target["valid_mask"].to(device=device).bool()
+            gt_range = target["range_y"].to(device=device)
+            if int(gt_x.shape[-1]) != rows or gt_x.shape != gt_mask.shape:
+                raise ValueError("matcher target row shapes are incompatible")
+            padding = max_gt - count
+            if padding:
+                gt_x = torch.cat((gt_x, gt_x.new_zeros((padding, rows))), dim=0)
+                gt_mask = torch.cat(
+                    (
+                        gt_mask,
+                        torch.zeros(
+                            (padding, rows),
+                            device=device,
+                            dtype=torch.bool,
+                        ),
+                    ),
+                    dim=0,
+                )
+                gt_range = torch.cat(
+                    (gt_range, gt_range.new_zeros((padding, 2))),
+                    dim=0,
+                )
+            padded_x.append(gt_x)
+            padded_mask.append(gt_mask)
+            padded_range.append(gt_range)
+        gt_x = torch.stack(padded_x)
+        gt_mask = torch.stack(padded_mask)
+        gt_range = torch.stack(padded_range)
+        column_exists = (
+            torch.arange(max_gt, device=device).view(1, max_gt)
+            < torch.tensor(gt_counts, device=device).view(batch, 1)
+        )
+
+        def component_mean(value: torch.Tensor) -> torch.Tensor:
+            mask = column_exists.view(1, batch, 1, max_gt).to(value.dtype)
+            numerator = (value.detach() * mask).sum(dim=(-2, -1))
+            denominator = (
+                column_exists.sum(dim=-1).view(1, batch).to(value.dtype)
+                * float(candidates)
+            )
+            return torch.where(
+                denominator > 0,
+                numerator / denominator.clamp_min(1.0),
+                torch.zeros_like(numerator),
+            )
+
+        cost_type = str(self.cfg.cost_type).strip().lower()
+        if cost_type in {
+            "range_aware_iou",
+            "range_aware_raster_iou",
+            "official_iou_surrogate",
+        }:
+            flat_pred = pred_x.reshape(layers * batch, candidates, rows)
+            flat_range = range_norm.reshape(layers * batch, candidates, 2)
+            repeated_gt_x = gt_x.unsqueeze(0).expand(layers, -1, -1, -1).reshape(
+                layers * batch,
+                max_gt,
+                rows,
+            )
+            repeated_gt_mask = gt_mask.unsqueeze(0).expand(
+                layers,
+                -1,
+                -1,
+                -1,
+            ).reshape(layers * batch, max_gt, rows)
+            pairwise_iou, _candidate_valid, gt_lane_valid = (
+                batched_pairwise_range_aware_row_strip_iou(
+                    flat_pred,
+                    flat_range,
+                    repeated_gt_x,
+                    repeated_gt_mask,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.range_aware_line_width),
+                    min_valid_rows=int(self.cfg.range_aware_min_valid_rows),
+                )
+            )
+            cost = (1.0 - pairwise_iou).reshape(
+                layers,
+                batch,
+                candidates,
+                max_gt,
+            )
+            valid_lane = gt_lane_valid.reshape(layers, batch, max_gt)
+            cost = torch.where(
+                valid_lane.unsqueeze(2),
+                cost,
+                torch.full_like(cost, 1e6),
+            )
+            zero = cost.new_zeros((layers, batch))
+            return cost, {
+                "mean_cost_obj": zero,
+                "mean_cost_point": zero.clone(),
+                "mean_cost_range": zero.clone(),
+                "mean_cost_line_iou": component_mean(cost),
+                "matcher_lambda_obj": zero.new_full(
+                    zero.shape,
+                    self.effective_lambda_obj(),
+                ),
+            }, gt_counts
+        if cost_type not in {"composite", "legacy"}:
+            raise ValueError(f"Unsupported matcher.cost_type: {self.cfg.cost_type!r}")
+
+        p_lane = torch.softmax(exist_logits, dim=-1)[..., 0]
+        object_cost_type = str(self.cfg.object_cost_type).strip().lower()
+        if object_cost_type in {
+            "neg_probability",
+            "negative_probability",
+            "minus_p",
+        }:
+            cost_obj = -p_lane.unsqueeze(-1).expand(
+                layers,
+                batch,
+                candidates,
+                max_gt,
+            )
+        elif object_cost_type in {
+            "neg_log_probability",
+            "negative_log_probability",
+            "nll",
+        }:
+            cost_obj = -torch.log(p_lane.clamp_min(self.cfg.eps)).unsqueeze(
+                -1
+            ).expand(layers, batch, candidates, max_gt)
+        else:
+            raise ValueError(
+                f"Unsupported matcher.object_cost_type: {self.cfg.object_cost_type!r}"
+            )
+
+        diff = (
+            pred_x.unsqueeze(3) - gt_x.view(1, batch, 1, max_gt, rows)
+        ).abs() / float(self.cfg.input_w)
+        row_mask = gt_mask.view(1, batch, 1, max_gt, rows)
+        valid_count = row_mask.sum(dim=-1).clamp_min(1)
+        cost_point = (diff * row_mask.float()).sum(dim=-1) / valid_count
+        valid_lane = gt_mask.sum(dim=-1) > 0
+        cost_point = torch.where(
+            valid_lane.view(1, batch, 1, max_gt),
+            cost_point,
+            torch.full_like(cost_point, 1e6),
+        )
+
+        pred_range = sort_range_norm(range_norm)
+        gt_range_norm = gt_range / float(self.cfg.input_h)
+        cost_range = (
+            pred_range[..., 0].unsqueeze(-1)
+            - gt_range_norm[:, :, 0].view(1, batch, 1, max_gt)
+        ).abs() + (
+            pred_range[..., 1].unsqueeze(-1)
+            - gt_range_norm[:, :, 1].view(1, batch, 1, max_gt)
+        ).abs()
+
+        radius = float(self.cfg.line_iou_radius)
+        pred = pred_x.unsqueeze(3)
+        gt = gt_x.view(1, batch, 1, max_gt, rows)
+        px1, px2 = pred - radius, pred + radius
+        gx1, gx2 = gt - radius, gt + radius
+        overlap = (
+            torch.minimum(px2, gx2) - torch.maximum(px1, gx1)
+        ).clamp(min=0.0)
+        union = (4.0 * radius - overlap).clamp(min=self.cfg.eps)
+        iou = overlap / union
+        enclosing = (
+            torch.maximum(px2, gx2) - torch.minimum(px1, gx1)
+        ).clamp(min=self.cfg.eps)
+        giou = iou - (enclosing - union) / enclosing
+        line_cost_rows = 1.0 - giou
+        cost_line_iou = (
+            line_cost_rows * row_mask.float()
+        ).sum(dim=-1) / valid_count
+        cost_line_iou = torch.where(
+            valid_lane.view(1, batch, 1, max_gt),
+            cost_line_iou,
+            torch.full_like(cost_line_iou, 1e6),
+        )
+
+        lambda_obj = self.effective_lambda_obj()
+        cost = (
+            lambda_obj * cost_obj
+            + self.cfg.lambda_point * cost_point
+            + self.cfg.lambda_range * cost_range
+            + self.cfg.lambda_line_iou * cost_line_iou
+        )
+        return cost, {
+            "mean_cost_obj": component_mean(cost_obj),
+            "mean_cost_point": component_mean(cost_point),
+            "mean_cost_range": component_mean(cost_range),
+            "mean_cost_line_iou": component_mean(cost_line_iou),
+            "matcher_lambda_obj": cost_obj.new_full(
+                (layers, batch),
+                lambda_obj,
+            ),
+        }, gt_counts
 
     def compute_cost_for_image(
         self,

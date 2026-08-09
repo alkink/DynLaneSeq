@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 import random
 import sys
 import time
+import traceback
 from typing import Any
+from types import MethodType
 
 import numpy as np
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -36,11 +40,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=0)
     parser.add_argument("--grad-accum", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--breakdown-steps", type=int, default=3)
     parser.add_argument("--profiler-steps", type=int, default=1)
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Include allocation events in the operator profiler (much slower).",
+    )
     parser.add_argument("--row-limit", type=int, default=25)
     parser.add_argument("--trace", default="")
+    parser.add_argument(
+        "--with-stack",
+        action="store_true",
+        help="Collect Python source stacks for synchronization/root-cause analysis.",
+    )
+    parser.add_argument(
+        "--dispatch-stack-audit",
+        action="store_true",
+        help=(
+            "Diagnostic only: attribute scalar extraction and nonzero ops to "
+            "their exact Python source lines with TorchDispatchMode."
+        ),
+    )
+    parser.add_argument(
+        "--module-breakdown",
+        action="store_true",
+        help="Time major V7 model classes and criterion methods with CUDA events.",
+    )
     parser.add_argument(
         "--compile-model",
         action="store_true",
@@ -60,6 +88,259 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+class SynchronizationStackAudit(TorchDispatchMode):
+    """Attribute eager synchronization-prone ops to repository source lines."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counts: dict[tuple[str, str, str, int, str], int] = defaultdict(int)
+
+    def __torch_dispatch__(
+        self,
+        func,
+        types,
+        args=(),
+        kwargs=None,
+    ):
+        name = str(func)
+        if name in {
+            "aten._local_scalar_dense.default",
+            "aten.nonzero.default",
+        }:
+            tensor = next(
+                (value for value in args if isinstance(value, torch.Tensor)),
+                None,
+            )
+            device = str(tensor.device) if tensor is not None else "no-tensor"
+            frames = traceback.extract_stack(limit=32)
+            selected = None
+            for frame in reversed(frames[:-1]):
+                path = Path(frame.filename).resolve()
+                if ROOT in path.parents and path.name != Path(__file__).name:
+                    selected = frame
+                    break
+            if selected is not None:
+                relative = str(Path(selected.filename).resolve().relative_to(ROOT))
+                key = (
+                    name,
+                    device,
+                    relative,
+                    int(selected.lineno),
+                    str(selected.line or ""),
+                )
+            else:
+                key = (name, device, "<outside repository>", 0, "")
+            self.counts[key] += 1
+        return func(*args, **(kwargs or {}))
+
+    def report(self) -> None:
+        print("\nDISPATCH SYNCHRONIZATION CALL SITES")
+        rows = sorted(
+            self.counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for (name, device, path, line, source), count in rows:
+            print(
+                f"{count:5d} {name:34s} {device:8s} "
+                f"{path}:{line} {source}"
+            )
+
+
+class CudaRegionTimer:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.records: dict[
+            str,
+            list[tuple[torch.cuda.Event, torch.cuda.Event, float]],
+        ] = defaultdict(list)
+
+    def begin(self) -> tuple[torch.cuda.Event, float]:
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start, time.perf_counter()
+
+    def end(self, name: str, token: tuple[torch.cuda.Event, float]) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        start, cpu_start = token
+        self.records[name].append((start, end, time.perf_counter() - cpu_start))
+
+    def report(self, optimizer_steps: int) -> None:
+        sync(self.device)
+        rows = []
+        for name, records in self.records.items():
+            cuda_ms = sum(start.elapsed_time(end) for start, end, _cpu in records)
+            cpu_ms = 1000.0 * sum(cpu for _start, _end, cpu in records)
+            rows.append((cuda_ms, cpu_ms, name, len(records)))
+        rows.sort(reverse=True)
+        print("\nCLASS / METHOD CUDA BREAKDOWN (inclusive)")
+        for cuda_ms, cpu_ms, name, calls in rows:
+            print(
+                f"{name:78s} cuda={cuda_ms / max(optimizer_steps, 1):9.3f} "
+                f"ms/step cpu={cpu_ms / max(optimizer_steps, 1):9.3f} "
+                f"ms/step calls={calls / max(optimizer_steps, 1):5.1f}/step"
+            )
+
+
+class V7ModuleBreakdown:
+    MODULE_NAMES = {
+        "encoder.backbone",
+        "encoder.fpn",
+        "encoder.proj",
+        "encoder.ms_proj.p4",
+        "encoder.ms_proj.p5",
+        "encoder.seg_aux_head",
+        "encoder.centerline_aux_head",
+        "structured_query_head.feature_proj",
+        "structured_query_head.layers.0",
+        "structured_query_head.layers.1",
+        "structured_query_head.layers.2",
+        "structured_query_head.layers.3",
+        "structured_query_head.lane_state_layers.0",
+        "structured_query_head.lane_state_layers.1",
+        "structured_query_head.lane_state_layers.2",
+        "structured_query_head.lane_state_layers.3",
+        "structured_query_head.ownership_layers.0",
+        "structured_query_head.ownership_layers.1",
+        "structured_query_head.ownership_layers.2",
+        "structured_query_head.ownership_layers.3",
+        "structured_query_head.set_selection_head.input_projection",
+        "structured_query_head.set_selection_head.proposal_encoder",
+        "structured_query_head.set_selection_head.slot_decoder",
+        "structured_query_head.set_selection_head.slot_refinement",
+    }
+    STRUCTURED_HEAD_METHODS = (
+        "_row_features",
+        "_initialize_image_reference",
+        "_predict_from_row_tokens",
+        "_sample_final_curve_evidence",
+    )
+    LANE_STATE_METHODS = (
+        "prepare",
+        "inject_rows",
+        "collect",
+        "decision",
+        "_semantic_context",
+    )
+    ROW_REFERENCE_METHODS = (
+        "_sample_local_profiles",
+        "_grouped_inter_attention",
+    )
+    OWNERSHIP_METHODS = (
+        "_set_attention_by_group",
+        "_semantic_context",
+    )
+    FOUR_SLOT_METHODS = (
+        "_proposal_features",
+        "_candidate_valid",
+    )
+    CRITERION_METHODS = (
+        "compute_exist_loss",
+        "compute_point_loss",
+        "compute_range_loss",
+        "compute_line_iou_loss",
+        "compute_seg_loss",
+        "compute_centerline_loss",
+        "compute_row_dfl_loss",
+        "compute_four_slot_selection_loss",
+        "compute_four_slot_geometry_loss",
+        "add_intermediate_losses",
+    )
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        criterion: torch.nn.Module,
+        matcher: object,
+        device: torch.device,
+    ) -> None:
+        self.timer = CudaRegionTimer(device)
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+        self.original_methods: list[tuple[object, str, object]] = []
+        self.active: dict[str, list[tuple[torch.cuda.Event, float]]] = defaultdict(list)
+        for name, module in model.named_modules():
+            if name not in self.MODULE_NAMES:
+                continue
+
+            def pre_hook(_module, _args, *, region=name):
+                self.active[region].append(self.timer.begin())
+
+            def post_hook(_module, _args, _output, *, region=name):
+                self.timer.end(region, self.active[region].pop())
+
+            self.handles.append(module.register_forward_pre_hook(pre_hook))
+            self.handles.append(module.register_forward_hook(post_hook))
+        named_modules = dict(model.named_modules())
+        structured_head = named_modules.get("structured_query_head")
+        if structured_head is not None:
+            self._wrap_existing_methods(
+                structured_head,
+                self.STRUCTURED_HEAD_METHODS,
+                prefix="structured_query_head",
+            )
+        for name, module in named_modules.items():
+            if name.startswith("structured_query_head.lane_state_layers.") and name.count(".") == 2:
+                self._wrap_existing_methods(
+                    module,
+                    self.LANE_STATE_METHODS,
+                    prefix=name,
+                )
+            elif name.startswith("structured_query_head.layers.") and name.count(".") == 2:
+                self._wrap_existing_methods(
+                    module,
+                    self.ROW_REFERENCE_METHODS,
+                    prefix=name,
+                )
+            elif name.startswith("structured_query_head.ownership_layers.") and name.count(".") == 2:
+                self._wrap_existing_methods(
+                    module,
+                    self.OWNERSHIP_METHODS,
+                    prefix=name,
+                )
+        four_slot_head = named_modules.get("structured_query_head.set_selection_head")
+        if four_slot_head is not None:
+            self._wrap_existing_methods(
+                four_slot_head,
+                self.FOUR_SLOT_METHODS,
+                prefix="structured_query_head.set_selection_head",
+            )
+        for method_name in self.CRITERION_METHODS:
+            self._wrap_method(criterion, method_name, prefix="criterion")
+        if hasattr(matcher, "match_many"):
+            self._wrap_method(matcher, "match_many", prefix="matcher")
+
+    def _wrap_existing_methods(
+        self,
+        owner: object,
+        names: tuple[str, ...],
+        *,
+        prefix: str,
+    ) -> None:
+        for name in names:
+            if hasattr(owner, name):
+                self._wrap_method(owner, name, prefix=prefix)
+
+    def _wrap_method(self, owner: object, name: str, *, prefix: str) -> None:
+        original = getattr(owner, name)
+        self.original_methods.append((owner, name, original))
+
+        def wrapped(_owner, *args, **kwargs):
+            token = self.timer.begin()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self.timer.end(f"{prefix}.{name}", token)
+
+        setattr(owner, name, MethodType(wrapped, owner))
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        for owner, name, original in self.original_methods:
+            setattr(owner, name, original)
 
 
 def seed_everything(seed: int) -> None:
@@ -258,6 +539,8 @@ def main() -> None:
         cfg.setdefault("training", {})["batch_size"] = int(args.batch_size)
     if args.grad_accum > 0:
         cfg.setdefault("training", {})["gradient_accumulation_steps"] = int(args.grad_accum)
+    if args.num_workers > 0:
+        cfg.setdefault("dataloader", {})["num_workers"] = int(args.num_workers)
     if args.disable_intermediate_supervision:
         cfg.setdefault("model", {}).setdefault("structured_query", {})[
             "intermediate_supervision"
@@ -312,6 +595,7 @@ def main() -> None:
             "batch_size": batch_size,
             "gradient_accumulation_steps": accumulation_steps,
             "effective_batch_size": batch_size * accumulation_steps,
+            "num_workers": int(cfg.get("dataloader", {}).get("num_workers", 2)),
             "amp_dtype": str(amp_dtype),
             "channels_last": channels_last,
             "sampling_backend": row_reference.get("sampling_backend", "grid_sample"),
@@ -348,27 +632,39 @@ def main() -> None:
         clip_norm=clip_norm,
     )
 
+    module_breakdown = (
+        V7ModuleBreakdown(model, criterion, matcher, device)
+        if bool(args.module_breakdown)
+        else None
+    )
     totals: dict[str, float] = defaultdict(float)
     torch.cuda.reset_peak_memory_stats(device)
     sync(device)
     wall_start = time.perf_counter()
-    run_optimizer_steps(
-        count=max(args.breakdown_steps, 1),
-        iterator=iterator,
-        model=model,
-        matcher=matcher,
-        criterion=criterion,
-        optimizer=optimizer,
-        cfg=cfg,
-        device=device,
-        channels_last=channels_last,
-        accumulation_steps=accumulation_steps,
-        amp_enabled=amp_enabled,
-        amp_dtype=amp_dtype,
-        scaler=scaler,
-        clip_norm=clip_norm,
-        totals=totals,
+    dispatch_audit = (
+        SynchronizationStackAudit()
+        if bool(args.dispatch_stack_audit)
+        else None
     )
+    dispatch_context = dispatch_audit if dispatch_audit is not None else nullcontext()
+    with dispatch_context:
+        run_optimizer_steps(
+            count=max(args.breakdown_steps, 1),
+            iterator=iterator,
+            model=model,
+            matcher=matcher,
+            criterion=criterion,
+            optimizer=optimizer,
+            cfg=cfg,
+            device=device,
+            channels_last=channels_last,
+            accumulation_steps=accumulation_steps,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            clip_norm=clip_norm,
+            totals=totals,
+        )
     sync(device)
     wall_elapsed = time.perf_counter() - wall_start
     accounted = sum(totals.values())
@@ -387,8 +683,15 @@ def main() -> None:
         f"{'synchronized_total':26s} "
         f"{wall_elapsed / max(args.breakdown_steps, 1):8.4f} s/optimizer-step "
         f"| {effective_images / max(wall_elapsed, 1e-9):.2f} img/s "
-        f"| peak={torch.cuda.max_memory_allocated(device) / (1024.0 ** 3):.2f} GiB"
+        f"| allocated={torch.cuda.max_memory_allocated(device) / (1024.0 ** 3):.2f} GiB "
+        f"| reserved={torch.cuda.max_memory_reserved(device) / (1024.0 ** 3):.2f} GiB "
+        f"| device={torch.cuda.get_device_properties(device).total_memory / (1024.0 ** 3):.2f} GiB"
     )
+    if dispatch_audit is not None:
+        dispatch_audit.report()
+    if module_breakdown is not None:
+        module_breakdown.timer.report(max(args.breakdown_steps, 1))
+        module_breakdown.close()
 
     if args.profiler_steps <= 0:
         return
@@ -398,10 +701,9 @@ def main() -> None:
     ]
     with torch.profiler.profile(
         activities=activities,
-        record_shapes=False,
-        profile_memory=True,
-        with_stack=False,
-        acc_events=True,
+        record_shapes=bool(args.with_stack),
+        profile_memory=bool(args.profile_memory),
+        with_stack=bool(args.with_stack),
     ) as profiler:
         run_optimizer_steps(
             count=args.profiler_steps,
@@ -434,6 +736,32 @@ def main() -> None:
             row_limit=max(args.row_limit, 1),
         )
     )
+    if args.with_stack:
+        print("\nSYNCHRONIZATION SOURCE STACKS")
+        grouped = profiler.key_averages(group_by_stack_n=8)
+        interesting = {
+            "aten::_local_scalar_dense",
+            "aten::item",
+            "aten::nonzero",
+            "aten::to",
+            "aten::_to_copy",
+        }
+        rows = [event for event in grouped if event.key in interesting]
+        rows.sort(
+            key=lambda event: (
+                int(event.count),
+                float(event.self_cpu_time_total),
+            ),
+            reverse=True,
+        )
+        for event in rows[:40]:
+            stack = tuple(getattr(event, "stack", ()) or ())
+            source = " <- ".join(stack[-5:]) if stack else "<stack unavailable>"
+            print(
+                f"{event.key:28s} count={int(event.count):5d} "
+                f"self_cpu={float(event.self_cpu_time_total) / 1000.0:9.3f} ms "
+                f"{source}"
+            )
     if args.trace:
         trace_path = Path(args.trace)
         trace_path.parent.mkdir(parents=True, exist_ok=True)

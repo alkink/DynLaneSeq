@@ -7,7 +7,29 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .common import sort_range_norm
+from .common import (
+    fixed_indices,
+    fixed_row_fractions,
+    fixed_sample_indices,
+    sort_range_norm,
+)
+
+
+def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Count repeated non-negative indices without per-image Python loops."""
+
+    if indices.ndim != 2:
+        raise ValueError("slot indices must have shape [B,S]")
+    slots = int(indices.shape[1])
+    if slots <= 1:
+        return indices.new_zeros((indices.shape[0],))
+    same = indices.unsqueeze(-1) == indices.unsqueeze(-2)
+    same = same & (indices.unsqueeze(-1) >= 0)
+    # Row ``s`` is a duplicate iff the same real proposal appeared in an
+    # earlier slot.  This is exactly ``active_count - unique_count`` while
+    # avoiding one CUDA ``unique`` launch per image.
+    repeated = torch.tril(same, diagonal=-1).any(dim=-1)
+    return repeated.sum(dim=-1)
 
 
 @torch.no_grad()
@@ -124,7 +146,11 @@ def decode_unique_four_slot_routes(
         float("-inf"),
     )
     best_combination = score.argmax(dim=-1)
-    batch_ids = torch.arange(batch, device=logits.device)
+    batch_ids = fixed_indices(
+        batch,
+        device=logits.device,
+        dtype=torch.long,
+    )
     assigned_class = chosen_indices[batch_ids, best_combination]
     selected = torch.where(
         assigned_class < candidates,
@@ -144,12 +170,7 @@ def decode_unique_four_slot_routes(
         raw_class.new_full(raw_class.shape, -1),
     )
     repair_count = (selected != raw_indices).sum(dim=-1)
-    raw_collision_count = raw_indices.new_zeros((batch,))
-    for batch_index in range(batch):
-        active = raw_indices[batch_index][raw_indices[batch_index] >= 0]
-        raw_collision_count[batch_index] = int(active.numel()) - int(
-            active.unique().numel()
-        )
+    raw_collision_count = _count_repeated_real_indices(raw_indices)
     result = {
         "indices": selected,
         "scores": selected_probability,
@@ -165,6 +186,7 @@ def decode_unique_four_slot_routes(
 def decode_unique_real_slot_routes(
     logits: torch.Tensor,
     candidate_valid: torch.Tensor,
+    combinations: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Decode one globally-unique *real* proposal for every lane slot.
 
@@ -202,11 +224,20 @@ def decode_unique_real_slot_routes(
         top_values = F.pad(top_values, (0, padding), value=float("-inf"))
         top_indices = F.pad(top_indices, (0, padding), value=0)
 
-    combinations = torch.tensor(
-        tuple(product(range(int(slots)), repeat=int(slots))),
-        dtype=torch.long,
-        device=logits.device,
-    )
+    if combinations is None:
+        combinations = torch.tensor(
+            tuple(product(range(int(slots)), repeat=int(slots))),
+            dtype=torch.long,
+            device=logits.device,
+        )
+    else:
+        combinations = combinations.to(device=logits.device, dtype=torch.long)
+        expected_shape = (int(slots) ** int(slots), int(slots))
+        if tuple(combinations.shape) != expected_shape:
+            raise ValueError(
+                "invalid precomputed real-route combinations: "
+                f"{tuple(combinations.shape)} != {expected_shape}"
+            )
     combination_count = int(combinations.shape[0])
     gather_index = combinations.view(
         1,
@@ -238,7 +269,11 @@ def decode_unique_real_slot_routes(
     )
     has_assignment = torch.isfinite(score).any(dim=-1)
     best = score.argmax(dim=-1)
-    batch_ids = torch.arange(batch, device=logits.device)
+    batch_ids = fixed_indices(
+        batch,
+        device=logits.device,
+        dtype=torch.long,
+    )
     assigned = chosen_indices[batch_ids, best]
     assigned = torch.where(
         has_assignment.unsqueeze(-1),
@@ -307,46 +342,72 @@ def structured_unique_route_marginals(
     if tau <= 0.0:
         raise ValueError("structured route temperature must be positive")
 
-    outputs: list[torch.Tensor] = []
-    for batch_index in range(int(batch)):
-        valid_ids = torch.nonzero(
-            candidate_valid[batch_index].bool(),
-            as_tuple=False,
-        ).flatten()
-        if int(valid_ids.numel()) < int(slots):
-            hard = decode_unique_real_slot_routes(
-                logits[batch_index],
-                candidate_valid[batch_index],
-            )["indices"]
-            fallback = logits.new_zeros((slots, candidates), dtype=torch.float32)
-            for slot, candidate in enumerate(hard.tolist()):
-                if int(candidate) >= 0:
-                    fallback[slot, int(candidate)] = 1.0
-            outputs.append(fallback)
-            continue
+    if int(candidates) < int(slots):
+        return logits.new_zeros(
+            (batch, slots, candidates),
+            dtype=torch.float32,
+        )
 
-        valid_count = int(valid_ids.numel())
-        scores = logits[batch_index, :, valid_ids].float() / tau
-        dummy = scores.new_zeros((valid_count - int(slots), valid_count))
-        log_transport = torch.cat((scores, dummy), dim=0)
-        # Twenty alternating projections are enough for the 32x32 matrices in
-        # this model while remaining cheap relative to the image decoder.
-        for _ in range(20):
-            log_transport = log_transport - torch.logsumexp(
-                log_transport,
-                dim=1,
-                keepdim=True,
-            )
-            log_transport = log_transport - torch.logsumexp(
-                log_transport,
-                dim=0,
-                keepdim=True,
-            )
-        local = log_transport[:slots].exp()
-        marginal = logits.new_zeros((slots, candidates), dtype=torch.float32)
-        marginal[:, valid_ids] = local
-        outputs.append(marginal)
-    return torch.stack(outputs)
+    # Build one masked NxN transport per image.  The upper block contains the
+    # S real slot rows and V valid proposal columns.  Exactly V-S dummy rows
+    # are connected to that block; the remaining dummy rows are connected
+    # only to the invalid columns.  The two disconnected blocks make the real
+    # marginal identical to running the historical VxV Sinkhorn separately,
+    # without a host boolean, CUDA nonzero, or Python image loop.
+    candidate_valid = candidate_valid.bool()
+    valid_count = candidate_valid.sum(dim=-1)
+    enough = valid_count >= int(slots)
+    safe_valid = torch.where(
+        enough.unsqueeze(-1),
+        candidate_valid,
+        torch.ones_like(candidate_valid),
+    )
+    safe_count = safe_valid.sum(dim=-1)
+    scores = (logits.float() / tau).masked_fill(
+        ~safe_valid[:, None, :],
+        float("-inf"),
+    )
+    dummy_count = int(candidates) - int(slots)
+    dummy_index = fixed_indices(
+        dummy_count,
+        device=logits.device,
+        dtype=torch.long,
+    ).view(1, dummy_count, 1)
+    valid_dummy_count = (safe_count - int(slots)).view(batch, 1, 1)
+    dummy_for_valid = dummy_index < valid_dummy_count
+    dummy_connection = torch.where(
+        dummy_for_valid,
+        safe_valid[:, None, :],
+        ~safe_valid[:, None, :],
+    )
+    dummy = scores.new_zeros((batch, dummy_count, candidates)).masked_fill(
+        ~dummy_connection,
+        float("-inf"),
+    )
+    log_transport = torch.cat((scores, dummy), dim=1)
+    for _ in range(20):
+        log_transport = log_transport - torch.logsumexp(
+            log_transport,
+            dim=2,
+            keepdim=True,
+        )
+        log_transport = log_transport - torch.logsumexp(
+            log_transport,
+            dim=1,
+            keepdim=True,
+        )
+    marginal = log_transport[:, :slots].exp().masked_fill(
+        ~candidate_valid[:, None, :],
+        0.0,
+    )
+    # Fewer than S valid candidates has no injective assignment.  Preserve
+    # the historical detached hard fallback (all zeros in that case) while
+    # keeping the common path entirely on device.
+    return torch.where(
+        enough.view(batch, 1, 1),
+        marginal,
+        torch.zeros_like(marginal),
+    )
 
 
 class FourSlotBoundedRefinement(nn.Module):
@@ -535,9 +596,10 @@ class FourSlotBoundedRefinement(nn.Module):
             slots * sample_count,
             1,
         )
-        row_index = torch.arange(
+        row_index = fixed_indices(
             batch * rows,
             device=row_value_features.device,
+            dtype=torch.long,
         ).view(-1, 1)
         paired = torch.stack((left, right), dim=-1).reshape(
             batch * rows,
@@ -907,6 +969,19 @@ class FourSlotLaneSelectionHead(nn.Module):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "_real_route_combinations",
+            torch.tensor(
+                tuple(
+                    product(
+                        range(self.num_slots),
+                        repeat=self.num_slots,
+                    )
+                ),
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
 
         # Compatibility attributes consumed by StructuredLaneQueryHead's
         # shared set-selection integration path.
@@ -1020,9 +1095,10 @@ class FourSlotLaneSelectionHead(nn.Module):
         if queries.shape != expected or ownership.shape != expected:
             raise ValueError("four-slot query/ownership feature shape mismatch")
 
-        y_norm = (
-            torch.arange(rows, device=row_tokens.device, dtype=row_tokens.dtype)
-            / float(max(rows, 1))
+        y_norm = fixed_row_fractions(
+            rows,
+            device=row_tokens.device,
+            dtype=row_tokens.dtype,
         ).view(1, 1, rows)
         temperature = max(self.range_temperature, 1.0e-4)
         row_weight = torch.sigmoid((y_norm - ranges[..., :1]) / temperature)
@@ -1090,12 +1166,11 @@ class FourSlotLaneSelectionHead(nn.Module):
             reference_max = pred_x.new_zeros((batch, candidates, 1))
 
         sample_count = min(self.curve_samples, rows)
-        sample_ids = torch.linspace(
-            0,
-            rows - 1,
+        sample_ids = fixed_sample_indices(
+            rows,
             sample_count,
             device=pred_x.device,
-        ).round().long()
+        )
         sampled_x = pred_x_norm.index_select(-1, sample_ids)
         sampled_confidence = row_confidence.index_select(-1, sample_ids)
         if sample_count < self.curve_samples:
@@ -1141,9 +1216,10 @@ class FourSlotLaneSelectionHead(nn.Module):
         pred_x = outputs["pred_x_rows"].detach()
         ranges = sort_range_norm(outputs["range_norm"].detach().float())
         rows = int(pred_x.shape[-1])
-        y_norm = (
-            torch.arange(rows, device=pred_x.device, dtype=ranges.dtype)
-            / float(max(rows, 1))
+        y_norm = fixed_row_fractions(
+            rows,
+            device=pred_x.device,
+            dtype=ranges.dtype,
         ).view(1, 1, rows)
         visible = (
             (y_norm >= ranges[..., :1])
@@ -1168,8 +1244,8 @@ class FourSlotLaneSelectionHead(nn.Module):
         # the public routing logits below.
         attention_valid = candidate_valid.clone()
         all_invalid = ~attention_valid.any(dim=1)
-        if bool(all_invalid.any()):
-            attention_valid[all_invalid, 0] = True
+        # Avoid a device-to-host boolean synchronization in every forward.
+        attention_valid[:, 0] |= all_invalid
         memory = self.proposal_encoder(
             memory,
             src_key_padding_mask=~attention_valid,
@@ -1218,6 +1294,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             real_decoded = decode_unique_real_slot_routes(
                 real_route_logits,
                 candidate_valid,
+                self._real_route_combinations,
             )
             geometry_indices = real_decoded["indices"]
             slot_active = (active_logits >= 0.0) & (geometry_indices >= 0)
@@ -1243,12 +1320,7 @@ class FourSlotLaneSelectionHead(nn.Module):
                 selected_scores,
                 torch.sigmoid(-active_logits.float()),
             )
-            collision_count = raw_indices.new_zeros((features.shape[0],))
-            for batch_index in range(int(features.shape[0])):
-                active_raw = raw_indices[batch_index][raw_indices[batch_index] >= 0]
-                collision_count[batch_index] = int(active_raw.numel()) - int(
-                    active_raw.unique().numel()
-                )
+            collision_count = _count_repeated_real_indices(raw_indices)
             repair_count = (selected_indices != raw_indices).sum(dim=-1)
             route_entropy = -(
                 real_probability

@@ -7,9 +7,76 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .common import soft_expected_x, sort_range_norm
+from .common import (
+    fixed_indices,
+    fixed_linspace,
+    fixed_row_fractions,
+    fixed_sample_indices,
+    soft_expected_x,
+    sort_range_norm,
+)
 from .four_slot_selection import FourSlotLaneSelectionHead
 from .unified_lane_set import ProtectedOwnershipLayer, UnifiedLaneSetLayer
+
+
+class _ReuseFp32NchwFeatureMap(torch.autograd.Function):
+    """Reuse one FP32 NCHW copy while preserving per-consumer BF16 gradients.
+
+    The historical grid-sample path converted the same BHWC evidence tensor
+    to FP32 NCHW independently in every decoder layer.  Reusing the ordinary
+    conversion node would accumulate the four gradients in FP32 and cast only
+    once, subtly changing AMP rounding.  This alias node instead casts each
+    consumer's gradient back to the source dtype before normal autograd
+    accumulation, exactly matching the old four-conversion graph.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        source_bhwc: torch.Tensor,
+        cached_fp32_nchw: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.source_dtype = source_bhwc.dtype
+        return cached_fp32_nchw
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_nchw: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        grad_bhwc = grad_nchw.permute(0, 2, 3, 1).to(
+            dtype=ctx.source_dtype
+        )
+        return grad_bhwc, None
+
+
+def prepare_shared_grid_sample_feature_map(
+    row_value_features: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the layer-invariant FP32 NCHW grid-sample input once."""
+
+    with torch.autocast(
+        device_type=row_value_features.device.type,
+        enabled=False,
+    ):
+        return (
+            row_value_features.detach()
+            .float()
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+
+
+def reuse_shared_grid_sample_feature_map(
+    row_value_features: torch.Tensor,
+    cached_fp32_nchw: torch.Tensor,
+) -> torch.Tensor:
+    if row_value_features.requires_grad:
+        return _ReuseFp32NchwFeatureMap.apply(
+            row_value_features,
+            cached_fp32_nchw,
+        )
+    return cached_fp32_nchw
 
 
 def _heterogeneous_group_attention(
@@ -259,6 +326,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         reference_x_rows: torch.Tensor,
         *,
         input_w: int,
+        shared_feature_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vectorized bilinear sampling with an FP32 grid-sample island.
 
@@ -278,7 +346,16 @@ class ReferenceGuidedRowLayer(nn.Module):
             )
         device_type = row_value_features.device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            feature_map = row_value_features.float().permute(0, 3, 1, 2).contiguous()
+            feature_map = (
+                row_value_features.float()
+                .permute(0, 3, 1, 2)
+                .contiguous()
+                if shared_feature_map is None
+                else reuse_shared_grid_sample_feature_map(
+                    row_value_features,
+                    shared_feature_map,
+                )
+            )
             reference = reference_x_rows.float()
             offsets = self.offsets_px.to(device=reference.device, dtype=reference.dtype)
             sample_x = (reference.unsqueeze(-1) + offsets.view(1, 1, 1, -1)).clamp(
@@ -286,7 +363,7 @@ class ReferenceGuidedRowLayer(nn.Module):
                 max=float(max(int(input_w) - 1, 1)),
             )
             grid_x = 2.0 * sample_x / float(max(int(input_w) - 1, 1)) - 1.0
-            grid_y = torch.linspace(
+            grid_y = fixed_linspace(
                 -1.0,
                 1.0,
                 rows,
@@ -375,9 +452,10 @@ class ReferenceGuidedRowLayer(nn.Module):
             instances * offsets_count,
             1,
         )
-        row_index = torch.arange(
+        row_index = fixed_indices(
             b * rows,
             device=row_value_features.device,
+            dtype=torch.long,
         ).view(-1, 1)
         paired_index = torch.stack((left, right), dim=-1).reshape(
             b * rows,
@@ -405,6 +483,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         reference_x_rows: torch.Tensor,
         *,
         input_w: int,
+        shared_feature_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.sampling_backend == "linear_gather":
             return self._sample_local_profiles_linear(
@@ -416,6 +495,7 @@ class ReferenceGuidedRowLayer(nn.Module):
             row_value_features,
             reference_x_rows,
             input_w=input_w,
+            shared_feature_map=shared_feature_map,
         )
 
     def _grouped_inter_attention(
@@ -459,6 +539,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         input_w: int,
         num_groups: int | None = None,
         group_sizes: tuple[int, ...] | None = None,
+        shared_grid_sample_feature_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, n, r, c = row_tokens.shape
         if c != self.dim:
@@ -467,6 +548,7 @@ class ReferenceGuidedRowLayer(nn.Module):
             row_value_features,
             reference_x_rows,
             input_w=int(input_w),
+            shared_feature_map=shared_grid_sample_feature_map,
         )
         offsets = int(profiles.shape[3])
         head_dim = self.dim // self.num_heads
@@ -541,7 +623,7 @@ class ReferenceGuidedRowLayer(nn.Module):
         x_norm = 2.0 * reference_x_rows.to(dtype=row_tokens.dtype) / float(
             max(int(input_w) - 1, 1)
         ) - 1.0
-        y_norm = torch.linspace(
+        y_norm = fixed_linspace(
             -1.0,
             1.0,
             r,
@@ -1094,8 +1176,8 @@ class SetAwareLaneSelectionHead(nn.Module):
         """Return the normalized lane-row coordinates used by range masks."""
 
         if self.row_grid_mode == "fixed_rows":
-            return torch.arange(rows, device=device, dtype=dtype) / float(rows)
-        return torch.linspace(0.0, 1.0, rows, device=device, dtype=dtype)
+            return fixed_row_fractions(rows, device=device, dtype=dtype)
+        return fixed_linspace(0.0, 1.0, rows, device=device, dtype=dtype)
 
     def build_selection_features(
         self,
@@ -1202,12 +1284,11 @@ class SetAwareLaneSelectionHead(nn.Module):
             reference_max = reference_delta.amax(dim=-1, keepdim=True)
 
         sample_count = min(self.curve_samples, rows)
-        sample_ids = torch.linspace(
-            0,
-            rows - 1,
+        sample_ids = fixed_sample_indices(
+            rows,
             sample_count,
             device=pred_x.device,
-        ).round().long()
+        )
         sampled_x = pred_x_norm.index_select(-1, sample_ids)
         sampled_confidence = row_confidence.index_select(-1, sample_ids)
         if sample_count < self.curve_samples:
@@ -1403,9 +1484,10 @@ class SetAwareLaneSelectionHead(nn.Module):
         # (the last row is *not* 1.0).  ``linspace(0, 1, rows)`` previously
         # disagreed at range boundaries and could make a Hungarian target
         # valid for the target builder but invalid for the pointer decoder.
-        y_norm = (
-            torch.arange(rows, device=pred_x.device, dtype=ranges.dtype)
-            / float(rows)
+        y_norm = fixed_row_fractions(
+            rows,
+            device=pred_x.device,
+            dtype=ranges.dtype,
         ).view(1, 1, rows)
         visible = (
             (y_norm >= ranges[..., :1])
@@ -2726,9 +2808,10 @@ class StructuredLaneQueryHead(nn.Module):
             candidates,
             1,
         )
-        row_index = torch.arange(
+        row_index = fixed_indices(
             batch * rows,
             device=row_value_features.device,
+            dtype=torch.long,
         ).view(-1, 1)
         paired_index = torch.stack((left, right), dim=-1).reshape(
             batch * rows,
@@ -2760,7 +2843,7 @@ class StructuredLaneQueryHead(nn.Module):
         sigma_px: float,
         strength: float,
     ) -> torch.Tensor:
-        positions = torch.linspace(
+        positions = fixed_linspace(
             0.0,
             float(max(self.input_w - 1, 1)),
             int(x_bins),
@@ -2831,7 +2914,7 @@ class StructuredLaneQueryHead(nn.Module):
         )
 
         x_norm = 2.0 * reference_x / float(max(self.input_w - 1, 1)) - 1.0
-        y_norm = torch.linspace(
+        y_norm = fixed_linspace(
             -1.0,
             1.0,
             self.num_rows,
@@ -2934,6 +3017,15 @@ class StructuredLaneQueryHead(nn.Module):
             ownership_state if ownership_state is not None else lane_state
         )
         row_value_features, row_key_features = self._row_features(features)
+        shared_grid_sample_feature_map = None
+        if self.row_reference_enabled and any(
+            isinstance(layer, ReferenceGuidedRowLayer)
+            and layer.sampling_backend == "grid_sample"
+            for layer in self.layers
+        ):
+            shared_grid_sample_feature_map = (
+                prepare_shared_grid_sample_feature_map(row_value_features)
+            )
 
         intermediate_outputs: list[dict[str, torch.Tensor]] = []
         bounded_delta_max_abs_by_layer: list[torch.Tensor] = []
@@ -2982,6 +3074,11 @@ class StructuredLaneQueryHead(nn.Module):
                     input_w=self.input_w,
                     num_groups=active_num_groups,
                     group_sizes=active_group_sizes,
+                    shared_grid_sample_feature_map=(
+                        shared_grid_sample_feature_map
+                        if layer.sampling_backend == "grid_sample"
+                        else None
+                    ),
                 )
                 if isinstance(lane_layer, UnifiedLaneSetLayer):
                     lane_state = lane_layer.collect(lane_state, row_tokens)
@@ -3054,7 +3151,14 @@ class StructuredLaneQueryHead(nn.Module):
                     row_delta_norm=row_delta_norm,
                     row_delta_head=row_delta_head,
                 )
-                if self.row_reference_prediction_mode == "bounded_delta":
+                # These reductions are audit-only.  Keeping them out of the
+                # training graph avoids eight small CUDA reductions per
+                # microbatch without changing a model output consumed by any
+                # loss.  Contract/evaluation tools use inference_only=True.
+                if (
+                    self.row_reference_prediction_mode == "bounded_delta"
+                    and inference_only
+                ):
                     delta_abs = layer_outputs["pred_delta_x_rows"].detach().abs()
                     bounded_delta_max_abs_by_layer.append(
                         delta_abs.amax(dim=(1, 2))
