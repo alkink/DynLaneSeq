@@ -89,24 +89,28 @@ def _cache_path(
     max_batches: int,
     eval_batch_size: int | None,
     sample_strategy: str,
+    amp_dtype: str,
 ) -> Path:
     checkpoint = Path(checkpoint_path)
     stat = checkpoint.stat()
-    payload = "|".join(
-        [
-            str(Path(config_path).resolve()),
-            str(checkpoint.resolve()),
-            str(stat.st_size),
-            str(stat.st_mtime_ns),
-            str(Path(list_path).resolve()),
-            sha256_file(list_path),
-            str(split),
-            str(max_batches),
-            str(eval_batch_size),
-            str(sample_strategy),
-            str(CACHE_VERSION),
-        ]
-    )
+    fields = [
+        str(Path(config_path).resolve()),
+        str(checkpoint.resolve()),
+        str(stat.st_size),
+        str(stat.st_mtime_ns),
+        str(Path(list_path).resolve()),
+        sha256_file(list_path),
+        str(split),
+        str(max_batches),
+        str(eval_batch_size),
+        str(sample_strategy),
+        str(CACHE_VERSION),
+    ]
+    # Preserve existing FP32 cache identities while preventing an AMP audit
+    # from silently reusing numerically different cached predictions.
+    if str(amp_dtype) != "none":
+        fields.append(f"amp_dtype={amp_dtype}")
+    payload = "|".join(fields)
     key = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return Path(cache_dir) / f"{checkpoint.stem}_{key}.pt"
 
@@ -214,6 +218,7 @@ def load_or_collect_cache(
     eval_batch_size: int | None = None,
     num_workers: int | None = None,
     sample_strategy: str = "sequential",
+    amp_dtype: str = "none",
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
@@ -231,6 +236,23 @@ def load_or_collect_cache(
     if not resolved_list.exists():
         raise FileNotFoundError(f"Evaluation list does not exist: {resolved_list}")
     effective_eval_batch_size = int(dataloader_cfg.get("eval_batch_size", 1))
+    normalized_amp = str(amp_dtype).strip().lower()
+    amp_types = {
+        "none": None,
+        "fp32": None,
+        "float32": None,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+    }
+    if normalized_amp not in amp_types:
+        raise ValueError(f"unsupported diagnostic AMP dtype: {amp_dtype!r}")
+    canonical_amp = (
+        "none"
+        if amp_types[normalized_amp] is None
+        else str(amp_types[normalized_amp]).replace("torch.", "", 1)
+    )
     cache_path = _cache_path(
         cache_dir,
         config_path,
@@ -240,6 +262,7 @@ def load_or_collect_cache(
         max_batches,
         effective_eval_batch_size,
         sample_strategy,
+        canonical_amp,
     )
     if (reuse_cache or require_cache) and cache_path.exists():
         try:
@@ -279,12 +302,19 @@ def load_or_collect_cache(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         images = images.to(torch_device, non_blocking=True)
-        if pass_targets:
-            outputs = model(images, targets=targets)
-        elif supports_inference_only:
-            outputs = model(images, inference_only=True)
-        else:
-            outputs = model(images)
+        active_amp_dtype = amp_types[normalized_amp]
+        amp_enabled = active_amp_dtype is not None and torch_device.type == "cuda"
+        with torch.autocast(
+            device_type=torch_device.type,
+            enabled=amp_enabled,
+            dtype=active_amp_dtype,
+        ):
+            if pass_targets:
+                outputs = model(images, targets=targets)
+            elif supports_inference_only:
+                outputs = model(images, inference_only=True)
+            else:
+                outputs = model(images)
         stages = collect_prediction_stages(outputs)
         cpu_stages = {name: _cpu_stage(stage) for name, stage in stages.items()}
         for bi, (target, meta) in enumerate(zip(targets, metas)):
@@ -318,6 +348,7 @@ def load_or_collect_cache(
             "eval_batch_size": effective_eval_batch_size,
             "num_workers": int(dataloader_cfg.get("num_workers", 0)),
             "sample_strategy": str(sample_strategy),
+            "amp_dtype": canonical_amp,
             "sampled_dataset_indices": sampled_indices,
             "input_w": int(model_cfg.get("input_w", 800)),
             "input_h": int(model_cfg.get("input_h", 288)),

@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--metric-workers", type=int, default=8)
     parser.add_argument(
+        "--amp-dtype",
+        choices=("none", "float32", "bfloat16", "bf16", "float16", "fp16"),
+        default="none",
+        help="Autocast precision used only while collecting model predictions.",
+    )
+    parser.add_argument(
         "--sample-strategy",
         choices=("uniform", "sequential"),
         default="uniform",
@@ -408,6 +414,7 @@ def main() -> None:
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         sample_strategy=args.sample_strategy,
+        amp_dtype=args.amp_dtype,
         desc="V4 selection-coverage cache",
     )
     cache = ensure_official_iou_cache(
