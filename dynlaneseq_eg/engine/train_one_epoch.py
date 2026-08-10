@@ -389,6 +389,9 @@ def train_one_epoch(
     clip_norm = float(train_cfg.get("clip_grad_norm", 1.0))
     clip_mode = str(train_cfg.get("clip_grad_norm_mode", "global"))
     check_finite_grad = bool(train_cfg.get("check_finite_grad", True))
+    resume_safe_data = bool(
+        cfg.get("dataloader", {}).get("resume_safe", False)
+    )
     accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
     log_interval = int(train_cfg.get("log_interval", 10))
     iteration = start_iter
@@ -430,6 +433,12 @@ def train_one_epoch(
                 loss_dict = criterion(outputs, targets, matches)
                 loss = loss_dict["loss_total"]
             if not torch.isfinite(loss):
+                if resume_safe_data:
+                    raise FloatingPointError(
+                        "resume-safe data addressing requires exactly "
+                        f"{accumulation_steps} micro-batches per logical "
+                        "iteration; refusing to skip a non-finite loss"
+                    )
                 print(f"iter {iteration + 1:07d} | non-finite loss; skipping optimizer step")
                 print(f"iter {iteration + 1:07d} | {format_loss_diagnostics(loss_dict, metas)}")
                 optimizer.zero_grad(set_to_none=True)
@@ -449,6 +458,11 @@ def train_one_epoch(
                 scaler.unscale_(optimizer)
                 grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
                 if check_finite_grad and not bool(torch.isfinite(grad_norm).detach().cpu()):
+                    if resume_safe_data:
+                        raise FloatingPointError(
+                            "resume-safe data addressing refuses to skip a "
+                            "non-finite gradient step"
+                        )
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0
@@ -462,6 +476,11 @@ def train_one_epoch(
             else:
                 grad_norm = clip_optimizer_gradients(model, optimizer, clip_norm, clip_mode)
                 if check_finite_grad and not bool(torch.isfinite(grad_norm).detach().cpu()):
+                    if resume_safe_data:
+                        raise FloatingPointError(
+                            "resume-safe data addressing refuses to skip a "
+                            "non-finite gradient step"
+                        )
                     print(f"iter {iteration + 1:07d} | non-finite grad norm; skipping optimizer step")
                     optimizer.zero_grad(set_to_none=True)
                     micro_in_step = 0

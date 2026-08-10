@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import CULaneDataset, TuSimpleDataset, lane_collate
+from .data.resume_safe import GlobalIterationBatchSampler
 from .losses import HungarianMatcherS0, S0Criterion, S1Criterion, S2Criterion, S3Criterion, S4Criterion
 from .losses.loss_s0 import LossConfig
 from .losses.loss_s1 import S1LossConfig
@@ -318,19 +319,48 @@ def build_dataset(cfg: dict[str, Any], split: str = "train", training: bool = Fa
     return dataset_cls(dataset_cfg, split=split, training=training)
 
 
-def build_dataloader(cfg: dict[str, Any], split: str = "train", training: bool = False) -> DataLoader:
+def build_dataloader(
+    cfg: dict[str, Any],
+    split: str = "train",
+    training: bool = False,
+    *,
+    start_iteration: int = 0,
+) -> DataLoader:
     dl_cfg = cfg.get("dataloader", {})
     train_cfg = cfg.get("training", {})
     dataset = build_dataset(cfg, split=split, training=training)
     num_workers = int(dl_cfg.get("num_workers", 2))
+    batch_size = int(
+        train_cfg.get("batch_size", 2)
+        if training
+        else dl_cfg.get("eval_batch_size", 1)
+    )
+    resume_safe = bool(training and dl_cfg.get("resume_safe", False))
     kwargs = {
-        "batch_size": int(train_cfg.get("batch_size", 2) if training else dl_cfg.get("eval_batch_size", 1)),
-        "shuffle": bool(training and dl_cfg.get("shuffle", True)),
         "num_workers": num_workers,
         "pin_memory": bool(dl_cfg.get("pin_memory", True)),
         "collate_fn": lane_collate,
-        "drop_last": False,
     }
+    if resume_safe:
+        if "seed" not in train_cfg:
+            raise ValueError("dataloader.resume_safe requires training.seed")
+        kwargs["batch_sampler"] = GlobalIterationBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            base_seed=int(train_cfg["seed"]),
+            start_iteration=int(start_iteration),
+            gradient_accumulation_steps=max(
+                int(train_cfg.get("gradient_accumulation_steps", 1)), 1
+            ),
+        )
+    else:
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "shuffle": bool(training and dl_cfg.get("shuffle", True)),
+                "drop_last": False,
+            }
+        )
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", False))
         kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))

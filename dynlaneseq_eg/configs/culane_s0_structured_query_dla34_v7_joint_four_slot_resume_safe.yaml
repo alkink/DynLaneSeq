@@ -1,0 +1,10 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_278k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v7_joint_four_slot_resume_safe
+
+# The legacy loader re-seeds its private shuffle generator and every worker on
+# each process start. Checkpoint RNG restoration therefore cannot reproduce an
+# uninterrupted stream. This mode derives shuffled micro-batches and complete
+# augmentation RNG from global optimizer iteration instead.
+dataloader:
+  resume_safe: true

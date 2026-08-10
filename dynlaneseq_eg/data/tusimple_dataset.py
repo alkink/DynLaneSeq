@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import Dataset
 
 from .lane_target_builder import LaneTargetBuilder, TargetBuilderConfig
+from .resume_safe import SeededSampleIndex, unpack_seeded_sample_index
 from .transforms import LaneTransforms, TransformConfig
 
 
@@ -104,8 +106,9 @@ class TuSimpleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        rec = self.records[index]
+    def __getitem__(self, index: int | SeededSampleIndex) -> dict[str, Any]:
+        sample_index, augmentation_seed = unpack_seeded_sample_index(index)
+        rec = self.records[sample_index]
         image = Image.open(rec.image_path).convert("RGB")
         orig_w, orig_h = image.size
         lanes = [[(float(x), float(y)) for x, y in lane] for lane in rec.lanes]
@@ -118,6 +121,11 @@ class TuSimpleDataset(Dataset):
             lanes,
             seg_mask=seg_mask,
             training=self.training,
+            rng=(
+                None
+                if augmentation_seed is None
+                else np.random.RandomState(augmentation_seed)
+            ),
         )
         crop_w = int(round(float(aug_meta.get("crop_w", orig_w))))
         crop_h = int(round(float(aug_meta.get("crop_h", orig_h))))
@@ -138,7 +146,10 @@ class TuSimpleDataset(Dataset):
         crop_y = float(aug_meta.get("crop_y", 0.0))
         meta = {
             "dataset": "TuSimple",
-            "sample_index": int(index),
+            "sample_index": sample_index,
+            "augmentation_seed": (
+                -1 if augmentation_seed is None else augmentation_seed
+            ),
             "image_path": str(rec.image_path),
             "anno_path": str(rec.annotation_path),
             "raw_file": rec.raw_file,

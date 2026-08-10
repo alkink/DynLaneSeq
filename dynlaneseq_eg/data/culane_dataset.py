@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
 from .lane_target_builder import LaneTargetBuilder, TargetBuilderConfig
+from .resume_safe import SeededSampleIndex, unpack_seeded_sample_index
 from .transforms import LaneTransforms, TransformConfig
 
 
@@ -78,8 +80,9 @@ class CULaneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        rec = self.records[index]
+    def __getitem__(self, index: int | SeededSampleIndex) -> dict[str, Any]:
+        sample_index, augmentation_seed = unpack_seeded_sample_index(index)
+        rec = self.records[sample_index]
         with Image.open(rec.image_path) as image_file:
             image = image_file.convert("RGB")
         orig_w, orig_h = image.size
@@ -95,6 +98,11 @@ class CULaneDataset(Dataset):
             lanes,
             seg_mask=seg_mask,
             training=self.training,
+            rng=(
+                None
+                if augmentation_seed is None
+                else np.random.RandomState(augmentation_seed)
+            ),
         )
         crop_w = int(round(float(aug_meta.get("crop_w", orig_w))))
         crop_h = int(round(float(aug_meta.get("crop_h", orig_h))))
@@ -114,6 +122,10 @@ class CULaneDataset(Dataset):
         else:
             targets = {}
         meta = {
+            "sample_index": sample_index,
+            "augmentation_seed": (
+                -1 if augmentation_seed is None else augmentation_seed
+            ),
             "image_path": str(rec.image_path),
             "anno_path": str(rec.anno_path),
             "seg_path": str(rec.seg_path) if rec.seg_path else "",

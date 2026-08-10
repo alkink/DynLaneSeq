@@ -238,6 +238,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--resume-safe-data",
+        choices=("config", "true", "false"),
+        default="config",
+        help=(
+            "Override dataloader.resume_safe. The resume-safe path addresses "
+            "shuffle and augmentation by global optimizer iteration so a "
+            "process restart cannot replay the data stream."
+        ),
+    )
+    parser.add_argument(
         "--resume-group-lr",
         action="append",
         default=[],
@@ -290,6 +300,10 @@ def main() -> None:
     if args.compile_model != "config":
         cfg.setdefault("training", {})["compile_model"] = (
             args.compile_model == "true"
+        )
+    if args.resume_safe_data != "config":
+        cfg.setdefault("dataloader", {})["resume_safe"] = (
+            args.resume_safe_data == "true"
         )
     if args.seed >= 0:
         cfg.setdefault("training", {})["seed"] = int(args.seed)
@@ -364,10 +378,29 @@ def main() -> None:
         and not amp_dtype_is_bf16
     )
     scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler) if use_grad_scaler else None
-    loader = build_dataloader(cfg, split="train", training=True)
+    resume_safe_data = bool(cfg.get("dataloader", {}).get("resume_safe", False))
+    # The legacy DataLoader must retain its exact construction timing for the
+    # paired control. The resume-safe loader is deliberately deferred until
+    # after checkpoint restoration because its first batch is a pure function
+    # of the restored logical iteration.
+    loader = (
+        None
+        if resume_safe_data
+        else build_dataloader(cfg, split="train", training=True)
+    )
     out_dir = Path(cfg.get("output_dir", "outputs/train"))
     vis_interval = int(cfg.get("training", {}).get("vis_interval", 100))
-    planned_iters = args.max_iters or int(cfg.get("training", {}).get("max_iters", len(loader)))
+    configured_max_iters = int(cfg.get("training", {}).get("max_iters", 0))
+    if args.max_iters:
+        planned_iters = int(args.max_iters)
+    elif configured_max_iters > 0:
+        planned_iters = configured_max_iters
+    elif loader is not None:
+        planned_iters = len(loader)
+    else:
+        raise ValueError(
+            "resume-safe training requires --max-iters or training.max_iters"
+        )
     scheduler = build_scheduler(cfg, optimizer, total_iters=planned_iters)
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive")
@@ -457,6 +490,13 @@ def main() -> None:
                 resume_group_lr_overrides,
             )
             print({"resume_optimizer_lr_overrides": changes})
+    if loader is None:
+        loader = build_dataloader(
+            cfg,
+            split="train",
+            training=True,
+            start_iteration=start_iter,
+        )
     if bool(train_cfg.get("compile_model", False)):
         compile_kwargs = {}
         if train_cfg.get("compile_backend") is not None:
@@ -467,6 +507,15 @@ def main() -> None:
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
     accumulation_steps = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
     approx_epochs = planned_iters * accumulation_steps / max(len(loader), 1)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    data_stream_contract = (
+        batch_sampler.contract()
+        if hasattr(batch_sampler, "contract")
+        else {
+            "enabled": False,
+            "legacy_generator_reseeded_on_process_start": True,
+        }
+    )
     row_reference_cfg = (
         cfg.get("model", {})
         .get("structured_query", {})
@@ -483,6 +532,7 @@ def main() -> None:
             "gradient_accumulation_steps": accumulation_steps,
             "effective_batch_size": batch_size * accumulation_steps,
             "seed": seed,
+            "data_stream_contract": data_stream_contract,
             "iters": planned_iters,
             "start_iter": start_iter,
             "approx_epochs_this_run": round(approx_epochs, 2),
