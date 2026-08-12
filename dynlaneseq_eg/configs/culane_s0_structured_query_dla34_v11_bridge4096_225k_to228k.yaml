@@ -1,0 +1,13 @@
+_base_: culane_s0_structured_query_dla34_v11_unified_slot_row_225k_to228k.yaml
+
+# Clip-disjoint bridge between the 64-image memorization diagnostic and any
+# all-train continuation.  The runner supplies a deterministic 4,096-image
+# list: eight frames from each of 512 distinct training clips.  At effective
+# batch 16, 3,000 optimizer steps expose 48,000 samples (~11.72 subset epochs).
+output_dir: outputs/diagnostics/v11_bridge4096_gate_225k/train
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 3000
+  checkpoint_interval: 500
