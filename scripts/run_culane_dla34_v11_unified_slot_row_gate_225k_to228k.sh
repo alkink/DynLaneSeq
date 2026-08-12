@@ -148,7 +148,10 @@ print({
 PY
 
 CONTRACT_REPORT="${OUTPUT_ROOT}/audits/v11_initialization_contract.json"
-if [[ "${RUN_PREFLIGHT}" == "1" && ! -f "${CONTRACT_REPORT}" ]]; then
+# Re-run the contract on every explicitly requested preflight.  A failed
+# report must never become a sticky cache entry after a code-only numerical
+# correction, and the 16-batch audit is cheap relative to the 3k gate.
+if [[ "${RUN_PREFLIGHT}" == "1" ]]; then
   "${PYTHON}" -u -m dynlaneseq_eg.tools.audit_v11_unified_slot_row_contract \
     --config "${V11_CONFIG}" \
     --source-config "${V7_CONFIG}" \

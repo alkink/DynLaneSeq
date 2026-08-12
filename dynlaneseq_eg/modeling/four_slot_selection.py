@@ -314,6 +314,7 @@ def structured_unique_route_marginals(
     candidate_valid: torch.Tensor,
     *,
     temperature: float = 1.0,
+    iterations: int = 20,
 ) -> torch.Tensor:
     """Differentiable rectangular-Sinkhorn real-route marginals.
 
@@ -341,6 +342,9 @@ def structured_unique_route_marginals(
     tau = float(temperature)
     if tau <= 0.0:
         raise ValueError("structured route temperature must be positive")
+    sinkhorn_iterations = int(iterations)
+    if sinkhorn_iterations < 1:
+        raise ValueError("structured route iterations must be positive")
 
     if int(candidates) < int(slots):
         return logits.new_zeros(
@@ -385,7 +389,7 @@ def structured_unique_route_marginals(
         float("-inf"),
     )
     log_transport = torch.cat((scores, dummy), dim=1)
-    for _ in range(20):
+    for _ in range(sinkhorn_iterations):
         log_transport = log_transport - torch.logsumexp(
             log_transport,
             dim=2,
@@ -1717,6 +1721,7 @@ class FourSlotUnifiedProposalVisualDecoder(nn.Module):
         range_delta_offsets_norm: tuple[float, ...],
         proposal_logit_residual_scale: float = 1.0,
         proposal_attention_temperature: float = 1.0,
+        proposal_attention_sinkhorn_iterations: int = 64,
         visual_prior_strength: float = 0.25,
         visual_prior_sigma: float = 0.35,
         output_head_init_std: float = 1.0e-5,
@@ -1747,6 +1752,10 @@ class FourSlotUnifiedProposalVisualDecoder(nn.Module):
             raise ValueError("proposal residual scale must be positive")
         if float(proposal_attention_temperature) <= 0.0:
             raise ValueError("proposal attention temperature must be positive")
+        if int(proposal_attention_sinkhorn_iterations) < 1:
+            raise ValueError(
+                "proposal attention Sinkhorn iterations must be positive"
+            )
         if float(visual_prior_strength) < 0.0:
             raise ValueError("visual prior strength must be non-negative")
         if float(visual_prior_sigma) <= 0.0:
@@ -1766,6 +1775,9 @@ class FourSlotUnifiedProposalVisualDecoder(nn.Module):
         )
         self.proposal_attention_temperature = float(
             proposal_attention_temperature
+        )
+        self.proposal_attention_sinkhorn_iterations = int(
+            proposal_attention_sinkhorn_iterations
         )
         self.visual_prior_strength = float(visual_prior_strength)
         self.visual_prior_sigma = float(visual_prior_sigma)
@@ -2035,6 +2047,7 @@ class FourSlotUnifiedProposalVisualDecoder(nn.Module):
             proposal_logits,
             candidate_valid,
             temperature=self.proposal_attention_temperature,
+            iterations=self.proposal_attention_sinkhorn_iterations,
         )
         proposal_context = torch.einsum(
             "bsn,bnrh->bsrh",
@@ -2387,6 +2400,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         ),
         unified_slot_decoder_proposal_logit_residual_scale: float = 1.0,
         unified_slot_decoder_proposal_attention_temperature: float = 1.0,
+        unified_slot_decoder_proposal_attention_sinkhorn_iterations: int = 64,
         unified_slot_decoder_visual_prior_strength: float = 0.25,
         unified_slot_decoder_visual_prior_sigma: float = 0.35,
         unified_slot_decoder_output_head_init_std: float = 1.0e-5,
@@ -2721,6 +2735,9 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
                 proposal_attention_temperature=float(
                     unified_slot_decoder_proposal_attention_temperature
+                ),
+                proposal_attention_sinkhorn_iterations=int(
+                    unified_slot_decoder_proposal_attention_sinkhorn_iterations
                 ),
                 visual_prior_strength=float(
                     unified_slot_decoder_visual_prior_strength

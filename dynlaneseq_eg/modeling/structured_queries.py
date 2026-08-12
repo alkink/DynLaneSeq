@@ -2906,6 +2906,12 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0,
                     )
                 ),
+                unified_slot_decoder_proposal_attention_sinkhorn_iterations=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_proposal_attention_sinkhorn_iterations",
+                        64,
+                    )
+                ),
                 unified_slot_decoder_visual_prior_strength=float(
                     self.set_selection_cfg.get(
                         "four_slot_unified_slot_decoder_visual_prior_strength",

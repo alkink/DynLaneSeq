@@ -309,6 +309,12 @@ def test_v11_config_is_one_loss_one_fresh_trainable_subtree():
     selection = cfg["model"]["structured_query"]["set_selection"]
     assert selection["four_slot_refinement_enabled"] is False
     assert selection["four_slot_unified_slot_decoder_enabled"] is True
+    assert (
+        selection[
+            "four_slot_unified_slot_decoder_proposal_attention_sinkhorn_iterations"
+        ]
+        == 64
+    )
     assert selection["four_slot_slot_owned_geometry_enabled"] is False
     assert selection["four_slot_global_visual_geometry_enabled"] is False
     assert cfg["loss"]["w_four_slot_selection"] == 0.0
