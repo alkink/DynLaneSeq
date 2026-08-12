@@ -1,0 +1,9 @@
+_base_: culane_s0_structured_query_dla34_v11_unified_slot_row_225k_to228k.yaml
+
+output_dir: outputs/diagnostics/v11_unified_slot_row_gate_225k/memorize64
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  max_iters: 3000
+  checkpoint_interval: 500

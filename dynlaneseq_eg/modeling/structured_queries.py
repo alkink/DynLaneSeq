@@ -2826,6 +2826,110 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0e-3,
                     )
                 ),
+                unified_slot_decoder_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_enabled",
+                        False,
+                    )
+                ),
+                unified_slot_decoder_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                unified_slot_decoder_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                unified_slot_decoder_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                unified_slot_decoder_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_vertical_layers",
+                        2,
+                    )
+                ),
+                unified_slot_decoder_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_dropout",
+                        0.0,
+                    )
+                ),
+                unified_slot_decoder_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_delta_offsets_px",
+                        (
+                            -800.0,
+                            -600.0,
+                            -400.0,
+                            -300.0,
+                            -200.0,
+                            -128.0,
+                            -64.0,
+                            -32.0,
+                            0.0,
+                            32.0,
+                            64.0,
+                            128.0,
+                            200.0,
+                            300.0,
+                            400.0,
+                            600.0,
+                            800.0,
+                        ),
+                    )
+                ),
+                unified_slot_decoder_range_delta_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_range_delta_offsets_norm",
+                        (-1.0, -0.50, -0.25, -0.10, 0.0, 0.10, 0.25, 0.50, 1.0),
+                    )
+                ),
+                unified_slot_decoder_proposal_logit_residual_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_proposal_logit_residual_scale",
+                        1.0,
+                    )
+                ),
+                unified_slot_decoder_proposal_attention_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_proposal_attention_temperature",
+                        1.0,
+                    )
+                ),
+                unified_slot_decoder_visual_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_visual_prior_strength",
+                        0.25,
+                    )
+                ),
+                unified_slot_decoder_visual_prior_sigma=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_visual_prior_sigma",
+                        0.35,
+                    )
+                ),
+                unified_slot_decoder_output_head_init_std=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_output_head_init_std",
+                        1.0e-5,
+                    )
+                ),
+                unified_slot_decoder_activity_head_init_std=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_unified_slot_decoder_activity_head_init_std",
+                        1.0e-7,
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(
@@ -3651,6 +3755,17 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_owned_entropy",
                 "selection_slot_owned_top1_mass",
                 "selection_slot_owned_reference_shift_px",
+                "selection_slot_unified_aux_x_rows",
+                "selection_slot_unified_aux_range_norm",
+                "selection_slot_unified_proposal_logits",
+                "selection_slot_unified_proposal_attention",
+                "selection_slot_unified_proposal_entropy",
+                "selection_slot_unified_visual_attention",
+                "selection_slot_unified_first_visual_attention",
+                "selection_slot_unified_visual_entropy",
+                "selection_slot_unified_activity_residual",
+                "selection_slot_unified_base_x_rows",
+                "selection_slot_unified_base_range_norm",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

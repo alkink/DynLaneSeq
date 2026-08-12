@@ -1,0 +1,109 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v11_unified_slot_row_gate_225k/generalization
+
+# V11 faithful global slot-row arm.  The new final lane object retrieves a soft
+# memory from every proposal row, reads the complete P2 row grid and owns its
+# final x/range.  The frozen V7 hard ID remains diagnostic only; neither its
+# gathered curve nor its refiner participates in the final geometry equation.
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_refinement_enabled: false
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: true
+      four_slot_unified_slot_decoder_hidden_dim: 256
+      four_slot_unified_slot_decoder_num_heads: 8
+      four_slot_unified_slot_decoder_ff_dim: 512
+      four_slot_unified_slot_decoder_vertical_layers: 2
+      four_slot_unified_slot_decoder_dropout: 0.0
+      four_slot_unified_slot_decoder_delta_offsets_px:
+        [-800.0, -600.0, -400.0, -300.0, -200.0, -128.0, -64.0,
+         -32.0, 0.0, 32.0, 64.0, 128.0, 200.0, 300.0, 400.0,
+         600.0, 800.0]
+      four_slot_unified_slot_decoder_range_delta_offsets_norm:
+        [-1.0, -0.50, -0.25, -0.10, 0.0, 0.10, 0.25, 0.50, 1.0]
+      four_slot_unified_slot_decoder_proposal_logit_residual_scale: 1.0
+      four_slot_unified_slot_decoder_proposal_attention_temperature: 1.0
+      four_slot_unified_slot_decoder_visual_prior_strength: 0.25
+      four_slot_unified_slot_decoder_visual_prior_sigma: 0.35
+      four_slot_unified_slot_decoder_output_head_init_std: 0.00001
+      four_slot_unified_slot_decoder_activity_head_init_std: 0.0000001
+
+loss:
+  # Freeze every legacy proposal and V7 selection objective in the first
+  # causal arm.  Only the single V11 assignment/loss trains fresh parameters.
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+
+  # One final-geometry Hungarian assignment supervises activity, the global
+  # proposal-memory distribution and final/coarse geometry together.
+  w_four_slot_unified: 1.0
+  four_slot_unified_active_weight: 1.0
+  four_slot_unified_attention_weight: 1.0
+  four_slot_unified_point_weight: 5.0
+  four_slot_unified_range_weight: 1.0
+  four_slot_unified_line_iou_weight: 2.0
+  four_slot_unified_dfl_weight: 1.0
+  four_slot_unified_aux_geometry_weight: 0.25
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: unified_slot_row_decoder
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.set_selection_head.unified_slot_decoder.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 3000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.unified_slot_decoder
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.unified_slot_decoder
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.unified_slot_decoder
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

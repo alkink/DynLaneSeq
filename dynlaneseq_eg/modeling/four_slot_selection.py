@@ -1684,6 +1684,556 @@ class FourSlotGlobalVisualGeometry(nn.Module):
         }
 
 
+class FourSlotUnifiedProposalVisualDecoder(nn.Module):
+    """Turn four slots into row-level lane objects over proposal and P2 memory.
+
+    V7 exposes a strong proposal population but commits final geometry to one
+    hard proposal ID.  V10 went too far in the opposite direction and asked a
+    cold P2-only branch to rediscover the lane set.  This decoder instead uses
+    a soft global retrieval over all 32 proposal row memories as its coarse
+    geometry, then consumes the complete P2 row grid.  Its final residual
+    support spans the full image width; the legacy hard ID is diagnostic only.
+
+    Proposal/backbone tensors are detached in the first causal gate.  Geometry
+    nevertheless reaches every fresh row-state, proposal-attention and visual
+    projection parameter.  A post-geometry activity residual is emitted from
+    the same lane-object state; route probability is deliberately absent from
+    the public deployment score.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        input_w: int,
+        slot_dim: int,
+        num_slots: int,
+        hidden_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        vertical_layers: int,
+        dropout: float,
+        delta_offsets_px: tuple[float, ...],
+        range_delta_offsets_norm: tuple[float, ...],
+        proposal_logit_residual_scale: float = 1.0,
+        proposal_attention_temperature: float = 1.0,
+        visual_prior_strength: float = 0.25,
+        visual_prior_sigma: float = 0.35,
+        output_head_init_std: float = 1.0e-5,
+        activity_head_init_std: float = 1.0e-7,
+    ) -> None:
+        super().__init__()
+        offsets = tuple(float(value) for value in delta_offsets_px)
+        range_offsets = tuple(float(value) for value in range_delta_offsets_norm)
+        for values, label in ((offsets, "x"), (range_offsets, "range")):
+            if len(values) < 3 or tuple(sorted(values)) != values:
+                raise ValueError(f"unified slot {label} offsets must be sorted")
+            if not any(abs(value) < 1.0e-12 for value in values):
+                raise ValueError(f"unified slot {label} offsets need zero")
+            if any(
+                abs(left + right) > 1.0e-6
+                for left, right in zip(values, reversed(values))
+            ):
+                raise ValueError(
+                    f"unified slot {label} offsets must be symmetric"
+                )
+        if int(num_slots) < 1:
+            raise ValueError("unified slot decoder needs at least one slot")
+        if int(hidden_dim) < 1 or int(hidden_dim) % int(num_heads):
+            raise ValueError("unified slot heads must divide hidden_dim")
+        if int(vertical_layers) < 1:
+            raise ValueError("unified slot decoder needs vertical interaction")
+        if float(proposal_logit_residual_scale) <= 0.0:
+            raise ValueError("proposal residual scale must be positive")
+        if float(proposal_attention_temperature) <= 0.0:
+            raise ValueError("proposal attention temperature must be positive")
+        if float(visual_prior_strength) < 0.0:
+            raise ValueError("visual prior strength must be non-negative")
+        if float(visual_prior_sigma) <= 0.0:
+            raise ValueError("visual prior sigma must be positive")
+        if float(output_head_init_std) <= 0.0:
+            raise ValueError("output-head init std must be positive")
+        if float(activity_head_init_std) <= 0.0:
+            raise ValueError("activity-head init std must be positive")
+
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.slot_dim = int(slot_dim)
+        self.num_slots = int(num_slots)
+        self.hidden_dim = int(hidden_dim)
+        self.proposal_logit_residual_scale = float(
+            proposal_logit_residual_scale
+        )
+        self.proposal_attention_temperature = float(
+            proposal_attention_temperature
+        )
+        self.visual_prior_strength = float(visual_prior_strength)
+        self.visual_prior_sigma = float(visual_prior_sigma)
+
+        # Persistent [B,S,R,H] lane-object initialization.  No hard proposal
+        # row is gathered here: proposal identity is memory, never ownership.
+        self.proposal_row_norm = nn.LayerNorm(self.dim)
+        self.proposal_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.proposal_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.slot_norm = nn.LayerNorm(self.slot_dim)
+        self.slot_projection = nn.Linear(self.slot_dim, self.hidden_dim)
+        self.slot_tokens = nn.Embedding(self.num_slots, self.hidden_dim)
+        self.row_position_projection = nn.Linear(4, self.hidden_dim, bias=False)
+        self.initial_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Full-width row-aligned P2 evidence.  No anchor-local crop is used.
+        self.feature_norm = nn.LayerNorm(self.dim)
+        self.feature_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.feature_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.x_position_projection = nn.Linear(4, self.hidden_dim, bias=False)
+        self.first_visual_query = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.second_visual_query = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.first_visual_context = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.second_visual_context = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+
+        # Evidence-aware global attention over *all* proposals.  The old V7
+        # route logit is a warm-start prior, not a geometry gather operator.
+        self.global_proposal_query = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.global_proposal_context = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.coarse_geometry_projection = nn.Linear(
+            3,
+            self.hidden_dim,
+            bias=False,
+        )
+        self.proposal_fusion_norm = nn.LayerNorm(self.hidden_dim)
+        self.proposal_fusion_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+
+        vertical_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.vertical_encoder = nn.TransformerEncoder(
+            vertical_layer,
+            num_layers=int(vertical_layers),
+            enable_nested_tensor=False,
+        )
+        self.final_norm = nn.LayerNorm(self.hidden_dim)
+        self.final_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+
+        # The wide distribution can move a soft proposal-memory lane anywhere
+        # in an 800-pixel frame.  Symmetric zero initialization initially
+        # exposes the predicted-soft reference without a scalar blend gate.
+        self.delta_head = nn.Linear(
+            self.hidden_dim,
+            len(offsets),
+            bias=False,
+        )
+        self.range_delta_head = nn.Linear(
+            self.hidden_dim,
+            2 * len(range_offsets),
+            bias=False,
+        )
+        self.post_geometry_activity = nn.Linear(self.hidden_dim, 1)
+        # Tiny but non-zero heads make every edge a genuine forward derivative
+        # from the first backward pass while keeping the predicted-soft start
+        # and legacy activity essentially unchanged.
+        nn.init.normal_(self.delta_head.weight, std=float(output_head_init_std))
+        nn.init.normal_(
+            self.range_delta_head.weight,
+            std=float(output_head_init_std),
+        )
+        nn.init.normal_(
+            self.post_geometry_activity.weight,
+            std=float(activity_head_init_std),
+        )
+        nn.init.zeros_(self.post_geometry_activity.bias)
+        nn.init.normal_(self.slot_tokens.weight, std=0.02)
+        # Start from the measured V7 predicted-soft policy, not from an
+        # arbitrary random re-ranking of 32 proposals.  This is a small
+        # trainable residual (not a mix gate): it has nonzero gradient on the
+        # first step and can grow without a bounded scalar bottleneck.
+        nn.init.normal_(self.global_proposal_query.weight, std=1.0e-3)
+        self.register_buffer(
+            "delta_offsets_px",
+            torch.tensor(offsets, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "range_delta_offsets_norm",
+            torch.tensor(range_offsets, dtype=torch.float32),
+        )
+
+    @staticmethod
+    def _position_basis(values: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (
+                values,
+                values.square(),
+                torch.sin(math.pi * values),
+                torch.cos(math.pi * values),
+            ),
+            dim=-1,
+        )
+
+    def _visual_attention(
+        self,
+        hidden: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        center_x: torch.Tensor,
+        x_fraction: torch.Tensor,
+        *,
+        query_projection: nn.Linear,
+        context_projection: nn.Linear,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = torch.einsum(
+            "bsrh,brxh->bsrx",
+            query_projection(hidden),
+            keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        distance = x_fraction.view(1, 1, 1, -1) - center_x.unsqueeze(-1)
+        prior = -0.5 * distance.square() / (self.visual_prior_sigma**2)
+        logits = logits + self.visual_prior_strength * prior.to(logits.dtype)
+        probability = torch.softmax(logits.float(), dim=-1)
+        context = torch.einsum(
+            "bsrx,brxh->bsrh",
+            probability,
+            values.float(),
+        )
+        return hidden + context_projection(context), probability
+
+    def forward(
+        self,
+        *,
+        slot_states: torch.Tensor,
+        legacy_active_logits: torch.Tensor,
+        proposal_row_tokens: torch.Tensor,
+        proposal_x_rows: torch.Tensor,
+        proposal_range_norm: torch.Tensor,
+        route_indices: torch.Tensor,
+        legacy_route_logits: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        row_value_features: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if row_value_features.ndim != 4:
+            raise ValueError("unified P2 rows must have shape [B,R,X,C]")
+        batch, rows, x_bins, channels = row_value_features.shape
+        if int(channels) != self.dim:
+            raise ValueError("unified P2 feature dimension mismatch")
+        if tuple(slot_states.shape[:2]) != (batch, self.num_slots):
+            raise ValueError("unified slot state shape mismatch")
+        slots = self.num_slots
+        candidates = int(proposal_x_rows.shape[1])
+        if tuple(route_indices.shape) != (batch, slots):
+            raise ValueError("unified route index shape mismatch")
+        if tuple(legacy_active_logits.shape) != (batch, slots):
+            raise ValueError("unified activity shape mismatch")
+        if tuple(legacy_route_logits.shape) != (batch, slots, candidates):
+            raise ValueError("unified legacy route-logit shape mismatch")
+        if tuple(candidate_valid.shape) != (batch, candidates):
+            raise ValueError("unified candidate-valid shape mismatch")
+        # The first gate protects every successful upstream tensor.  Fresh
+        # projections still receive both final-geometry and cluster-attention
+        # gradients through this decoder.
+        proposal_rows = proposal_row_tokens.detach().float()
+        proposal_x = proposal_x_rows.detach().float()
+        proposal_range = sort_range_norm(
+            proposal_range_norm.detach().float()
+        )
+        # The old unique ID is retained only as public provenance.  It does
+        # not gate or initialize geometry; every slot is valid whenever the
+        # proposal population contains at least one valid memory row.
+        geometry_valid = candidate_valid.bool().any(dim=-1, keepdim=True).expand(
+            -1,
+            slots,
+        )
+
+        row_fraction = fixed_row_fractions(
+            rows,
+            device=slot_states.device,
+            dtype=torch.float32,
+        )
+        row_position = self.row_position_projection(
+            self._position_basis(row_fraction)
+        ).view(1, 1, rows, self.hidden_dim)
+        slot_seed = self.slot_projection(
+            self.slot_norm(slot_states.detach().float())
+        ).unsqueeze(2)
+        slot_seed = slot_seed + self.slot_tokens.weight.view(
+            1,
+            slots,
+            1,
+            self.hidden_dim,
+        )
+        normalized_proposal_rows = self.proposal_row_norm(proposal_rows)
+        hidden = slot_seed + row_position
+        hidden = self.initial_norm(hidden)
+
+        # First retrieve one coherent global proposal distribution per slot
+        # from all 32 full row memories.  The frozen V7 logits are merely a
+        # useful prior; the differentiable correction sees every proposal row.
+        proposal_keys = self.proposal_key(normalized_proposal_rows)
+        proposal_values = self.proposal_value(normalized_proposal_rows)
+        row_logits = torch.einsum(
+            "bsrh,bnrh->bsnr",
+            self.global_proposal_query(hidden),
+            proposal_keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        row_y = row_fraction.view(1, 1, rows)
+        proposal_visible = (
+            (row_y >= proposal_range[..., :1])
+            & (row_y <= proposal_range[..., 1:])
+            & torch.isfinite(proposal_x)
+        )
+        visible_weight = proposal_visible[:, None].to(row_logits.dtype)
+        learned_logits = (row_logits * visible_weight).sum(dim=-1)
+        learned_logits = learned_logits / visible_weight.sum(dim=-1).clamp_min(
+            1.0
+        )
+        proposal_logits = legacy_route_logits.detach().float() + (
+            self.proposal_logit_residual_scale * learned_logits
+        )
+        proposal_logits = proposal_logits.masked_fill(
+            ~candidate_valid[:, None, :].bool(),
+            -1.0e4,
+        )
+        # Four slots compete through a differentiable injective relaxation:
+        # every slot has unit mass and every proposal has total capacity <= 1.
+        # This is cross-slot set reasoning without reinstating a hard ID.
+        proposal_attention = structured_unique_route_marginals(
+            proposal_logits,
+            candidate_valid,
+            temperature=self.proposal_attention_temperature,
+        )
+        proposal_context = torch.einsum(
+            "bsn,bnrh->bsrh",
+            proposal_attention,
+            proposal_values,
+        )
+        coarse_x = torch.einsum(
+            "bsn,bnr->bsr",
+            proposal_attention,
+            proposal_x,
+        )
+        coarse_range = sort_range_norm(
+            torch.einsum(
+                "bsn,bnd->bsd",
+                proposal_attention,
+                proposal_range,
+            )
+        )
+        coarse_geometry = torch.cat(
+            (
+                coarse_x.unsqueeze(-1)
+                / float(max(self.input_w - 1, 1)),
+                coarse_range.unsqueeze(2).expand(-1, -1, rows, -1),
+            ),
+            dim=-1,
+        )
+        hidden = hidden + self.global_proposal_context(proposal_context)
+        hidden = hidden + self.coarse_geometry_projection(coarse_geometry)
+        hidden = hidden + self.proposal_fusion_ffn(
+            self.proposal_fusion_norm(hidden)
+        )
+
+        # Only after global memory retrieval does the slot read live,
+        # full-width row-aligned P2 evidence.  Both passes attend over every x
+        # bin; the Gaussian term is a broad positional prior, not a crop.
+        features = self.feature_norm(row_value_features.detach().float())
+        x_fraction = torch.linspace(
+            0.0,
+            1.0,
+            x_bins,
+            device=slot_states.device,
+            dtype=torch.float32,
+        )
+        x_position = self.x_position_projection(
+            self._position_basis(x_fraction)
+        ).view(1, 1, x_bins, self.hidden_dim)
+        feature_keys = self.feature_key(features) + x_position
+        feature_values = self.feature_value(features) + x_position
+        coarse_center = (
+            coarse_x / float(max(self.input_w - 1, 1))
+        ).clamp(0.0, 1.0)
+        hidden, first_visual_probability = self._visual_attention(
+            hidden,
+            feature_keys,
+            feature_values,
+            coarse_center,
+            x_fraction,
+            query_projection=self.first_visual_query,
+            context_projection=self.first_visual_context,
+        )
+        hidden = self.vertical_encoder(
+            hidden.reshape(batch * slots, rows, self.hidden_dim)
+        ).reshape(batch, slots, rows, self.hidden_dim)
+        hidden, visual_probability = self._visual_attention(
+            hidden,
+            feature_keys,
+            feature_values,
+            coarse_center,
+            x_fraction,
+            query_projection=self.second_visual_query,
+            context_projection=self.second_visual_context,
+        )
+        hidden = hidden + self.final_ffn(self.final_norm(hidden))
+
+        delta_logits = self.delta_head(self.final_norm(hidden))
+        delta_probability = torch.softmax(delta_logits.float(), dim=-1)
+        delta_offsets = self.delta_offsets_px.to(
+            device=hidden.device,
+            dtype=delta_probability.dtype,
+        )
+        # Subtract the explicit uniform distribution so zero logits produce
+        # an exactly-zero residual in floating point, not merely a symmetric
+        # sum that can leave a sub-ULP remainder.
+        delta = (
+            (
+                delta_probability
+                - 1.0 / float(int(delta_probability.shape[-1]))
+            )
+            * delta_offsets
+        ).sum(dim=-1)
+        delta = torch.where(
+            geometry_valid.unsqueeze(-1),
+            delta,
+            torch.zeros_like(delta),
+        )
+        # Final geometry is owned by the soft proposal-memory slot.  The old
+        # hard-routed/refined V7 curve is not part of this equation.
+        raw_final_x = coarse_x + delta
+        final_x = raw_final_x.clamp(
+            0.0,
+            float(max(self.input_w - 1, 1)),
+        )
+
+        pooled_hidden = hidden.mean(dim=2)
+        range_logits = self.range_delta_head(
+            self.final_norm(pooled_hidden)
+        ).view(batch, slots, 2, int(self.range_delta_offsets_norm.numel()))
+        range_probability = torch.softmax(range_logits.float(), dim=-1)
+        range_offsets = self.range_delta_offsets_norm.to(
+            device=hidden.device,
+            dtype=range_probability.dtype,
+        )
+        range_delta = (
+            (
+                range_probability
+                - 1.0 / float(int(range_probability.shape[-1]))
+            )
+            * range_offsets
+        ).sum(dim=-1)
+        range_delta = torch.where(
+            geometry_valid.unsqueeze(-1),
+            range_delta,
+            torch.zeros_like(range_delta),
+        )
+        raw_final_range = coarse_range + range_delta
+        final_range = sort_range_norm(raw_final_range.clamp(0.0, 1.0))
+
+        activity_residual = self.post_geometry_activity(
+            self.final_norm(pooled_hidden)
+        ).squeeze(-1)
+        final_active_logits = legacy_active_logits.detach().float() + (
+            activity_residual
+        )
+        final_active = (final_active_logits >= 0.0) & geometry_valid
+        public_indices = torch.where(
+            final_active,
+            route_indices,
+            route_indices.new_full(route_indices.shape, -1),
+        )
+        final_scores = torch.sigmoid(final_active_logits)
+
+        valid_rows = geometry_valid.unsqueeze(-1).expand(-1, -1, rows)
+        valid_count = valid_rows.float().sum(dim=(1, 2)).clamp_min(1.0)
+        mean_abs_delta = (
+            delta.abs() * valid_rows.float()
+        ).sum(dim=(1, 2)) / valid_count
+        proposal_entropy = -(
+            proposal_attention
+            * proposal_attention.clamp_min(1.0e-12).log()
+        ).sum(dim=-1)
+        visual_entropy = -(
+            visual_probability
+            * visual_probability.clamp_min(1.0e-12).log()
+        ).sum(dim=-1)
+        return {
+            "selection_slot_pred_x_rows": final_x,
+            "selection_slot_range_norm": final_range,
+            "selection_slot_active_logits": final_active_logits,
+            "selection_slot_active": final_active,
+            "selection_slot_geometry_valid": geometry_valid,
+            "selection_slot_indices": public_indices,
+            "selection_slot_scores": final_scores,
+            "selection_slot_input_reference_x_rows": coarse_x,
+            "selection_slot_input_range_norm": coarse_range,
+            "selection_slot_row_delta_logits": delta_logits,
+            "selection_slot_row_delta_offsets_px": self.delta_offsets_px,
+            "selection_slot_range_delta": range_delta,
+            "selection_slot_range_delta_logits": range_logits,
+            "selection_slot_range_delta_offsets_norm": (
+                self.range_delta_offsets_norm
+            ),
+            "selection_slot_range_delta_boundary_mass": (
+                range_probability[..., (0, -1)].sum(dim=-1)
+            ),
+            "selection_slot_delta_mean_abs": mean_abs_delta,
+            "selection_slot_delta_max_abs": delta.abs().amax(dim=(1, 2)),
+            "selection_slot_delta_boundary_mass": (
+                delta_probability[..., (0, -1)].sum(dim=-1).mean(dim=(1, 2))
+            ),
+            "selection_slot_unified_aux_x_rows": coarse_x,
+            "selection_slot_unified_aux_range_norm": coarse_range,
+            "selection_slot_unified_proposal_logits": proposal_logits,
+            "selection_slot_unified_proposal_attention": proposal_attention,
+            "selection_slot_unified_proposal_entropy": proposal_entropy.mean(
+                dim=-1
+            ),
+            "selection_slot_unified_visual_attention": visual_probability,
+            "selection_slot_unified_first_visual_attention": (
+                first_visual_probability
+            ),
+            "selection_slot_unified_visual_entropy": visual_entropy.mean(
+                dim=(1, 2)
+            ),
+            "selection_slot_unified_activity_residual": activity_residual,
+            "selection_slot_unified_base_x_rows": coarse_x,
+            "selection_slot_unified_base_range_norm": coarse_range,
+        }
+
+
 class FourSlotLaneSelectionHead(nn.Module):
     """Route four persistent lane-object slots over frozen V5 proposals.
 
@@ -1799,6 +2349,48 @@ class FourSlotLaneSelectionHead(nn.Module):
         global_visual_geometry_range_end_prior: float = 0.95,
         global_visual_geometry_zero_init_delta_head: bool = True,
         global_visual_geometry_delta_head_init_std: float = 1.0e-3,
+        unified_slot_decoder_enabled: bool = False,
+        unified_slot_decoder_hidden_dim: int | None = None,
+        unified_slot_decoder_num_heads: int = 8,
+        unified_slot_decoder_ff_dim: int | None = None,
+        unified_slot_decoder_vertical_layers: int = 2,
+        unified_slot_decoder_dropout: float = 0.0,
+        unified_slot_decoder_delta_offsets_px: tuple[float, ...] = (
+            -800.0,
+            -600.0,
+            -400.0,
+            -300.0,
+            -200.0,
+            -128.0,
+            -64.0,
+            -32.0,
+            0.0,
+            32.0,
+            64.0,
+            128.0,
+            200.0,
+            300.0,
+            400.0,
+            600.0,
+            800.0,
+        ),
+        unified_slot_decoder_range_delta_offsets_norm: tuple[float, ...] = (
+            -1.0,
+            -0.50,
+            -0.25,
+            -0.10,
+            0.0,
+            0.10,
+            0.25,
+            0.50,
+            1.0,
+        ),
+        unified_slot_decoder_proposal_logit_residual_scale: float = 1.0,
+        unified_slot_decoder_proposal_attention_temperature: float = 1.0,
+        unified_slot_decoder_visual_prior_strength: float = 0.25,
+        unified_slot_decoder_visual_prior_sigma: float = 0.35,
+        unified_slot_decoder_output_head_init_std: float = 1.0e-5,
+        unified_slot_decoder_activity_head_init_std: float = 1.0e-7,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -1826,6 +2418,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.global_visual_geometry_enabled = bool(
             global_visual_geometry_enabled
         )
+        self.unified_slot_decoder_enabled = bool(
+            unified_slot_decoder_enabled
+        )
         if sum(
             (
                 self.refinement_enabled,
@@ -1838,6 +2433,10 @@ class FourSlotLaneSelectionHead(nn.Module):
                 "mutually exclusive"
             )
         self.factorized_routing = bool(factorized_routing)
+        if self.unified_slot_decoder_enabled and not self.factorized_routing:
+            raise ValueError(
+                "unified slot decoder requires factorized activity/routing"
+            )
         self.geometry_detach_router_states = bool(
             geometry_detach_router_states
         )
@@ -1886,6 +2485,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             self.refinement_enabled
             or self.slot_owned_geometry_enabled
             or self.global_visual_geometry_enabled
+            or self.unified_slot_decoder_enabled
         )
 
         # Exact successful probe descriptor:
@@ -2085,6 +2685,57 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
             )
             if self.global_visual_geometry_enabled
+            else None
+        )
+        # V11 keeps the proven V7 selector only as a frozen soft-distribution
+        # prior and public provenance.  All 32 proposal row memories and the
+        # full P2 grid feed a new lane-object state whose soft coarse geometry
+        # and full-width residual own the final curve.
+        self.unified_slot_decoder = (
+            FourSlotUnifiedProposalVisualDecoder(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    unified_slot_decoder_hidden_dim or self.hidden_dim
+                ),
+                num_heads=int(unified_slot_decoder_num_heads),
+                ff_dim=int(
+                    unified_slot_decoder_ff_dim
+                    or 2
+                    * int(
+                        unified_slot_decoder_hidden_dim or self.hidden_dim
+                    )
+                ),
+                vertical_layers=int(unified_slot_decoder_vertical_layers),
+                dropout=float(unified_slot_decoder_dropout),
+                delta_offsets_px=tuple(
+                    unified_slot_decoder_delta_offsets_px
+                ),
+                range_delta_offsets_norm=tuple(
+                    unified_slot_decoder_range_delta_offsets_norm
+                ),
+                proposal_logit_residual_scale=float(
+                    unified_slot_decoder_proposal_logit_residual_scale
+                ),
+                proposal_attention_temperature=float(
+                    unified_slot_decoder_proposal_attention_temperature
+                ),
+                visual_prior_strength=float(
+                    unified_slot_decoder_visual_prior_strength
+                ),
+                visual_prior_sigma=float(
+                    unified_slot_decoder_visual_prior_sigma
+                ),
+                output_head_init_std=float(
+                    unified_slot_decoder_output_head_init_std
+                ),
+                activity_head_init_std=float(
+                    unified_slot_decoder_activity_head_init_std
+                ),
+            )
+            if self.unified_slot_decoder_enabled
             else None
         )
         nn.init.normal_(self.slot_tokens.weight, std=0.02)
@@ -2464,6 +3115,24 @@ class FourSlotLaneSelectionHead(nn.Module):
                 self.global_visual_geometry(
                     slot_states=slots,
                     slot_active=slot_active,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.unified_slot_decoder is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError(
+                    "unified slot decoder requires projected P2 row features"
+                )
+            result.update(
+                self.unified_slot_decoder(
+                    slot_states=slots,
+                    legacy_active_logits=active_logits,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    route_indices=geometry_indices,
+                    legacy_route_logits=geometry_route_logits,
+                    candidate_valid=candidate_valid,
                     row_value_features=row_value_features,
                 )
             )

@@ -219,6 +219,30 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_geometry_match_all_slots=bool(
             loss.get("four_slot_geometry_match_all_slots", False)
         ),
+        w_four_slot_unified=float(
+            loss.get("w_four_slot_unified", 0.0)
+        ),
+        four_slot_unified_active_weight=float(
+            loss.get("four_slot_unified_active_weight", 1.0)
+        ),
+        four_slot_unified_attention_weight=float(
+            loss.get("four_slot_unified_attention_weight", 1.0)
+        ),
+        four_slot_unified_point_weight=float(
+            loss.get("four_slot_unified_point_weight", 5.0)
+        ),
+        four_slot_unified_range_weight=float(
+            loss.get("four_slot_unified_range_weight", 1.0)
+        ),
+        four_slot_unified_line_iou_weight=float(
+            loss.get("four_slot_unified_line_iou_weight", 2.0)
+        ),
+        four_slot_unified_dfl_weight=float(
+            loss.get("four_slot_unified_dfl_weight", 1.0)
+        ),
+        four_slot_unified_aux_geometry_weight=float(
+            loss.get("four_slot_unified_aux_geometry_weight", 0.25)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

@@ -1183,6 +1183,17 @@ class LossConfig:
     four_slot_geometry_range_weight: float = 0.0
     four_slot_geometry_match_min_quality: float = 0.20
     four_slot_geometry_match_all_slots: bool = False
+    # V11 uses one final-slot Hungarian assignment for activity, global
+    # proposal-memory attention and final slot-owned geometry.  This removes
+    # the independent selection/geometry assignment contracts used by V7.
+    w_four_slot_unified: float = 0.0
+    four_slot_unified_active_weight: float = 1.0
+    four_slot_unified_attention_weight: float = 1.0
+    four_slot_unified_point_weight: float = 5.0
+    four_slot_unified_range_weight: float = 1.0
+    four_slot_unified_line_iou_weight: float = 2.0
+    four_slot_unified_dfl_weight: float = 1.0
+    four_slot_unified_aux_geometry_weight: float = 0.25
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1484,6 +1495,7 @@ class S0Criterion(nn.Module):
         if (
             self.cfg.w_four_slot_selection != 0
             or self.cfg.w_four_slot_geometry != 0
+            or self.cfg.w_four_slot_unified != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1595,6 +1607,31 @@ class S0Criterion(nn.Module):
                 "mean_refined_quality": zero,
                 "mean_quality_gain": zero,
             }
+        if self.cfg.w_four_slot_unified != 0:
+            four_slot_unified = self.compute_four_slot_unified_loss(
+                outputs,
+                targets,
+                four_slot_targets,
+            )
+        else:
+            four_slot_unified = {
+                "total": zero,
+                "active": zero,
+                "attention": zero,
+                "point": zero,
+                "range": zero,
+                "line_iou": zero,
+                "dfl": zero,
+                "aux_point": zero,
+                "aux_range": zero,
+                "aux_line_iou": zero,
+                "mean_matched": zero,
+                "mean_base_quality": zero,
+                "mean_final_quality": zero,
+                "mean_quality_gain": zero,
+                "mean_target_support_mass": zero,
+                "mean_active_probability": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1620,6 +1657,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_pointer_selection * pointer_selection["total"]
             + self.cfg.w_four_slot_selection * four_slot_selection["total"]
             + self.cfg.w_four_slot_geometry * four_slot_geometry["total"]
+            + self.cfg.w_four_slot_unified * four_slot_unified["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -1719,6 +1757,44 @@ class S0Criterion(nn.Module):
             ],
             "four_slot_geometry_mean_quality_gain": four_slot_geometry[
                 "mean_quality_gain"
+            ],
+            "loss_four_slot_unified": four_slot_unified["total"],
+            "loss_four_slot_unified_active": four_slot_unified["active"],
+            "loss_four_slot_unified_attention": four_slot_unified[
+                "attention"
+            ],
+            "loss_four_slot_unified_point": four_slot_unified["point"],
+            "loss_four_slot_unified_range": four_slot_unified["range"],
+            "loss_four_slot_unified_line_iou": four_slot_unified[
+                "line_iou"
+            ],
+            "loss_four_slot_unified_dfl": four_slot_unified["dfl"],
+            "loss_four_slot_unified_aux_point": four_slot_unified[
+                "aux_point"
+            ],
+            "loss_four_slot_unified_aux_range": four_slot_unified[
+                "aux_range"
+            ],
+            "loss_four_slot_unified_aux_line_iou": four_slot_unified[
+                "aux_line_iou"
+            ],
+            "four_slot_unified_mean_matched": four_slot_unified[
+                "mean_matched"
+            ],
+            "four_slot_unified_mean_base_quality": four_slot_unified[
+                "mean_base_quality"
+            ],
+            "four_slot_unified_mean_final_quality": four_slot_unified[
+                "mean_final_quality"
+            ],
+            "four_slot_unified_mean_quality_gain": four_slot_unified[
+                "mean_quality_gain"
+            ],
+            "four_slot_unified_mean_target_support_mass": four_slot_unified[
+                "mean_target_support_mass"
+            ],
+            "four_slot_unified_mean_active_probability": four_slot_unified[
+                "mean_active_probability"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -2885,6 +2961,399 @@ class S0Criterion(nn.Module):
                 if isinstance(route_entropy, torch.Tensor)
                 else zero
             ),
+        }
+
+    @torch.no_grad()
+    def _match_four_slot_unified_final(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[
+        list[dict[str, torch.Tensor]],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Build the sole V11 slot-to-GT assignment from final geometry.
+
+        Activity confidence is intentionally absent from this detached cost.
+        It therefore cannot select its own positive target.  The returned
+        assignment is reused by activity, proposal-memory attention and every
+        final/coarse geometry term.
+        """
+
+        refined = outputs.get("selection_slot_pred_x_rows")
+        ranges = outputs.get("selection_slot_range_norm")
+        geometry_valid = outputs.get("selection_slot_geometry_valid")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (refined, ranges, geometry_valid)
+        ):
+            raise ValueError(
+                "unified four-slot loss requires final geometry and validity"
+            )
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=refined.device,
+                dtype=torch.float32,
+                rows=int(refined.shape[-1]),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        quality, slot_valid, gt_valid = (
+            batched_pairwise_range_aware_row_strip_iou(
+                refined.detach().float(),
+                ranges.detach().float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        pair_valid = (
+            geometry_valid.bool() & slot_valid
+        ).unsqueeze(-1) & gt_valid.unsqueeze(1)
+        cost_batch = (1.0 - quality).masked_fill(
+            ~pair_valid,
+            torch.inf,
+        ).detach().cpu()
+        cpu_pairs: list[torch.Tensor] = []
+        counts: list[int] = []
+        for cost in cost_batch:
+            finite = torch.isfinite(cost)
+            slot_ids = torch.nonzero(
+                finite.any(dim=1),
+                as_tuple=False,
+            ).flatten()
+            gt_ids = torch.nonzero(
+                finite.any(dim=0),
+                as_tuple=False,
+            ).flatten()
+            if slot_ids.numel() == 0 or gt_ids.numel() == 0:
+                pairs = torch.empty((0, 2), dtype=torch.long)
+            else:
+                local_cost = cost.index_select(0, slot_ids).index_select(
+                    1,
+                    gt_ids,
+                )
+                local_slot, local_gt = (
+                    HungarianMatcherS0._linear_sum_assignment(local_cost)
+                )
+                pairs = torch.stack(
+                    (
+                        slot_ids.index_select(0, local_slot),
+                        gt_ids.index_select(0, local_gt),
+                    ),
+                    dim=-1,
+                )
+            cpu_pairs.append(pairs)
+            counts.append(int(pairs.shape[0]))
+        packed = (
+            torch.cat(cpu_pairs, dim=0).to(refined.device)
+            if any(counts)
+            else torch.empty(
+                (0, 2),
+                dtype=torch.long,
+                device=refined.device,
+            )
+        )
+        matches: list[dict[str, torch.Tensor]] = []
+        offset = 0
+        for count in counts:
+            pairs = packed[offset : offset + count]
+            offset += count
+            matches.append(
+                {
+                    "pred_indices": pairs[:, 0],
+                    "gt_indices": pairs[:, 1],
+                }
+            )
+        return (
+            matches,
+            quality,
+            refined.new_tensor(counts, dtype=torch.float32),
+        )
+
+    @torch.no_grad()
+    def _four_slot_unified_proposal_targets(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the V7 near-best proposal distribution for every GT.
+
+        Unlike the old independent selection loss, V11 indexes these rows
+        with the *same* final slot-to-GT assignment used by geometry.  The
+        soft distribution is appropriate here because proposal attention is
+        memory retrieval, not a deployment hard-ID score.
+        """
+
+        proposal_x = outputs["pred_x_rows"].detach().float()
+        proposal_range = outputs["range_norm"].detach().float()
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=proposal_x.device,
+                dtype=torch.float32,
+                rows=int(proposal_x.shape[-1]),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        quality, candidate_valid, gt_valid = (
+            batched_pairwise_range_aware_row_strip_iou(
+                proposal_x,
+                proposal_range,
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        if int(quality.shape[-1]) == 0:
+            return (
+                quality.permute(0, 2, 1),
+                torch.zeros_like(quality, dtype=torch.bool).permute(0, 2, 1),
+            )
+        masked_quality = quality.masked_fill(
+            ~candidate_valid.unsqueeze(-1),
+            float("-inf"),
+        )
+        best = masked_quality.amax(dim=1)
+        effective_floor = best.clamp(max=float(self.cfg.four_slot_cluster_min))
+        cutoff = torch.maximum(
+            effective_floor,
+            best - float(self.cfg.four_slot_cluster_delta),
+        )
+        support = (
+            candidate_valid.unsqueeze(-1)
+            & gt_valid.unsqueeze(1)
+            & (quality >= cutoff.unsqueeze(1))
+        )
+        probability = torch.softmax(
+            (quality / float(self.cfg.four_slot_cluster_temperature)).masked_fill(
+                ~support,
+                float("-inf"),
+            ),
+            dim=1,
+        )
+        probability = torch.where(
+            support,
+            probability,
+            torch.zeros_like(probability),
+        )
+        return probability.permute(0, 2, 1), support.permute(0, 2, 1)
+
+    def compute_four_slot_unified_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Joint V11 activity, global-memory and slot-geometry objective."""
+
+        refined = outputs.get("selection_slot_pred_x_rows")
+        ranges = outputs.get("selection_slot_range_norm")
+        active_logits = outputs.get("selection_slot_active_logits")
+        delta_logits = outputs.get("selection_slot_row_delta_logits")
+        delta_offsets = outputs.get("selection_slot_row_delta_offsets_px")
+        reference = outputs.get("selection_slot_input_reference_x_rows")
+        attention = outputs.get("selection_slot_unified_proposal_attention")
+        aux_x = outputs.get("selection_slot_unified_aux_x_rows")
+        aux_range = outputs.get("selection_slot_unified_aux_range_norm")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (
+                refined,
+                ranges,
+                active_logits,
+                delta_logits,
+                delta_offsets,
+                reference,
+                attention,
+                aux_x,
+                aux_range,
+            )
+        ):
+            raise ValueError(
+                "w_four_slot_unified > 0 requires V11 unified outputs"
+            )
+        matches, final_quality_batch, match_count = (
+            self._match_four_slot_unified_final(
+                outputs,
+                targets,
+                padded_targets,
+            )
+        )
+
+        slot_outputs = {
+            "pred_x_rows": refined,
+            "range_norm": ranges,
+            "row_x_logits": delta_logits,
+            "row_x_offsets_px": delta_offsets,
+            "input_reference_x_rows": reference,
+        }
+        point = self.compute_point_loss(slot_outputs, targets, matches)
+        range_loss = self.compute_range_loss(slot_outputs, targets, matches)
+        line_iou = self.compute_line_iou_loss(slot_outputs, targets, matches)
+        dfl = self.compute_row_dfl_loss(slot_outputs, targets, matches)
+
+        auxiliary_outputs = {
+            "pred_x_rows": aux_x,
+            "range_norm": aux_range,
+        }
+        aux_point = self.compute_point_loss(
+            auxiliary_outputs,
+            targets,
+            matches,
+        )
+        aux_range_loss = self.compute_range_loss(
+            auxiliary_outputs,
+            targets,
+            matches,
+        )
+        aux_line_iou = self.compute_line_iou_loss(
+            auxiliary_outputs,
+            targets,
+            matches,
+        )
+
+        active_target = torch.zeros_like(active_logits, dtype=torch.float32)
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            if pred_ids.numel():
+                active_target[batch_index, pred_ids] = 1.0
+        active_loss = F.binary_cross_entropy_with_logits(
+            active_logits.float(),
+            active_target,
+        )
+
+        proposal_target, proposal_support = (
+            self._four_slot_unified_proposal_targets(
+                outputs,
+                targets,
+                padded_targets,
+            )
+        )
+        attention_rows: list[torch.Tensor] = []
+        support_mass_rows: list[torch.Tensor] = []
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            gt_ids = match["gt_indices"]
+            if pred_ids.numel() == 0:
+                continue
+            predicted = attention[batch_index, pred_ids].float()
+            target_probability = proposal_target[
+                batch_index,
+                gt_ids,
+            ].to(predicted.dtype)
+            support = proposal_support[batch_index, gt_ids]
+            attention_rows.append(
+                -(
+                    target_probability
+                    * predicted.clamp_min(1.0e-12).log()
+                ).sum(dim=-1)
+            )
+            support_mass_rows.append(
+                (predicted * support.to(predicted.dtype)).sum(dim=-1)
+            )
+        if attention_rows:
+            attention_loss = torch.cat(attention_rows).mean()
+            mean_support_mass = torch.cat(support_mass_rows).mean().detach()
+        else:
+            attention_loss = attention.sum() * 0.0
+            mean_support_mass = attention_loss.detach()
+
+        aux_total = (
+            float(self.cfg.four_slot_unified_point_weight) * aux_point
+            + float(self.cfg.four_slot_unified_range_weight) * aux_range_loss
+            + float(self.cfg.four_slot_unified_line_iou_weight)
+            * aux_line_iou
+        )
+        total = (
+            float(self.cfg.four_slot_unified_active_weight) * active_loss
+            + float(self.cfg.four_slot_unified_attention_weight)
+            * attention_loss
+            + float(self.cfg.four_slot_unified_point_weight) * point
+            + float(self.cfg.four_slot_unified_range_weight) * range_loss
+            + float(self.cfg.four_slot_unified_line_iou_weight) * line_iou
+            + float(self.cfg.four_slot_unified_dfl_weight) * dfl
+            + float(self.cfg.four_slot_unified_aux_geometry_weight) * aux_total
+        )
+
+        base_x = outputs.get("selection_slot_unified_base_x_rows")
+        base_range = outputs.get("selection_slot_unified_base_range_norm")
+        matched_final: list[torch.Tensor] = []
+        matched_base: list[torch.Tensor] = []
+        if isinstance(base_x, torch.Tensor) and isinstance(
+            base_range,
+            torch.Tensor,
+        ):
+            if padded_targets is None:
+                padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                    targets,
+                    device=base_x.device,
+                    dtype=torch.float32,
+                    rows=int(base_x.shape[-1]),
+                )
+            else:
+                padded_gt_x, padded_gt_valid = padded_targets
+            with torch.no_grad():
+                base_quality_batch, _base_valid, _gt_valid = (
+                    batched_pairwise_range_aware_row_strip_iou(
+                        base_x.detach().float(),
+                        base_range.detach().float(),
+                        padded_gt_x,
+                        padded_gt_valid,
+                        input_h=int(self.cfg.input_h),
+                        line_width=float(self.cfg.four_slot_line_width),
+                        min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                    )
+                )
+            for batch_index, match in enumerate(matches):
+                pred_ids = match["pred_indices"]
+                gt_ids = match["gt_indices"]
+                if pred_ids.numel() == 0:
+                    continue
+                matched_final.append(
+                    final_quality_batch[batch_index, pred_ids, gt_ids]
+                )
+                matched_base.append(
+                    base_quality_batch[batch_index, pred_ids, gt_ids]
+                )
+        zero = total.detach() * 0.0
+        mean_final = (
+            torch.cat(matched_final).mean().detach()
+            if matched_final
+            else zero
+        )
+        mean_base = (
+            torch.cat(matched_base).mean().detach()
+            if matched_base
+            else zero
+        )
+        return {
+            "total": total,
+            "active": active_loss,
+            "attention": attention_loss,
+            "point": point,
+            "range": range_loss,
+            "line_iou": line_iou,
+            "dfl": dfl,
+            "aux_point": aux_point,
+            "aux_range": aux_range_loss,
+            "aux_line_iou": aux_line_iou,
+            "mean_matched": match_count.mean().detach(),
+            "mean_base_quality": mean_base,
+            "mean_final_quality": mean_final,
+            "mean_quality_gain": (mean_final - mean_base).detach(),
+            "mean_target_support_mass": mean_support_mass,
+            "mean_active_probability": torch.sigmoid(
+                active_logits.float()
+            ).mean().detach(),
         }
 
     @torch.no_grad()
