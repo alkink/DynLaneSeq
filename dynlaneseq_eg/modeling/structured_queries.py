@@ -2735,6 +2735,97 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0e-3,
                     )
                 ),
+                global_visual_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_enabled",
+                        False,
+                    )
+                ),
+                global_visual_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                global_visual_geometry_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                global_visual_geometry_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                global_visual_geometry_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_vertical_layers",
+                        2,
+                    )
+                ),
+                global_visual_geometry_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_dropout",
+                        0.0,
+                    )
+                ),
+                global_visual_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_delta_offsets_px",
+                        (-96.0, -48.0, -24.0, 0.0, 24.0, 48.0, 96.0),
+                    )
+                ),
+                global_visual_geometry_detach_slot_states=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_detach_slot_states",
+                        False,
+                    )
+                ),
+                global_visual_geometry_slot_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_slot_gradient_scale",
+                        1.0,
+                    )
+                ),
+                global_visual_geometry_spatial_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_spatial_prior_strength",
+                        1.0,
+                    )
+                ),
+                global_visual_geometry_spatial_prior_sigma=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_spatial_prior_sigma",
+                        0.22,
+                    )
+                ),
+                global_visual_geometry_range_start_prior=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_range_start_prior",
+                        0.05,
+                    )
+                ),
+                global_visual_geometry_range_end_prior=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_range_end_prior",
+                        0.95,
+                    )
+                ),
+                global_visual_geometry_zero_init_delta_head=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_zero_init_delta_head",
+                        True,
+                    )
+                ),
+                global_visual_geometry_delta_head_init_std=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_global_visual_geometry_delta_head_init_std",
+                        1.0e-3,
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(

@@ -401,9 +401,13 @@ def _collect_v7(
     model.eval()
     selector = model.structured_query_head.set_selection_head
     refiner = (
-        selector.slot_owned_geometry
-        if selector.slot_owned_geometry is not None
-        else selector.slot_refinement
+        selector.global_visual_geometry
+        if getattr(selector, "global_visual_geometry", None) is not None
+        else (
+            selector.slot_owned_geometry
+            if selector.slot_owned_geometry is not None
+            else selector.slot_refinement
+        )
     )
     if refiner is None:
         raise ValueError("route-policy audit requires a four-slot geometry head")
@@ -447,10 +451,15 @@ def _collect_v7(
             target_mode=str(loss_cfg.get("four_slot_target_mode", "all_gt")),
         )
         target_rows_batch = target_data["rows"]
-        production_replay = _run_refiner(
-            refiner,
-            captured,
-            reference_mode=str(refiner.reference_mode),
+        global_visual = not hasattr(refiner, "reference_mode")
+        production_replay = (
+            refiner(**captured)
+            if global_visual
+            else _run_refiner(
+                refiner,
+                captured,
+                reference_mode=str(refiner.reference_mode),
+            )
         )
         replay_max_error = max(
             replay_max_error,
@@ -496,31 +505,41 @@ def _collect_v7(
             batch_assignments.append(slots_for_gt)
             batch_target_argmax.append(target_argmax)
 
-        predicted_soft = _run_refiner(
-            refiner,
-            captured,
-            reference_mode="soft",
-            structured_unique=True,
-        )
-        target_soft = _run_refiner(
-            refiner,
-            captured,
-            reference_mode="soft",
-            route_indices=forced_routes,
-            route_logits=target_soft_logits,
-            structured_unique=False,
-        )
-        target_hard = _run_refiner(
-            refiner,
-            captured,
-            reference_mode="hard_st",
-            route_indices=forced_routes,
-        )
-        current_hard = _run_refiner(
-            refiner,
-            captured,
-            reference_mode="hard_st",
-        )
+        if global_visual:
+            # V10 has deliberately removed the proposal-policy argument from
+            # final geometry.  Replaying every route policy must therefore be
+            # identical; retaining the standard report tree makes the audit
+            # directly comparable and verifies that invariance empirically.
+            predicted_soft = production_replay
+            target_soft = production_replay
+            target_hard = production_replay
+            current_hard = production_replay
+        else:
+            predicted_soft = _run_refiner(
+                refiner,
+                captured,
+                reference_mode="soft",
+                structured_unique=True,
+            )
+            target_soft = _run_refiner(
+                refiner,
+                captured,
+                reference_mode="soft",
+                route_indices=forced_routes,
+                route_logits=target_soft_logits,
+                structured_unique=False,
+            )
+            target_hard = _run_refiner(
+                refiner,
+                captured,
+                reference_mode="hard_st",
+                route_indices=forced_routes,
+            )
+            current_hard = _run_refiner(
+                refiner,
+                captured,
+                reference_mode="hard_st",
+            )
         policy_outputs = {
             "current_hard": current_hard,
             "predicted_soft": predicted_soft,
@@ -689,11 +708,19 @@ def _collect_v7(
     total = sum(error_counts.values())
     result = {
         "iteration": int(iteration),
-        "production_reference_mode": str(refiner.reference_mode),
+        "production_reference_mode": (
+            "global_visual"
+            if not hasattr(refiner, "reference_mode")
+            else str(refiner.reference_mode)
+        ),
         "production_policy": (
-            "predicted_soft"
-            if str(refiner.reference_mode) == "soft"
-            else "current_hard"
+            "current_hard"
+            if not hasattr(refiner, "reference_mode")
+            else (
+                "predicted_soft"
+                if str(refiner.reference_mode) == "soft"
+                else "current_hard"
+            )
         ),
         "sampled_indices": _limited_indices(sampled_indices, image_limit),
         "images": len(records),

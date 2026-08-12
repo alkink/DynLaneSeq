@@ -1331,6 +1331,359 @@ class FourSlotBoundedRefinement(nn.Module):
         return result
 
 
+class FourSlotGlobalVisualGeometry(nn.Module):
+    """Predict four slot-owned lanes from the complete P2 row grid.
+
+    Unlike the V7--V9 geometry paths, this module never gathers or averages
+    proposal coordinates.  Every slot attends over every horizontal P2 bin
+    on every output row, exchanges information vertically, attends a second
+    time, and then predicts a bounded residual and an absolute visible range.
+    Proposal routing remains available for activity/scoring diagnostics, but
+    a wrong proposal ID cannot choose the geometry-producing visual region.
+
+    The P2 tensor is deliberately detached in the first causal gate.  Final
+    geometry can shape the new visual projections and (optionally) the live
+    persistent slot state, while it cannot update the proposal detector,
+    backbone/FPN, or the separate active/no-lane head.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        input_w: int,
+        slot_dim: int,
+        num_slots: int,
+        hidden_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        vertical_layers: int,
+        dropout: float,
+        delta_offsets_px: tuple[float, ...],
+        detach_slot_states: bool = False,
+        slot_state_gradient_scale: float = 1.0,
+        spatial_prior_strength: float = 1.0,
+        spatial_prior_sigma: float = 0.22,
+        range_start_prior: float = 0.05,
+        range_end_prior: float = 0.95,
+        zero_init_delta_head: bool = True,
+        delta_head_init_std: float = 1.0e-3,
+    ) -> None:
+        super().__init__()
+        offsets = tuple(float(value) for value in delta_offsets_px)
+        if len(offsets) < 3 or tuple(sorted(offsets)) != offsets:
+            raise ValueError("global visual geometry offsets must be sorted")
+        if not any(abs(value) < 1.0e-12 for value in offsets):
+            raise ValueError("global visual geometry offsets must include zero")
+        if any(
+            abs(left + right) > 1.0e-6
+            for left, right in zip(offsets, reversed(offsets))
+        ):
+            raise ValueError("global visual geometry offsets must be symmetric")
+        if int(num_slots) < 1:
+            raise ValueError("global visual geometry needs at least one slot")
+        if int(hidden_dim) < 1 or int(hidden_dim) % int(num_heads):
+            raise ValueError(
+                "global visual geometry heads must divide hidden_dim"
+            )
+        if int(vertical_layers) < 0:
+            raise ValueError("global visual vertical layer count is invalid")
+        if not 0.0 <= float(slot_state_gradient_scale) <= 1.0:
+            raise ValueError("visual slot gradient scale must be in [0, 1]")
+        if float(spatial_prior_strength) < 0.0:
+            raise ValueError("visual spatial-prior strength must be non-negative")
+        if float(spatial_prior_sigma) <= 0.0:
+            raise ValueError("visual spatial-prior sigma must be positive")
+        if not 0.0 < float(range_start_prior) < float(range_end_prior) < 1.0:
+            raise ValueError("visual range priors must satisfy 0 < start < end < 1")
+
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.slot_dim = int(slot_dim)
+        self.num_slots = int(num_slots)
+        self.hidden_dim = int(hidden_dim)
+        self.detach_slot_states = bool(detach_slot_states)
+        self.slot_state_gradient_scale = float(slot_state_gradient_scale)
+        self.spatial_prior_strength = float(spatial_prior_strength)
+        self.spatial_prior_sigma = float(spatial_prior_sigma)
+
+        self.feature_norm = nn.LayerNorm(self.dim)
+        self.feature_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.feature_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.x_position_projection = nn.Linear(4, self.hidden_dim, bias=False)
+        self.row_position_projection = nn.Linear(4, self.hidden_dim, bias=False)
+        self.slot_norm = nn.LayerNorm(self.slot_dim)
+        self.slot_projection = nn.Linear(self.slot_dim, self.hidden_dim)
+        self.visual_slot_tokens = nn.Embedding(self.num_slots, self.hidden_dim)
+        self.query_norm = nn.LayerNorm(self.hidden_dim)
+        self.first_query = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.second_query = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.first_context = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.second_context = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.first_output_norm = nn.LayerNorm(self.hidden_dim)
+        self.first_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+        if int(vertical_layers):
+            vertical_layer = nn.TransformerEncoderLayer(
+                d_model=self.hidden_dim,
+                nhead=int(num_heads),
+                dim_feedforward=int(ff_dim),
+                dropout=float(dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.vertical_encoder = nn.TransformerEncoder(
+                vertical_layer,
+                num_layers=int(vertical_layers),
+                enable_nested_tensor=False,
+            )
+        else:
+            self.vertical_encoder = None
+        self.second_output_norm = nn.LayerNorm(self.hidden_dim)
+        self.second_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+        self.delta_norm = nn.LayerNorm(
+            self.hidden_dim,
+            elementwise_affine=False,
+        )
+        self.delta_head = nn.Linear(
+            self.hidden_dim,
+            len(offsets),
+            bias=False,
+        )
+        self.range_norm = nn.LayerNorm(self.hidden_dim)
+        self.range_head = nn.Linear(self.hidden_dim, 2)
+
+        # A weak, learnable left-to-right discovery prior breaks the four-way
+        # permutation symmetry at cold start.  It biases attention only; the
+        # full image width remains reachable and the anchors/slope are live.
+        initial_anchors = torch.linspace(
+            0.15,
+            0.85,
+            self.num_slots,
+            dtype=torch.float32,
+        )
+        self.anchor_logits = nn.Parameter(
+            torch.logit(initial_anchors.clamp(1.0e-4, 1.0 - 1.0e-4))
+        )
+        self.anchor_slopes = nn.Parameter(torch.zeros(self.num_slots))
+
+        nn.init.normal_(self.visual_slot_tokens.weight, std=0.02)
+        if bool(zero_init_delta_head):
+            nn.init.zeros_(self.delta_head.weight)
+        else:
+            nn.init.normal_(self.delta_head.weight, std=float(delta_head_init_std))
+        nn.init.zeros_(self.range_head.weight)
+        nn.init.constant_(
+            self.range_head.bias[0],
+            math.log(float(range_start_prior) / (1.0 - float(range_start_prior))),
+        )
+        nn.init.constant_(
+            self.range_head.bias[1],
+            math.log(float(range_end_prior) / (1.0 - float(range_end_prior))),
+        )
+        self.register_buffer(
+            "delta_offsets_px",
+            torch.tensor(offsets, dtype=torch.float32),
+        )
+
+    @staticmethod
+    def _position_basis(values: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (
+                values,
+                values.square(),
+                torch.sin(math.pi * values),
+                torch.cos(math.pi * values),
+            ),
+            dim=-1,
+        )
+
+    def _spatial_prior(
+        self,
+        row_fraction: torch.Tensor,
+        x_fraction: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        anchor = torch.sigmoid(
+            self.anchor_logits[:, None]
+            + self.anchor_slopes[:, None] * (row_fraction[None, :] - 0.5)
+        )
+        distance = x_fraction.view(1, 1, -1) - anchor.unsqueeze(-1)
+        prior = -0.5 * distance.square() / (self.spatial_prior_sigma**2)
+        return self.spatial_prior_strength * prior, anchor
+
+    def _attend(
+        self,
+        query_state: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        spatial_prior: torch.Tensor,
+        projection: nn.Linear,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = torch.einsum(
+            "bsrh,brxh->bsrx",
+            projection(query_state),
+            keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        logits = logits + spatial_prior.unsqueeze(0).to(dtype=logits.dtype)
+        probability = torch.softmax(logits.float(), dim=-1)
+        context = torch.einsum("bsrx,brxh->bsrh", probability, values.float())
+        return logits, probability, context
+
+    def forward(
+        self,
+        *,
+        slot_states: torch.Tensor,
+        slot_active: torch.Tensor,
+        row_value_features: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if row_value_features.ndim != 4:
+            raise ValueError("P2 row features must have shape [B,R,X,C]")
+        batch, rows, x_bins, channels = row_value_features.shape
+        if int(channels) != self.dim:
+            raise ValueError("P2 row feature dimension mismatch")
+        if slot_states.ndim != 3 or int(slot_states.shape[0]) != batch:
+            raise ValueError("visual slot states must have shape [B,S,D]")
+        slots = int(slot_states.shape[1])
+        if slots != self.num_slots:
+            raise ValueError("visual slot count does not match configuration")
+        if tuple(slot_active.shape) != (batch, slots):
+            raise ValueError("visual slot activity must have shape [B,S]")
+
+        # The causal gate freezes the visual producer.  Only these fresh P2
+        # projections and the live slot-side graph receive geometry gradient.
+        features = row_value_features.detach().float()
+        feature_state = self.feature_norm(features)
+        x_fraction = torch.linspace(
+            0.0,
+            1.0,
+            x_bins,
+            device=features.device,
+            dtype=torch.float32,
+        )
+        row_fraction = fixed_row_fractions(
+            rows,
+            device=features.device,
+            dtype=torch.float32,
+        )
+        x_position = self.x_position_projection(
+            self._position_basis(x_fraction)
+        ).view(1, 1, x_bins, self.hidden_dim)
+        keys = self.feature_key(feature_state) + x_position
+        values = self.feature_value(feature_state) + x_position
+
+        if self.detach_slot_states:
+            slot_input = slot_states.detach()
+        else:
+            scale = self.slot_state_gradient_scale
+            slot_input = slot_states.detach() + scale * (
+                slot_states - slot_states.detach()
+            )
+        row_position = self.row_position_projection(
+            self._position_basis(row_fraction)
+        ).view(1, 1, rows, self.hidden_dim)
+        visual_tokens = self.visual_slot_tokens.weight.view(
+            1,
+            slots,
+            1,
+            self.hidden_dim,
+        )
+        query_state = self.slot_projection(
+            self.slot_norm(slot_input.float())
+        ).unsqueeze(2)
+        query_state = self.query_norm(query_state + visual_tokens + row_position)
+        spatial_prior, anchor = self._spatial_prior(row_fraction, x_fraction)
+
+        _first_logits, first_probability, first_context = self._attend(
+            query_state,
+            keys,
+            values,
+            spatial_prior,
+            self.first_query,
+        )
+        hidden = query_state + self.first_context(first_context)
+        hidden = hidden + self.first_ffn(self.first_output_norm(hidden))
+        if self.vertical_encoder is not None:
+            hidden = self.vertical_encoder(
+                hidden.reshape(batch * slots, rows, self.hidden_dim)
+            ).reshape(batch, slots, rows, self.hidden_dim)
+
+        _second_logits, probability, second_context = self._attend(
+            hidden,
+            keys,
+            values,
+            spatial_prior,
+            self.second_query,
+        )
+        hidden = hidden + self.second_context(second_context)
+        hidden = hidden + self.second_ffn(self.second_output_norm(hidden))
+        x_pixels = x_fraction * float(max(self.input_w - 1, 1))
+        reference_x = torch.einsum("bsrx,x->bsr", probability, x_pixels)
+
+        delta_logits = self.delta_head(self.delta_norm(hidden))
+        delta_probability = torch.softmax(delta_logits.float(), dim=-1)
+        delta_offsets = self.delta_offsets_px.to(
+            device=delta_probability.device,
+            dtype=delta_probability.dtype,
+        )
+        delta = (delta_probability * delta_offsets).sum(dim=-1)
+        refined_x = (reference_x + delta).clamp(
+            0.0,
+            float(max(self.input_w - 1, 1)),
+        )
+
+        pooled_hidden = hidden.mean(dim=2)
+        predicted_range = sort_range_norm(
+            torch.sigmoid(self.range_head(self.range_norm(pooled_hidden))).float()
+        )
+        geometry_valid = torch.ones(
+            (batch, slots),
+            dtype=torch.bool,
+            device=slot_states.device,
+        )
+        active_rows = geometry_valid.unsqueeze(-1).expand(-1, -1, rows)
+        active_count = active_rows.float().sum(dim=(1, 2)).clamp_min(1.0)
+        entropy = -(probability * probability.clamp_min(1.0e-12).log()).sum(
+            dim=-1
+        )
+        top1 = probability.amax(dim=-1)
+        mean_abs = (delta.abs() * active_rows.float()).sum(dim=(1, 2))
+        mean_abs = mean_abs / active_count
+        max_abs = delta.abs().amax(dim=(1, 2))
+        boundary_mass = delta_probability[..., (0, -1)].sum(dim=-1).mean(
+            dim=(1, 2)
+        )
+        return {
+            "selection_slot_pred_x_rows": refined_x,
+            "selection_slot_range_norm": predicted_range,
+            "selection_slot_active": slot_active.bool(),
+            "selection_slot_geometry_valid": geometry_valid,
+            "selection_slot_input_reference_x_rows": reference_x,
+            "selection_slot_input_range_norm": predicted_range,
+            "selection_slot_row_delta_logits": delta_logits,
+            "selection_slot_row_delta_offsets_px": self.delta_offsets_px,
+            "selection_slot_range_delta": torch.zeros_like(predicted_range),
+            "selection_slot_range_delta_boundary_mass": predicted_range.new_zeros(
+                (batch, slots)
+            ),
+            "selection_slot_delta_mean_abs": mean_abs,
+            "selection_slot_delta_max_abs": max_abs,
+            "selection_slot_delta_boundary_mass": boundary_mass,
+            "selection_slot_visual_attention": probability,
+            "selection_slot_visual_first_attention": first_probability,
+            "selection_slot_visual_attention_entropy": entropy.mean(dim=(1, 2)),
+            "selection_slot_visual_attention_top1_mass": top1.mean(dim=(1, 2)),
+            "selection_slot_visual_anchor_fraction": anchor,
+        }
+
+
 class FourSlotLaneSelectionHead(nn.Module):
     """Route four persistent lane-object slots over frozen V5 proposals.
 
@@ -1423,6 +1776,29 @@ class FourSlotLaneSelectionHead(nn.Module):
         slot_owned_geometry_vertical_dropout: float = 0.0,
         slot_owned_geometry_zero_init_delta_heads: bool = False,
         slot_owned_geometry_delta_head_init_std: float = 1.0e-3,
+        global_visual_geometry_enabled: bool = False,
+        global_visual_geometry_hidden_dim: int | None = None,
+        global_visual_geometry_num_heads: int = 8,
+        global_visual_geometry_ff_dim: int | None = None,
+        global_visual_geometry_vertical_layers: int = 2,
+        global_visual_geometry_dropout: float = 0.0,
+        global_visual_geometry_delta_offsets_px: tuple[float, ...] = (
+            -96.0,
+            -48.0,
+            -24.0,
+            0.0,
+            24.0,
+            48.0,
+            96.0,
+        ),
+        global_visual_geometry_detach_slot_states: bool = False,
+        global_visual_geometry_slot_gradient_scale: float = 1.0,
+        global_visual_geometry_spatial_prior_strength: float = 1.0,
+        global_visual_geometry_spatial_prior_sigma: float = 0.22,
+        global_visual_geometry_range_start_prior: float = 0.05,
+        global_visual_geometry_range_end_prior: float = 0.95,
+        global_visual_geometry_zero_init_delta_head: bool = True,
+        global_visual_geometry_delta_head_init_std: float = 1.0e-3,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -1447,10 +1823,19 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.min_valid_rows = int(min_valid_rows)
         self.refinement_enabled = bool(refinement_enabled)
         self.slot_owned_geometry_enabled = bool(slot_owned_geometry_enabled)
-        if self.refinement_enabled and self.slot_owned_geometry_enabled:
+        self.global_visual_geometry_enabled = bool(
+            global_visual_geometry_enabled
+        )
+        if sum(
+            (
+                self.refinement_enabled,
+                self.slot_owned_geometry_enabled,
+                self.global_visual_geometry_enabled,
+            )
+        ) > 1:
             raise ValueError(
-                "legacy slot refinement and slot-owned geometry are mutually "
-                "exclusive"
+                "legacy, proposal-memory, and global-visual geometry are "
+                "mutually exclusive"
             )
         self.factorized_routing = bool(factorized_routing)
         self.geometry_detach_router_states = bool(
@@ -1498,7 +1883,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.detach_geometry_features = True
         self.retain_pointer_diagnostic_tensors = False
         self.requires_row_value_features = (
-            self.refinement_enabled or self.slot_owned_geometry_enabled
+            self.refinement_enabled
+            or self.slot_owned_geometry_enabled
+            or self.global_visual_geometry_enabled
         )
 
         # Exact successful probe descriptor:
@@ -1645,6 +2032,59 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
             )
             if self.slot_owned_geometry_enabled
+            else None
+        )
+        # V10 removes proposal identity from the geometry-producing forward.
+        # Four persistent slots directly scan the complete P2 row grid and
+        # own their final x/range predictions.  This distinct prefix prevents
+        # accidental reuse of V7--V9 weights trained around proposal anchors.
+        self.global_visual_geometry = (
+            FourSlotGlobalVisualGeometry(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    global_visual_geometry_hidden_dim or self.hidden_dim
+                ),
+                num_heads=int(global_visual_geometry_num_heads),
+                ff_dim=int(
+                    global_visual_geometry_ff_dim
+                    or 2 * int(
+                        global_visual_geometry_hidden_dim or self.hidden_dim
+                    )
+                ),
+                vertical_layers=int(global_visual_geometry_vertical_layers),
+                dropout=float(global_visual_geometry_dropout),
+                delta_offsets_px=tuple(
+                    global_visual_geometry_delta_offsets_px
+                ),
+                detach_slot_states=bool(
+                    global_visual_geometry_detach_slot_states
+                ),
+                slot_state_gradient_scale=float(
+                    global_visual_geometry_slot_gradient_scale
+                ),
+                spatial_prior_strength=float(
+                    global_visual_geometry_spatial_prior_strength
+                ),
+                spatial_prior_sigma=float(
+                    global_visual_geometry_spatial_prior_sigma
+                ),
+                range_start_prior=float(
+                    global_visual_geometry_range_start_prior
+                ),
+                range_end_prior=float(
+                    global_visual_geometry_range_end_prior
+                ),
+                zero_init_delta_head=bool(
+                    global_visual_geometry_zero_init_delta_head
+                ),
+                delta_head_init_std=float(
+                    global_visual_geometry_delta_head_init_std
+                ),
+            )
+            if self.global_visual_geometry_enabled
             else None
         )
         nn.init.normal_(self.slot_tokens.weight, std=0.02)
@@ -2011,6 +2451,18 @@ class FourSlotLaneSelectionHead(nn.Module):
                     route_indices=geometry_indices,
                     route_logits=geometry_route_logits,
                     candidate_valid=candidate_valid,
+                    slot_active=slot_active,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.global_visual_geometry is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError(
+                    "global visual slot geometry requires projected P2 rows"
+                )
+            result.update(
+                self.global_visual_geometry(
+                    slot_states=slots,
                     slot_active=slot_active,
                     row_value_features=row_value_features,
                 )
