@@ -56,6 +56,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--split", choices=("train", "val", "test"), default="val")
+    parser.add_argument(
+        "--list-path",
+        default="",
+        help="Optional explicit list for fixed-set train/validation audits.",
+    )
+    parser.add_argument(
+        "--sample-strategy",
+        choices=("uniform", "sequential"),
+        default="uniform",
+    )
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--metric-workers", type=int, default=1)
@@ -81,7 +92,22 @@ def _prepare_config(path: str, args: argparse.Namespace) -> dict[str, Any]:
     cfg["dataloader"]["persistent_workers"] = bool(int(args.num_workers) > 0)
     cfg.setdefault("model", {})["pretrained_backbone"] = False
     cfg["model"]["require_pretrained_backbone"] = False
+    if args.list_path:
+        cfg.setdefault("dataset", {}).setdefault("lists", {})[args.split] = str(
+            Path(args.list_path).expanduser().resolve()
+        )
     return cfg
+
+
+def _sampling_limit(args: argparse.Namespace) -> tuple[int, int | None]:
+    max_images = int(args.max_images)
+    if max_images <= 0:
+        return 0, None
+    return math.ceil(max_images / int(args.eval_batch_size)), max_images
+
+
+def _limited_indices(indices: list[int], limit: int | None) -> list[int]:
+    return indices if limit is None else indices[:limit]
 
 
 def _plain_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -377,11 +403,11 @@ def _collect_v7(
     refiner = selector.slot_refinement
     if refiner is None:
         raise ValueError("V7 audit requires a four-slot refiner")
-    loader = build_dataloader(cfg, split="val", training=False)
-    max_batches = math.ceil(int(args.max_images) / int(args.eval_batch_size))
+    loader = build_dataloader(cfg, split=args.split, training=False)
+    max_batches, image_limit = _sampling_limit(args)
     loader, sampled_indices = select_diagnostic_loader(
         loader,
-        strategy="uniform",
+        strategy=args.sample_strategy,
         max_batches=max_batches,
         num_workers=int(args.num_workers),
     )
@@ -650,7 +676,7 @@ def _collect_v7(
     total = sum(error_counts.values())
     result = {
         "iteration": int(iteration),
-        "sampled_indices": sampled_indices[: int(args.max_images)],
+        "sampled_indices": _limited_indices(sampled_indices, image_limit),
         "images": len(records),
         "replay_max_abs_error": replay_max_error,
         "target_argmax_raw_collision_count": target_argmax_collision_count,
@@ -705,15 +731,18 @@ def _collect_v8_forced_mix(
     )
     labels = tuple(label for label, _value in requested_policies)
     metric_tree = _metric_template(labels, thresholds)
-    loader = build_dataloader(cfg, split="val", training=False)
-    max_batches = math.ceil(int(args.max_images) / int(args.eval_batch_size))
+    loader = build_dataloader(cfg, split=args.split, training=False)
+    max_batches, image_limit = _sampling_limit(args)
     loader, sampled_indices = select_diagnostic_loader(
         loader,
-        strategy="uniform",
+        strategy=args.sample_strategy,
         max_batches=max_batches,
         num_workers=int(args.num_workers),
     )
-    if sampled_indices[: int(args.max_images)] != expected_indices[: int(args.max_images)]:
+    if _limited_indices(sampled_indices, image_limit) != _limited_indices(
+        expected_indices,
+        image_limit,
+    ):
         raise ValueError("V7 and V8 diagnostic indices differ")
     records: list[dict[str, Any]] = []
     effective: dict[str, float] = {}
@@ -915,11 +944,16 @@ def main() -> None:
     payload = {
         "experiment": "V7/V8 route-support and reference-policy zero-step audit",
         "diagnostic_only": True,
-        "test_set_used": False,
+        "test_set_used": args.split == "test",
         "training_steps": 0,
         "protocol": {
-            "split": "val",
-            "sample_strategy": "uniform",
+            "split": args.split,
+            "list_path": (
+                str(Path(args.list_path).expanduser().resolve())
+                if args.list_path
+                else None
+            ),
+            "sample_strategy": args.sample_strategy,
             "max_images": int(args.max_images),
             "eval_batch_size": int(args.eval_batch_size),
             "amp_dtype": "none",

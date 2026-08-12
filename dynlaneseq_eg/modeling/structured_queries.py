@@ -2572,6 +2572,12 @@ class StructuredLaneQueryHead(nn.Module):
                         0.80,
                     )
                 ),
+                geometry_detach_router_states=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_geometry_detach_router_states",
+                        True,
+                    )
+                ),
                 refinement_structured_unique_routing=bool(
                     self.set_selection_cfg.get(
                         "four_slot_refinement_structured_unique_routing",

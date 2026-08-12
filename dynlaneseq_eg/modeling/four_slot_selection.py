@@ -1237,6 +1237,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         refinement_route_temperature: float = 1.0,
         factorized_routing: bool = False,
         active_prior_prob: float = 0.80,
+        geometry_detach_router_states: bool = True,
         refinement_structured_unique_routing: bool = False,
         refinement_route_gradient_scale: float = 1.0,
         refinement_reference_mode: str = "hard_st",
@@ -1279,6 +1280,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.min_valid_rows = int(min_valid_rows)
         self.refinement_enabled = bool(refinement_enabled)
         self.factorized_routing = bool(factorized_routing)
+        self.geometry_detach_router_states = bool(
+            geometry_detach_router_states
+        )
         self.register_buffer(
             "_route_combinations",
             torch.tensor(
@@ -1664,13 +1668,25 @@ class FourSlotLaneSelectionHead(nn.Module):
                 real_probability
                 * real_probability.clamp_min(1.0e-12).log()
             ).sum(dim=-1)
-            # Detaching the normalized states blocks geometry loss from the
-            # active head and shared router trunk, while the shared route
-            # projection weights still receive the controlled route gradient.
+            # The protected V7 contract detaches the normalized states so
+            # geometry reaches only the shared route projections.  V8.1 can
+            # open this exact backward edge without changing any forward
+            # value, allowing a paired causal test of geometry supervision on
+            # the global proposal encoder and slot decoder.
+            geometry_slots = (
+                slots.detach()
+                if self.geometry_detach_router_states
+                else slots
+            )
+            geometry_candidates = (
+                candidates.detach()
+                if self.geometry_detach_router_states
+                else candidates
+            )
             geometry_route_logits = torch.einsum(
                 "bsd,bnd->bsn",
-                self.slot_query(slots.detach()),
-                self.candidate_key(candidates.detach()),
+                self.slot_query(geometry_slots),
+                self.candidate_key(geometry_candidates),
             ) / math.sqrt(float(self.hidden_dim))
             geometry_route_logits = geometry_route_logits.masked_fill(
                 ~candidate_valid[:, None, :],

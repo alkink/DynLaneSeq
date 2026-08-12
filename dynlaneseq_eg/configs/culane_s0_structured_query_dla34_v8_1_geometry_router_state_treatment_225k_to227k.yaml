@@ -1,0 +1,13 @@
+_base_: culane_s0_structured_query_dla34_v8_1_geometry_router_state_control_225k_to227k.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v8_1_geometry_router_state_gate_225k/treatment
+
+# The only functional difference from control is this backward edge.  Detach
+# removal changes no forward tensor, route ID, score, activity or geometry at
+# initialization.  Geometry can now train the global proposal encoder and slot
+# decoder through the same structured hard-ST routing marginal.
+model:
+  structured_query:
+    set_selection:
+      four_slot_geometry_detach_router_states: false
+

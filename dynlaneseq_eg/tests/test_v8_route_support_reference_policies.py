@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from argparse import Namespace
+
 import torch
 
 from dynlaneseq_eg.losses.loss_s0 import (
@@ -8,9 +10,20 @@ from dynlaneseq_eg.losses.loss_s0 import (
 )
 from dynlaneseq_eg.tools.audit_v8_route_support_reference_policies import (
     _hard_min_slots,
+    _limited_indices,
+    _sampling_limit,
     _target_hard_unique_routes,
     _target_soft_weights,
 )
+
+
+def test_sampling_limit_supports_complete_fixed_lists() -> None:
+    args = Namespace(max_images=0, eval_batch_size=8)
+    assert _sampling_limit(args) == (0, None)
+    assert _limited_indices([1, 2, 3], None) == [1, 2, 3]
+    args.max_images = 17
+    assert _sampling_limit(args) == (3, 17)
+    assert _limited_indices(list(range(20)), 17) == list(range(17))
 
 
 def test_hard_min_slots_respects_route_and_activity_cost() -> None:
