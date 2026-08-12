@@ -21,6 +21,7 @@ RUN_FIXED64="${RUN_FIXED64:-1}"
 RUN_GENERALIZATION="${RUN_GENERALIZATION:-1}"
 EVAL_TRAJECTORY="${EVAL_TRAJECTORY:-0}"
 SUMMARY_PREFIX="${SUMMARY_PREFIX:-v8_1}"
+ALLOW_FAILED_FIXED64_EXPLORATORY="${ALLOW_FAILED_FIXED64_EXPLORATORY:-0}"
 
 CONTROL_CONFIG="${CONTROL_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v8_1_geometry_router_state_control_225k_to227k.yaml}"
 TREATMENT_CONFIG="${TREATMENT_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v8_1_geometry_router_state_treatment_225k_to227k.yaml}"
@@ -257,6 +258,7 @@ if [[ "${RUN_FIXED64}" == "1" ]]; then
   route_report "${TREATMENT_MEMORY_CONFIG}" "${MEMORY_TREATMENT_DIR}/iter_${END_TAG}.pt" "${FIXED_TREATMENT_ROUTE}" train "${FIXED_LIST}" 0 sequential
   coverage_report "${TREATMENT_MEMORY_CONFIG}" "${MEMORY_TREATMENT_DIR}/iter_${END_TAG}.pt" "${FIXED_TREATMENT_COVERAGE}" "${CACHE_ROOT}/fixed64_treatment" train "${FIXED_LIST}" 0 sequential
 
+  set +e
   "${PYTHON}" -u -m dynlaneseq_eg.tools.summarize_v8_1_geometry_router_state_gate \
     --mode fixed64 \
     --population-contract "${POPULATION_REPORT}" \
@@ -268,10 +270,16 @@ if [[ "${RUN_FIXED64}" == "1" ]]; then
     --treatment-coverage "${FIXED_TREATMENT_COVERAGE}" \
     --iteration "${END_ITERATION}" \
     --output-json "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json"
+  fixed64_status=$?
+  set -e
+  if (( fixed64_status != 0 )) && [[ "${ALLOW_FAILED_FIXED64_EXPLORATORY}" != "1" ]]; then
+    exit "${fixed64_status}"
+  fi
 elif [[ ! -f "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json" ]]; then
   echo "RUN_FIXED64=0 requires an existing fixed-64 summary." >&2
   exit 1
 else
+  set +e
   "${PYTHON}" - "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json" <<'PY'
 import json
 import sys
@@ -279,6 +287,16 @@ from pathlib import Path
 if json.loads(Path(sys.argv[1]).read_text()).get("passed") is not True:
     raise SystemExit("existing fixed-64 gate failed")
 PY
+  fixed64_status=$?
+  set -e
+  if (( fixed64_status != 0 )) && [[ "${ALLOW_FAILED_FIXED64_EXPLORATORY}" != "1" ]]; then
+    exit "${fixed64_status}"
+  fi
+fi
+
+if [[ "${ALLOW_FAILED_FIXED64_EXPLORATORY}" == "1" ]]; then
+  echo "EXPLORATORY ONLY: continuing past the recorded fixed-64 FAIL."
+  echo "This does not authorize long training or alter the fixed-64 verdict."
 fi
 
 if [[ "${RUN_GENERALIZATION}" != "1" ]]; then
