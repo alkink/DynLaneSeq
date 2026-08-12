@@ -1,0 +1,8 @@
+_base_: culane_s0_structured_query_dla34_v9_slot_owned_control_memorize64.yaml
+
+output_dir: outputs/diagnostics/v9_slot_owned_geometry_gate_225k/memorize64/treatment
+
+model:
+  structured_query:
+    set_selection:
+      four_slot_geometry_detach_router_states: false

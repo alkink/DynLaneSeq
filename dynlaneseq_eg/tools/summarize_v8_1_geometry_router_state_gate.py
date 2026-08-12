@@ -36,11 +36,16 @@ def _route_summary(report: dict[str, Any]) -> dict[str, Any]:
     total = int(decomposition["total_assigned_gt"])
     correct = int(decomposition["counts"]["CORRECT_ID"])
     policies = v7["reference_policies"]
+    production_policy = str(v7.get("production_policy", "current_hard"))
+    if production_policy not in policies:
+        raise ValueError(
+            f"route report has no production policy {production_policy!r}"
+        )
     stages: dict[str, Any] = {}
     for stage in ("reference", "refined"):
         stages[stage] = {
             threshold: dict(
-                policies["current_hard"][stage]["fixed_neural_active"][threshold]
+                policies[production_policy][stage]["fixed_neural_active"][threshold]
             )
             for threshold in THRESHOLDS
         }
@@ -69,6 +74,7 @@ def _route_summary(report: dict[str, Any]) -> dict[str, Any]:
             decomposition["fraction_support_mass_ge_0p8"]
         ),
         "active_predictions_per_image": float(predictions) / float(max(images, 1)),
+        "production_policy": production_policy,
         "current_hard": stages,
         "target_hard": target_hard,
     }
@@ -260,4 +266,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

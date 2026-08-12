@@ -2578,6 +2578,12 @@ class StructuredLaneQueryHead(nn.Module):
                         True,
                     )
                 ),
+                geometry_router_state_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_geometry_router_state_gradient_scale",
+                        1.0,
+                    )
+                ),
                 refinement_structured_unique_routing=bool(
                     self.set_selection_cfg.get(
                         "four_slot_refinement_structured_unique_routing",
@@ -2637,6 +2643,96 @@ class StructuredLaneQueryHead(nn.Module):
                     for value in self.set_selection_cfg.get(
                         "four_slot_range_delta_offsets_norm",
                         (-0.10, -0.05, -0.025, 0.0, 0.025, 0.05, 0.10),
+                    )
+                ),
+                slot_owned_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_enabled",
+                        False,
+                    )
+                ),
+                slot_owned_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                slot_owned_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_delta_offsets_px",
+                        (
+                            -160.0,
+                            -96.0,
+                            -48.0,
+                            -24.0,
+                            0.0,
+                            24.0,
+                            48.0,
+                            96.0,
+                            160.0,
+                        ),
+                    )
+                ),
+                slot_owned_geometry_evidence_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_evidence_offsets_px",
+                        (-48.0, -24.0, -12.0, 0.0, 12.0, 24.0, 48.0),
+                    )
+                ),
+                slot_owned_geometry_route_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_route_temperature",
+                        1.0,
+                    )
+                ),
+                slot_owned_geometry_route_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_route_gradient_scale",
+                        1.0,
+                    )
+                ),
+                slot_owned_geometry_structured_unique_routing=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_structured_unique_routing",
+                        True,
+                    )
+                ),
+                slot_owned_geometry_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_vertical_layers",
+                        2,
+                    )
+                ),
+                slot_owned_geometry_vertical_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_vertical_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                slot_owned_geometry_vertical_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_vertical_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                slot_owned_geometry_vertical_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_vertical_dropout",
+                        0.0,
+                    )
+                ),
+                slot_owned_geometry_zero_init_delta_heads=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_zero_init_delta_heads",
+                        False,
+                    )
+                ),
+                slot_owned_geometry_delta_head_init_std=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_geometry_delta_head_init_std",
+                        1.0e-3,
                     )
                 ),
             )
@@ -3460,6 +3556,10 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_neighborhood_top1_mass",
                 "selection_slot_neighborhood_mix",
                 "selection_slot_neighborhood_reference_shift_px",
+                "selection_slot_owned_weight",
+                "selection_slot_owned_entropy",
+                "selection_slot_owned_top1_mass",
+                "selection_slot_owned_reference_shift_px",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

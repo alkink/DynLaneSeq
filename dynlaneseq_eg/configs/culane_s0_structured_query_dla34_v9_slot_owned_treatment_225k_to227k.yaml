@@ -1,0 +1,11 @@
+_base_: culane_s0_structured_query_dla34_v9_slot_owned_control_225k_to227k.yaml
+
+output_dir: outputs/diagnostics/v9_slot_owned_geometry_gate_225k/treatment
+
+# The sole treatment edge.  Forward tensors are identical to control; final
+# geometry can additionally shape global proposal context and persistent slot
+# states through the structured soft proposal memory.
+model:
+  structured_query:
+    set_selection:
+      four_slot_geometry_detach_router_states: false

@@ -400,9 +400,13 @@ def _collect_v7(
     iteration = load_checkpoint(args.checkpoint, model, strict=False)
     model.eval()
     selector = model.structured_query_head.set_selection_head
-    refiner = selector.slot_refinement
+    refiner = (
+        selector.slot_owned_geometry
+        if selector.slot_owned_geometry is not None
+        else selector.slot_refinement
+    )
     if refiner is None:
-        raise ValueError("V7 audit requires a four-slot refiner")
+        raise ValueError("route-policy audit requires a four-slot geometry head")
     loader = build_dataloader(cfg, split=args.split, training=False)
     max_batches, image_limit = _sampling_limit(args)
     loader, sampled_indices = select_diagnostic_loader(
@@ -443,12 +447,16 @@ def _collect_v7(
             target_mode=str(loss_cfg.get("four_slot_target_mode", "all_gt")),
         )
         target_rows_batch = target_data["rows"]
-        current_replay = _run_refiner(refiner, captured, reference_mode="hard_st")
+        production_replay = _run_refiner(
+            refiner,
+            captured,
+            reference_mode=str(refiner.reference_mode),
+        )
         replay_max_error = max(
             replay_max_error,
             float(
                 (
-                    current_replay["selection_slot_pred_x_rows"]
+                    production_replay["selection_slot_pred_x_rows"]
                     - outputs["selection_slot_pred_x_rows"]
                 ).abs().max()
             ),
@@ -508,8 +516,13 @@ def _collect_v7(
             reference_mode="hard_st",
             route_indices=forced_routes,
         )
+        current_hard = _run_refiner(
+            refiner,
+            captured,
+            reference_mode="hard_st",
+        )
         policy_outputs = {
-            "current_hard": current_replay,
+            "current_hard": current_hard,
             "predicted_soft": predicted_soft,
             "target_soft": target_soft,
             "target_hard": target_hard,
@@ -676,6 +689,12 @@ def _collect_v7(
     total = sum(error_counts.values())
     result = {
         "iteration": int(iteration),
+        "production_reference_mode": str(refiner.reference_mode),
+        "production_policy": (
+            "predicted_soft"
+            if str(refiner.reference_mode) == "soft"
+            else "current_hard"
+        ),
         "sampled_indices": _limited_indices(sampled_indices, image_limit),
         "images": len(records),
         "replay_max_abs_error": replay_max_error,

@@ -32,7 +32,10 @@ from dynlaneseq_eg.tools.train import seed_everything
 SELECTOR = "structured_query_head.set_selection_head."
 ROUTE_PREFIXES = (SELECTOR + "slot_query.", SELECTOR + "candidate_key.")
 ACTIVE_PREFIX = SELECTOR + "active."
-REFINER_PREFIX = SELECTOR + "slot_refinement."
+REFINER_PREFIXES = (
+    SELECTOR + "slot_refinement.",
+    SELECTOR + "slot_owned_geometry.",
+)
 CANDIDATE_PREFIXES = (
     SELECTOR + "input_norm.",
     SELECTOR + "input_projection.",
@@ -118,7 +121,7 @@ def _group(name: str) -> str:
         return "active_head"
     if name.startswith(ROUTE_PREFIXES):
         return "route_projection"
-    if name.startswith(REFINER_PREFIX):
+    if name.startswith(REFINER_PREFIXES):
         return "refiner"
     if name.startswith(CANDIDATE_PREFIXES):
         return "candidate_trunk"
@@ -334,6 +337,8 @@ def main() -> None:
         rng = _rng_snapshot(device)
 
         selector.geometry_detach_router_states = True
+        if selector.slot_owned_geometry is not None:
+            selector.slot_owned_geometry.detach_slot_states = True
         _restore_rng(rng, device)
         control_outputs, control_matches = forward_with_matches(
             model,
@@ -354,6 +359,8 @@ def main() -> None:
         del control_outputs, control_matches, control_losses
 
         selector.geometry_detach_router_states = False
+        if selector.slot_owned_geometry is not None:
+            selector.slot_owned_geometry.detach_slot_states = False
         _restore_rng(rng, device)
         treatment_outputs, treatment_matches = forward_with_matches(
             model,

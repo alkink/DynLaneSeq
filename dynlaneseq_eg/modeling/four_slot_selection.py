@@ -427,8 +427,10 @@ class FourSlotBoundedRefinement(nn.Module):
         slot_dim: int,
         hidden_dim: int,
         delta_offsets_px: tuple[float, ...],
+        evidence_offsets_px: tuple[float, ...] | None = None,
         straight_through_routing: bool = False,
         detach_slot_states: bool = True,
+        slot_state_gradient_scale: float = 1.0,
         route_temperature: float = 1.0,
         structured_unique_routing: bool = False,
         route_gradient_scale: float = 1.0,
@@ -448,6 +450,12 @@ class FourSlotBoundedRefinement(nn.Module):
             0.05,
             0.10,
         ),
+        vertical_layers: int = 0,
+        vertical_num_heads: int = 8,
+        vertical_ff_dim: int | None = None,
+        vertical_dropout: float = 0.0,
+        zero_init_delta_heads: bool = True,
+        delta_head_init_std: float = 1.0e-3,
     ) -> None:
         super().__init__()
         offsets = tuple(float(value) for value in delta_offsets_px)
@@ -460,12 +468,24 @@ class FourSlotBoundedRefinement(nn.Module):
             for left, right in zip(offsets, reversed(offsets))
         ):
             raise ValueError("slot refinement offsets must be symmetric")
+        evidence_offsets = (
+            offsets
+            if evidence_offsets_px is None
+            else tuple(float(value) for value in evidence_offsets_px)
+        )
+        if len(evidence_offsets) < 1:
+            raise ValueError("slot evidence offsets must not be empty")
+        if tuple(sorted(evidence_offsets)) != evidence_offsets:
+            raise ValueError("slot evidence offsets must be sorted")
+        if not any(abs(value) < 1.0e-12 for value in evidence_offsets):
+            raise ValueError("slot evidence offsets must include zero")
         self.dim = int(dim)
         self.input_w = int(input_w)
         self.slot_dim = int(slot_dim)
         self.hidden_dim = int(hidden_dim)
         self.straight_through_routing = bool(straight_through_routing)
         self.detach_slot_states = bool(detach_slot_states)
+        self.slot_state_gradient_scale = float(slot_state_gradient_scale)
         self.route_temperature = float(route_temperature)
         self.structured_unique_routing = bool(structured_unique_routing)
         self.route_gradient_scale = float(route_gradient_scale)
@@ -482,8 +502,15 @@ class FourSlotBoundedRefinement(nn.Module):
         )
         self.neighborhood_gradient_scale = float(neighborhood_gradient_scale)
         self.range_refinement = bool(range_refinement)
+        self.vertical_layers = int(vertical_layers)
+        self.zero_init_delta_heads = bool(zero_init_delta_heads)
+        self.delta_head_init_std = float(delta_head_init_std)
         if self.route_temperature <= 0.0:
             raise ValueError("slot refinement route_temperature must be positive")
+        if not 0.0 <= self.slot_state_gradient_scale <= 1.0:
+            raise ValueError(
+                "slot state gradient scale must be in [0, 1]"
+            )
         if not 0.0 <= self.route_gradient_scale <= 1.0:
             raise ValueError(
                 "slot refinement route_gradient_scale must be in [0, 1]"
@@ -509,6 +536,18 @@ class FourSlotBoundedRefinement(nn.Module):
             raise ValueError(
                 "slot neighborhood gradient scale must be in [0, 1]"
             )
+        if self.vertical_layers < 0:
+            raise ValueError("slot vertical layer count must be non-negative")
+        if int(vertical_num_heads) < 1 or self.hidden_dim % int(
+            vertical_num_heads
+        ):
+            raise ValueError(
+                "slot vertical attention heads must divide hidden_dim"
+            )
+        if float(vertical_dropout) < 0.0:
+            raise ValueError("slot vertical dropout must be non-negative")
+        if self.delta_head_init_std < 0.0:
+            raise ValueError("slot delta-head init std must be non-negative")
         range_offsets = tuple(float(value) for value in range_delta_offsets_norm)
         if self.range_refinement:
             if len(range_offsets) < 3 or tuple(sorted(range_offsets)) != range_offsets:
@@ -534,7 +573,7 @@ class FourSlotBoundedRefinement(nn.Module):
         self.evidence_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
         self.evidence_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
         self.offset_embedding = nn.Parameter(
-            torch.empty(len(offsets), self.hidden_dim)
+            torch.empty(len(evidence_offsets), self.hidden_dim)
         )
         self.context_projection = nn.Linear(
             self.hidden_dim,
@@ -547,6 +586,29 @@ class FourSlotBoundedRefinement(nn.Module):
             nn.GELU(),
             nn.Linear(2 * self.hidden_dim, self.hidden_dim),
         )
+        if self.vertical_layers:
+            self.row_position_projection = nn.Linear(
+                2,
+                self.hidden_dim,
+                bias=False,
+            )
+            vertical_layer = nn.TransformerEncoderLayer(
+                d_model=self.hidden_dim,
+                nhead=int(vertical_num_heads),
+                dim_feedforward=int(vertical_ff_dim or 2 * self.hidden_dim),
+                dropout=float(vertical_dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.vertical_encoder = nn.TransformerEncoder(
+                vertical_layer,
+                num_layers=self.vertical_layers,
+                enable_nested_tensor=False,
+            )
+        else:
+            self.row_position_projection = None
+            self.vertical_encoder = None
         self.delta_norm = nn.LayerNorm(
             self.hidden_dim,
             elementwise_affine=False,
@@ -600,12 +662,29 @@ class FourSlotBoundedRefinement(nn.Module):
         nn.init.normal_(self.offset_embedding, std=0.02)
         # Uniform probability over symmetric offsets has exactly zero expected
         # displacement, so the new graph starts as the verified V6-A model.
-        nn.init.zeros_(self.delta_head.weight)
+        if self.zero_init_delta_heads:
+            nn.init.zeros_(self.delta_head.weight)
+        else:
+            nn.init.normal_(
+                self.delta_head.weight,
+                std=self.delta_head_init_std,
+            )
         if self.range_delta_head is not None:
-            nn.init.zeros_(self.range_delta_head.weight)
+            if self.zero_init_delta_heads:
+                nn.init.zeros_(self.range_delta_head.weight)
+            else:
+                nn.init.normal_(
+                    self.range_delta_head.weight,
+                    std=self.delta_head_init_std,
+                )
         self.register_buffer(
             "delta_offsets_px",
             torch.tensor(offsets, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "evidence_offsets_px",
+            torch.tensor(evidence_offsets, dtype=torch.float32),
+            persistent=False,
         )
         self.register_buffer(
             "range_delta_offsets_norm",
@@ -814,7 +893,7 @@ class FourSlotBoundedRefinement(nn.Module):
         if int(reference_x_rows.shape[-1]) != rows:
             raise ValueError("slot references must share the P2 row grid")
         slots = int(reference_x_rows.shape[1])
-        offsets = self.delta_offsets_px.to(
+        offsets = self.evidence_offsets_px.to(
             device=reference_x_rows.device,
             dtype=torch.float32,
         )
@@ -937,6 +1016,7 @@ class FourSlotBoundedRefinement(nn.Module):
             torch.zeros_like(hard_routed_rows),
         )
         neighborhood_result: dict[str, torch.Tensor] | None = None
+        soft_route_weight: torch.Tensor | None = None
         if self.reference_mode == "neighborhood_soft":
             if candidate_valid is None:
                 raise ValueError(
@@ -999,6 +1079,12 @@ class FourSlotBoundedRefinement(nn.Module):
                     real_logits / self.route_temperature,
                     dim=-1,
                 )
+            if soft_forward and self.route_gradient_scale != 1.0:
+                candidate_weight = candidate_weight.detach() + (
+                    self.route_gradient_scale
+                    * (candidate_weight - candidate_weight.detach())
+                )
+            soft_route_weight = candidate_weight
             soft_reference_x = torch.einsum(
                 "bsn,bnr->bsr",
                 candidate_weight,
@@ -1052,9 +1138,12 @@ class FourSlotBoundedRefinement(nn.Module):
         )
         input_slot_range = slot_range
 
-        slot_input = (
-            slot_states.detach() if self.detach_slot_states else slot_states
-        )
+        if self.detach_slot_states:
+            slot_input = slot_states.detach()
+        else:
+            slot_input = slot_states.detach() + self.slot_state_gradient_scale * (
+                slot_states - slot_states.detach()
+            )
         query_state = self.row_projection(self.row_norm(routed_rows.float()))
         query_state = query_state + self.slot_projection(
             self.slot_norm(slot_input.float())
@@ -1081,6 +1170,27 @@ class FourSlotBoundedRefinement(nn.Module):
         context = (attention.unsqueeze(-1) * values).sum(dim=-2)
         hidden = query_state + self.context_projection(context)
         hidden = hidden + self.ffn(self.output_norm(hidden))
+        if self.vertical_encoder is not None:
+            if self.row_position_projection is None:
+                raise RuntimeError("slot row position projection is unavailable")
+            row_fraction = fixed_row_fractions(
+                rows,
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            row_position = torch.stack(
+                (row_fraction, row_fraction.square()),
+                dim=-1,
+            )
+            hidden = hidden + self.row_position_projection(row_position).view(
+                1,
+                1,
+                rows,
+                self.hidden_dim,
+            )
+            hidden = self.vertical_encoder(
+                hidden.reshape(batch * slots, rows, self.hidden_dim)
+            ).reshape(batch, slots, rows, self.hidden_dim)
         delta_logits = self.delta_head(self.delta_norm(hidden))
         probability = torch.softmax(delta_logits.float(), dim=-1)
         offsets = self.delta_offsets_px.to(
@@ -1193,6 +1303,31 @@ class FourSlotBoundedRefinement(nn.Module):
                     ),
                 }
             )
+        if self.reference_mode == "soft" and soft_route_weight is not None:
+            soft_entropy = -(
+                soft_route_weight
+                * soft_route_weight.clamp_min(1.0e-12).log()
+            ).sum(dim=-1)
+            valid_slots = route_valid.float()
+            valid_count = valid_slots.sum(dim=-1).clamp_min(1.0)
+            result.update(
+                {
+                    "selection_slot_owned_weight": soft_route_weight,
+                    "selection_slot_owned_entropy": (
+                        soft_entropy * valid_slots
+                    ).sum(dim=-1)
+                    / valid_count,
+                    "selection_slot_owned_top1_mass": (
+                        soft_route_weight.amax(dim=-1) * valid_slots
+                    ).sum(dim=-1)
+                    / valid_count,
+                    "selection_slot_owned_reference_shift_px": (
+                        (reference_x.float() - hard_reference_x.float()).abs()
+                        * active_rows.float()
+                    ).sum(dim=(1, 2))
+                    / active_count,
+                }
+            )
         return result
 
 
@@ -1238,6 +1373,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         factorized_routing: bool = False,
         active_prior_prob: float = 0.80,
         geometry_detach_router_states: bool = True,
+        geometry_router_state_gradient_scale: float = 1.0,
         refinement_structured_unique_routing: bool = False,
         refinement_route_gradient_scale: float = 1.0,
         refinement_reference_mode: str = "hard_st",
@@ -1256,6 +1392,37 @@ class FourSlotLaneSelectionHead(nn.Module):
             0.05,
             0.10,
         ),
+        slot_owned_geometry_enabled: bool = False,
+        slot_owned_geometry_hidden_dim: int | None = None,
+        slot_owned_geometry_delta_offsets_px: tuple[float, ...] = (
+            -160.0,
+            -96.0,
+            -48.0,
+            -24.0,
+            0.0,
+            24.0,
+            48.0,
+            96.0,
+            160.0,
+        ),
+        slot_owned_geometry_evidence_offsets_px: tuple[float, ...] = (
+            -48.0,
+            -24.0,
+            -12.0,
+            0.0,
+            12.0,
+            24.0,
+            48.0,
+        ),
+        slot_owned_geometry_route_temperature: float = 1.0,
+        slot_owned_geometry_route_gradient_scale: float = 1.0,
+        slot_owned_geometry_structured_unique_routing: bool = True,
+        slot_owned_geometry_vertical_layers: int = 2,
+        slot_owned_geometry_vertical_num_heads: int = 8,
+        slot_owned_geometry_vertical_ff_dim: int | None = None,
+        slot_owned_geometry_vertical_dropout: float = 0.0,
+        slot_owned_geometry_zero_init_delta_heads: bool = False,
+        slot_owned_geometry_delta_head_init_std: float = 1.0e-3,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -1279,10 +1446,24 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.range_temperature = float(range_temperature)
         self.min_valid_rows = int(min_valid_rows)
         self.refinement_enabled = bool(refinement_enabled)
+        self.slot_owned_geometry_enabled = bool(slot_owned_geometry_enabled)
+        if self.refinement_enabled and self.slot_owned_geometry_enabled:
+            raise ValueError(
+                "legacy slot refinement and slot-owned geometry are mutually "
+                "exclusive"
+            )
         self.factorized_routing = bool(factorized_routing)
         self.geometry_detach_router_states = bool(
             geometry_detach_router_states
         )
+        self.geometry_router_state_gradient_scale = float(
+            geometry_router_state_gradient_scale
+        )
+        if not 0.0 <= self.geometry_router_state_gradient_scale <= 1.0:
+            raise ValueError(
+                "four-slot geometry router-state gradient scale must be in "
+                "[0, 1]"
+            )
         self.register_buffer(
             "_route_combinations",
             torch.tensor(
@@ -1316,7 +1497,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.use_semantic_decision = False
         self.detach_geometry_features = True
         self.retain_pointer_diagnostic_tensors = False
-        self.requires_row_value_features = self.refinement_enabled
+        self.requires_row_value_features = (
+            self.refinement_enabled or self.slot_owned_geometry_enabled
+        )
 
         # Exact successful probe descriptor:
         # query + range-masked row state + ten geometry scalars + sampled
@@ -1408,6 +1591,60 @@ class FourSlotLaneSelectionHead(nn.Module):
                 range_delta_offsets_norm=tuple(range_delta_offsets_norm),
             )
             if self.refinement_enabled
+            else None
+        )
+        # V9 is deliberately a distinct module/prefix.  Loading a V7/V8
+        # checkpoint therefore initializes this row decoder from scratch
+        # instead of silently importing weights trained around a hard routed
+        # proposal.  Its forward consumes a global structured soft proposal
+        # memory; hard proposal IDs remain only for activity/diagnostics.
+        self.slot_owned_geometry = (
+            FourSlotBoundedRefinement(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                hidden_dim=int(
+                    slot_owned_geometry_hidden_dim or self.hidden_dim
+                ),
+                delta_offsets_px=tuple(slot_owned_geometry_delta_offsets_px),
+                evidence_offsets_px=tuple(
+                    slot_owned_geometry_evidence_offsets_px
+                ),
+                straight_through_routing=False,
+                detach_slot_states=self.geometry_detach_router_states,
+                slot_state_gradient_scale=(
+                    self.geometry_router_state_gradient_scale
+                ),
+                route_temperature=float(
+                    slot_owned_geometry_route_temperature
+                ),
+                structured_unique_routing=bool(
+                    slot_owned_geometry_structured_unique_routing
+                ),
+                route_gradient_scale=float(
+                    slot_owned_geometry_route_gradient_scale
+                ),
+                reference_mode="soft",
+                range_refinement=bool(range_refinement_enabled),
+                range_delta_offsets_norm=tuple(range_delta_offsets_norm),
+                vertical_layers=int(slot_owned_geometry_vertical_layers),
+                vertical_num_heads=int(
+                    slot_owned_geometry_vertical_num_heads
+                ),
+                vertical_ff_dim=(
+                    None
+                    if slot_owned_geometry_vertical_ff_dim is None
+                    else int(slot_owned_geometry_vertical_ff_dim)
+                ),
+                vertical_dropout=float(slot_owned_geometry_vertical_dropout),
+                zero_init_delta_heads=bool(
+                    slot_owned_geometry_zero_init_delta_heads
+                ),
+                delta_head_init_std=float(
+                    slot_owned_geometry_delta_head_init_std
+                ),
+            )
+            if self.slot_owned_geometry_enabled
             else None
         )
         nn.init.normal_(self.slot_tokens.weight, std=0.02)
@@ -1673,16 +1910,17 @@ class FourSlotLaneSelectionHead(nn.Module):
             # open this exact backward edge without changing any forward
             # value, allowing a paired causal test of geometry supervision on
             # the global proposal encoder and slot decoder.
-            geometry_slots = (
-                slots.detach()
-                if self.geometry_detach_router_states
-                else slots
-            )
-            geometry_candidates = (
-                candidates.detach()
-                if self.geometry_detach_router_states
-                else candidates
-            )
+            if self.geometry_detach_router_states:
+                geometry_slots = slots.detach()
+                geometry_candidates = candidates.detach()
+            else:
+                state_scale = self.geometry_router_state_gradient_scale
+                geometry_slots = slots.detach() + state_scale * (
+                    slots - slots.detach()
+                )
+                geometry_candidates = candidates.detach() + state_scale * (
+                    candidates - candidates.detach()
+                )
             geometry_route_logits = torch.einsum(
                 "bsd,bnd->bsn",
                 self.slot_query(geometry_slots),
@@ -1748,6 +1986,24 @@ class FourSlotLaneSelectionHead(nn.Module):
                 )
             result.update(
                 self.slot_refinement(
+                    slot_states=slots,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    route_indices=geometry_indices,
+                    route_logits=geometry_route_logits,
+                    candidate_valid=candidate_valid,
+                    slot_active=slot_active,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.slot_owned_geometry is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError(
+                    "slot-owned geometry requires projected P2 row features"
+                )
+            result.update(
+                self.slot_owned_geometry(
                     slot_states=slots,
                     proposal_row_tokens=outputs["structured_row_tokens"],
                     proposal_x_rows=outputs["pred_x_rows"],

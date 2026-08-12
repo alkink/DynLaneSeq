@@ -1,0 +1,51 @@
+_base_: culane_s0_structured_query_dla34_v9_slot_owned_control_225k_to227k.yaml
+
+output_dir: outputs/diagnostics/v9_slot_owned_geometry_gate_225k/memorize64/control
+
+model:
+  structured_query:
+    set_selection:
+      dropout: 0.0
+
+dataset:
+  augmentation:
+    horizontal_flip_prob: 0.0
+    color_jitter: false
+    channel_shuffle_prob: 0.0
+    hue_saturation_prob: 0.0
+    blur_prob: 0.0
+    affine_prob: 0.0
+    affine_translate_x: 0.0
+    affine_translate_y: 0.0
+    affine_rotate_deg: 0.0
+    affine_scale_min: 1.0
+    affine_scale_max: 1.0
+    random_shadow_prob: 0.0
+
+optimizer:
+  base_lr: 0.0003
+  evidence_lr: 0.0003
+  parameter_groups:
+    - name: global_slot_router
+      lr: 0.0003
+      prefixes:
+        - structured_query_head.set_selection_head.input_norm.
+        - structured_query_head.set_selection_head.input_projection.
+        - structured_query_head.set_selection_head.proposal_encoder.
+        - structured_query_head.set_selection_head.slot_decoder.
+        - structured_query_head.set_selection_head.slot_tokens.
+        - structured_query_head.set_selection_head.slot_norm.
+        - structured_query_head.set_selection_head.candidate_norm.
+        - structured_query_head.set_selection_head.slot_query.
+        - structured_query_head.set_selection_head.candidate_key.
+        - structured_query_head.set_selection_head.active.
+    - name: fresh_slot_geometry
+      lr: 0.0003
+      prefixes:
+        - structured_query_head.set_selection_head.slot_owned_geometry.
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  max_iters: 2000
+  checkpoint_interval: 500

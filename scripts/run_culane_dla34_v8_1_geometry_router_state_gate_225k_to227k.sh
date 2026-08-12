@@ -20,6 +20,7 @@ RUN_PREFLIGHT="${RUN_PREFLIGHT:-1}"
 RUN_FIXED64="${RUN_FIXED64:-1}"
 RUN_GENERALIZATION="${RUN_GENERALIZATION:-1}"
 EVAL_TRAJECTORY="${EVAL_TRAJECTORY:-0}"
+SUMMARY_PREFIX="${SUMMARY_PREFIX:-v8_1}"
 
 CONTROL_CONFIG="${CONTROL_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v8_1_geometry_router_state_control_225k_to227k.yaml}"
 TREATMENT_CONFIG="${TREATMENT_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v8_1_geometry_router_state_treatment_225k_to227k.yaml}"
@@ -266,12 +267,12 @@ if [[ "${RUN_FIXED64}" == "1" ]]; then
     --treatment-route "${FIXED_TREATMENT_ROUTE}" \
     --treatment-coverage "${FIXED_TREATMENT_COVERAGE}" \
     --iteration "${END_ITERATION}" \
-    --output-json "${OUTPUT_ROOT}/v8_1_fixed64_summary.json"
-elif [[ ! -f "${OUTPUT_ROOT}/v8_1_fixed64_summary.json" ]]; then
+    --output-json "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json"
+elif [[ ! -f "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json" ]]; then
   echo "RUN_FIXED64=0 requires an existing fixed-64 summary." >&2
   exit 1
 else
-  "${PYTHON}" - "${OUTPUT_ROOT}/v8_1_fixed64_summary.json" <<'PY'
+  "${PYTHON}" - "${OUTPUT_ROOT}/${SUMMARY_PREFIX}_fixed64_summary.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -314,7 +315,7 @@ for ((iteration=start_iteration; iteration<=END_ITERATION; iteration+=CHECKPOINT
   coverage_report "${CONTROL_CONFIG}" "${control_checkpoint}" "${control_coverage}" "${CACHE_ROOT}/val_control_${tag}" val "" "${VAL_MAX_BATCHES}" uniform
   coverage_report "${TREATMENT_CONFIG}" "${treatment_checkpoint}" "${treatment_coverage}" "${CACHE_ROOT}/val_treatment_${tag}" val "" "${VAL_MAX_BATCHES}" uniform
 
-  summary="${OUTPUT_ROOT}/v8_1_generalization_iter_${tag}_summary.json"
+  summary="${OUTPUT_ROOT}/${SUMMARY_PREFIX}_generalization_iter_${tag}_summary.json"
   if (( iteration == END_ITERATION )); then
     "${PYTHON}" -u -m dynlaneseq_eg.tools.summarize_v8_1_geometry_router_state_gate \
       --mode generalization \
@@ -347,4 +348,3 @@ done
 
 echo "V8.1 paired 2k gate passed its predeclared uniform-256 endpoint."
 echo "Long training is still closed until paired full-validation confirms the result."
-
