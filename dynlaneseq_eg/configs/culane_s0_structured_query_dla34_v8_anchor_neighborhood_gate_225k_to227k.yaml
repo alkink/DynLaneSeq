@@ -1,0 +1,93 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/unified_lane_set_v8_anchor_neighborhood_gate_225k
+
+# V8 does not ask frozen P2 to rediscover four lanes.  The verified V7 route
+# remains a coarse lane-cluster anchor.  Final geometry may inspect only the
+# four closest deployment-available proposals within a 48 px/common-range
+# neighborhood, then the existing bounded x/range refiner consumes a signed,
+# bounded local residual from that sparse slot-owned reference.  The residual
+# is exactly zero at initialization, so the 225k source forward is preserved.
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_refinement_reference_mode: neighborhood_soft
+      four_slot_refinement_straight_through_routing: false
+      four_slot_refinement_neighborhood_max_candidates: 4
+      four_slot_refinement_neighborhood_max_mean_distance_px: 48.0
+      four_slot_refinement_neighborhood_min_common_fraction: 0.50
+      four_slot_refinement_neighborhood_distance_temperature_px: 24.0
+      four_slot_refinement_neighborhood_gradient_scale: 0.10
+      four_slot_refinement_detach_slot_states: true
+
+# The source detector, route, activity and deployment scores are immutable.
+# Only final slot geometry is a backward root.
+loss:
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 1.0
+  four_slot_geometry_match_all_slots: true
+  four_slot_geometry_match_min_quality: 0.0
+  four_slot_geometry_point_weight: 5.0
+  four_slot_geometry_range_weight: 1.0
+  four_slot_geometry_line_iou_weight: 2.0
+  four_slot_geometry_dfl_weight: 1.0
+
+optimizer:
+  base_lr: 0.00002
+  evidence_lr: 0.00002
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: neighborhood_arbitrator
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.set_selection_head.slot_refinement.neighborhood_
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 2000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.slot_refinement
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

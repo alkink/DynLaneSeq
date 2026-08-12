@@ -2590,6 +2590,36 @@ class StructuredLaneQueryHead(nn.Module):
                         "hard_st",
                     )
                 ),
+                refinement_neighborhood_max_candidates=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_neighborhood_max_candidates",
+                        4,
+                    )
+                ),
+                refinement_neighborhood_max_mean_distance_px=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_neighborhood_max_mean_distance_px",
+                        48.0,
+                    )
+                ),
+                refinement_neighborhood_min_common_fraction=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_neighborhood_min_common_fraction",
+                        0.50,
+                    )
+                ),
+                refinement_neighborhood_distance_temperature_px=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_neighborhood_distance_temperature_px",
+                        24.0,
+                    )
+                ),
+                refinement_neighborhood_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_refinement_neighborhood_gradient_scale",
+                        0.10,
+                    )
+                ),
                 range_refinement_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_range_refinement_enabled",
@@ -3417,6 +3447,13 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_delta_mean_abs",
                 "selection_slot_delta_max_abs",
                 "selection_slot_delta_boundary_mass",
+                "selection_slot_neighborhood_support",
+                "selection_slot_neighborhood_mean_support",
+                "selection_slot_neighborhood_alternative_fraction",
+                "selection_slot_neighborhood_entropy",
+                "selection_slot_neighborhood_top1_mass",
+                "selection_slot_neighborhood_mix",
+                "selection_slot_neighborhood_reference_shift_px",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

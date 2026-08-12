@@ -500,7 +500,13 @@ def evaluate_probe(
                     else base_model.encoder.proj.out_channels
                 ),
             )
-            base_outputs = base_model.structured_query_head(p2)
+            # V5+ protected ownership consumes detached P4/P5 semantic
+            # features in addition to projected P2.  Calling the structured
+            # head directly therefore no longer reproduces the production
+            # forward contract.  Use the complete frozen model for the base
+            # comparison while retaining ``selected_feature`` for the
+            # independent probe arm.
+            base_outputs = base_model(images)
         selected_float = selected_feature.float()
         wrong_indices = torch.roll(
             torch.arange(int(selected_feature.shape[0]), device=device),

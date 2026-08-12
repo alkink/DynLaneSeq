@@ -45,6 +45,13 @@ STAGE_TENSOR_FIELDS = (
     "selection_slot_delta_mean_abs",
     "selection_slot_delta_max_abs",
     "selection_slot_delta_boundary_mass",
+    "selection_slot_neighborhood_support",
+    "selection_slot_neighborhood_mean_support",
+    "selection_slot_neighborhood_alternative_fraction",
+    "selection_slot_neighborhood_entropy",
+    "selection_slot_neighborhood_top1_mass",
+    "selection_slot_neighborhood_mix",
+    "selection_slot_neighborhood_reference_shift_px",
     "range_norm",
     "row_visibility_logits",
 )

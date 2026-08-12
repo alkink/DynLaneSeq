@@ -503,6 +503,13 @@ def main() -> None:
     slot_delta_mean_abs: list[float] = []
     slot_delta_max_abs: list[float] = []
     slot_delta_boundary_mass: list[float] = []
+    slot_neighborhood_support: list[float] = []
+    slot_neighborhood_mean_support: list[float] = []
+    slot_neighborhood_alternative_fraction: list[float] = []
+    slot_neighborhood_entropy: list[float] = []
+    slot_neighborhood_top1_mass: list[float] = []
+    slot_neighborhood_mix: list[float] = []
+    slot_neighborhood_reference_shift: list[float] = []
 
     iterator = tqdm(
         cache["records"],
@@ -685,6 +692,41 @@ def main() -> None:
                     (
                         "selection_slot_delta_boundary_mass",
                         slot_delta_boundary_mass,
+                    ),
+                ):
+                    value = stage.get(field)
+                    if isinstance(value, torch.Tensor):
+                        destination.extend(
+                            float(item) for item in value.reshape(-1)
+                        )
+                for field, destination in (
+                    (
+                        "selection_slot_neighborhood_support",
+                        slot_neighborhood_support,
+                    ),
+                    (
+                        "selection_slot_neighborhood_mean_support",
+                        slot_neighborhood_mean_support,
+                    ),
+                    (
+                        "selection_slot_neighborhood_alternative_fraction",
+                        slot_neighborhood_alternative_fraction,
+                    ),
+                    (
+                        "selection_slot_neighborhood_entropy",
+                        slot_neighborhood_entropy,
+                    ),
+                    (
+                        "selection_slot_neighborhood_top1_mass",
+                        slot_neighborhood_top1_mass,
+                    ),
+                    (
+                        "selection_slot_neighborhood_mix",
+                        slot_neighborhood_mix,
+                    ),
+                    (
+                        "selection_slot_neighborhood_reference_shift_px",
+                        slot_neighborhood_reference_shift,
                     ),
                 ):
                     value = stage.get(field)
@@ -894,6 +936,32 @@ def main() -> None:
                     / max(len(slot_delta_boundary_mass), 1),
                 }
                 if slot_refinement_mode
+                else None
+            ),
+            "neighborhood": (
+                {
+                    "mean_support": sum(slot_neighborhood_support)
+                    / max(len(slot_neighborhood_support), 1),
+                    "mean_support_per_image": sum(
+                        slot_neighborhood_mean_support
+                    )
+                    / max(len(slot_neighborhood_mean_support), 1),
+                    "mean_alternative_fraction": sum(
+                        slot_neighborhood_alternative_fraction
+                    )
+                    / max(len(slot_neighborhood_alternative_fraction), 1),
+                    "mean_entropy": sum(slot_neighborhood_entropy)
+                    / max(len(slot_neighborhood_entropy), 1),
+                    "mean_top1_mass": sum(slot_neighborhood_top1_mass)
+                    / max(len(slot_neighborhood_top1_mass), 1),
+                    "mean_mix": sum(slot_neighborhood_mix)
+                    / max(len(slot_neighborhood_mix), 1),
+                    "mean_reference_shift_px": sum(
+                        slot_neighborhood_reference_shift
+                    )
+                    / max(len(slot_neighborhood_reference_shift), 1),
+                }
+                if slot_neighborhood_mix
                 else None
             ),
         }

@@ -433,6 +433,11 @@ class FourSlotBoundedRefinement(nn.Module):
         structured_unique_routing: bool = False,
         route_gradient_scale: float = 1.0,
         reference_mode: str = "hard_st",
+        neighborhood_max_candidates: int = 4,
+        neighborhood_max_mean_distance_px: float = 48.0,
+        neighborhood_min_common_fraction: float = 0.50,
+        neighborhood_distance_temperature_px: float = 24.0,
+        neighborhood_gradient_scale: float = 0.10,
         range_refinement: bool = False,
         range_delta_offsets_norm: tuple[float, ...] = (
             -0.10,
@@ -465,6 +470,17 @@ class FourSlotBoundedRefinement(nn.Module):
         self.structured_unique_routing = bool(structured_unique_routing)
         self.route_gradient_scale = float(route_gradient_scale)
         self.reference_mode = str(reference_mode).strip().lower()
+        self.neighborhood_max_candidates = int(neighborhood_max_candidates)
+        self.neighborhood_max_mean_distance_px = float(
+            neighborhood_max_mean_distance_px
+        )
+        self.neighborhood_min_common_fraction = float(
+            neighborhood_min_common_fraction
+        )
+        self.neighborhood_distance_temperature_px = float(
+            neighborhood_distance_temperature_px
+        )
+        self.neighborhood_gradient_scale = float(neighborhood_gradient_scale)
         self.range_refinement = bool(range_refinement)
         if self.route_temperature <= 0.0:
             raise ValueError("slot refinement route_temperature must be positive")
@@ -472,9 +488,26 @@ class FourSlotBoundedRefinement(nn.Module):
             raise ValueError(
                 "slot refinement route_gradient_scale must be in [0, 1]"
             )
-        if self.reference_mode not in {"hard_st", "soft"}:
+        if self.reference_mode not in {"hard_st", "soft", "neighborhood_soft"}:
             raise ValueError(
-                "slot refinement reference_mode must be 'hard_st' or 'soft'"
+                "slot refinement reference_mode must be 'hard_st', 'soft', "
+                "or 'neighborhood_soft'"
+            )
+        if self.neighborhood_max_candidates < 1:
+            raise ValueError("slot neighborhood size must be positive")
+        if self.neighborhood_max_mean_distance_px <= 0.0:
+            raise ValueError("slot neighborhood distance must be positive")
+        if not 0.0 <= self.neighborhood_min_common_fraction <= 1.0:
+            raise ValueError(
+                "slot neighborhood common fraction must be in [0, 1]"
+            )
+        if self.neighborhood_distance_temperature_px <= 0.0:
+            raise ValueError(
+                "slot neighborhood distance temperature must be positive"
+            )
+        if not 0.0 <= self.neighborhood_gradient_scale <= 1.0:
+            raise ValueError(
+                "slot neighborhood gradient scale must be in [0, 1]"
             )
         range_offsets = tuple(float(value) for value in range_delta_offsets_norm)
         if self.range_refinement:
@@ -523,6 +556,38 @@ class FourSlotBoundedRefinement(nn.Module):
             len(offsets),
             bias=False,
         )
+        # V8 treats the production route only as a coarse lane-cluster anchor.
+        # A geometry-only row-wise arbitrator may combine at most K nearby
+        # proposals before the existing bounded P2 refiner.  Every input is
+        # detached; therefore final geometry can train this module without
+        # changing activity, global routing, proposal geometry or the visual
+        # backbone.  The scalar blend starts at zero, preserving the exact V7
+        # forward at initialization.  A gradient-only straight-through term
+        # lets the local scorer learn before that blend opens.
+        if self.reference_mode == "neighborhood_soft":
+            self.neighborhood_row_norm = nn.LayerNorm(self.dim)
+            self.neighborhood_anchor_projection = nn.Linear(
+                self.dim,
+                self.hidden_dim,
+                bias=False,
+            )
+            self.neighborhood_candidate_projection = nn.Linear(
+                self.dim,
+                self.hidden_dim,
+                bias=False,
+            )
+            self.neighborhood_slot_projection = nn.Linear(
+                self.slot_dim,
+                self.hidden_dim,
+                bias=False,
+            )
+            self.neighborhood_mix = nn.Parameter(torch.zeros(()))
+        else:
+            self.neighborhood_row_norm = None
+            self.neighborhood_anchor_projection = None
+            self.neighborhood_candidate_projection = None
+            self.neighborhood_slot_projection = None
+            self.register_parameter("neighborhood_mix", None)
         self.range_delta_head = (
             nn.Linear(
                 self.hidden_dim,
@@ -546,6 +611,197 @@ class FourSlotBoundedRefinement(nn.Module):
             "range_delta_offsets_norm",
             torch.tensor(range_offsets, dtype=torch.float32),
         )
+
+    @torch.no_grad()
+    def _proposal_neighborhood(
+        self,
+        proposal_x: torch.Tensor,
+        proposal_range: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        route_indices: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build a GT-free sparse neighborhood around every route anchor."""
+
+        batch, candidates, rows = proposal_x.shape
+        slots = int(route_indices.shape[1])
+        ranges = sort_range_norm(proposal_range.float())
+        row_y = fixed_row_fractions(
+            rows,
+            device=proposal_x.device,
+            dtype=torch.float32,
+        ).view(1, 1, rows)
+        visible = (
+            (row_y >= ranges[..., :1])
+            & (row_y <= ranges[..., 1:])
+            & torch.isfinite(proposal_x)
+        )
+        common = visible[:, :, None, :] & visible[:, None, :, :]
+        common_count = common.sum(dim=-1)
+        distance = (
+            proposal_x[:, :, None, :].float()
+            - proposal_x[:, None, :, :].float()
+        ).abs()
+        mean_distance = distance.masked_fill(~common, 0.0).sum(dim=-1)
+        mean_distance = mean_distance / common_count.clamp_min(1).float()
+        mean_distance = mean_distance.masked_fill(common_count == 0, torch.inf)
+        shorter_visible = torch.minimum(
+            visible.sum(dim=-1)[:, :, None],
+            visible.sum(dim=-1)[:, None, :],
+        ).clamp_min(1)
+        common_fraction = common_count.float() / shorter_visible.float()
+
+        safe_anchor = route_indices.clamp(min=0, max=max(candidates - 1, 0))
+        gather_index = safe_anchor.unsqueeze(-1).expand(-1, -1, candidates)
+        anchor_distance = mean_distance.gather(1, gather_index)
+        anchor_common = common_fraction.gather(1, gather_index)
+        route_valid = route_indices >= 0
+        eligible = candidate_valid[:, None, :].bool().expand(
+            batch,
+            slots,
+            candidates,
+        ).clone()
+        eligible &= route_valid.unsqueeze(-1)
+        eligible &= torch.isfinite(anchor_distance)
+        eligible &= anchor_common >= self.neighborhood_min_common_fraction
+        eligible &= anchor_distance <= self.neighborhood_max_mean_distance_px
+        eligible.scatter_(
+            2,
+            safe_anchor.unsqueeze(-1),
+            route_valid.unsqueeze(-1),
+        )
+
+        neighbor_count = min(self.neighborhood_max_candidates, candidates)
+        ranked_distance = anchor_distance.masked_fill(~eligible, torch.inf)
+        top_distance, top_indices = ranked_distance.topk(
+            neighbor_count,
+            dim=-1,
+            largest=False,
+            sorted=True,
+        )
+        top_valid = torch.isfinite(top_distance)
+        neighborhood_mask = torch.zeros_like(eligible)
+        neighborhood_mask.scatter_(2, top_indices, top_valid)
+        # An invalid route still needs one finite softmax entry; its public
+        # geometry is zeroed later, so this private fallback is unobservable.
+        fallback = ~neighborhood_mask.any(dim=-1)
+        neighborhood_mask.scatter_(
+            2,
+            safe_anchor.unsqueeze(-1),
+            fallback.unsqueeze(-1),
+        )
+        return {
+            "mask": neighborhood_mask,
+            "distance": anchor_distance,
+            "support": top_valid.sum(dim=-1),
+        }
+
+    def _neighborhood_reference(
+        self,
+        *,
+        slot_states: torch.Tensor,
+        proposal_rows: torch.Tensor,
+        proposal_x: torch.Tensor,
+        proposal_range: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        route_indices: torch.Tensor,
+        hard_reference_x: torch.Tensor,
+        hard_slot_range: torch.Tensor,
+        hard_routed_rows: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if (
+            self.neighborhood_row_norm is None
+            or self.neighborhood_anchor_projection is None
+            or self.neighborhood_candidate_projection is None
+            or self.neighborhood_slot_projection is None
+            or self.neighborhood_mix is None
+        ):
+            raise RuntimeError("slot neighborhood modules are not initialized")
+        neighborhood = self._proposal_neighborhood(
+            proposal_x,
+            proposal_range,
+            candidate_valid,
+            route_indices,
+        )
+        mask = neighborhood["mask"]
+        distance = neighborhood["distance"]
+        anchor_query = self.neighborhood_anchor_projection(
+            self.neighborhood_row_norm(hard_routed_rows.float())
+        )
+        anchor_query = anchor_query + self.neighborhood_slot_projection(
+            slot_states.detach().float()
+        ).unsqueeze(2)
+        candidate_key = self.neighborhood_candidate_projection(
+            self.neighborhood_row_norm(proposal_rows.float())
+        )
+        logits = torch.einsum(
+            "bsrh,bnrh->bsrn",
+            anchor_query,
+            candidate_key,
+        ) / math.sqrt(float(self.hidden_dim))
+        logits = logits - distance.unsqueeze(2) / float(
+            self.neighborhood_distance_temperature_px
+        )
+        logits = logits.masked_fill(~mask.unsqueeze(2), -1.0e4)
+        weight = torch.softmax(logits.float(), dim=-1)
+        soft_reference_x = torch.einsum(
+            "bsrn,bnr->bsr",
+            weight,
+            proposal_x.float(),
+        )
+        soft_routed_rows = torch.einsum(
+            "bsrn,bnrd->bsrd",
+            weight,
+            proposal_rows.float(),
+        )
+        candidate_weight = weight.mean(dim=2)
+        soft_slot_range = torch.einsum(
+            "bsn,bnd->bsd",
+            candidate_weight,
+            proposal_range.float(),
+        )
+
+        # Signed bounded residual, not a one-sided convex gate.  ``tanh`` is
+        # exactly zero at initialization and retains a non-zero derivative on
+        # both sides, so the source forward is preserved without the dead-zone
+        # created by clamp(0, 1).  The neighborhood stays local (<=48 px) and
+        # final x/range remain clipped/bounded by the production operator.
+        mix = torch.tanh(self.neighborhood_mix)
+        reference_x = hard_reference_x.float() + mix * (
+            soft_reference_x - hard_reference_x.float()
+        )
+        slot_range = hard_slot_range.float() + mix * (
+            soft_slot_range - hard_slot_range.float()
+        )
+        routed_rows = hard_routed_rows.float() + mix * (
+            soft_routed_rows - hard_routed_rows.float()
+        )
+        if self.training and torch.is_grad_enabled():
+            scale = self.neighborhood_gradient_scale
+            reference_x = reference_x + scale * (
+                soft_reference_x - soft_reference_x.detach()
+            )
+            slot_range = slot_range + scale * (
+                soft_slot_range - soft_slot_range.detach()
+            )
+            routed_rows = routed_rows + scale * (
+                soft_routed_rows - soft_routed_rows.detach()
+            )
+        entropy = -(weight * weight.clamp_min(1.0e-12).log()).sum(dim=-1)
+        active = (route_indices >= 0).unsqueeze(-1).expand_as(entropy)
+        denominator = active.float().sum(dim=(1, 2)).clamp_min(1.0)
+        mean_entropy = (entropy * active.float()).sum(dim=(1, 2)) / denominator
+        mean_top1 = (weight.amax(dim=-1) * active.float()).sum(dim=(1, 2))
+        mean_top1 = mean_top1 / denominator
+        return {
+            "reference_x": reference_x,
+            "slot_range": slot_range,
+            "routed_rows": routed_rows,
+            "support": neighborhood["support"],
+            "weight": weight,
+            "mean_entropy": mean_entropy,
+            "mean_top1": mean_top1,
+            "mix": mix,
+        }
 
     def _sample_local_evidence(
         self,
@@ -680,11 +936,35 @@ class FourSlotBoundedRefinement(nn.Module):
             hard_routed_rows,
             torch.zeros_like(hard_routed_rows),
         )
+        neighborhood_result: dict[str, torch.Tensor] | None = None
+        if self.reference_mode == "neighborhood_soft":
+            if candidate_valid is None:
+                raise ValueError(
+                    "neighborhood slot refinement requires candidate validity"
+                )
+            if tuple(candidate_valid.shape) != (batch, candidates):
+                raise ValueError("slot refinement candidate-valid shape mismatch")
+            neighborhood_result = self._neighborhood_reference(
+                slot_states=slot_states,
+                proposal_rows=proposal_rows,
+                proposal_x=proposal_x,
+                proposal_range=proposal_range,
+                candidate_valid=candidate_valid,
+                route_indices=route_indices,
+                hard_reference_x=hard_reference_x,
+                hard_slot_range=hard_slot_range,
+                hard_routed_rows=hard_routed_rows,
+            )
+            reference_x = neighborhood_result["reference_x"]
+            slot_range = neighborhood_result["slot_range"]
+            routed_rows = neighborhood_result["routed_rows"]
         soft_forward = self.reference_mode == "soft"
-        needs_soft_route = soft_forward or (
+        needs_soft_route = self.reference_mode != "neighborhood_soft" and (
+            soft_forward or (
             self.straight_through_routing
             and self.training
             and torch.is_grad_enabled()
+            )
         )
         if needs_soft_route:
             if route_logits is None or candidate_valid is None:
@@ -755,7 +1035,7 @@ class FourSlotBoundedRefinement(nn.Module):
                 routed_rows = hard_routed_rows.float() + (
                     soft_routed_rows - soft_routed_rows.detach()
                 ) * self.route_gradient_scale
-        else:
+        elif self.reference_mode != "neighborhood_soft":
             reference_x = hard_reference_x
             slot_range = hard_slot_range
             routed_rows = hard_routed_rows
@@ -875,6 +1155,44 @@ class FourSlotBoundedRefinement(nn.Module):
             result["selection_slot_range_delta_offsets_norm"] = (
                 self.range_delta_offsets_norm
             )
+        if neighborhood_result is not None:
+            support = neighborhood_result["support"].float()
+            valid_slots = route_valid.float()
+            valid_count = valid_slots.sum(dim=-1).clamp_min(1.0)
+            mean_support = (support * valid_slots).sum(dim=-1) / valid_count
+            alternative_fraction = (
+                ((support > 1).float() * valid_slots).sum(dim=-1) / valid_count
+            )
+            reference_shift = (
+                reference_x.float() - hard_reference_x.float()
+            ).abs()
+            reference_shift = (
+                reference_shift * active_rows.float()
+            ).sum(dim=(1, 2)) / active_count
+            result.update(
+                {
+                    "selection_slot_neighborhood_support": support,
+                    "selection_slot_neighborhood_mean_support": mean_support,
+                    "selection_slot_neighborhood_alternative_fraction": (
+                        alternative_fraction
+                    ),
+                    "selection_slot_neighborhood_weight": neighborhood_result[
+                        "weight"
+                    ],
+                    "selection_slot_neighborhood_entropy": neighborhood_result[
+                        "mean_entropy"
+                    ],
+                    "selection_slot_neighborhood_top1_mass": neighborhood_result[
+                        "mean_top1"
+                    ],
+                    "selection_slot_neighborhood_mix": neighborhood_result[
+                        "mix"
+                    ].expand(batch),
+                    "selection_slot_neighborhood_reference_shift_px": (
+                        reference_shift
+                    ),
+                }
+            )
         return result
 
 
@@ -922,6 +1240,11 @@ class FourSlotLaneSelectionHead(nn.Module):
         refinement_structured_unique_routing: bool = False,
         refinement_route_gradient_scale: float = 1.0,
         refinement_reference_mode: str = "hard_st",
+        refinement_neighborhood_max_candidates: int = 4,
+        refinement_neighborhood_max_mean_distance_px: float = 48.0,
+        refinement_neighborhood_min_common_fraction: float = 0.50,
+        refinement_neighborhood_distance_temperature_px: float = 24.0,
+        refinement_neighborhood_gradient_scale: float = 0.10,
         range_refinement_enabled: bool = False,
         range_delta_offsets_norm: tuple[float, ...] = (
             -0.10,
@@ -1062,6 +1385,21 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
                 route_gradient_scale=float(refinement_route_gradient_scale),
                 reference_mode=str(refinement_reference_mode),
+                neighborhood_max_candidates=int(
+                    refinement_neighborhood_max_candidates
+                ),
+                neighborhood_max_mean_distance_px=float(
+                    refinement_neighborhood_max_mean_distance_px
+                ),
+                neighborhood_min_common_fraction=float(
+                    refinement_neighborhood_min_common_fraction
+                ),
+                neighborhood_distance_temperature_px=float(
+                    refinement_neighborhood_distance_temperature_px
+                ),
+                neighborhood_gradient_scale=float(
+                    refinement_neighborhood_gradient_scale
+                ),
                 range_refinement=bool(range_refinement_enabled),
                 range_delta_offsets_norm=tuple(range_delta_offsets_norm),
             )
