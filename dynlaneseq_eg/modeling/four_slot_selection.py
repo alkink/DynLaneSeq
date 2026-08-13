@@ -2694,6 +2694,18 @@ class FourSlotVisualPrecisionGeometry(nn.Module):
             raise ValueError("V13 local P2 offsets cannot be empty")
         if not delta_offsets_px or not range_delta_offsets_norm:
             raise ValueError("V13 geometry offset supports cannot be empty")
+        for label, values in (
+            ("x", delta_offsets_px),
+            ("range", range_delta_offsets_norm),
+        ):
+            if len(values) % 2 != 1 or float(values[len(values) // 2]) != 0.0:
+                raise ValueError(f"V13 {label} offsets must have a zero center")
+            if any(
+                abs(float(values[index]) + float(values[-1 - index]))
+                > 1.0e-8
+                for index in range(len(values) // 2)
+            ):
+                raise ValueError(f"V13 {label} offsets must be symmetric")
         if float(gradient_only_candidate_scale) < 0.0:
             raise ValueError("V13 gradient-only scale must be non-negative")
 
@@ -2850,6 +2862,28 @@ class FourSlotVisualPrecisionGeometry(nn.Module):
             batch, rows, slots, samples, channels
         ).permute(0, 2, 1, 3, 4).contiguous()
 
+    @staticmethod
+    def _symmetric_expectation(
+        probability: torch.Tensor, offsets: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute an odd symmetric expectation with exact zero at uniform.
+
+        Pairwise probability differences avoid the tiny FP32 cancellation
+        residue produced by a long dot product of symmetric offsets.  This is
+        mathematically identical to the ordinary expectation for the
+        constructor-validated supports.
+        """
+
+        midpoint = int(probability.shape[-1]) // 2
+        positive_probability = probability[..., midpoint + 1 :]
+        negative_probability = probability[..., :midpoint].flip(-1)
+        positive_offsets = offsets[midpoint + 1 :].to(probability)
+        return torch.einsum(
+            "...k,k->...",
+            positive_probability - negative_probability,
+            positive_offsets,
+        )
+
     def forward(
         self,
         *,
@@ -2989,8 +3023,7 @@ class FourSlotVisualPrecisionGeometry(nn.Module):
         )
         delta_logits = self.delta_head(normalized_hidden)
         delta_probability = torch.softmax(delta_logits.float(), dim=-1)
-        delta = torch.einsum(
-            "bsrk,k->bsr",
+        delta = self._symmetric_expectation(
             delta_probability,
             self.delta_offsets_px.to(delta_probability),
         )
@@ -3007,8 +3040,7 @@ class FourSlotVisualPrecisionGeometry(nn.Module):
             batch, slots, 2, -1
         )
         range_probability = torch.softmax(range_logits.float(), dim=-1)
-        range_delta = torch.einsum(
-            "bsdk,k->bsd",
+        range_delta = self._symmetric_expectation(
             range_probability,
             self.range_delta_offsets_norm.to(range_probability),
         )

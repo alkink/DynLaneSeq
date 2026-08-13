@@ -381,6 +381,39 @@ def test_v13_masks_nonfinite_proposal_rows_before_coordinate_expectation():
     assert torch.isfinite(replay["selection_slot_pred_x_rows"]).all()
 
 
+def test_v13_full_support_uniform_distribution_has_bit_exact_zero_delta():
+    module = _head(v13=True).visual_precision_geometry
+    assert module is not None
+    offsets = torch.tensor(
+        [
+            -1600.0,
+            -1200.0,
+            -800.0,
+            -600.0,
+            -400.0,
+            -300.0,
+            -200.0,
+            -128.0,
+            -64.0,
+            -32.0,
+            0.0,
+            32.0,
+            64.0,
+            128.0,
+            200.0,
+            300.0,
+            400.0,
+            600.0,
+            800.0,
+            1200.0,
+            1600.0,
+        ]
+    )
+    probability = torch.softmax(torch.zeros(2, 4, 12, 21), dim=-1)
+    delta = module._symmetric_expectation(probability, offsets)
+    assert torch.equal(delta, torch.zeros_like(delta))
+
+
 def test_v13_config_is_full_width_single_geometry_objective():
     cfg = load_config(
         PROJECT_ROOT
