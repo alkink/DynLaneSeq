@@ -131,6 +131,13 @@ def _summary(values: Iterable[float]) -> dict[str, float | int]:
     }
 
 
+def _json_floats(values: Iterable[float]) -> list[float | None]:
+    return [
+        float(value) if math.isfinite(float(value)) else None
+        for value in values
+    ]
+
+
 def _curve_distance(
     geometry: PairGeometry | None,
     policy: AnchorGroupPolicy,
@@ -538,7 +545,7 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             image_policy: dict[str, Any] = {
                 "groups": [group.tolist() for group in groups],
                 "group_sizes": [int(group.numel()) for group in groups],
-                "corridor_px": diagnostics["corridor_px"],
+                "corridor_px": _json_floats(diagnostics["corridor_px"]),
                 "excluded_no_overlap": diagnostics["excluded_no_overlap"],
                 "excluded_outside_corridor": diagnostics[
                     "excluded_outside_corridor"

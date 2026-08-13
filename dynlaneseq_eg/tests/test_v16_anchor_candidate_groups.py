@@ -7,6 +7,7 @@ from dynlaneseq_eg.tools.audit_geometry_proposal_clustering import _pairwise_geo
 from dynlaneseq_eg.tools.audit_v16_anchor_candidate_groups import (
     POLICIES,
     _fixed_assignment_selection,
+    _json_floats,
     build_anchor_groups,
 )
 from dynlaneseq_eg.tools.summarize_v16_candidate_group_preflight import summarize
@@ -63,6 +64,7 @@ def test_overlap_upper_is_not_a_fixed_k_group() -> None:
     )
     assert [int(group.numel()) for group in groups] == [3, 2]
     assert sorted(value for group in groups for value in group.tolist()) == list(range(5))
+    assert _json_floats((float("inf"), 12.0)) == [None, 12.0]
 
 
 def test_fixed_assignment_oracle_selects_one_coherent_candidate_per_group() -> None:
