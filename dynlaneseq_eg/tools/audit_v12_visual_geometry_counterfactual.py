@@ -96,8 +96,10 @@ def _prepare_config(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _inference(model: torch.nn.Module, images: torch.Tensor) -> dict[str, Any]:
-    if bool(getattr(model, "supports_inference_only", False)):
-        return model(images, inference_only=True)
+    # ``inference_only`` intentionally strips diagnostic sidecar tensors from
+    # the public deployment result.  This audit needs the undeployed V12
+    # visual/proposal distributions while leaving the V7 deployment outputs
+    # untouched, so use the ordinary full forward without any matcher/loss.
     return model(images)
 
 
