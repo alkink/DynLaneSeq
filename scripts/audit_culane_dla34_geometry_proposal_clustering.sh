@@ -71,12 +71,14 @@ run_domain val
   --output-md "${OUTPUT_ROOT}/geometry_clustering_decision.md" \
   2>&1 | tee "${OUTPUT_ROOT}/geometry_clustering_decision.log"
 
-"${PYTHON}" - "${OUTPUT_ROOT}" "${MAX_IMAGES}" <<'PY'
+"${PYTHON}" - "${OUTPUT_ROOT}" "${MAX_IMAGES}" "${V7_CONFIG}" "${SOURCE_V7_CHECKPOINT}" <<'PY'
 import hashlib,json,subprocess,sys
 from pathlib import Path
 
 root=Path(sys.argv[1])
 count=str(sys.argv[2])
+config=Path(sys.argv[3])
+checkpoint=Path(sys.argv[4])
 paths=[
     root/f"train_uniform{count}.json",
     root/f"val_uniform{count}.json",
@@ -90,13 +92,32 @@ def sha(path):
     return digest.hexdigest()
 payload={
     "git_commit":subprocess.check_output(("git","rev-parse","HEAD"),text=True).strip(),
+    "config":{"path":str(config.resolve()),"sha256":sha(config)},
+    "source_checkpoint":{"path":str(checkpoint.resolve()),"sha256":sha(checkpoint)},
     "artifacts":{path.name:{"path":str(path.resolve()),"sha256":sha(path)} for path in paths},
     "training_performed":False,
+    "optimizer_steps":0,
+    "backward_performed":False,
     "checkpoint_selection_performed":False,
+    "threshold_search_performed":False,
     "test_set_used":False,
     "new_model_version_started":False,
 }
 (root/"provenance.json").write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+decision=json.loads((root/"geometry_clustering_decision.json").read_text(encoding="utf-8"))
+completion={
+    "formal_result":decision["formal_result"],
+    "passed":bool(decision["passed"]),
+    "decision":decision["decision"],
+    "training_performed":False,
+    "optimizer_steps":0,
+    "full_validation_started":False,
+    "long_training_started":False,
+    "new_model_version_started":False,
+    "test_set_used":False,
+    "required_next_action":"stop_for_user_review",
+}
+(root/"completion.json").write_text(json.dumps(completion,indent=2,sort_keys=True)+"\n",encoding="utf-8")
 PY
 
-echo "Geometry proposal clustering audit complete. Stop for user/Sol review."
+echo "Geometry proposal clustering audit complete. Stop for user review; no training was run."

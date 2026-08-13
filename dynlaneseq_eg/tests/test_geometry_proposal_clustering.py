@@ -8,6 +8,7 @@ from dynlaneseq_eg.tools.audit_geometry_proposal_clustering import (
     _pair_geometry,
     _pairwise_geometry,
     _policy_distance,
+    _slot_cluster_mass_selection,
     build_cluster_prototypes,
     complete_link_clusters,
 )
@@ -39,7 +40,13 @@ def test_bottom_divergence_prevents_horizon_convergence_merge() -> None:
     assert geometry.unweighted_mean_px < 48.0
     assert flat_distance <= 1.0
     assert perspective_distance > 1.0
-    assert reason in {"weighted_q90", "lower_q90", "bottom_endpoint", "lower_divergence", "polynomial_q90"}
+    assert reason in {
+        "weighted_q90",
+        "lower_q90",
+        "bottom_endpoint",
+        "lower_divergence",
+        "polynomial_q90",
+    }
 
 
 def test_near_duplicate_lane_merges_under_perspective_contract() -> None:
@@ -73,6 +80,22 @@ def test_upper_only_overlap_is_not_treated_as_same_lane() -> None:
     )
     assert distance == float("inf")
     assert reason == "no_reliable_lower_evidence"
+
+
+def test_large_visible_range_start_gap_prevents_merge() -> None:
+    rows = 40
+    y = torch.arange(rows, dtype=torch.float32) / float(rows)
+    first = torch.full((rows,), 500.0)
+    second = first + 4.0
+    first_mask = torch.ones(rows, dtype=torch.bool)
+    second_mask = y >= 0.30
+    geometry = _pair_geometry(first, first_mask, second, second_mask, y)
+    distance, reason = _policy_distance(
+        geometry, _policy("perspective_balanced_48"), 1600
+    )
+    assert geometry.range_start_gap >= 0.29
+    assert distance > 1.0
+    assert reason == "range_start"
 
 
 def test_complete_link_does_not_chain_two_lanes_through_middle_curve() -> None:
@@ -130,3 +153,34 @@ def test_routed_cluster_selection_deduplicates_then_fills_to_count() -> None:
     )
     assert selected["routed_consensus"] == [0, 1, 2]
     assert selected["score_topk"] == [2, 0, 1]
+
+
+def test_slot_cluster_mass_recovers_probability_split_across_duplicates() -> None:
+    # Slot 0's best single proposal is candidate 2, but candidates 0 and 1
+    # jointly carry more probability and form one geometry cluster. Slot 1
+    # strongly owns candidate 2. Cluster-level uniqueness therefore recovers
+    # the intended two physical groups without GT.
+    stage = {
+        "selection_slot_indices": torch.tensor([2, 0, -1, -1]),
+        "selection_slot_active": torch.tensor([True, True, False, False]),
+        "selection_slot_official_candidate_valid": torch.tensor(
+            [True, True, False, False]
+        ),
+        "selection_slot_logits": torch.tensor(
+            [
+                [1.9, 1.9, 2.2, -4.0, -8.0],
+                [0.2, 0.1, 3.0, -4.0, -8.0],
+                [-2.0, -2.0, -2.0, -2.0, 4.0],
+                [-2.0, -2.0, -2.0, -2.0, 4.0],
+            ]
+        ),
+    }
+    result = _slot_cluster_mass_selection(
+        [[0, 1], [2], [3]],
+        stage,
+        torch.tensor([True, True, True, True]),
+    )
+    assert result["available"] is True
+    assert result["slot_ids"] == [0, 1]
+    assert result["cluster_ids"] == [0, 1]
+    assert len(result["selected_masses"]) == 2

@@ -13,6 +13,7 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from dynlaneseq_eg.evaluation.candidate_diagnostics import (
@@ -31,7 +32,9 @@ from dynlaneseq_eg.modeling.common import fixed_row_fractions, sort_range_norm
 
 REFERENCE_INPUT_WIDTH = 1600.0
 PROTOTYPE_MODES = ("medoid", "median", "mean")
-SELECTION_MODES = ("routed_consensus", "score_topk", "oracle_same_count")
+PRIMARY_POLICY = "perspective_balanced_48"
+PRIMARY_PROTOTYPE = "medoid"
+PRIMARY_SELECTION = "slot_cluster_mass_unique"
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,10 @@ class GeometryClusterPolicy:
     lower_y_floor: float
     max_lower_median_px: float
     max_lower_q90_px: float
+    max_top_endpoint_px: float
     max_bottom_endpoint_px: float
+    max_range_start_gap: float
+    max_range_end_gap: float
     max_lower_minus_upper_px: float
     max_polynomial_q90_px: float
 
@@ -72,7 +78,10 @@ POLICIES: tuple[GeometryClusterPolicy, ...] = (
         lower_y_floor=0.0,
         max_lower_median_px=math.inf,
         max_lower_q90_px=math.inf,
+        max_top_endpoint_px=math.inf,
         max_bottom_endpoint_px=math.inf,
+        max_range_start_gap=math.inf,
+        max_range_end_gap=math.inf,
         max_lower_minus_upper_px=math.inf,
         max_polynomial_q90_px=math.inf,
     ),
@@ -87,7 +96,10 @@ POLICIES: tuple[GeometryClusterPolicy, ...] = (
         lower_y_floor=0.58,
         max_lower_median_px=48.0,
         max_lower_q90_px=72.0,
+        max_top_endpoint_px=96.0,
         max_bottom_endpoint_px=80.0,
+        max_range_start_gap=0.25,
+        max_range_end_gap=0.15,
         max_lower_minus_upper_px=40.0,
         max_polynomial_q90_px=80.0,
     ),
@@ -102,7 +114,10 @@ POLICIES: tuple[GeometryClusterPolicy, ...] = (
         lower_y_floor=0.62,
         max_lower_median_px=36.0,
         max_lower_q90_px=56.0,
+        max_top_endpoint_px=80.0,
         max_bottom_endpoint_px=64.0,
+        max_range_start_gap=0.18,
+        max_range_end_gap=0.10,
         max_lower_minus_upper_px=32.0,
         max_polynomial_q90_px=64.0,
     ),
@@ -124,7 +139,10 @@ class PairGeometry:
     lower_median_px: float
     lower_q90_px: float
     upper_median_px: float
+    top_endpoint_px: float
     bottom_endpoint_px: float
+    range_start_gap: float
+    range_end_gap: float
     lower_minus_upper_px: float
     polynomial_q90_px: float
 
@@ -225,8 +243,25 @@ def _pair_geometry(
     valid_b = int(mask_b.bool().sum())
     if common_count == 0 or min(valid_a, valid_b) == 0:
         return PairGeometry(
-            False, common_count, 0.0, 0.0, 0.0, math.inf, math.inf, math.inf, math.inf, False,
-            math.inf, math.inf, math.inf, math.inf, math.inf, math.inf,
+            valid=False,
+            common_rows=common_count,
+            overlap_fraction_min=0.0,
+            min_common_y=0.0,
+            max_common_y=0.0,
+            unweighted_mean_px=math.inf,
+            unweighted_q90_px=math.inf,
+            weighted_median_px=math.inf,
+            weighted_q90_px=math.inf,
+            lower_available=False,
+            lower_median_px=math.inf,
+            lower_q90_px=math.inf,
+            upper_median_px=math.inf,
+            top_endpoint_px=math.inf,
+            bottom_endpoint_px=math.inf,
+            range_start_gap=math.inf,
+            range_end_gap=math.inf,
+            lower_minus_upper_px=math.inf,
+            polynomial_q90_px=math.inf,
         )
     y = y_fraction[common].float()
     gap = (x_a[common].float() - x_b[common].float()).abs()
@@ -243,9 +278,15 @@ def _pair_geometry(
     lower_median = float(lower.median()) if lower.numel() else math.inf
     lower_q90 = float(torch.quantile(lower, 0.90)) if lower.numel() else math.inf
     lower_available = bool(int(lower.numel()) >= 3 and float(y.max()) >= 0.55)
-    bottom_count = min(3, int(gap.numel()))
-    bottom_indices = y.argsort(descending=True)[:bottom_count]
+    endpoint_count = min(3, int(gap.numel()))
+    top_indices = y.argsort()[:endpoint_count]
+    bottom_indices = y.argsort(descending=True)[:endpoint_count]
+    top_endpoint = float(gap[top_indices].median())
     bottom_endpoint = float(gap[bottom_indices].median())
+    valid_a_y = y_fraction[mask_a.bool() & torch.isfinite(x_a)].float()
+    valid_b_y = y_fraction[mask_b.bool() & torch.isfinite(x_b)].float()
+    range_start_gap = float((valid_a_y.min() - valid_b_y.min()).abs())
+    range_end_gap = float((valid_a_y.max() - valid_b_y.max()).abs())
 
     # The polynomial is never extrapolated beyond the observed common range.
     # Raw rows remain the primary signal; this merely suppresses row noise.
@@ -285,7 +326,10 @@ def _pair_geometry(
         lower_median_px=lower_median,
         lower_q90_px=lower_q90,
         upper_median_px=upper_median,
+        top_endpoint_px=top_endpoint,
         bottom_endpoint_px=bottom_endpoint,
+        range_start_gap=range_start_gap,
+        range_end_gap=range_end_gap,
         lower_minus_upper_px=max(0.0, lower_median - upper_median),
         polynomial_q90_px=polynomial_q90,
     )
@@ -325,13 +369,25 @@ def _policy_distance(
             (
                 geometry.lower_median_px / (float(policy.max_lower_median_px) * scale),
                 geometry.lower_q90_px / (float(policy.max_lower_q90_px) * scale),
+                geometry.top_endpoint_px / (float(policy.max_top_endpoint_px) * scale),
                 geometry.bottom_endpoint_px / (float(policy.max_bottom_endpoint_px) * scale),
+                geometry.range_start_gap / float(policy.max_range_start_gap),
+                geometry.range_end_gap / float(policy.max_range_end_gap),
                 geometry.lower_minus_upper_px / (float(policy.max_lower_minus_upper_px) * scale),
                 geometry.polynomial_q90_px / (float(policy.max_polynomial_q90_px) * scale),
             )
         )
         reasons.extend(
-            ("lower_median", "lower_q90", "bottom_endpoint", "lower_divergence", "polynomial_q90")
+            (
+                "lower_median",
+                "lower_q90",
+                "top_endpoint",
+                "bottom_endpoint",
+                "range_start",
+                "range_end",
+                "lower_divergence",
+                "polynomial_q90",
+            )
         )
     index = int(np.argmax(np.asarray(values, dtype=np.float64)))
     distance = float(values[index])
@@ -482,7 +538,7 @@ def build_cluster_prototypes(
     return output
 
 
-def _current_writer_routes(stage: dict[str, torch.Tensor]) -> list[int]:
+def _current_writer_slot_routes(stage: dict[str, torch.Tensor]) -> list[tuple[int, int]]:
     indices = stage.get("selection_slot_indices")
     active = stage.get("selection_slot_active")
     if not isinstance(indices, torch.Tensor):
@@ -490,7 +546,93 @@ def _current_writer_routes(stage: dict[str, torch.Tensor]) -> list[int]:
     valid = indices >= 0
     if isinstance(active, torch.Tensor):
         valid &= active.bool()
-    return [int(value) for value in indices[valid].tolist()]
+    writer_valid = stage.get("selection_slot_official_candidate_valid")
+    if isinstance(writer_valid, torch.Tensor) and tuple(writer_valid.shape) == tuple(valid.shape):
+        valid &= writer_valid.bool()
+    return [
+        (int(slot), int(indices[slot]))
+        for slot in torch.nonzero(valid, as_tuple=False).flatten().tolist()
+    ]
+
+
+def _current_writer_routes(stage: dict[str, torch.Tensor]) -> list[int]:
+    return [route for _slot, route in _current_writer_slot_routes(stage)]
+
+
+def _slot_cluster_mass_selection(
+    clusters: list[list[int]],
+    stage: dict[str, torch.Tensor],
+    candidate_valid: torch.Tensor,
+) -> dict[str, Any]:
+    """Aggregate V7 proposal probability into GT-free geometry clusters.
+
+    V7 performs uniqueness at proposal-ID level.  Near-duplicate proposals can
+    therefore split a slot's probability mass and make a physical lane cluster
+    look weaker than any single proposal ID.  This policy first sums the real
+    conditional route probability inside each deterministic geometry cluster,
+    then assigns active writer-valid slots to distinct clusters.  No GT, loss,
+    optimizer, or learned clustering parameter is involved.
+    """
+
+    writer_slots = _current_writer_slot_routes(stage)
+    logits = stage.get("selection_slot_logits")
+    candidate_count = int(candidate_valid.numel())
+    if not writer_slots:
+        return {
+            "cluster_ids": [],
+            "slot_ids": [],
+            "selected_masses": [],
+            "available": True,
+            "reason": "no_writer_slots",
+        }
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+        return {
+            "cluster_ids": [],
+            "slot_ids": [slot for slot, _route in writer_slots],
+            "selected_masses": [],
+            "available": False,
+            "reason": "missing_slot_logits",
+        }
+    if int(logits.shape[-1]) < candidate_count or len(clusters) < len(writer_slots):
+        return {
+            "cluster_ids": [],
+            "slot_ids": [slot for slot, _route in writer_slots],
+            "selected_masses": [],
+            "available": False,
+            "reason": "insufficient_clusters_or_logits",
+        }
+
+    slot_ids = [slot for slot, _route in writer_slots]
+    real_logits = logits[slot_ids, :candidate_count].float().clone()
+    real_logits[:, ~candidate_valid.bool()] = -1.0e4
+    probability = torch.softmax(real_logits, dim=-1)
+    mass = torch.stack(
+        [probability[:, cluster].sum(dim=-1) for cluster in clusters],
+        dim=-1,
+    )
+    # The tiny deterministic column term only resolves exact floating-point
+    # ties; it cannot change a non-tied assignment.
+    cost = -mass.clamp_min(1.0e-12).log().cpu().numpy().astype(np.float64)
+    cost += np.arange(len(clusters), dtype=np.float64)[None, :] * 1.0e-12
+    row_indices, column_indices = linear_sum_assignment(cost)
+    assigned = {int(row): int(column) for row, column in zip(row_indices, column_indices)}
+    if len(assigned) != len(slot_ids):
+        return {
+            "cluster_ids": [],
+            "slot_ids": slot_ids,
+            "selected_masses": [],
+            "available": False,
+            "reason": "incomplete_linear_assignment",
+        }
+    cluster_ids = [assigned[row] for row in range(len(slot_ids))]
+    selected_masses = [float(mass[row, cluster_ids[row]]) for row in range(len(slot_ids))]
+    return {
+        "cluster_ids": cluster_ids,
+        "slot_ids": slot_ids,
+        "selected_masses": selected_masses,
+        "available": True,
+        "reason": "ok",
+    }
 
 
 def _cluster_selection_ids(
@@ -523,19 +665,37 @@ def _cluster_selection_ids(
 
 
 def _new_metric() -> dict[str, int]:
-    return {"tp": 0, "predictions": 0, "gt": 0}
+    return {
+        "tp": 0,
+        "predictions": 0,
+        "gt": 0,
+        "images": 0,
+        "count_mismatch_images": 0,
+    }
 
 
-def _accumulate_metric(row: dict[str, int], tp: int, predictions: int, gt: int) -> None:
+def _accumulate_metric(
+    row: dict[str, int],
+    tp: int,
+    predictions: int,
+    gt: int,
+    *,
+    expected_predictions: int | None = None,
+) -> None:
     row["tp"] += int(tp)
     row["predictions"] += int(predictions)
     row["gt"] += int(gt)
+    row["images"] += 1
+    if expected_predictions is not None and int(predictions) != int(expected_predictions):
+        row["count_mismatch_images"] += 1
 
 
 def _finish_metric(row: dict[str, int]) -> dict[str, float | int]:
     tp = int(row["tp"])
     predictions = int(row["predictions"])
     gt = int(row["gt"])
+    images = int(row["images"])
+    mismatch = int(row["count_mismatch_images"])
     fp = predictions - tp
     fn = gt - tp
     denominator = 2 * tp + fp + fn
@@ -548,6 +708,9 @@ def _finish_metric(row: dict[str, int]) -> dict[str, float | int]:
         "precision": float(tp) / float(max(predictions, 1)),
         "recall": float(tp) / float(max(gt, 1)),
         "f1": 0.0 if denominator <= 0 else float(2 * tp) / float(denominator),
+        "images": images,
+        "count_mismatch_images": mismatch,
+        "exact_count_parity": bool(mismatch == 0),
     }
 
 
@@ -687,7 +850,10 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             if labels[first] >= 0 and labels[second] >= 0:
                 prefix = "same_gt" if labels[first] == labels[second] else "different_gt"
                 pair_distributions[f"{prefix}/lower_median_px"].append(geometry.lower_median_px)
+                pair_distributions[f"{prefix}/top_endpoint_px"].append(geometry.top_endpoint_px)
                 pair_distributions[f"{prefix}/bottom_endpoint_px"].append(geometry.bottom_endpoint_px)
+                pair_distributions[f"{prefix}/range_start_gap"].append(geometry.range_start_gap)
+                pair_distributions[f"{prefix}/range_end_gap"].append(geometry.range_end_gap)
                 pair_distributions[f"{prefix}/lower_minus_upper_px"].append(geometry.lower_minus_upper_px)
                 pair_distributions[f"{prefix}/weighted_q90_px"].append(geometry.weighted_q90_px)
 
@@ -839,6 +1005,7 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         stage = record["stages"][stage_name]
         gt_count = int(item["proposal_iou"].shape[0])
         current_routes = _current_writer_routes(stage)
+        current_hits: dict[str, int] = {}
         slot_iou = stage.get("selection_slot_official_iou")
         slot_valid = stage.get("selection_slot_official_candidate_valid")
         active = stage.get("selection_slot_active")
@@ -853,14 +1020,18 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                     range(current_count),
                     threshold,
                 )
+                current_hits[f"{threshold:.2f}"] = int(assignment.hit_count)
                 _accumulate_metric(
                     metric_rows[f"current_v7_refined/{threshold:.2f}"],
                     assignment.hit_count,
                     current_count,
                     gt_count,
+                    expected_predictions=current_count,
                 )
         else:
-            current_count = min(len(current_routes), int(args.top_k))
+            raise RuntimeError(
+                "geometry clustering audit requires cached official V7 slot geometry"
+            )
 
         current_count = min(current_count, int(args.top_k))
         for threshold in thresholds:
@@ -882,6 +1053,10 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             "gt_count": gt_count,
             "current_writer_count": current_count,
             "current_routes": current_routes,
+            "current_v7_refined": {
+                f"hits_{threshold:.2f}": current_hits[f"{threshold:.2f}"]
+                for threshold in thresholds
+            },
             "policies": {},
         }
         for policy in POLICIES:
@@ -909,10 +1084,27 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                     current_routes,
                     current_count,
                 )
+                mass_selection = _slot_cluster_mass_selection(
+                    clusters,
+                    stage,
+                    item["candidate_valid"],
+                )
+                selections["slot_cluster_mass_unique"] = list(
+                    mass_selection["cluster_ids"]
+                )
                 image_mode: dict[str, Any] = {
                     "medoid_ids": prototype["medoid_ids"],
                     "routed_consensus_cluster_ids": selections["routed_consensus"],
                     "score_topk_cluster_ids": selections["score_topk"],
+                    "slot_cluster_mass_unique_cluster_ids": selections[
+                        "slot_cluster_mass_unique"
+                    ],
+                    "slot_cluster_mass_unique_slot_ids": mass_selection["slot_ids"],
+                    "slot_cluster_mass_unique_selected_masses": mass_selection[
+                        "selected_masses"
+                    ],
+                    "slot_cluster_mass_unique_available": mass_selection["available"],
+                    "slot_cluster_mass_unique_reason": mass_selection["reason"],
                 }
                 for threshold in thresholds:
                     for selection_name, selected_ids in selections.items():
@@ -929,7 +1121,14 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                             assignment.hit_count,
                             len(selected_ids),
                             gt_count,
+                            expected_predictions=current_count,
                         )
+                        image_mode[
+                            f"{selection_name}_hits_{threshold:.2f}"
+                        ] = int(assignment.hit_count)
+                        image_mode[
+                            f"{selection_name}_predictions_{threshold:.2f}"
+                        ] = int(len(selected_ids))
                     oracle = cardinality_oracle_assignment(
                         local_iou,
                         threshold,
@@ -992,10 +1191,21 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         "scope": {
             "gt_used_in_clustering": False,
             "gt_used_for_posthoc_audit_only": True,
+            "optimizer_steps": 0,
+            "backward_performed": False,
+            "checkpoint_weights_changed": False,
             "checkpoint_selection_performed": False,
             "threshold_search_performed": False,
             "test_set_used": bool(args.split == "test"),
             "new_model_version": False,
+        },
+        "primary_confirmatory_contract": {
+            "policy": PRIMARY_POLICY,
+            "prototype": PRIMARY_PROTOTYPE,
+            "selection": PRIMARY_SELECTION,
+            "prediction_count": "exact_current_v7_writer_count",
+            "cluster_gt_free": True,
+            "slot_probability_aggregated_within_cluster": True,
         },
         "metadata": metadata_for_json(
             cache,
@@ -1095,9 +1305,10 @@ def write_markdown(path: str | Path, report: dict[str, Any]) -> None:
             "",
             (
                 "| Policy / prototype | Oracle TP@.50 | Retention@.50 | Oracle "
-                "TP@.75 | Retention@.75 | Routed F1@.50 | Routed F1@.75 |"
+                "TP@.75 | Retention@.75 | Cluster-mass F1@.50 | Cluster-mass "
+                "F1@.75 | Routed F1@.50 | Routed F1@.75 |"
             ),
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for policy in POLICIES:
@@ -1109,6 +1320,8 @@ def write_markdown(path: str | Path, report: dict[str, Any]) -> None:
                 f"{_metric_value(report, prefix + '/oracle_same_count/0.50', 'all32_tp_retention')} | "
                 f"{_metric_value(report, prefix + '/oracle_same_count/0.75', 'tp')} | "
                 f"{_metric_value(report, prefix + '/oracle_same_count/0.75', 'all32_tp_retention')} | "
+                f"{_metric_value(report, prefix + '/slot_cluster_mass_unique/0.50', 'f1')} | "
+                f"{_metric_value(report, prefix + '/slot_cluster_mass_unique/0.75', 'f1')} | "
                 f"{_metric_value(report, prefix + '/routed_consensus/0.50', 'f1')} | "
                 f"{_metric_value(report, prefix + '/routed_consensus/0.75', 'f1')} |"
             )
@@ -1119,6 +1332,14 @@ def write_markdown(path: str | Path, report: dict[str, Any]) -> None:
             "",
             f"Current V7 refined F1@.50: **{_metric_value(report, 'current_v7_refined/0.50', 'f1')}**  ",
             f"Current V7 refined F1@.75: **{_metric_value(report, 'current_v7_refined/0.75', 'f1')}**  ",
+            (
+                "Primary bottom-aware cluster-mass medoid F1@.50: **"
+                f"{_metric_value(report, PRIMARY_POLICY + '/' + PRIMARY_PROTOTYPE + '/' + PRIMARY_SELECTION + '/0.50', 'f1')}**  "
+            ),
+            (
+                "Primary bottom-aware cluster-mass medoid F1@.75: **"
+                f"{_metric_value(report, PRIMARY_POLICY + '/' + PRIMARY_PROTOTYPE + '/' + PRIMARY_SELECTION + '/0.75', 'f1')}**  "
+            ),
             f"All-32 same-count oracle TP@.50: **{_metric_value(report, 'all32_oracle_same_count/0.50', 'tp')}**  ",
             f"All-32 same-count oracle TP@.75: **{_metric_value(report, 'all32_oracle_same_count/0.75', 'tp')}**",
             "",
