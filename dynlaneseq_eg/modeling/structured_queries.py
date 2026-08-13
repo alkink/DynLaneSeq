@@ -3002,6 +3002,125 @@ class StructuredLaneQueryHead(nn.Module):
                         4.0,
                     )
                 ),
+                visual_precision_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_enabled",
+                        False,
+                    )
+                ),
+                visual_precision_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                visual_precision_geometry_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                visual_precision_geometry_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                visual_precision_geometry_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_vertical_layers",
+                        2,
+                    )
+                ),
+                visual_precision_geometry_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_dropout",
+                        0.0,
+                    )
+                ),
+                visual_precision_geometry_local_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_local_offsets_px",
+                        (
+                            -128.0,
+                            -64.0,
+                            -32.0,
+                            -16.0,
+                            -8.0,
+                            0.0,
+                            8.0,
+                            16.0,
+                            32.0,
+                            64.0,
+                            128.0,
+                        ),
+                    )
+                ),
+                visual_precision_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_delta_offsets_px",
+                        (
+                            -1600.0,
+                            -1200.0,
+                            -800.0,
+                            -600.0,
+                            -400.0,
+                            -300.0,
+                            -200.0,
+                            -128.0,
+                            -64.0,
+                            -32.0,
+                            0.0,
+                            32.0,
+                            64.0,
+                            128.0,
+                            200.0,
+                            300.0,
+                            400.0,
+                            600.0,
+                            800.0,
+                            1200.0,
+                            1600.0,
+                        ),
+                    )
+                ),
+                visual_precision_geometry_range_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_range_offsets_norm",
+                        (
+                            -1.0,
+                            -0.50,
+                            -0.25,
+                            -0.10,
+                            0.0,
+                            0.10,
+                            0.25,
+                            0.50,
+                            1.0,
+                        ),
+                    )
+                ),
+                visual_precision_geometry_proposal_distance_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_proposal_distance_scale",
+                        8.0,
+                    )
+                ),
+                visual_precision_geometry_invisible_row_logit_bias=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_invisible_row_logit_bias",
+                        -2.0,
+                    )
+                ),
+                visual_precision_geometry_gradient_only_candidate_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_precision_geometry_gradient_only_candidate_scale",
+                        0.10,
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(

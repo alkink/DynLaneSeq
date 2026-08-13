@@ -1201,6 +1201,14 @@ class LossConfig:
     four_slot_visual_first_first_pass_weight: float = 0.5
     four_slot_visual_first_final_pass_weight: float = 1.0
     four_slot_visual_first_proposal_weight: float = 1.0
+    # V13 bypasses proposal identity entirely.  A source-stable assignment
+    # supervises full-width slot-owned x/range emitted from visual-first,
+    # row-wise proposal context and precise local P2 evidence.
+    w_four_slot_visual_precision: float = 0.0
+    four_slot_visual_precision_point_weight: float = 5.0
+    four_slot_visual_precision_range_weight: float = 1.0
+    four_slot_visual_precision_line_iou_weight: float = 2.0
+    four_slot_visual_precision_dfl_weight: float = 1.0
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1504,6 +1512,7 @@ class S0Criterion(nn.Module):
             or self.cfg.w_four_slot_geometry != 0
             or self.cfg.w_four_slot_unified != 0
             or self.cfg.w_four_slot_visual_first != 0
+            or self.cfg.w_four_slot_visual_precision != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1661,6 +1670,28 @@ class S0Criterion(nn.Module):
                 "mean_first_visual_mae_px": zero,
                 "mean_final_visual_mae_px": zero,
             }
+        if self.cfg.w_four_slot_visual_precision != 0:
+            four_slot_visual_precision = (
+                self.compute_four_slot_visual_precision_loss(
+                    outputs,
+                    targets,
+                    four_slot_targets,
+                )
+            )
+        else:
+            four_slot_visual_precision = {
+                "total": zero,
+                "point": zero,
+                "range": zero,
+                "line_iou": zero,
+                "dfl": zero,
+                "mean_matched": zero,
+                "mean_anchor_quality": zero,
+                "mean_final_quality": zero,
+                "mean_quality_gain": zero,
+                "mean_abs_delta_px": zero,
+                "mean_candidate_gate": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1689,6 +1720,8 @@ class S0Criterion(nn.Module):
             + self.cfg.w_four_slot_unified * four_slot_unified["total"]
             + self.cfg.w_four_slot_visual_first
             * four_slot_visual_first["total"]
+            + self.cfg.w_four_slot_visual_precision
+            * four_slot_visual_precision["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -1854,6 +1887,39 @@ class S0Criterion(nn.Module):
             ),
             "four_slot_visual_first_mean_final_visual_mae_px": (
                 four_slot_visual_first["mean_final_visual_mae_px"]
+            ),
+            "loss_four_slot_visual_precision": (
+                four_slot_visual_precision["total"]
+            ),
+            "loss_four_slot_visual_precision_point": (
+                four_slot_visual_precision["point"]
+            ),
+            "loss_four_slot_visual_precision_range": (
+                four_slot_visual_precision["range"]
+            ),
+            "loss_four_slot_visual_precision_line_iou": (
+                four_slot_visual_precision["line_iou"]
+            ),
+            "loss_four_slot_visual_precision_dfl": (
+                four_slot_visual_precision["dfl"]
+            ),
+            "four_slot_visual_precision_mean_matched": (
+                four_slot_visual_precision["mean_matched"]
+            ),
+            "four_slot_visual_precision_mean_anchor_quality": (
+                four_slot_visual_precision["mean_anchor_quality"]
+            ),
+            "four_slot_visual_precision_mean_final_quality": (
+                four_slot_visual_precision["mean_final_quality"]
+            ),
+            "four_slot_visual_precision_mean_quality_gain": (
+                four_slot_visual_precision["mean_quality_gain"]
+            ),
+            "four_slot_visual_precision_mean_abs_delta_px": (
+                four_slot_visual_precision["mean_abs_delta_px"]
+            ),
+            "four_slot_visual_precision_mean_candidate_gate": (
+                four_slot_visual_precision["mean_candidate_gate"]
             ),
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -3484,6 +3550,135 @@ class S0Criterion(nn.Module):
             "mean_target_top1": mean_target_top1,
             "mean_first_visual_mae_px": first_mae,
             "mean_final_visual_mae_px": final_mae,
+        }
+
+    def compute_four_slot_visual_precision_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Train V13 slot-owned geometry under the stable V7 assignment."""
+
+        refined = outputs.get("selection_slot_pred_x_rows")
+        ranges = outputs.get("selection_slot_range_norm")
+        delta_logits = outputs.get("selection_slot_row_delta_logits")
+        delta_offsets = outputs.get("selection_slot_row_delta_offsets_px")
+        reference = outputs.get("selection_slot_v13_anchor_x_rows")
+        candidate_gate = outputs.get("selection_slot_v13_candidate_gate")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (
+                refined,
+                ranges,
+                delta_logits,
+                delta_offsets,
+                reference,
+                candidate_gate,
+            )
+        ):
+            raise ValueError(
+                "w_four_slot_visual_precision > 0 requires V13 outputs"
+            )
+        matches, anchor_quality_batch, match_count = (
+            self._match_four_slot_visual_first_anchor(
+                outputs,
+                targets,
+                padded_targets,
+            )
+        )
+        slot_outputs = {
+            "pred_x_rows": refined,
+            "range_norm": ranges,
+            "row_x_logits": delta_logits,
+            "row_x_offsets_px": delta_offsets,
+            "input_reference_x_rows": reference,
+        }
+        point = self.compute_point_loss(slot_outputs, targets, matches)
+        range_loss = self.compute_range_loss(slot_outputs, targets, matches)
+        line_iou = self.compute_line_iou_loss(slot_outputs, targets, matches)
+        dfl = self.compute_row_dfl_loss(slot_outputs, targets, matches)
+        total = (
+            float(self.cfg.four_slot_visual_precision_point_weight) * point
+            + float(self.cfg.four_slot_visual_precision_range_weight)
+            * range_loss
+            + float(self.cfg.four_slot_visual_precision_line_iou_weight)
+            * line_iou
+            + float(self.cfg.four_slot_visual_precision_dfl_weight) * dfl
+        )
+
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=refined.device,
+                dtype=torch.float32,
+                rows=int(refined.shape[-1]),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        with torch.no_grad():
+            final_quality_batch, _slot_valid, _gt_valid = (
+                batched_pairwise_range_aware_row_strip_iou(
+                    refined.detach().float(),
+                    ranges.detach().float(),
+                    padded_gt_x,
+                    padded_gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.four_slot_line_width),
+                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                )
+            )
+        anchor_rows: list[torch.Tensor] = []
+        final_rows: list[torch.Tensor] = []
+        delta_rows: list[torch.Tensor] = []
+        gate_rows: list[torch.Tensor] = []
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            gt_ids = match["gt_indices"]
+            if pred_ids.numel() == 0:
+                continue
+            anchor_rows.append(
+                anchor_quality_batch[batch_index, pred_ids, gt_ids]
+            )
+            final_rows.append(
+                final_quality_batch[batch_index, pred_ids, gt_ids]
+            )
+            delta_rows.append(
+                (
+                    refined[batch_index, pred_ids].float()
+                    - reference[batch_index, pred_ids].float()
+                ).abs().mean(dim=-1)
+            )
+            gate_rows.append(
+                candidate_gate[batch_index, pred_ids].float().abs().mean(
+                    dim=-1
+                )
+            )
+        zero = total.detach() * 0.0
+        mean_anchor = (
+            torch.cat(anchor_rows).mean().detach() if anchor_rows else zero
+        )
+        mean_final = (
+            torch.cat(final_rows).mean().detach() if final_rows else zero
+        )
+        mean_delta = (
+            torch.cat(delta_rows).mean().detach() if delta_rows else zero
+        )
+        mean_gate = (
+            torch.cat(gate_rows).mean().detach() if gate_rows else zero
+        )
+        return {
+            "total": total,
+            "point": point,
+            "range": range_loss,
+            "line_iou": line_iou,
+            "dfl": dfl,
+            "mean_matched": match_count.mean().detach(),
+            "mean_anchor_quality": mean_anchor,
+            "mean_final_quality": mean_final,
+            "mean_quality_gain": (mean_final - mean_anchor).detach(),
+            "mean_abs_delta_px": mean_delta,
+            "mean_candidate_gate": mean_gate,
         }
 
     def compute_four_slot_unified_loss(

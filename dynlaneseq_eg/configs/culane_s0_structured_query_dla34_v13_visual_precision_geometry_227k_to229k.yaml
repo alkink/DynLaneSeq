@@ -1,0 +1,78 @@
+_base_: culane_s0_structured_query_dla34_v12_visual_first_association_stage_a_225k_to227k.yaml
+
+output_dir: outputs/diagnostics/v13_visual_precision_geometry_227k
+
+# V13 keeps the learned V12 visual locator frozen and replaces the failed
+# visual-state -> global proposal-ID -> geometry interface.  Proposal memory
+# is consumed row-wise as feature context only; a new slot-row decoder reads
+# fine local P2 evidence and owns final x/range over full-image support.
+model:
+  structured_query:
+    set_selection:
+      four_slot_visual_first_association_enabled: true
+      four_slot_visual_precision_geometry_enabled: true
+      four_slot_visual_precision_geometry_hidden_dim: 256
+      four_slot_visual_precision_geometry_num_heads: 8
+      four_slot_visual_precision_geometry_ff_dim: 512
+      four_slot_visual_precision_geometry_vertical_layers: 2
+      four_slot_visual_precision_geometry_dropout: 0.0
+      four_slot_visual_precision_geometry_local_offsets_px:
+        [-128, -64, -32, -16, -8, 0, 8, 16, 32, 64, 128]
+      # Symmetric support preserves exact V7 at uniform initialization but can
+      # move a slot across the full 1600-pixel image when evidence requires it.
+      four_slot_visual_precision_geometry_delta_offsets_px:
+        [-1600, -1200, -800, -600, -400, -300, -200, -128, -64, -32,
+         0, 32, 64, 128, 200, 300, 400, 600, 800, 1200, 1600]
+      four_slot_visual_precision_geometry_range_offsets_norm:
+        [-1.0, -0.50, -0.25, -0.10, 0.0, 0.10, 0.25, 0.50, 1.0]
+      four_slot_visual_precision_geometry_proposal_distance_scale: 8.0
+      four_slot_visual_precision_geometry_invisible_row_logit_bias: -2.0
+      four_slot_visual_precision_geometry_gradient_only_candidate_scale: 0.10
+
+loss:
+  # V12 association has already been measured.  V13 is a single-objective
+  # causal gate: stable V7 Hungarian assignment and direct final geometry.
+  w_four_slot_visual_first: 0.0
+  w_four_slot_visual_precision: 1.0
+  four_slot_visual_precision_point_weight: 5.0
+  four_slot_visual_precision_range_weight: 1.0
+  four_slot_visual_precision_line_iou_weight: 2.0
+  four_slot_visual_precision_dfl_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: visual_precision_geometry
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.set_selection_head.visual_precision_geometry.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 2000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.visual_precision_geometry
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.visual_precision_geometry
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.visual_precision_geometry
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

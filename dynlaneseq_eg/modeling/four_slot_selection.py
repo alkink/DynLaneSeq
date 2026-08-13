@@ -2643,6 +2643,408 @@ class FourSlotVisualFirstAssociation(nn.Module):
             # Retained for the future Stage-B geometry consumer and topology
             # audits.  It is not a deployed output in association-only mode.
             "selection_slot_v12_associated_state": associated_hidden,
+            # Pre-proposal visual lane-object state.  V13 consumes this state
+            # directly so the failed global proposal-ID interface cannot
+            # become the owner of final geometry again.
+            "selection_slot_v12_visual_state": hidden,
+        }
+
+
+class FourSlotVisualPrecisionGeometry(nn.Module):
+    """Own final lane geometry without selecting a proposal identity.
+
+    V12 proved that full-width P2 evidence localizes the correct lane on
+    unseen images, but mapping that visual state back to one of 32 proposal
+    IDs erased almost all of the visual advantage.  V13 therefore keeps the
+    proposal population as row-wise *feature context* only.  It retrieves
+    proposal row tokens independently at every row, reads precise local P2
+    evidence around both the visual and V7 centers, reasons across the four
+    slots and vertically, and emits full-width x/range corrections itself.
+
+    The V7 curve is a parity anchor, not a movement bound.  Zero-initialized
+    per-row gates and symmetric full-width offsets make initialization exactly
+    V7 while retaining enough support to move a slot to another global lane.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        input_w: int,
+        visual_dim: int,
+        num_slots: int,
+        hidden_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        vertical_layers: int,
+        dropout: float,
+        local_offsets_px: tuple[float, ...],
+        delta_offsets_px: tuple[float, ...],
+        range_delta_offsets_norm: tuple[float, ...],
+        proposal_distance_scale: float = 8.0,
+        invisible_row_logit_bias: float = -2.0,
+        gradient_only_candidate_scale: float = 0.10,
+    ) -> None:
+        super().__init__()
+        if int(hidden_dim) < 1 or int(hidden_dim) % int(num_heads):
+            raise ValueError("V13 heads must divide hidden_dim")
+        if int(vertical_layers) < 1:
+            raise ValueError("V13 needs at least one vertical layer")
+        if not local_offsets_px:
+            raise ValueError("V13 local P2 offsets cannot be empty")
+        if not delta_offsets_px or not range_delta_offsets_norm:
+            raise ValueError("V13 geometry offset supports cannot be empty")
+        if float(gradient_only_candidate_scale) < 0.0:
+            raise ValueError("V13 gradient-only scale must be non-negative")
+
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.visual_dim = int(visual_dim)
+        self.num_slots = int(num_slots)
+        self.hidden_dim = int(hidden_dim)
+        self.proposal_distance_scale = float(proposal_distance_scale)
+        self.invisible_row_logit_bias = float(invisible_row_logit_bias)
+        self.gradient_only_candidate_scale = float(
+            gradient_only_candidate_scale
+        )
+        self.register_buffer(
+            "local_offsets_px",
+            torch.tensor(local_offsets_px, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "delta_offsets_px",
+            torch.tensor(delta_offsets_px, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "range_delta_offsets_norm",
+            torch.tensor(range_delta_offsets_norm, dtype=torch.float32),
+        )
+
+        self.visual_norm = nn.LayerNorm(self.visual_dim)
+        self.visual_projection = nn.Linear(self.visual_dim, self.hidden_dim)
+        self.geometry_projection = nn.Linear(5, self.hidden_dim, bias=False)
+
+        # Row-wise proposal memory: no global [S,N] identity and no coordinate
+        # averaging in the final output.  A proposal may provide a useful row
+        # token even when no single proposal is the correct whole-lane member.
+        self.proposal_norm = nn.LayerNorm(self.dim)
+        self.proposal_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.proposal_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.proposal_query = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.proposal_context = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+
+        # Fine P2 evidence is sampled around two independent centers: the V12
+        # visual curve and the exact V7 anchor.  Relative positions influence
+        # keys, never values, preserving correct/wrong/zero-image causality.
+        sample_count = 2 * len(local_offsets_px)
+        self.local_feature_norm = nn.LayerNorm(self.dim)
+        self.local_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.local_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.local_query = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.local_context = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.local_position = nn.Parameter(
+            torch.empty(sample_count, self.hidden_dim)
+        )
+        nn.init.normal_(self.local_position, std=0.02)
+
+        self.fusion_norm = nn.LayerNorm(self.hidden_dim)
+        self.fusion_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+        self.cross_slot_norm = nn.LayerNorm(self.hidden_dim)
+        self.cross_slot_attention = nn.MultiheadAttention(
+            self.hidden_dim,
+            int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        vertical_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.vertical_encoder = nn.TransformerEncoder(
+            vertical_layer,
+            num_layers=int(vertical_layers),
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Every output is row/slot conditioned.  The global scalar gate that
+        # invalidated V8 is gone.  Symmetric uniform offset probabilities have
+        # exactly zero expectation at initialization.
+        self.candidate_mix = nn.Linear(self.hidden_dim, 1)
+        self.candidate_gate = nn.Linear(self.hidden_dim, 1)
+        self.delta_head = nn.Linear(
+            self.hidden_dim, len(delta_offsets_px), bias=False
+        )
+        self.range_delta_head = nn.Linear(
+            self.hidden_dim,
+            2 * len(range_delta_offsets_norm),
+            bias=False,
+        )
+        # Candidate mixing is hidden behind the zero candidate gate, so its
+        # ordinary random weight cannot change initialization.  Keeping a
+        # live derivative here lets the gradient-only candidate surrogate
+        # reach the local-P2 and vertical trunks on the very first step.
+        nn.init.zeros_(self.candidate_mix.bias)
+        nn.init.zeros_(self.candidate_gate.weight)
+        nn.init.zeros_(self.candidate_gate.bias)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.range_delta_head.weight)
+
+    def _sample_local_evidence(
+        self,
+        features: torch.Tensor,
+        visual_x: torch.Tensor,
+        anchor_x: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, rows, x_bins, channels = features.shape
+        slots = int(visual_x.shape[1])
+        offsets = self.local_offsets_px.to(
+            device=features.device, dtype=torch.float32
+        )
+        centers = torch.stack((visual_x, anchor_x), dim=-1)
+        sample_x = centers.unsqueeze(-1) + offsets.view(1, 1, 1, 1, -1)
+        sample_x = sample_x.clamp(0.0, float(max(self.input_w - 1, 1)))
+        sample_x = sample_x.flatten(-2)
+        feature_x = sample_x * float(max(x_bins - 1, 0)) / float(
+            max(self.input_w - 1, 1)
+        )
+        left = feature_x.floor().long()
+        right = (left + 1).clamp(max=max(x_bins - 1, 0))
+        alpha = feature_x - left.float()
+        samples = int(sample_x.shape[-1])
+
+        flat = features.reshape(batch * rows, x_bins, channels)
+        left = left.permute(0, 2, 1, 3).reshape(
+            batch * rows, slots * samples
+        )
+        right = right.permute(0, 2, 1, 3).reshape(
+            batch * rows, slots * samples
+        )
+        alpha = alpha.permute(0, 2, 1, 3).reshape(
+            batch * rows, slots * samples, 1
+        )
+        row_index = fixed_indices(
+            batch * rows, device=features.device, dtype=torch.long
+        ).view(-1, 1)
+        left_value = flat[row_index, left]
+        right_value = flat[row_index, right]
+        sampled = torch.lerp(left_value, right_value, alpha.to(features.dtype))
+        return sampled.view(
+            batch, rows, slots, samples, channels
+        ).permute(0, 2, 1, 3, 4).contiguous()
+
+    def forward(
+        self,
+        *,
+        visual_state: torch.Tensor,
+        visual_x_rows: torch.Tensor,
+        anchor_x_rows: torch.Tensor,
+        anchor_range_norm: torch.Tensor,
+        anchor_geometry_valid: torch.Tensor,
+        proposal_row_tokens: torch.Tensor,
+        proposal_x_rows: torch.Tensor,
+        proposal_range_norm: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        row_value_features: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch, slots, rows, _visual_channels = visual_state.shape
+        if slots != self.num_slots:
+            raise ValueError("V13 visual slot count mismatch")
+        if tuple(visual_x_rows.shape) != (batch, slots, rows):
+            raise ValueError("V13 visual x shape mismatch")
+        if tuple(anchor_x_rows.shape) != (batch, slots, rows):
+            raise ValueError("V13 anchor x shape mismatch")
+        candidates = int(proposal_x_rows.shape[1])
+        if tuple(candidate_valid.shape) != (batch, candidates):
+            raise ValueError("V13 candidate-valid shape mismatch")
+        if tuple(row_value_features.shape[:2]) != (batch, rows):
+            raise ValueError("V13 P2 row geometry mismatch")
+
+        visual_state = visual_state.detach().float()
+        visual_x = visual_x_rows.detach().float()
+        anchor_x = anchor_x_rows.detach().float()
+        anchor_range = sort_range_norm(anchor_range_norm.detach().float())
+        anchor_valid = anchor_geometry_valid.detach().bool()
+        proposal_rows = proposal_row_tokens.detach().float()
+        proposal_x = proposal_x_rows.detach().float()
+        proposal_x_finite = torch.isfinite(proposal_x)
+        safe_proposal_x = torch.where(
+            proposal_x_finite, proposal_x, torch.zeros_like(proposal_x)
+        )
+        proposal_range = sort_range_norm(proposal_range_norm.detach().float())
+        features = row_value_features.detach().float()
+
+        hidden = self.visual_projection(self.visual_norm(visual_state))
+        proposal_key = self.proposal_key(self.proposal_norm(proposal_rows))
+        proposal_value = self.proposal_value(
+            self.proposal_norm(proposal_rows)
+        )
+        proposal_logits = torch.einsum(
+            "bsrh,bnrh->bsrn",
+            self.proposal_query(hidden),
+            proposal_key,
+        ) / math.sqrt(float(self.hidden_dim))
+        row_fraction = fixed_row_fractions(
+            rows, device=hidden.device, dtype=torch.float32
+        ).view(1, 1, rows)
+        proposal_visible = (
+            (row_fraction >= proposal_range[..., :1])
+            & (row_fraction <= proposal_range[..., 1:])
+            & proposal_x_finite
+        )
+        valid = candidate_valid[:, :, None].bool() & proposal_x_finite
+        distance = (
+            safe_proposal_x[:, None] - visual_x.unsqueeze(2)
+        ).abs().permute(0, 1, 3, 2) / float(max(self.input_w - 1, 1))
+        proposal_logits = proposal_logits - self.proposal_distance_scale * distance
+        proposal_logits = proposal_logits + torch.where(
+            proposal_visible.permute(0, 2, 1)[:, None],
+            torch.zeros_like(proposal_logits),
+            proposal_logits.new_full((), self.invisible_row_logit_bias),
+        )
+        proposal_logits = proposal_logits.masked_fill(
+            ~valid.permute(0, 2, 1)[:, None], -1.0e4
+        )
+        proposal_attention = torch.softmax(proposal_logits.float(), dim=-1)
+        proposal_context = torch.einsum(
+            "bsrn,bnrh->bsrh", proposal_attention, proposal_value
+        )
+        proposal_expected_x = torch.einsum(
+            "bsrn,bnr->bsr", proposal_attention, safe_proposal_x
+        )
+        hidden = hidden + self.proposal_context(proposal_context)
+        width = float(max(self.input_w - 1, 1))
+        geometry = torch.stack(
+            (
+                anchor_x / width,
+                visual_x / width,
+                proposal_expected_x / width,
+                (visual_x - anchor_x) / width,
+                (proposal_expected_x - visual_x) / width,
+            ),
+            dim=-1,
+        )
+        hidden = hidden + self.geometry_projection(geometry)
+
+        local = self._sample_local_evidence(
+            features, visual_x, anchor_x
+        )
+        local = self.local_feature_norm(local)
+        local_key = self.local_key(local) + self.local_position.view(
+            1, 1, 1, -1, self.hidden_dim
+        )
+        local_value = self.local_value(local)
+        local_logits = torch.einsum(
+            "bsrh,bsrkh->bsrk",
+            self.local_query(hidden),
+            local_key,
+        ) / math.sqrt(float(self.hidden_dim))
+        local_attention = torch.softmax(local_logits.float(), dim=-1)
+        local_context = torch.einsum(
+            "bsrk,bsrkh->bsrh", local_attention, local_value
+        )
+        hidden = hidden + self.local_context(local_context)
+        hidden = hidden + self.fusion_ffn(self.fusion_norm(hidden))
+
+        by_row = hidden.permute(0, 2, 1, 3).reshape(
+            batch * rows, slots, self.hidden_dim
+        )
+        normalized = self.cross_slot_norm(by_row)
+        cross_slot, _weight = self.cross_slot_attention(
+            normalized, normalized, normalized, need_weights=False
+        )
+        hidden = (by_row + cross_slot).reshape(
+            batch, rows, slots, self.hidden_dim
+        ).permute(0, 2, 1, 3)
+        hidden = self.vertical_encoder(
+            hidden.reshape(batch * slots, rows, self.hidden_dim)
+        ).reshape(batch, slots, rows, self.hidden_dim)
+        normalized_hidden = self.output_norm(hidden)
+
+        candidate_mix = torch.sigmoid(
+            self.candidate_mix(normalized_hidden).squeeze(-1)
+        )
+        candidate_x = candidate_mix * proposal_expected_x + (
+            1.0 - candidate_mix
+        ) * visual_x
+        candidate_gate = torch.tanh(
+            self.candidate_gate(normalized_hidden).squeeze(-1)
+        )
+        delta_logits = self.delta_head(normalized_hidden)
+        delta_probability = torch.softmax(delta_logits.float(), dim=-1)
+        delta = torch.einsum(
+            "bsrk,k->bsr",
+            delta_probability,
+            self.delta_offsets_px.to(delta_probability),
+        )
+        correction = candidate_gate * (candidate_x - anchor_x) + delta
+        if self.training and torch.is_grad_enabled():
+            surrogate = candidate_x - anchor_x
+            correction = correction + self.gradient_only_candidate_scale * (
+                surrogate - surrogate.detach()
+            )
+        final_x = (anchor_x + correction).clamp(0.0, width)
+
+        pooled = normalized_hidden.mean(dim=2)
+        range_logits = self.range_delta_head(pooled).view(
+            batch, slots, 2, -1
+        )
+        range_probability = torch.softmax(range_logits.float(), dim=-1)
+        range_delta = torch.einsum(
+            "bsdk,k->bsd",
+            range_probability,
+            self.range_delta_offsets_norm.to(range_probability),
+        )
+        final_range = sort_range_norm(
+            (anchor_range + range_delta).clamp(0.0, 1.0)
+        )
+        final_x = torch.where(
+            anchor_valid.unsqueeze(-1), final_x, torch.zeros_like(final_x)
+        )
+        final_range = torch.where(
+            anchor_valid.unsqueeze(-1),
+            final_range,
+            torch.zeros_like(final_range),
+        )
+        return {
+            "selection_slot_v13_anchor_x_rows": anchor_x,
+            "selection_slot_v13_anchor_range_norm": anchor_range,
+            "selection_slot_v13_visual_x_rows": visual_x,
+            "selection_slot_v13_proposal_expected_x_rows": proposal_expected_x,
+            "selection_slot_v13_candidate_x_rows": candidate_x,
+            "selection_slot_v13_candidate_gate": candidate_gate,
+            "selection_slot_v13_proposal_row_attention": proposal_attention,
+            "selection_slot_v13_local_attention": local_attention,
+            "selection_slot_v13_hidden": hidden,
+            "selection_slot_input_reference_x_rows": anchor_x,
+            "selection_slot_input_range_norm": anchor_range,
+            "selection_slot_row_delta_logits": delta_logits,
+            "selection_slot_row_delta_offsets_px": self.delta_offsets_px,
+            "selection_slot_range_delta_logits": range_logits,
+            "selection_slot_range_delta_offsets_norm": (
+                self.range_delta_offsets_norm
+            ),
+            "selection_slot_range_delta": range_delta,
+            "selection_slot_pred_x_rows": final_x,
+            "selection_slot_range_norm": final_range,
+            "selection_slot_geometry_valid": anchor_valid,
         }
 
 
@@ -2815,6 +3217,62 @@ class FourSlotLaneSelectionHead(nn.Module):
         visual_first_association_visual_prior_strength: float = 0.25,
         visual_first_association_visual_prior_sigma: float = 0.35,
         visual_first_association_curve_distance_scale: float = 4.0,
+        visual_precision_geometry_enabled: bool = False,
+        visual_precision_geometry_hidden_dim: int | None = None,
+        visual_precision_geometry_num_heads: int = 8,
+        visual_precision_geometry_ff_dim: int | None = None,
+        visual_precision_geometry_vertical_layers: int = 2,
+        visual_precision_geometry_dropout: float = 0.0,
+        visual_precision_geometry_local_offsets_px: tuple[float, ...] = (
+            -128.0,
+            -64.0,
+            -32.0,
+            -16.0,
+            -8.0,
+            0.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+            128.0,
+        ),
+        visual_precision_geometry_delta_offsets_px: tuple[float, ...] = (
+            -1600.0,
+            -1200.0,
+            -800.0,
+            -600.0,
+            -400.0,
+            -300.0,
+            -200.0,
+            -128.0,
+            -64.0,
+            -32.0,
+            0.0,
+            32.0,
+            64.0,
+            128.0,
+            200.0,
+            300.0,
+            400.0,
+            600.0,
+            800.0,
+            1200.0,
+            1600.0,
+        ),
+        visual_precision_geometry_range_offsets_norm: tuple[float, ...] = (
+            -1.0,
+            -0.50,
+            -0.25,
+            -0.10,
+            0.0,
+            0.10,
+            0.25,
+            0.50,
+            1.0,
+        ),
+        visual_precision_geometry_proposal_distance_scale: float = 8.0,
+        visual_precision_geometry_invisible_row_logit_bias: float = -2.0,
+        visual_precision_geometry_gradient_only_candidate_scale: float = 0.10,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -2848,6 +3306,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.visual_first_association_enabled = bool(
             visual_first_association_enabled
         )
+        self.visual_precision_geometry_enabled = bool(
+            visual_precision_geometry_enabled
+        )
         if sum(
             (
                 self.refinement_enabled,
@@ -2876,6 +3337,15 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.unified_slot_decoder_enabled:
                 raise ValueError(
                     "V11 unified and V12 visual-first modules are exclusive"
+                )
+        if self.visual_precision_geometry_enabled:
+            if not self.visual_first_association_enabled:
+                raise ValueError(
+                    "V13 precision geometry requires V12 visual-first state"
+                )
+            if not self.refinement_enabled:
+                raise ValueError(
+                    "V13 precision geometry requires exact V7 anchors"
                 )
         self.geometry_detach_router_states = bool(
             geometry_detach_router_states
@@ -2927,6 +3397,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.global_visual_geometry_enabled
             or self.unified_slot_decoder_enabled
             or self.visual_first_association_enabled
+            or self.visual_precision_geometry_enabled
         )
 
         # Exact successful probe descriptor:
@@ -3224,6 +3695,55 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
             )
             if self.visual_first_association_enabled
+            else None
+        )
+        # V13 is not another proposal selector.  It consumes the proven V12
+        # visual lane state, row-wise proposal feature memory and precise local
+        # P2 samples, then owns final x/range directly.  V7 remains only the
+        # parity anchor and activity/score source in the causal gate.
+        self.visual_precision_geometry = (
+            FourSlotVisualPrecisionGeometry(
+                self.dim,
+                input_w=self.input_w,
+                visual_dim=int(
+                    visual_first_association_hidden_dim or self.hidden_dim
+                ),
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    visual_precision_geometry_hidden_dim or self.hidden_dim
+                ),
+                num_heads=int(visual_precision_geometry_num_heads),
+                ff_dim=int(
+                    visual_precision_geometry_ff_dim
+                    or 2
+                    * int(
+                        visual_precision_geometry_hidden_dim or self.hidden_dim
+                    )
+                ),
+                vertical_layers=int(
+                    visual_precision_geometry_vertical_layers
+                ),
+                dropout=float(visual_precision_geometry_dropout),
+                local_offsets_px=tuple(
+                    visual_precision_geometry_local_offsets_px
+                ),
+                delta_offsets_px=tuple(
+                    visual_precision_geometry_delta_offsets_px
+                ),
+                range_delta_offsets_norm=tuple(
+                    visual_precision_geometry_range_offsets_norm
+                ),
+                proposal_distance_scale=float(
+                    visual_precision_geometry_proposal_distance_scale
+                ),
+                invisible_row_logit_bias=float(
+                    visual_precision_geometry_invisible_row_logit_bias
+                ),
+                gradient_only_candidate_scale=float(
+                    visual_precision_geometry_gradient_only_candidate_scale
+                ),
+            )
+            if self.visual_precision_geometry_enabled
             else None
         )
         nn.init.normal_(self.slot_tokens.weight, std=0.02)
@@ -3627,6 +4147,34 @@ class FourSlotLaneSelectionHead(nn.Module):
                     anchor_x_rows=anchor_x,
                     anchor_range_norm=anchor_range,
                     anchor_geometry_valid=anchor_valid,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    candidate_valid=candidate_valid,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.visual_precision_geometry is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V13 precision geometry requires P2 rows")
+            required_v13 = (
+                result.get("selection_slot_v12_visual_state"),
+                result.get("selection_slot_v12_visual_x_rows"),
+                result.get("selection_slot_v12_anchor_x_rows"),
+                result.get("selection_slot_v12_anchor_range_norm"),
+                result.get("selection_slot_v12_geometry_valid"),
+            )
+            if not all(isinstance(value, torch.Tensor) for value in required_v13):
+                raise ValueError(
+                    "V13 requires the complete V12 visual-first state"
+                )
+            result.update(
+                self.visual_precision_geometry(
+                    visual_state=required_v13[0],
+                    visual_x_rows=required_v13[1],
+                    anchor_x_rows=required_v13[2],
+                    anchor_range_norm=required_v13[3],
+                    anchor_geometry_valid=required_v13[4],
                     proposal_row_tokens=outputs["structured_row_tokens"],
                     proposal_x_rows=outputs["pred_x_rows"],
                     proposal_range_norm=outputs["range_norm"],

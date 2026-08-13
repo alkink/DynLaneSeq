@@ -43,7 +43,7 @@ def _proposal_outputs(*, batch: int = 1) -> dict[str, torch.Tensor]:
     }
 
 
-def _head() -> FourSlotLaneSelectionHead:
+def _head(*, v13: bool = False) -> FourSlotLaneSelectionHead:
     return FourSlotLaneSelectionHead(
         16,
         input_w=100,
@@ -75,6 +75,21 @@ def _head() -> FourSlotLaneSelectionHead:
         visual_first_association_vertical_layers=1,
         visual_first_association_dropout=0.0,
         visual_first_association_sinkhorn_iterations=64,
+        visual_precision_geometry_enabled=v13,
+        visual_precision_geometry_hidden_dim=32,
+        visual_precision_geometry_num_heads=4,
+        visual_precision_geometry_ff_dim=64,
+        visual_precision_geometry_vertical_layers=1,
+        visual_precision_geometry_dropout=0.0,
+        visual_precision_geometry_local_offsets_px=(-20.0, 0.0, 20.0),
+        visual_precision_geometry_delta_offsets_px=(
+            -100.0,
+            -50.0,
+            0.0,
+            50.0,
+            100.0,
+        ),
+        visual_precision_geometry_range_offsets_norm=(-1.0, 0.0, 1.0),
     )
 
 
@@ -244,3 +259,150 @@ def test_v12_config_has_one_association_objective_and_frozen_deployment():
         "structured_query_head.set_selection_head.visual_first_association"
     ]
     assert cfg["training"]["max_iters"] == 2000
+
+
+def test_v13_starts_exactly_at_v7_but_has_full_geometry_owner():
+    torch.manual_seed(3407)
+    head = _head(v13=True).eval()
+    outputs = _proposal_outputs()
+    p2 = torch.randn(1, 12, 20, 16)
+    precision = head.visual_precision_geometry
+    assert precision is not None
+    head.visual_precision_geometry = None
+    with torch.no_grad():
+        source = head(outputs, row_value_features=p2)
+    head.visual_precision_geometry = precision
+    with torch.no_grad():
+        treatment = head(outputs, row_value_features=p2)
+    assert torch.equal(
+        treatment["selection_slot_pred_x_rows"],
+        source["selection_slot_pred_x_rows"],
+    )
+    assert torch.equal(
+        treatment["selection_slot_range_norm"],
+        source["selection_slot_range_norm"],
+    )
+    assert torch.equal(
+        treatment["selection_slot_active"], source["selection_slot_active"]
+    )
+    assert treatment["selection_slot_v13_proposal_row_attention"].shape == (
+        1,
+        4,
+        12,
+        8,
+    )
+    assert treatment["selection_slot_v13_local_attention"].shape == (
+        1,
+        4,
+        12,
+        6,
+    )
+    assert float(precision.delta_offsets_px.min()) == -100.0
+    assert float(precision.delta_offsets_px.max()) == 100.0
+
+
+def test_v13_geometry_loss_reaches_new_visual_proposal_and_local_paths():
+    torch.manual_seed(3407)
+    head = _head(v13=True)
+    proposal_outputs = _proposal_outputs()
+    p2 = torch.randn(1, 12, 20, 16, requires_grad=True)
+    result = head(proposal_outputs, row_value_features=p2)
+    criterion = S0Criterion(
+        LossConfig(
+            input_w=100,
+            input_h=50,
+            four_slot_line_width=15.0,
+            four_slot_min_valid_rows=3,
+            w_four_slot_visual_precision=1.0,
+        )
+    )
+    losses = criterion.compute_four_slot_visual_precision_loss(
+        {**proposal_outputs, **result}, _targets()
+    )
+    losses["total"].backward()
+    module = head.visual_precision_geometry
+    assert module is not None
+    for parameter in (
+        module.proposal_query.weight,
+        module.proposal_key.weight,
+        module.local_query.weight,
+        module.local_key.weight,
+        module.candidate_gate.weight,
+        module.delta_head.weight,
+        module.range_delta_head.weight,
+    ):
+        assert parameter.grad is not None
+        assert float(parameter.grad.abs().sum()) > 0.0
+    assert any(
+        parameter.grad is not None and float(parameter.grad.abs().sum()) > 0.0
+        for parameter in module.vertical_encoder.parameters()
+    )
+    assert all(value.grad is None for value in proposal_outputs.values())
+    assert p2.grad is None
+    assert head.visual_first_association is not None
+    assert all(
+        parameter.grad is None
+        for parameter in head.visual_first_association.parameters()
+    )
+    assert torch.isfinite(losses["total"])
+
+
+def test_v13_masks_nonfinite_proposal_rows_before_coordinate_expectation():
+    torch.manual_seed(3407)
+    head = _head(v13=True).eval()
+    proposal_outputs = _proposal_outputs()
+    p2 = torch.randn(1, 12, 20, 16)
+    with torch.no_grad():
+        baseline = head(proposal_outputs, row_value_features=p2)
+    module = head.visual_precision_geometry
+    assert module is not None
+    proposal_x = proposal_outputs["pred_x_rows"].detach().clone()
+    proposal_x[:, 0, 3] = float("nan")
+    with torch.no_grad():
+        replay = module(
+            visual_state=baseline["selection_slot_v12_visual_state"],
+            visual_x_rows=baseline["selection_slot_v12_visual_x_rows"],
+            anchor_x_rows=baseline["selection_slot_v12_anchor_x_rows"],
+            anchor_range_norm=baseline[
+                "selection_slot_v12_anchor_range_norm"
+            ],
+            anchor_geometry_valid=baseline[
+                "selection_slot_v12_geometry_valid"
+            ],
+            proposal_row_tokens=proposal_outputs["structured_row_tokens"],
+            proposal_x_rows=proposal_x,
+            proposal_range_norm=proposal_outputs["range_norm"],
+            candidate_valid=torch.ones(1, 8, dtype=torch.bool),
+            row_value_features=p2,
+        )
+    assert torch.isfinite(
+        replay["selection_slot_v13_proposal_expected_x_rows"]
+    ).all()
+    assert torch.isfinite(replay["selection_slot_pred_x_rows"]).all()
+
+
+def test_v13_config_is_full_width_single_geometry_objective():
+    cfg = load_config(
+        PROJECT_ROOT
+        / "dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v13_visual_precision_geometry_227k_to229k.yaml"
+    )
+    selection = cfg["model"]["structured_query"]["set_selection"]
+    assert selection["four_slot_visual_first_association_enabled"] is True
+    assert selection["four_slot_visual_precision_geometry_enabled"] is True
+    offsets = selection[
+        "four_slot_visual_precision_geometry_delta_offsets_px"
+    ]
+    assert min(offsets) <= -1600 and max(offsets) >= 1600
+    assert cfg["loss"]["w_four_slot_visual_first"] == 0.0
+    assert cfg["loss"]["w_four_slot_visual_precision"] == 1.0
+    nonzero_objectives = {
+        name: value
+        for name, value in cfg["loss"].items()
+        if isinstance(value, (int, float))
+        and value != 0.0
+        and (name.startswith("w_") or name.startswith("lambda_"))
+    }
+    assert nonzero_objectives == {"w_four_slot_visual_precision": 1.0}
+    assert cfg["training"]["trainable_parameter_prefixes"] == [
+        "structured_query_head.set_selection_head.visual_precision_geometry"
+    ]
