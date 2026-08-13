@@ -26,13 +26,18 @@ def _slot_outputs(offset: float, active: tuple[bool, bool]) -> dict[str, torch.T
         "selection_slot_active": torch.tensor(active),
         "selection_slot_unified_base_x_rows": x - 0.5,
         "selection_slot_unified_base_range_norm": lane_range * 0.9,
+        "selection_slot_row_delta_logits": torch.zeros(2, 3, 3),
+        "selection_slot_row_delta_offsets_px": torch.tensor(
+            [-10.0, 0.0, 10.0]
+        ),
+        "selection_slot_range_delta": torch.zeros(2, 2),
     }
 
 
 def test_factorial_policy_axes_mix_only_the_named_tensors() -> None:
     source = _slot_outputs(0.0, (True, False))
     v11 = _slot_outputs(2.0, (False, True))
-    policies = _factorial_policies(source, v11)
+    policies = _factorial_policies(source, v11, input_w=100)
     fixed = policies["v11_final_x_v7_range__v7_activity"]
     assert torch.equal(fixed["x"], v11["selection_slot_pred_x_rows"])
     assert torch.equal(fixed["range"], source["selection_slot_range_norm"])
@@ -41,6 +46,22 @@ def test_factorial_policy_axes_mix_only_the_named_tensors() -> None:
     assert torch.equal(joint["x"], v11["selection_slot_pred_x_rows"])
     assert torch.equal(joint["range"], v11["selection_slot_range_norm"])
     assert torch.equal(joint["active"], v11["selection_slot_active"])
+
+
+def test_v11_residual_can_be_replayed_on_exact_v7_anchor() -> None:
+    source = _slot_outputs(0.0, (True, False))
+    v11 = _slot_outputs(2.0, (False, True))
+    v11["selection_slot_row_delta_logits"][..., 2] = 8.0
+    v11["selection_slot_range_delta"] = torch.tensor(
+        [[0.1, -0.1], [0.2, -0.2]]
+    )
+    policies = _factorial_policies(source, v11, input_w=100)
+    anchored = policies["v7_anchor_plus_v11_residual__v7_activity"]
+    assert not torch.equal(anchored["x"], source["selection_slot_pred_x_rows"])
+    assert not torch.equal(
+        anchored["range"], source["selection_slot_range_norm"]
+    )
+    assert torch.equal(anchored["active"], source["selection_slot_active"])
 
 
 def test_official_counter_uses_strict_threshold_and_writer_validity() -> None:

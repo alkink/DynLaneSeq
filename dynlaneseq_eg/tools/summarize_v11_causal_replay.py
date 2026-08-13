@@ -13,6 +13,8 @@ PRIMARY = (
     "v11_final__v7_activity",
     "v7_geometry__v11_activity",
     "v11_final__v11_activity",
+    "v7_anchor_plus_v11_residual__v7_activity",
+    "v7_anchor_plus_v11_residual__v11_activity",
 )
 ABLATIONS = (
     "p2_zero_content",
@@ -105,6 +107,15 @@ def _domain_summary(report: dict[str, Any]) -> dict[str, Any]:
                 report,
                 "v11_final__v7_activity",
                 "v11_coarse__v7_activity",
+                threshold,
+            )
+            for threshold in thresholds
+        },
+        "learned_residual_on_v7_anchor_minus_v7": {
+            threshold: _delta(
+                report,
+                "v7_anchor_plus_v11_residual__v7_activity",
+                "v7_geometry__v7_activity",
                 threshold,
             )
             for threshold in thresholds

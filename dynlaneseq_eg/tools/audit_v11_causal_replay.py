@@ -21,6 +21,7 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     sha256_file,
 )
 from dynlaneseq_eg.factory import build_dataloader, build_model
+from dynlaneseq_eg.modeling.common import sort_range_norm
 from dynlaneseq_eg.tools.diagnostic_sampling import select_diagnostic_loader
 from dynlaneseq_eg.tools.train import seed_everything
 
@@ -32,6 +33,8 @@ PRIMARY_POLICIES = (
     "v11_final__v7_activity",
     "v7_geometry__v11_activity",
     "v11_final__v11_activity",
+    "v7_anchor_plus_v11_residual__v7_activity",
+    "v7_anchor_plus_v11_residual__v11_activity",
 )
 
 # x source, range source, activity source.  The names are intentionally
@@ -319,6 +322,8 @@ def _variant_kwargs(
 def _factorial_policies(
     source: dict[str, torch.Tensor],
     v11: dict[str, torch.Tensor],
+    *,
+    input_w: int,
 ) -> OrderedDict[str, dict[str, torch.Tensor]]:
     x_values = {
         "v7": source["selection_slot_pred_x_rows"],
@@ -334,7 +339,7 @@ def _factorial_policies(
         "v7": source["selection_slot_active"].bool(),
         "v11": v11["selection_slot_active"].bool(),
     }
-    return OrderedDict(
+    policies = OrderedDict(
         (
             name,
             {
@@ -345,6 +350,45 @@ def _factorial_policies(
         )
         for name, (x_name, range_name, activity_name) in FACTORIAL_AXES.items()
     )
+    delta_probability = torch.softmax(
+        v11["selection_slot_row_delta_logits"].float(),
+        dim=-1,
+    )
+    delta_offsets = v11["selection_slot_row_delta_offsets_px"].float()
+    x_residual = (
+        (
+            delta_probability
+            - 1.0 / float(int(delta_probability.shape[-1]))
+        )
+        * delta_offsets
+    ).sum(dim=-1)
+    anchored_x = (
+        source["selection_slot_pred_x_rows"].float() + x_residual
+    ).clamp(0.0, float(max(int(input_w) - 1, 1)))
+    anchored_range = sort_range_norm(
+        (
+            source["selection_slot_range_norm"].float()
+            + v11["selection_slot_range_delta"].float()
+        ).clamp(0.0, 1.0)
+    )
+    for activity_name, active in activity_values.items():
+        suffix = f"__{activity_name}_activity"
+        policies[f"v7_anchor_plus_v11_residual{suffix}"] = {
+            "x": anchored_x,
+            "range": anchored_range,
+            "active": active,
+        }
+        policies[f"v7_anchor_plus_v11_x_residual{suffix}"] = {
+            "x": anchored_x,
+            "range": source["selection_slot_range_norm"],
+            "active": active,
+        }
+        policies[f"v7_anchor_plus_v11_range_residual{suffix}"] = {
+            "x": source["selection_slot_pred_x_rows"],
+            "range": anchored_range,
+            "active": active,
+        }
+    return policies
 
 
 def _new_metric_tree(
@@ -886,6 +930,18 @@ def _collect_v11_and_policies(
                     outputs,
                     "selection_slot_unified_base_range_norm",
                 )[bi].detach().float().cpu(),
+                "selection_slot_row_delta_logits": _required_output(
+                    outputs,
+                    "selection_slot_row_delta_logits",
+                )[bi].detach().float().cpu(),
+                "selection_slot_row_delta_offsets_px": _required_output(
+                    outputs,
+                    "selection_slot_row_delta_offsets_px",
+                ).detach().float().cpu(),
+                "selection_slot_range_delta": _required_output(
+                    outputs,
+                    "selection_slot_range_delta",
+                )[bi].detach().float().cpu(),
             }
             current_routes = _required_output(
                 outputs,
@@ -928,7 +984,11 @@ def _collect_v11_and_policies(
                     .max()
                 ),
             )
-            policies = _factorial_policies(source, v11)
+            policies = _factorial_policies(
+                source,
+                v11,
+                input_w=int(source_record["meta"].get("input_w", 800)),
+            )
             for name, value in variants.items():
                 policies[f"ablation_{name}__v7_activity"] = {
                     "x": value["selection_slot_pred_x_rows"][bi]
