@@ -1234,6 +1234,15 @@ class LossConfig:
     four_slot_v15_range_weight: float = 1.0
     four_slot_v15_line_iou_weight: float = 2.0
     four_slot_v15_dfl_weight: float = 1.0
+    # V16 directly ranks coherent proposal members inside GT-free,
+    # anchor-owned variable groups.  No coordinate mixture is supervised.
+    w_four_slot_v16: float = 0.0
+    four_slot_v16_quality_weight: float = 1.0
+    four_slot_v16_pairwise_weight: float = 1.0
+    four_slot_v16_hard_weight: float = 1.0
+    four_slot_v16_representable_min: float = 0.50
+    four_slot_v16_pair_margin: float = 0.02
+    four_slot_v16_hard_margin: float = 0.02
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1541,6 +1550,7 @@ class S0Criterion(nn.Module):
             or self.cfg.w_four_slot_v14_stage_a != 0
             or self.cfg.w_four_slot_v14_stage_b != 0
             or self.cfg.w_four_slot_v15 != 0
+            or self.cfg.w_four_slot_v16 != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1781,6 +1791,27 @@ class S0Criterion(nn.Module):
                 "mean_quality_gain": zero,
                 "mean_abs_delta_px": zero,
             }
+        if self.cfg.w_four_slot_v16 != 0:
+            four_slot_v16 = self.compute_four_slot_v16_loss(
+                outputs,
+                targets,
+                four_slot_targets,
+            )
+        else:
+            four_slot_v16 = {
+                "total": zero,
+                "quality": zero,
+                "pairwise": zero,
+                "hard": zero,
+                "mean_matched": zero,
+                "mean_representable": zero,
+                "mean_group_size": zero,
+                "mean_anchor_quality": zero,
+                "mean_selected_quality": zero,
+                "mean_oracle_quality": zero,
+                "mean_quality_gain": zero,
+                "mean_target_top1": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1816,6 +1847,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_four_slot_v14_stage_b
             * four_slot_v14_stage_b["total"]
             + self.cfg.w_four_slot_v15 * four_slot_v15["total"]
+            + self.cfg.w_four_slot_v16 * four_slot_v16["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -2090,6 +2122,32 @@ class S0Criterion(nn.Module):
             ],
             "four_slot_v15_mean_abs_delta_px": four_slot_v15[
                 "mean_abs_delta_px"
+            ],
+            "loss_four_slot_v16": four_slot_v16["total"],
+            "loss_four_slot_v16_quality": four_slot_v16["quality"],
+            "loss_four_slot_v16_pairwise": four_slot_v16["pairwise"],
+            "loss_four_slot_v16_hard": four_slot_v16["hard"],
+            "four_slot_v16_mean_matched": four_slot_v16["mean_matched"],
+            "four_slot_v16_mean_representable": four_slot_v16[
+                "mean_representable"
+            ],
+            "four_slot_v16_mean_group_size": four_slot_v16[
+                "mean_group_size"
+            ],
+            "four_slot_v16_mean_anchor_quality": four_slot_v16[
+                "mean_anchor_quality"
+            ],
+            "four_slot_v16_mean_selected_quality": four_slot_v16[
+                "mean_selected_quality"
+            ],
+            "four_slot_v16_mean_oracle_quality": four_slot_v16[
+                "mean_oracle_quality"
+            ],
+            "four_slot_v16_mean_quality_gain": four_slot_v16[
+                "mean_quality_gain"
+            ],
+            "four_slot_v16_mean_target_top1": four_slot_v16[
+                "mean_target_top1"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -4412,6 +4470,193 @@ class S0Criterion(nn.Module):
             "mean_final_quality": mean_final,
             "mean_quality_gain": (mean_final - mean_anchor).detach(),
             "mean_abs_delta_px": mean_delta,
+        }
+
+    def compute_four_slot_v16_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Directly learn one coherent proposal quality order per V7 slot.
+
+        V16 geometry is target-free and only defines the variable candidate
+        mask.  A frozen V7 writer-valid assignment supplies the GT identity.
+        Regression calibrates every local member, pairwise logistic loss
+        orders meaningfully different members, and hard CE is used only when
+        the best member has a defensible quality margin.  Near ties are never
+        forced into an arbitrary exact-ID classification.
+        """
+
+        scores = outputs.get("selection_slot_v16_candidate_scores")
+        group_mask = outputs.get("selection_slot_v16_group_mask")
+        selected_ids = outputs.get("selection_slot_v16_selected_indices")
+        anchor_ids = outputs.get("selection_slot_v16_anchor_indices")
+        anchor_x = outputs.get("selection_slot_v16_anchor_x_rows")
+        anchor_range = outputs.get("selection_slot_v16_anchor_range_norm")
+        writer_valid = outputs.get("selection_slot_v16_writer_valid")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (
+                scores,
+                group_mask,
+                selected_ids,
+                anchor_ids,
+                anchor_x,
+                anchor_range,
+                writer_valid,
+            )
+        ):
+            raise ValueError("w_four_slot_v16 requires complete V16 outputs")
+        proposal_x = outputs["pred_x_rows"].detach().float()
+        proposal_range = outputs["range_norm"].detach().float()
+        candidate_valid = outputs["selection_slot_candidate_valid"].detach().bool()
+        batch, slots, candidates = scores.shape
+        if tuple(group_mask.shape) != (batch, slots, candidates):
+            raise ValueError("V16 group mask shape mismatch")
+
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=scores.device,
+                dtype=torch.float32,
+                rows=int(proposal_x.shape[-1]),
+            )
+            padded_targets = (padded_gt_x, padded_gt_valid)
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+
+        anchor_view = dict(outputs)
+        anchor_view["selection_slot_v14_anchor_x_rows"] = anchor_x
+        anchor_view["selection_slot_v14_anchor_range_norm"] = anchor_range
+        anchor_view["selection_slot_v14_writer_valid"] = writer_valid
+        matches, _anchor_slot_quality, match_count = (
+            self._match_four_slot_v14_anchor(
+                anchor_view,
+                targets,
+                padded_targets,
+            )
+        )
+        with torch.no_grad():
+            quality, quality_candidate_valid, gt_valid = (
+                batched_pairwise_range_aware_row_strip_iou(
+                    proposal_x,
+                    proposal_range,
+                    padded_gt_x,
+                    padded_gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.four_slot_line_width),
+                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                )
+            )
+        candidate_valid = candidate_valid & quality_candidate_valid
+
+        quality_losses: list[torch.Tensor] = []
+        pairwise_losses: list[torch.Tensor] = []
+        hard_losses: list[torch.Tensor] = []
+        anchor_rows: list[torch.Tensor] = []
+        selected_rows: list[torch.Tensor] = []
+        oracle_rows: list[torch.Tensor] = []
+        group_sizes: list[torch.Tensor] = []
+        top1_rows: list[torch.Tensor] = []
+        representable_counts = scores.new_zeros((batch,), dtype=torch.float32)
+        representable_min = float(self.cfg.four_slot_v16_representable_min)
+        pair_margin = float(self.cfg.four_slot_v16_pair_margin)
+        hard_margin = float(self.cfg.four_slot_v16_hard_margin)
+        for batch_index, match in enumerate(matches):
+            for slot_tensor, gt_tensor in zip(
+                match["pred_indices"], match["gt_indices"]
+            ):
+                slot = int(slot_tensor)
+                gt = int(gt_tensor)
+                if not bool(gt_valid[batch_index, gt]):
+                    continue
+                local_mask = (
+                    group_mask[batch_index, slot].detach().bool()
+                    & candidate_valid[batch_index]
+                )
+                local_ids = torch.nonzero(
+                    local_mask, as_tuple=False
+                ).flatten()
+                if int(local_ids.numel()) == 0:
+                    continue
+                local_quality = quality[batch_index, local_ids, gt].detach()
+                best_quality, best_offset = local_quality.max(dim=0)
+                if float(best_quality) < representable_min:
+                    continue
+                representable_counts[batch_index] += 1.0
+                local_scores = scores[batch_index, slot, local_ids].float()
+                quality_losses.append(
+                    F.smooth_l1_loss(
+                        torch.sigmoid(local_scores),
+                        local_quality.to(local_scores.dtype),
+                        reduction="mean",
+                    )
+                )
+
+                quality_gap = local_quality[:, None] - local_quality[None, :]
+                ordered_pair = quality_gap >= pair_margin
+                if bool(ordered_pair.any()):
+                    score_gap = local_scores[:, None] - local_scores[None, :]
+                    pairwise_losses.append(
+                        F.softplus(-score_gap[ordered_pair]).mean()
+                    )
+
+                if int(local_ids.numel()) == 1:
+                    second_quality = best_quality.new_tensor(float("-inf"))
+                else:
+                    second_quality = local_quality.topk(2).values[1]
+                if float(best_quality - second_quality) >= hard_margin:
+                    hard_losses.append(
+                        -F.log_softmax(local_scores, dim=-1)[best_offset]
+                    )
+
+                best_id = local_ids[best_offset]
+                selected_id = selected_ids[batch_index, slot]
+                anchor_id = anchor_ids[batch_index, slot]
+                anchor_rows.append(quality[batch_index, anchor_id, gt])
+                selected_rows.append(quality[batch_index, selected_id, gt])
+                oracle_rows.append(best_quality)
+                group_sizes.append(scores.new_tensor(float(local_ids.numel())))
+                top1_rows.append((selected_id == best_id).to(torch.float32))
+
+        zero = scores.sum() * 0.0
+        quality_loss = (
+            torch.stack(quality_losses).mean() if quality_losses else zero
+        )
+        pairwise_loss = (
+            torch.stack(pairwise_losses).mean() if pairwise_losses else zero
+        )
+        hard_loss = torch.stack(hard_losses).mean() if hard_losses else zero
+        total = (
+            float(self.cfg.four_slot_v16_quality_weight) * quality_loss
+            + float(self.cfg.four_slot_v16_pairwise_weight) * pairwise_loss
+            + float(self.cfg.four_slot_v16_hard_weight) * hard_loss
+        )
+        detached_zero = total.detach() * 0.0
+
+        def mean_or_zero(values: list[torch.Tensor]) -> torch.Tensor:
+            return (
+                torch.stack(values).float().mean().detach()
+                if values
+                else detached_zero
+            )
+
+        mean_anchor = mean_or_zero(anchor_rows)
+        mean_selected = mean_or_zero(selected_rows)
+        return {
+            "total": total,
+            "quality": quality_loss,
+            "pairwise": pairwise_loss,
+            "hard": hard_loss,
+            "mean_matched": match_count.mean().detach(),
+            "mean_representable": representable_counts.mean().detach(),
+            "mean_group_size": mean_or_zero(group_sizes),
+            "mean_anchor_quality": mean_anchor,
+            "mean_selected_quality": mean_selected,
+            "mean_oracle_quality": mean_or_zero(oracle_rows),
+            "mean_quality_gain": (mean_selected - mean_anchor).detach(),
+            "mean_target_top1": mean_or_zero(top1_rows),
         }
 
     def compute_four_slot_unified_loss(

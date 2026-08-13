@@ -13,6 +13,7 @@ from .common import (
     fixed_sample_indices,
     sort_range_norm,
 )
+from .v16_candidate_reranker import FourSlotCandidateAlignedReranker
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -4846,6 +4847,19 @@ class FourSlotLaneSelectionHead(nn.Module):
             0.50,
             1.0,
         ),
+        candidate_aligned_reranker_enabled: bool = False,
+        candidate_aligned_reranker_hidden_dim: int = 128,
+        candidate_aligned_reranker_row_dilations: tuple[int, ...] = (1, 2, 4),
+        candidate_aligned_reranker_evidence_offsets_px: tuple[float, ...] = (
+            -24.0,
+            0.0,
+            24.0,
+        ),
+        candidate_aligned_reranker_dropout: float = 0.0,
+        candidate_aligned_reranker_corridor_fraction: float = 0.60,
+        candidate_aligned_reranker_min_corridor_px: float = 72.0,
+        candidate_aligned_reranker_max_corridor_px: float = 256.0,
+        candidate_aligned_reranker_min_overlap_fraction: float = 0.25,
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -4944,6 +4958,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.bottom_aware_relational_geometry_enabled = bool(
             bottom_aware_relational_geometry_enabled
         )
+        self.candidate_aligned_reranker_enabled = bool(
+            candidate_aligned_reranker_enabled
+        )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
         )
@@ -5022,6 +5039,24 @@ class FourSlotLaneSelectionHead(nn.Module):
                 raise ValueError(
                     "V15 relational geometry is exclusive with V11-V14 modules"
                 )
+        if self.candidate_aligned_reranker_enabled:
+            if not self.factorized_routing:
+                raise ValueError("V16 candidate reranker requires factorized routing")
+            if not self.refinement_enabled:
+                raise ValueError("V16 candidate reranker requires exact V7 anchors")
+            if any(
+                (
+                    self.unified_slot_decoder_enabled,
+                    self.visual_first_association_enabled,
+                    self.corrected_visual_first_association_enabled,
+                    self.corrected_visual_first_geometry_enabled,
+                    self.visual_precision_geometry_enabled,
+                    self.bottom_aware_relational_geometry_enabled,
+                    self.slot_owned_geometry_enabled,
+                    self.global_visual_geometry_enabled,
+                )
+            ):
+                raise ValueError("V16 candidate reranker is exclusive with V9-V15 modules")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -5085,6 +5120,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.corrected_visual_first_geometry_enabled
             or self.visual_precision_geometry_enabled
             or self.bottom_aware_relational_geometry_enabled
+            or self.candidate_aligned_reranker_enabled
         )
 
         # Exact successful probe descriptor:
@@ -5516,6 +5552,43 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
             )
             if self.bottom_aware_relational_geometry_enabled
+            else None
+        )
+        # V16 keeps V7 deployment bit-exact and trains only a private hard
+        # representative selector.  The candidate groups are GT-free,
+        # variable-size and disjoint; every emitted sidecar curve is one
+        # complete proposal member, never a coordinate mixture.
+        self.candidate_aligned_reranker = (
+            FourSlotCandidateAlignedReranker(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(candidate_aligned_reranker_hidden_dim),
+                row_dilations=tuple(
+                    int(value)
+                    for value in candidate_aligned_reranker_row_dilations
+                ),
+                evidence_offsets_px=tuple(
+                    float(value)
+                    for value in candidate_aligned_reranker_evidence_offsets_px
+                ),
+                dropout=float(candidate_aligned_reranker_dropout),
+                min_valid_rows=self.min_valid_rows,
+                corridor_fraction=float(
+                    candidate_aligned_reranker_corridor_fraction
+                ),
+                min_corridor_px=float(
+                    candidate_aligned_reranker_min_corridor_px
+                ),
+                max_corridor_px=float(
+                    candidate_aligned_reranker_max_corridor_px
+                ),
+                min_overlap_fraction=float(
+                    candidate_aligned_reranker_min_overlap_fraction
+                ),
+            )
+            if self.candidate_aligned_reranker_enabled
             else None
         )
         # V13 is not another proposal selector.  It consumes the proven V12
@@ -6054,6 +6127,38 @@ class FourSlotLaneSelectionHead(nn.Module):
             result.update(
                 self.bottom_aware_relational_geometry(
                     slot_states=slots,
+                    anchor_x_rows=anchor_x,
+                    anchor_range_norm=anchor_range,
+                    anchor_geometry_valid=anchor_valid,
+                    anchor_active=anchor_active,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    candidate_valid=candidate_valid,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.candidate_aligned_reranker is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V16 candidate reranker requires P2 rows")
+            anchor_x = result.get("selection_slot_pred_x_rows")
+            anchor_range = result.get("selection_slot_range_norm")
+            anchor_valid = result.get("selection_slot_geometry_valid")
+            anchor_active = result.get("selection_slot_active")
+            if not all(
+                isinstance(value, torch.Tensor)
+                for value in (
+                    anchor_x,
+                    anchor_range,
+                    anchor_valid,
+                    anchor_active,
+                )
+            ):
+                raise ValueError("V16 requires the complete exact-V7 anchor")
+            result.update(
+                self.candidate_aligned_reranker(
+                    slot_states=slots,
+                    anchor_indices=geometry_indices,
                     anchor_x_rows=anchor_x,
                     anchor_range_norm=anchor_range,
                     anchor_geometry_valid=anchor_valid,

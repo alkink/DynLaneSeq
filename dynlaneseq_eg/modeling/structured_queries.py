@@ -3248,6 +3248,62 @@ class StructuredLaneQueryHead(nn.Module):
                         (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 1.0),
                     )
                 ),
+                candidate_aligned_reranker_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_enabled",
+                        False,
+                    )
+                ),
+                candidate_aligned_reranker_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_hidden_dim",
+                        128,
+                    )
+                ),
+                candidate_aligned_reranker_row_dilations=tuple(
+                    int(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_row_dilations",
+                        (1, 2, 4),
+                    )
+                ),
+                candidate_aligned_reranker_evidence_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_evidence_offsets_px",
+                        (-24.0, 0.0, 24.0),
+                    )
+                ),
+                candidate_aligned_reranker_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_dropout",
+                        0.0,
+                    )
+                ),
+                candidate_aligned_reranker_corridor_fraction=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_corridor_fraction",
+                        0.60,
+                    )
+                ),
+                candidate_aligned_reranker_min_corridor_px=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_min_corridor_px",
+                        72.0,
+                    )
+                ),
+                candidate_aligned_reranker_max_corridor_px=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_max_corridor_px",
+                        256.0,
+                    )
+                ),
+                candidate_aligned_reranker_min_overlap_fraction=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_candidate_aligned_reranker_min_overlap_fraction",
+                        0.25,
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",

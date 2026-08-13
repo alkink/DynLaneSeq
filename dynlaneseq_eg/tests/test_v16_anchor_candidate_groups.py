@@ -3,6 +3,10 @@ from __future__ import annotations
 import torch
 
 from dynlaneseq_eg.modeling.common import fixed_row_fractions
+from dynlaneseq_eg.modeling.v16_candidate_groups import (
+    V16CandidateGroupConfig,
+    build_v16_anchor_candidate_groups,
+)
 from dynlaneseq_eg.tools.audit_geometry_proposal_clustering import _pairwise_geometry
 from dynlaneseq_eg.tools.audit_v16_anchor_candidate_groups import (
     POLICIES,
@@ -81,6 +85,88 @@ def test_fixed_assignment_oracle_selects_one_coherent_candidate_per_group() -> N
         {0: 0, 1: 1},
     )
     assert selected.tolist() == [1, 3]
+
+
+def test_tensor_group_builder_matches_audited_scalar_contract() -> None:
+    rows = 21
+    y = fixed_row_fractions(rows, device=torch.device("cpu"), dtype=torch.float32)
+    curves = torch.stack(
+        (
+            80.0 + 18.0 * y.square(),
+            92.0 + 22.0 * y.square(),
+            119.0 + 26.0 * y.square(),
+            350.0 - 35.0 * y + 20.0 * y.square(),
+            375.0 - 28.0 * y + 18.0 * y.square(),
+            720.0 + 10.0 * y,
+        )
+    )
+    ranges = torch.tensor(
+        (
+            (0.00, 1.00),
+            (0.10, 1.00),
+            (0.25, 0.90),
+            (0.00, 1.00),
+            (0.20, 1.00),
+            (0.00, 1.00),
+        )
+    )
+    row_mask = (y[None] >= ranges[:, :1]) & (y[None] <= ranges[:, 1:])
+    scalar_groups, scalar_diagnostic = build_anchor_groups(
+        anchors=torch.tensor([0, 3]),
+        candidate_valid=torch.ones(6, dtype=torch.bool),
+        pair_geometry=_pairwise_geometry(curves, row_mask, y),
+        input_w=1600,
+        policy=POLICIES[0],
+    )
+    tensor = build_v16_anchor_candidate_groups(
+        proposal_x_rows=curves.unsqueeze(0),
+        proposal_range_norm=ranges.unsqueeze(0),
+        candidate_valid=torch.ones(1, 6, dtype=torch.bool),
+        anchor_indices=torch.tensor([[0, 3]]),
+        anchor_active=torch.ones(1, 2, dtype=torch.bool),
+        input_w=1600,
+        config=V16CandidateGroupConfig(),
+    )
+    tensor_groups = [
+        torch.nonzero(tensor["group_mask"][0, slot], as_tuple=False)
+        .flatten()
+        .tolist()
+        for slot in range(2)
+    ]
+    assert [sorted(group.tolist()) for group in scalar_groups] == [
+        sorted(group) for group in tensor_groups
+    ]
+    assert torch.allclose(
+        tensor["corridor_px"][0],
+        torch.tensor(scalar_diagnostic["corridor_px"]),
+        atol=1.0e-4,
+        rtol=0.0,
+    )
+
+
+def test_tensor_groups_use_only_active_anchors_and_retain_them() -> None:
+    rows = 12
+    curves = torch.stack(
+        (
+            torch.full((rows,), 100.0),
+            torch.full((rows,), 120.0),
+            torch.full((rows,), 500.0),
+            torch.full((rows,), 520.0),
+        )
+    ).unsqueeze(0)
+    result = build_v16_anchor_candidate_groups(
+        proposal_x_rows=curves,
+        proposal_range_norm=torch.tensor([[[0.0, 1.0]] * 4]),
+        candidate_valid=torch.ones(1, 4, dtype=torch.bool),
+        anchor_indices=torch.tensor([[0, 2, 3]]),
+        anchor_active=torch.tensor([[True, True, False]]),
+        input_w=1600,
+    )
+    mask = result["group_mask"][0]
+    assert bool(mask[0, 0])
+    assert bool(mask[1, 2])
+    assert not bool(mask[2].any())
+    assert bool((mask.sum(dim=0) <= 1).all())
 
 
 def _report(*, support: float, near: float, gap50: float, gap75: float) -> dict:

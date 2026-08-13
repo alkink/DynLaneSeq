@@ -319,6 +319,25 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_v15_dfl_weight=float(
             loss.get("four_slot_v15_dfl_weight", 1.0)
         ),
+        w_four_slot_v16=float(loss.get("w_four_slot_v16", 0.0)),
+        four_slot_v16_quality_weight=float(
+            loss.get("four_slot_v16_quality_weight", 1.0)
+        ),
+        four_slot_v16_pairwise_weight=float(
+            loss.get("four_slot_v16_pairwise_weight", 1.0)
+        ),
+        four_slot_v16_hard_weight=float(
+            loss.get("four_slot_v16_hard_weight", 1.0)
+        ),
+        four_slot_v16_representable_min=float(
+            loss.get("four_slot_v16_representable_min", 0.50)
+        ),
+        four_slot_v16_pair_margin=float(
+            loss.get("four_slot_v16_pair_margin", 0.02)
+        ),
+        four_slot_v16_hard_margin=float(
+            loss.get("four_slot_v16_hard_margin", 0.02)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

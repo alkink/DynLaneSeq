@@ -59,9 +59,59 @@ Coordinates are never averaged. Stage A retains exact V7 deployment output and
 evaluates the reranked proposal reference as a counterfactual sidecar, so a
 failed association learner cannot masquerade as a geometry improvement.
 
+The scorer has hidden width 128, three candidate-aligned P2 samples per row at
+`[-24, 0, 24]` px, and dilated row blocks `[1, 2, 4]`. It produces one scalar
+for every member of the variable group. Its only objective is:
+
+1. Smooth-L1 calibration of `sigmoid(score)` to detached official-surrogate
+   proposal/GT quality;
+2. pairwise logistic ordering only for quality gaps of at least `0.02`;
+3. hard best-member cross entropy only when best versus second-best quality
+   differs by at least `0.02`.
+
+Groups whose best member is below IoU `0.50` do not supervise the scorer. This
+prevents an unrepresentable slot/GT pair from teaching an arbitrary proposal
+identity. Near-ties are not forced into a false exact-ID target.
+
 Activity, count, scores, proposal detector, backbone, and the existing V7
 refiner remain frozen. A fresh geometry refiner is a later version and is not
 authorized by this contract.
+
+### Immutable training protocol
+
+- source: V7 iteration 225000;
+- train subset: 4096 images from 512 clips;
+- held-out: 256 images from 64 train-disjoint clips;
+- validation diagnostic: fixed uniform/balanced 256 images;
+- optimizer: AdamW, LR `1e-4`, weight decay `1e-4`, constant schedule;
+- exactly 2000 optimizer steps, physical batch 4, accumulation 4;
+- augmentation and dropout disabled;
+- fixed endpoint only; intermediate 500-step checkpoints are debug artefacts;
+- FP32 evaluation, threshold 0, Top-4, NMS 0, test closed.
+
+Before training, Gate 0 requires bit-exact V7 public tensors and writer files,
+disjoint variable-size groups, retained anchors, exact whole-proposal gathers,
+zero selected duplicates, a target-free forward, and nonzero gradients in the
+visual, proposal, row, and score subpaths. Both wrong-image controls must be
+deterministic cross-clip derangements with zero same-image and zero same-clip
+pairs.
+
+### Fixed endpoint decision gate
+
+The same checks must pass independently on held-out-256 and validation-256:
+
+- reranked raw proposal gains at least 3 TP at IoU .50 and 6 TP at IoU .75
+  over the raw V7 routed proposal;
+- F1 strictly improves at both thresholds;
+- prediction/activity/count/score remain exact V7;
+- correct P2 is non-inferior to cross-clip-wrong and zero-content P2 at both
+  thresholds;
+- cross-clip P2 changes at least 1% of hard decisions and changes candidate
+  scores by more than `1e-4` on average;
+- selected duplicates remain zero; no averaging, padding, or fixed K occurs.
+
+These are association-stage diagnostics, not a claim that raw proposal output
+is the final deployable V16 lane. Passing authorizes review, not another run.
 
 ## Stop condition
 
