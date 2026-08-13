@@ -414,6 +414,101 @@ def structured_unique_route_marginals(
     )
 
 
+def structured_unique_route_marginals_with_private_dustbins(
+    real_logits: torch.Tensor,
+    candidate_valid: torch.Tensor,
+    private_dustbin_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    iterations: int = 20,
+) -> torch.Tensor:
+    """Injective proposal transport with one private dustbin per slot.
+
+    The returned tensor has shape ``[B,S,N+S]``.  Every real slot row has
+    unit mass, every real proposal column has capacity at most one, and slot
+    ``s`` is the only real row that can use private dustbin ``N+s``.  ``N``
+    dummy rows complete a square ``(N+S) x (N+S)`` Sinkhorn problem; their
+    mass is discarded after normalization.
+
+    This operator is used for both the learned V14 association and its target
+    transport.  Using the same feasible polytope prevents independent GT
+    target rows from asking two slots to own the same proposal.
+    """
+
+    if real_logits.ndim != 3:
+        raise ValueError("private-dustbin logits must have shape [B,S,N]")
+    batch, slots, candidates = real_logits.shape
+    if candidate_valid.shape != (batch, candidates):
+        raise ValueError("private-dustbin validity must have shape [B,N]")
+    if private_dustbin_logits.shape != (batch, slots):
+        raise ValueError("private dustbin logits must have shape [B,S]")
+    tau = float(temperature)
+    if tau <= 0.0:
+        raise ValueError("private-dustbin temperature must be positive")
+    sinkhorn_iterations = int(iterations)
+    if sinkhorn_iterations < 1:
+        raise ValueError("private-dustbin Sinkhorn iterations must be positive")
+
+    real_scores = (real_logits.float() / tau).masked_fill(
+        ~candidate_valid.bool()[:, None, :],
+        float("-inf"),
+    )
+    private_scores = real_scores.new_full(
+        (batch, slots, slots),
+        float("-inf"),
+    )
+    diagonal = fixed_indices(
+        slots,
+        device=real_logits.device,
+        dtype=torch.long,
+    ).view(1, slots, 1).expand(batch, -1, -1)
+    private_scores.scatter_(
+        2,
+        diagonal,
+        (private_dustbin_logits.float() / tau).unsqueeze(-1),
+    )
+    real_rows = torch.cat((real_scores, private_scores), dim=-1)
+
+    # There are N+S columns and S real rows, hence exactly N dummy rows make
+    # the transport square.  Dummy rows may fill any unused/invalid proposal
+    # or private-dustbin column, while the masked real rows retain the desired
+    # capacity constraints.
+    dummy_rows = real_rows.new_zeros(
+        (batch, candidates, candidates + slots)
+    )
+    log_transport = torch.cat((real_rows, dummy_rows), dim=1)
+    for _ in range(sinkhorn_iterations):
+        log_transport = log_transport - torch.logsumexp(
+            log_transport,
+            dim=2,
+            keepdim=True,
+        )
+        log_transport = log_transport - torch.logsumexp(
+            log_transport,
+            dim=1,
+            keepdim=True,
+        )
+    marginal = log_transport[:, :slots].exp()
+    real_marginal = marginal[..., :candidates].masked_fill(
+        ~candidate_valid.bool()[:, None, :],
+        0.0,
+    )
+    private_mask = torch.eye(
+        slots,
+        device=real_logits.device,
+        dtype=torch.bool,
+    ).view(1, slots, slots)
+    private_marginal = marginal[..., candidates:].masked_fill(
+        ~private_mask,
+        0.0,
+    )
+    result = torch.cat((real_marginal, private_marginal), dim=-1)
+    # The finite iteration budget ends on a column normalization.  Restore
+    # exact real-slot row mass; the following audits still enforce the real
+    # column-capacity tolerance independently.
+    return result / result.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+
+
 class FourSlotBoundedRefinement(nn.Module):
     """Locally refine routed proposal curves without touching the detector.
 
@@ -2650,6 +2745,632 @@ class FourSlotVisualFirstAssociation(nn.Module):
         }
 
 
+class FourSlotCorrectedVisualFirstAssociation(nn.Module):
+    """V14 Stage-A image-causal association with feasible joint targets.
+
+    One P2 pass precedes all proposal ranking.  The learned transport has 32
+    real proposal columns plus one private dustbin per slot; no V7 route logit
+    is added.  Exact V7 geometry/activity/score stay on the public deployment
+    path, so Stage A changes only diagnostic sidecar tensors.
+    """
+
+    FEATURE_POLICIES = {
+        "correct",
+        "zero_content",
+        "position_only",
+        "zero_content_zero_position",
+        "x_reversed",
+        "row_reversed",
+    }
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        input_w: int,
+        slot_dim: int,
+        num_slots: int,
+        hidden_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        vertical_layers: int,
+        dropout: float,
+        min_valid_rows: int = 5,
+        proposal_attention_temperature: float = 1.0,
+        proposal_attention_sinkhorn_iterations: int = 64,
+        visual_prior_strength: float = 0.25,
+        visual_prior_sigma: float = 0.35,
+    ) -> None:
+        super().__init__()
+        if int(num_slots) < 1:
+            raise ValueError("V14 association needs at least one slot")
+        if int(hidden_dim) < 1 or int(hidden_dim) % int(num_heads):
+            raise ValueError("V14 attention heads must divide hidden_dim")
+        if int(vertical_layers) < 1:
+            raise ValueError("V14 association needs vertical interaction")
+        if int(min_valid_rows) < 1:
+            raise ValueError("V14 min_valid_rows must be positive")
+        if float(proposal_attention_temperature) <= 0.0:
+            raise ValueError("V14 proposal temperature must be positive")
+        if int(proposal_attention_sinkhorn_iterations) < 1:
+            raise ValueError("V14 Sinkhorn iterations must be positive")
+        if float(visual_prior_strength) < 0.0:
+            raise ValueError("V14 visual prior strength must be non-negative")
+        if float(visual_prior_sigma) <= 0.0:
+            raise ValueError("V14 visual prior sigma must be positive")
+
+        self.dim = int(dim)
+        self.input_w = int(input_w)
+        self.slot_dim = int(slot_dim)
+        self.num_slots = int(num_slots)
+        self.hidden_dim = int(hidden_dim)
+        self.min_valid_rows = int(min_valid_rows)
+        self.proposal_attention_temperature = float(
+            proposal_attention_temperature
+        )
+        self.proposal_attention_sinkhorn_iterations = int(
+            proposal_attention_sinkhorn_iterations
+        )
+        self.visual_prior_strength = float(visual_prior_strength)
+        self.visual_prior_sigma = float(visual_prior_sigma)
+
+        self.slot_norm = nn.LayerNorm(self.slot_dim)
+        self.slot_projection = nn.Linear(self.slot_dim, self.hidden_dim)
+        self.slot_tokens = nn.Embedding(self.num_slots, self.hidden_dim)
+        self.row_position_projection = nn.Linear(4, self.hidden_dim, bias=False)
+        self.anchor_geometry_projection = nn.Linear(3, self.hidden_dim, bias=False)
+        self.initial_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Image content and x position have deliberately separate paths.  P2
+        # values never receive positional embeddings; the intervention audit
+        # can therefore retain position keys while deleting image content.
+        self.feature_norm = nn.LayerNorm(self.dim)
+        self.feature_key = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.feature_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.x_position_key = nn.Linear(4, self.hidden_dim, bias=False)
+        self.visual_query = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.visual_context = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.visual_x_projection = nn.Linear(4, self.hidden_dim, bias=False)
+
+        vertical_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.vertical_encoder = nn.TransformerEncoder(
+            vertical_layer,
+            num_layers=int(vertical_layers),
+            enable_nested_tensor=False,
+        )
+        self.visual_norm = nn.LayerNorm(self.hidden_dim)
+        self.visual_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+
+        # Proposal row content and geometry share one key only after the slot
+        # has read P2.  No legacy route logit or hard proposal ID is accepted.
+        self.proposal_row_norm = nn.LayerNorm(self.dim)
+        self.proposal_content_key = nn.Linear(
+            self.dim, self.hidden_dim, bias=False
+        )
+        self.proposal_geometry_key = nn.Linear(
+            4, self.hidden_dim, bias=False
+        )
+        self.proposal_value = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.proposal_query = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.private_dustbin = nn.Linear(self.hidden_dim, 1)
+        self.proposal_context = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        self.association_norm = nn.LayerNorm(self.hidden_dim)
+        self.association_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+
+        nn.init.normal_(self.slot_tokens.weight, std=0.02)
+
+    @staticmethod
+    def _position_basis(values: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (
+                values,
+                values.square(),
+                torch.sin(math.pi * values),
+                torch.cos(math.pi * values),
+            ),
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        *,
+        slot_states: torch.Tensor,
+        anchor_x_rows: torch.Tensor,
+        anchor_range_norm: torch.Tensor,
+        anchor_geometry_valid: torch.Tensor,
+        anchor_active: torch.Tensor,
+        proposal_row_tokens: torch.Tensor,
+        proposal_x_rows: torch.Tensor,
+        proposal_range_norm: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        row_value_features: torch.Tensor,
+        feature_policy: str = "correct",
+    ) -> dict[str, torch.Tensor]:
+        policy = str(feature_policy).strip().lower()
+        if policy not in self.FEATURE_POLICIES:
+            raise ValueError(f"unsupported V14 feature policy: {feature_policy}")
+        if row_value_features.ndim != 4:
+            raise ValueError("V14 P2 rows must have shape [B,R,X,C]")
+        batch, rows, x_bins, channels = row_value_features.shape
+        slots = self.num_slots
+        candidates = int(proposal_x_rows.shape[1])
+        if int(channels) != self.dim:
+            raise ValueError("V14 P2 feature dimension mismatch")
+        if tuple(slot_states.shape[:2]) != (batch, slots):
+            raise ValueError("V14 slot state shape mismatch")
+        if tuple(anchor_x_rows.shape) != (batch, slots, rows):
+            raise ValueError("V14 anchor x shape mismatch")
+        if tuple(anchor_range_norm.shape) != (batch, slots, 2):
+            raise ValueError("V14 anchor range shape mismatch")
+        if tuple(anchor_geometry_valid.shape) != (batch, slots):
+            raise ValueError("V14 geometry-valid shape mismatch")
+        if tuple(anchor_active.shape) != (batch, slots):
+            raise ValueError("V14 source-active shape mismatch")
+        if tuple(candidate_valid.shape) != (batch, candidates):
+            raise ValueError("V14 candidate validity shape mismatch")
+
+        anchor_x = anchor_x_rows.detach().float()
+        anchor_range = sort_range_norm(anchor_range_norm.detach().float())
+        geometry_valid = anchor_geometry_valid.detach().bool()
+        source_active = anchor_active.detach().bool()
+        proposal_rows = proposal_row_tokens.detach().float()
+        proposal_x = proposal_x_rows.detach().float()
+        proposal_range = sort_range_norm(proposal_range_norm.detach().float())
+        candidate_valid = candidate_valid.detach().bool()
+        raw_features = row_value_features.detach().float()
+        if policy == "x_reversed":
+            raw_features = raw_features.flip(dims=(2,))
+        elif policy == "row_reversed":
+            raw_features = raw_features.flip(dims=(1,))
+        elif policy in {
+            "zero_content",
+            "position_only",
+            "zero_content_zero_position",
+        }:
+            raw_features = torch.zeros_like(raw_features)
+
+        row_fraction = fixed_row_fractions(
+            rows,
+            device=slot_states.device,
+            dtype=torch.float32,
+        )
+        row_position = self.row_position_projection(
+            self._position_basis(row_fraction)
+        ).view(1, 1, rows, self.hidden_dim)
+        anchor_geometry = torch.cat(
+            (
+                anchor_x.unsqueeze(-1) / float(max(self.input_w - 1, 1)),
+                anchor_range.unsqueeze(2).expand(-1, -1, rows, -1),
+            ),
+            dim=-1,
+        )
+        initial = self.slot_projection(
+            self.slot_norm(slot_states.detach().float())
+        ).unsqueeze(2)
+        initial = initial + self.slot_tokens.weight.view(
+            1, slots, 1, self.hidden_dim
+        )
+        initial = initial + row_position
+        initial = initial + self.anchor_geometry_projection(anchor_geometry)
+        initial = self.initial_norm(initial)
+
+        features = self.feature_norm(raw_features)
+        content_keys = self.feature_key(features)
+        content_values = self.feature_value(features)
+        if policy in {"position_only", "zero_content_zero_position"}:
+            content_keys = torch.zeros_like(content_keys)
+            content_values = torch.zeros_like(content_values)
+        x_fraction = torch.linspace(
+            0.0,
+            1.0,
+            x_bins,
+            device=slot_states.device,
+            dtype=torch.float32,
+        )
+        position_keys = self.x_position_key(
+            self._position_basis(x_fraction)
+        ).view(1, 1, x_bins, self.hidden_dim)
+        if policy == "zero_content_zero_position":
+            position_keys = torch.zeros_like(position_keys)
+        feature_keys = content_keys + position_keys
+
+        # The supervised visual-localization distribution may train U0.  The
+        # association branch replays the exact same query with U0 detached:
+        # its forward values are identical, while L_assoc cannot turn the V7
+        # anchor/slot projection into a direct proposal-ranking shortcut.
+        visual_logits = torch.einsum(
+            "bsrh,brxh->bsrx",
+            self.visual_query(initial),
+            feature_keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        association_visual_logits = torch.einsum(
+            "bsrh,brxh->bsrx",
+            self.visual_query(initial.detach()),
+            feature_keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        anchor_center = (
+            anchor_x / float(max(self.input_w - 1, 1))
+        ).clamp(0.0, 1.0)
+        distance = x_fraction.view(1, 1, 1, -1) - anchor_center.unsqueeze(-1)
+        prior = -0.5 * distance.square() / (self.visual_prior_sigma**2)
+        visual_logits = visual_logits + self.visual_prior_strength * prior
+        association_visual_logits = (
+            association_visual_logits + self.visual_prior_strength * prior
+        )
+        visual_probability = torch.softmax(
+            association_visual_logits.float(), dim=-1
+        )
+        visual_context = torch.einsum(
+            "bsrx,brxh->bsrh",
+            visual_probability,
+            content_values.float(),
+        )
+        visual_x_fraction = torch.einsum(
+            "bsrx,x->bsr", visual_probability, x_fraction
+        )
+        # Preserve U0 in the forward value but stop association supervision
+        # from learning a proposal/anchor-only shortcut through it.  The
+        # association path must improve through the P2 context, expected-x
+        # state and the vertical consumer; the direct visual DFL objective
+        # still trains U0/query/key localization above.
+        visual_hidden = initial.detach() + self.visual_context(visual_context)
+        visual_hidden = visual_hidden + self.visual_x_projection(
+            self._position_basis(visual_x_fraction)
+        )
+        visual_hidden = self.vertical_encoder(
+            visual_hidden.reshape(batch * slots, rows, self.hidden_dim)
+        ).reshape(batch, slots, rows, self.hidden_dim)
+        visual_hidden = visual_hidden + self.visual_ffn(
+            self.visual_norm(visual_hidden)
+        )
+
+        normalized_proposal_rows = self.proposal_row_norm(proposal_rows)
+        row_y = row_fraction.view(1, 1, rows)
+        proposal_visible = (
+            (row_y >= proposal_range[..., :1])
+            & (row_y <= proposal_range[..., 1:])
+            & torch.isfinite(proposal_x)
+        )
+        proposal_geometry = torch.stack(
+            (
+                proposal_x / float(max(self.input_w - 1, 1)),
+                proposal_range[..., 0].unsqueeze(-1).expand(-1, -1, rows),
+                proposal_range[..., 1].unsqueeze(-1).expand(-1, -1, rows),
+                proposal_visible.float(),
+            ),
+            dim=-1,
+        )
+        proposal_keys = self.proposal_content_key(normalized_proposal_rows)
+        proposal_keys = proposal_keys + self.proposal_geometry_key(
+            proposal_geometry
+        )
+        proposal_values = self.proposal_value(normalized_proposal_rows)
+        row_logits = torch.einsum(
+            "bsrh,bnrh->bsnr",
+            self.proposal_query(visual_hidden),
+            proposal_keys,
+        ) / math.sqrt(float(self.hidden_dim))
+        visible_weight = proposal_visible[:, None].to(row_logits.dtype)
+        proposal_logits = (row_logits * visible_weight).sum(dim=-1)
+        proposal_logits = proposal_logits / visible_weight.sum(
+            dim=-1
+        ).clamp_min(1.0)
+        proposal_logits = proposal_logits.masked_fill(
+            ~candidate_valid[:, None, :],
+            -1.0e4,
+        )
+        private_logits = self.private_dustbin(
+            visual_hidden.mean(dim=2)
+        ).squeeze(-1)
+        proposal_attention = (
+            structured_unique_route_marginals_with_private_dustbins(
+                proposal_logits,
+                candidate_valid,
+                private_logits,
+                temperature=self.proposal_attention_temperature,
+                iterations=self.proposal_attention_sinkhorn_iterations,
+            )
+        )
+        real_attention = proposal_attention[..., :candidates]
+        proposal_context = torch.einsum(
+            "bsn,bnrh->bsrh",
+            real_attention,
+            proposal_values,
+        )
+        associated_hidden = visual_hidden + self.proposal_context(
+            proposal_context
+        )
+        associated_hidden = associated_hidden + self.association_ffn(
+            self.association_norm(associated_hidden)
+        )
+
+        writer_rows = (
+            (row_fraction.view(1, 1, rows) >= anchor_range[..., :1])
+            & (row_fraction.view(1, 1, rows) <= anchor_range[..., 1:])
+            & torch.isfinite(anchor_x)
+        )
+        writer_valid = (
+            source_active
+            & geometry_valid
+            & (writer_rows.sum(dim=-1) >= self.min_valid_rows)
+        )
+        visual_entropy = -(
+            visual_probability
+            * visual_probability.clamp_min(1.0e-12).log()
+        ).sum(dim=-1)
+        proposal_entropy = -(
+            proposal_attention
+            * proposal_attention.clamp_min(1.0e-12).log()
+        ).sum(dim=-1)
+        return {
+            "selection_slot_v14_anchor_x_rows": anchor_x,
+            "selection_slot_v14_anchor_range_norm": anchor_range,
+            "selection_slot_v14_geometry_valid": geometry_valid,
+            "selection_slot_v14_source_active": source_active,
+            "selection_slot_v14_writer_valid": writer_valid,
+            "selection_slot_v14_visual_logits": visual_logits,
+            "selection_slot_v14_visual_attention": visual_probability,
+            "selection_slot_v14_visual_x_rows": (
+                visual_x_fraction * float(max(self.input_w - 1, 1))
+            ),
+            "selection_slot_v14_visual_state": visual_hidden,
+            "selection_slot_v14_proposal_logits": proposal_logits,
+            "selection_slot_v14_private_dustbin_logits": private_logits,
+            "selection_slot_v14_proposal_attention": proposal_attention,
+            "selection_slot_v14_real_proposal_attention": real_attention,
+            "selection_slot_v14_associated_state": associated_hidden,
+            "selection_slot_v14_visual_entropy": visual_entropy.mean(
+                dim=(1, 2)
+            ),
+            "selection_slot_v14_proposal_entropy": proposal_entropy.mean(
+                dim=-1
+            ),
+            "selection_slot_v14_feature_policy_id": visual_logits.new_full(
+                (batch,),
+                float(sorted(self.FEATURE_POLICIES).index(policy)),
+            ),
+        }
+
+
+class FourSlotV14ParityAnchoredGeometry(nn.Module):
+    """Stage-B geometry owned by frozen, image-causal V14 lane states.
+
+    The exact deployed V7 curve/range are immutable anchors.  Stage-A visual
+    and proposal transport tensors are memory only; a fresh row consumer emits
+    symmetric residual distributions whose uniform initialization is exactly
+    zero.  This module cannot alter activity, score, public route identity, or
+    the proposal detector.
+    """
+
+    def __init__(
+        self,
+        proposal_dim: int,
+        *,
+        input_w: int,
+        visual_dim: int,
+        num_slots: int,
+        hidden_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        vertical_layers: int,
+        dropout: float,
+        delta_offsets_px: tuple[float, ...],
+        range_offsets_norm: tuple[float, ...],
+    ) -> None:
+        super().__init__()
+        if int(hidden_dim) < 1 or int(hidden_dim) % int(num_heads):
+            raise ValueError("V14 Stage-B heads must divide hidden_dim")
+        if int(vertical_layers) < 1:
+            raise ValueError("V14 Stage-B needs vertical interaction")
+        for label, values in (
+            ("x", delta_offsets_px),
+            ("range", range_offsets_norm),
+        ):
+            if not values or len(values) % 2 != 1:
+                raise ValueError(f"V14 Stage-B {label} offsets must be odd")
+            if float(values[len(values) // 2]) != 0.0:
+                raise ValueError(f"V14 Stage-B {label} offsets need zero center")
+            if any(
+                abs(float(values[index]) + float(values[-1 - index])) > 1.0e-8
+                for index in range(len(values) // 2)
+            ):
+                raise ValueError(f"V14 Stage-B {label} offsets must be symmetric")
+        self.input_w = int(input_w)
+        self.visual_dim = int(visual_dim)
+        self.proposal_dim = int(proposal_dim)
+        self.num_slots = int(num_slots)
+        self.hidden_dim = int(hidden_dim)
+        self.register_buffer(
+            "delta_offsets_px",
+            torch.tensor(delta_offsets_px, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "range_offsets_norm",
+            torch.tensor(range_offsets_norm, dtype=torch.float32),
+        )
+
+        self.visual_norm = nn.LayerNorm(self.visual_dim)
+        self.visual_projection = nn.Linear(self.visual_dim, self.hidden_dim)
+        self.proposal_norm = nn.LayerNorm(self.proposal_dim)
+        self.proposal_value = nn.Linear(
+            self.proposal_dim, self.hidden_dim, bias=False
+        )
+        self.proposal_context = nn.Linear(
+            self.hidden_dim, self.hidden_dim, bias=False
+        )
+        # anchor x, associated coarse x, displacement, real proposal mass,
+        # and proposal-visible mass at this row.
+        self.geometry_projection = nn.Linear(5, self.hidden_dim, bias=False)
+        self.fusion_norm = nn.LayerNorm(self.hidden_dim)
+        self.fusion_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, int(ff_dim)),
+            nn.GELU(),
+            nn.Linear(int(ff_dim), self.hidden_dim),
+        )
+        vertical_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.vertical_encoder = nn.TransformerEncoder(
+            vertical_layer,
+            num_layers=int(vertical_layers),
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        self.delta_head = nn.Linear(
+            self.hidden_dim, len(delta_offsets_px), bias=False
+        )
+        self.range_head = nn.Linear(
+            self.hidden_dim, 2 * len(range_offsets_norm), bias=False
+        )
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.range_head.weight)
+
+    @staticmethod
+    def _symmetric_expectation(
+        logits: torch.Tensor, offsets: torch.Tensor
+    ) -> torch.Tensor:
+        probability = torch.softmax(logits.float(), dim=-1)
+        centered = probability - 1.0 / float(probability.shape[-1])
+        return torch.einsum(
+            "...k,k->...", centered, offsets.to(probability)
+        )
+
+    def forward(
+        self,
+        *,
+        visual_state: torch.Tensor,
+        proposal_attention: torch.Tensor,
+        proposal_row_tokens: torch.Tensor,
+        proposal_x_rows: torch.Tensor,
+        proposal_range_norm: torch.Tensor,
+        anchor_x_rows: torch.Tensor,
+        anchor_range_norm: torch.Tensor,
+        anchor_geometry_valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        visual = visual_state.detach().float()
+        attention = proposal_attention.detach().float()
+        proposal_rows = proposal_row_tokens.detach().float()
+        proposal_x = proposal_x_rows.detach().float()
+        proposal_range = sort_range_norm(proposal_range_norm.detach().float())
+        anchor_x = anchor_x_rows.detach().float()
+        anchor_range = sort_range_norm(anchor_range_norm.detach().float())
+        geometry_valid = anchor_geometry_valid.detach().bool()
+        batch, slots, rows, _channels = visual.shape
+        candidates = int(proposal_x.shape[1])
+        if tuple(attention.shape) != (batch, slots, candidates + slots):
+            raise ValueError("V14 Stage-B attention shape mismatch")
+        if tuple(anchor_x.shape) != (batch, slots, rows):
+            raise ValueError("V14 Stage-B anchor shape mismatch")
+
+        real_attention = attention[..., :candidates]
+        real_mass = real_attention.sum(dim=-1).clamp_min(1.0e-6)
+        normalized_attention = real_attention / real_mass.unsqueeze(-1)
+        proposal_values = self.proposal_value(
+            self.proposal_norm(proposal_rows)
+        )
+        proposal_context = torch.einsum(
+            "bsn,bnrh->bsrh", normalized_attention, proposal_values
+        )
+        coarse_x = torch.einsum(
+            "bsn,bnr->bsr", normalized_attention, proposal_x
+        )
+        row_fraction = fixed_row_fractions(
+            rows, device=visual.device, dtype=torch.float32
+        )
+        proposal_visible = (
+            (row_fraction.view(1, 1, rows) >= proposal_range[..., :1])
+            & (row_fraction.view(1, 1, rows) <= proposal_range[..., 1:])
+            & torch.isfinite(proposal_x)
+        )
+        visible_mass = torch.einsum(
+            "bsn,bnr->bsr", normalized_attention, proposal_visible.float()
+        )
+        scale = float(max(self.input_w - 1, 1))
+        geometry = torch.stack(
+            (
+                anchor_x / scale,
+                coarse_x / scale,
+                (coarse_x - anchor_x) / scale,
+                real_mass.unsqueeze(-1).expand(-1, -1, rows),
+                visible_mass,
+            ),
+            dim=-1,
+        )
+        hidden = self.visual_projection(self.visual_norm(visual))
+        hidden = hidden + self.proposal_context(proposal_context)
+        hidden = hidden + self.geometry_projection(geometry)
+        hidden = hidden + self.fusion_ffn(self.fusion_norm(hidden))
+        hidden = self.vertical_encoder(
+            hidden.reshape(batch * slots, rows, self.hidden_dim)
+        ).reshape(batch, slots, rows, self.hidden_dim)
+        normalized = self.output_norm(hidden)
+        delta_logits = self.delta_head(normalized)
+        delta = self._symmetric_expectation(
+            delta_logits, self.delta_offsets_px
+        )
+        final_x = (anchor_x + delta).clamp(0.0, scale)
+        pooled = normalized.mean(dim=2)
+        range_logits = self.range_head(pooled).view(
+            batch, slots, 2, -1
+        )
+        range_delta = self._symmetric_expectation(
+            range_logits, self.range_offsets_norm
+        )
+        final_range = sort_range_norm(
+            (anchor_range + range_delta).clamp(0.0, 1.0)
+        )
+        final_x = torch.where(
+            geometry_valid.unsqueeze(-1), final_x, anchor_x
+        )
+        final_range = torch.where(
+            geometry_valid.unsqueeze(-1), final_range, anchor_range
+        )
+        return {
+            "selection_slot_v14_stage_b_anchor_x_rows": anchor_x,
+            "selection_slot_v14_stage_b_anchor_range_norm": anchor_range,
+            "selection_slot_v14_stage_b_geometry_valid": geometry_valid,
+            "selection_slot_v14_stage_b_hidden": hidden,
+            "selection_slot_v14_stage_b_real_attention_mass": real_mass,
+            "selection_slot_v14_stage_b_coarse_x_rows": coarse_x,
+            "selection_slot_v14_stage_b_delta_x_rows": delta,
+            "selection_slot_pred_x_rows": final_x,
+            "selection_slot_range_norm": final_range,
+            "selection_slot_input_reference_x_rows": anchor_x,
+            "selection_slot_row_delta_logits": delta_logits,
+            "selection_slot_row_delta_offsets_px": self.delta_offsets_px,
+            "selection_slot_range_delta_logits": range_logits,
+            "selection_slot_range_delta_offsets_norm": self.range_offsets_norm,
+        }
+
+
 class FourSlotVisualPrecisionGeometry(nn.Module):
     """Own final lane geometry without selecting a proposal identity.
 
@@ -3249,6 +3970,56 @@ class FourSlotLaneSelectionHead(nn.Module):
         visual_first_association_visual_prior_strength: float = 0.25,
         visual_first_association_visual_prior_sigma: float = 0.35,
         visual_first_association_curve_distance_scale: float = 4.0,
+        corrected_visual_first_association_enabled: bool = False,
+        corrected_visual_first_association_hidden_dim: int | None = None,
+        corrected_visual_first_association_num_heads: int = 8,
+        corrected_visual_first_association_ff_dim: int | None = None,
+        corrected_visual_first_association_vertical_layers: int = 2,
+        corrected_visual_first_association_dropout: float = 0.0,
+        corrected_visual_first_association_proposal_temperature: float = 1.0,
+        corrected_visual_first_association_sinkhorn_iterations: int = 64,
+        corrected_visual_first_association_visual_prior_strength: float = 0.25,
+        corrected_visual_first_association_visual_prior_sigma: float = 0.35,
+        corrected_visual_first_geometry_enabled: bool = False,
+        corrected_visual_first_geometry_hidden_dim: int | None = None,
+        corrected_visual_first_geometry_num_heads: int = 8,
+        corrected_visual_first_geometry_ff_dim: int | None = None,
+        corrected_visual_first_geometry_vertical_layers: int = 2,
+        corrected_visual_first_geometry_dropout: float = 0.0,
+        corrected_visual_first_geometry_delta_offsets_px: tuple[float, ...] = (
+            -1600.0,
+            -1200.0,
+            -800.0,
+            -600.0,
+            -400.0,
+            -300.0,
+            -200.0,
+            -128.0,
+            -64.0,
+            -32.0,
+            0.0,
+            32.0,
+            64.0,
+            128.0,
+            200.0,
+            300.0,
+            400.0,
+            600.0,
+            800.0,
+            1200.0,
+            1600.0,
+        ),
+        corrected_visual_first_geometry_range_offsets_norm: tuple[float, ...] = (
+            -1.0,
+            -0.50,
+            -0.25,
+            -0.10,
+            0.0,
+            0.10,
+            0.25,
+            0.50,
+            1.0,
+        ),
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -3338,6 +4109,12 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.visual_first_association_enabled = bool(
             visual_first_association_enabled
         )
+        self.corrected_visual_first_association_enabled = bool(
+            corrected_visual_first_association_enabled
+        )
+        self.corrected_visual_first_geometry_enabled = bool(
+            corrected_visual_first_geometry_enabled
+        )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
         )
@@ -3370,6 +4147,35 @@ class FourSlotLaneSelectionHead(nn.Module):
                 raise ValueError(
                     "V11 unified and V12 visual-first modules are exclusive"
                 )
+        if self.corrected_visual_first_association_enabled:
+            if not self.factorized_routing:
+                raise ValueError(
+                    "V14 corrected visual-first association requires "
+                    "factorized routing"
+                )
+            if not self.refinement_enabled:
+                raise ValueError(
+                    "V14 Stage A requires exact V7 refined anchors"
+                )
+            if self.unified_slot_decoder_enabled:
+                raise ValueError(
+                    "V11 unified and V14 corrected modules are exclusive"
+                )
+            if self.visual_first_association_enabled:
+                raise ValueError(
+                    "V12 and V14 visual-first modules are mutually exclusive"
+                )
+            if self.visual_precision_geometry_enabled:
+                raise ValueError(
+                    "V13 precision geometry and V14 are mutually exclusive"
+                )
+        if self.corrected_visual_first_geometry_enabled:
+            if not self.corrected_visual_first_association_enabled:
+                raise ValueError(
+                    "V14 Stage B requires the corrected Stage-A association"
+                )
+            if not self.refinement_enabled:
+                raise ValueError("V14 Stage B requires exact V7 anchors")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -3429,6 +4235,8 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.global_visual_geometry_enabled
             or self.unified_slot_decoder_enabled
             or self.visual_first_association_enabled
+            or self.corrected_visual_first_association_enabled
+            or self.corrected_visual_first_geometry_enabled
             or self.visual_precision_geometry_enabled
         )
 
@@ -3727,6 +4535,81 @@ class FourSlotLaneSelectionHead(nn.Module):
                 ),
             )
             if self.visual_first_association_enabled
+            else None
+        )
+        # V14 is the corrected, capacity-compatible Stage-A contract.  It is
+        # intentionally separate from V12 so the earlier result remains
+        # reproducible and the new target/dustbin semantics are auditable.
+        self.corrected_visual_first_association = (
+            FourSlotCorrectedVisualFirstAssociation(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    corrected_visual_first_association_hidden_dim
+                    or self.hidden_dim
+                ),
+                num_heads=int(corrected_visual_first_association_num_heads),
+                ff_dim=int(
+                    corrected_visual_first_association_ff_dim
+                    or (2 * self.hidden_dim)
+                ),
+                vertical_layers=int(
+                    corrected_visual_first_association_vertical_layers
+                ),
+                dropout=float(corrected_visual_first_association_dropout),
+                min_valid_rows=self.min_valid_rows,
+                proposal_attention_temperature=float(
+                    corrected_visual_first_association_proposal_temperature
+                ),
+                proposal_attention_sinkhorn_iterations=int(
+                    corrected_visual_first_association_sinkhorn_iterations
+                ),
+                visual_prior_strength=float(
+                    corrected_visual_first_association_visual_prior_strength
+                ),
+                visual_prior_sigma=float(
+                    corrected_visual_first_association_visual_prior_sigma
+                ),
+            )
+            if self.corrected_visual_first_association_enabled
+            else None
+        )
+        self.corrected_visual_first_geometry = (
+            FourSlotV14ParityAnchoredGeometry(
+                self.dim,
+                input_w=self.input_w,
+                visual_dim=int(
+                    corrected_visual_first_association_hidden_dim
+                    or self.hidden_dim
+                ),
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    corrected_visual_first_geometry_hidden_dim
+                    or self.hidden_dim
+                ),
+                num_heads=int(corrected_visual_first_geometry_num_heads),
+                ff_dim=int(
+                    corrected_visual_first_geometry_ff_dim
+                    or 2
+                    * int(
+                        corrected_visual_first_geometry_hidden_dim
+                        or self.hidden_dim
+                    )
+                ),
+                vertical_layers=int(
+                    corrected_visual_first_geometry_vertical_layers
+                ),
+                dropout=float(corrected_visual_first_geometry_dropout),
+                delta_offsets_px=tuple(
+                    corrected_visual_first_geometry_delta_offsets_px
+                ),
+                range_offsets_norm=tuple(
+                    corrected_visual_first_geometry_range_offsets_norm
+                ),
+            )
+            if self.corrected_visual_first_geometry_enabled
             else None
         )
         # V13 is not another proposal selector.  It consumes the proven V12
@@ -4184,6 +5067,65 @@ class FourSlotLaneSelectionHead(nn.Module):
                     proposal_range_norm=outputs["range_norm"],
                     candidate_valid=candidate_valid,
                     row_value_features=row_value_features,
+                )
+            )
+        if self.corrected_visual_first_association is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError(
+                    "V14 corrected association requires projected P2 rows"
+                )
+            anchor_x = result.get("selection_slot_pred_x_rows")
+            anchor_range = result.get("selection_slot_range_norm")
+            anchor_valid = result.get("selection_slot_geometry_valid")
+            anchor_active = result.get("selection_slot_active")
+            if not all(
+                isinstance(value, torch.Tensor)
+                for value in (
+                    anchor_x,
+                    anchor_range,
+                    anchor_valid,
+                    anchor_active,
+                )
+            ):
+                raise ValueError(
+                    "V14 Stage A requires the complete exact-V7 anchor"
+                )
+            result.update(
+                self.corrected_visual_first_association(
+                    slot_states=slots,
+                    anchor_x_rows=anchor_x,
+                    anchor_range_norm=anchor_range,
+                    anchor_geometry_valid=anchor_valid,
+                    anchor_active=anchor_active,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    candidate_valid=candidate_valid,
+                    row_value_features=row_value_features,
+                )
+            )
+        if self.corrected_visual_first_geometry is not None:
+            required_v14 = (
+                result.get("selection_slot_v14_visual_state"),
+                result.get("selection_slot_v14_proposal_attention"),
+                result.get("selection_slot_v14_anchor_x_rows"),
+                result.get("selection_slot_v14_anchor_range_norm"),
+                result.get("selection_slot_v14_geometry_valid"),
+            )
+            if not all(isinstance(value, torch.Tensor) for value in required_v14):
+                raise ValueError(
+                    "V14 Stage B requires the complete frozen Stage-A state"
+                )
+            result.update(
+                self.corrected_visual_first_geometry(
+                    visual_state=required_v14[0],
+                    proposal_attention=required_v14[1],
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    anchor_x_rows=required_v14[2],
+                    anchor_range_norm=required_v14[3],
+                    anchor_geometry_valid=required_v14[4],
                 )
             )
         if self.visual_precision_geometry is not None:

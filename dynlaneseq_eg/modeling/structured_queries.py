@@ -3002,6 +3002,138 @@ class StructuredLaneQueryHead(nn.Module):
                         4.0,
                     )
                 ),
+                corrected_visual_first_association_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_enabled",
+                        False,
+                    )
+                ),
+                corrected_visual_first_association_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                corrected_visual_first_association_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                corrected_visual_first_association_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                corrected_visual_first_association_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_vertical_layers",
+                        2,
+                    )
+                ),
+                corrected_visual_first_association_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_dropout",
+                        0.0,
+                    )
+                ),
+                corrected_visual_first_association_proposal_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_proposal_temperature",
+                        1.0,
+                    )
+                ),
+                corrected_visual_first_association_sinkhorn_iterations=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_sinkhorn_iterations",
+                        64,
+                    )
+                ),
+                corrected_visual_first_association_visual_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_visual_prior_strength",
+                        0.25,
+                    )
+                ),
+                corrected_visual_first_association_visual_prior_sigma=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_association_visual_prior_sigma",
+                        0.35,
+                    )
+                ),
+                corrected_visual_first_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_enabled",
+                        False,
+                    )
+                ),
+                corrected_visual_first_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                corrected_visual_first_geometry_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                corrected_visual_first_geometry_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                corrected_visual_first_geometry_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_vertical_layers",
+                        2,
+                    )
+                ),
+                corrected_visual_first_geometry_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_dropout",
+                        0.0,
+                    )
+                ),
+                corrected_visual_first_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_delta_offsets_px",
+                        (
+                            -1600.0,
+                            -1200.0,
+                            -800.0,
+                            -600.0,
+                            -400.0,
+                            -300.0,
+                            -200.0,
+                            -128.0,
+                            -64.0,
+                            -32.0,
+                            0.0,
+                            32.0,
+                            64.0,
+                            128.0,
+                            200.0,
+                            300.0,
+                            400.0,
+                            600.0,
+                            800.0,
+                            1200.0,
+                            1600.0,
+                        ),
+                    )
+                ),
+                corrected_visual_first_geometry_range_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_corrected_visual_first_geometry_range_offsets_norm",
+                        (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 1.0),
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",

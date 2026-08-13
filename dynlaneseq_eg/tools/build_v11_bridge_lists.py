@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heldout-clips", type=int, default=64)
     parser.add_argument("--heldout-images", type=int, default=256)
     parser.add_argument("--val-images", type=int, default=256)
+    parser.add_argument("--optimizer-steps", type=int, default=3000)
+    parser.add_argument("--effective-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--experiment-name",
+        default="V11 clip-disjoint bridge-list contract",
+    )
     parser.add_argument("--output-json", required=True)
     return parser.parse_args()
 
@@ -305,8 +311,21 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     _write(destinations["heldout_clip"], heldout_subset, train_order)
     _write(destinations["val"], val_subset, val_order)
 
+    optimizer_steps = int(getattr(args, "optimizer_steps", 3000))
+    effective_batch_size = int(
+        getattr(args, "effective_batch_size", 16)
+    )
+    if optimizer_steps < 1 or effective_batch_size < 1:
+        raise ValueError("bridge exposure contract must be positive")
+    sample_exposures = optimizer_steps * effective_batch_size
     report: dict[str, object] = {
-        "experiment": "V11 clip-disjoint bridge-list contract",
+        "experiment": str(
+            getattr(
+                args,
+                "experiment_name",
+                "V11 clip-disjoint bridge-list contract",
+            )
+        ),
         "seed": int(args.seed),
         "sources": {
             "train": str(train_source),
@@ -320,10 +339,11 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             "heldout_clips": int(args.heldout_clips),
             "heldout_images": int(args.heldout_images),
             "val_images": int(args.val_images),
-            "effective_batch_size": 16,
-            "optimizer_steps": 3000,
-            "training_sample_exposures": 48000,
-            "approximate_subset_epochs": 48000.0 / int(args.train_images),
+            "effective_batch_size": effective_batch_size,
+            "optimizer_steps": optimizer_steps,
+            "training_sample_exposures": sample_exposures,
+            "approximate_subset_epochs": float(sample_exposures)
+            / int(args.train_images),
         },
         "lists": {
             name: {

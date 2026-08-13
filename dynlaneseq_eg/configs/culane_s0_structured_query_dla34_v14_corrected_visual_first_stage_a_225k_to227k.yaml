@@ -1,0 +1,112 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v14_corrected_visual_first_stage_ab_225k
+
+# build_dataset() consumes this top-level mapping.  Keeping it outside the
+# dataset block is intentional and is verified by Gate 0.
+augmentation:
+  horizontal_flip_prob: 0.0
+  color_jitter: false
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.0
+  blur_prob: 0.0
+  affine_prob: 0.0
+  affine_translate_x: 0.0
+  affine_translate_y: 0.0
+  affine_rotate_deg: 0.0
+  affine_scale_min: 1.0
+  affine_scale_max: 1.0
+  random_shadow_prob: 0.0
+
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: false
+      four_slot_visual_first_association_enabled: false
+      four_slot_visual_precision_geometry_enabled: false
+      four_slot_corrected_visual_first_association_enabled: true
+      four_slot_corrected_visual_first_association_hidden_dim: 256
+      four_slot_corrected_visual_first_association_num_heads: 8
+      four_slot_corrected_visual_first_association_ff_dim: 512
+      four_slot_corrected_visual_first_association_vertical_layers: 2
+      four_slot_corrected_visual_first_association_dropout: 0.0
+      four_slot_corrected_visual_first_association_proposal_temperature: 1.0
+      four_slot_corrected_visual_first_association_sinkhorn_iterations: 64
+      four_slot_corrected_visual_first_association_visual_prior_strength: 0.25
+      four_slot_corrected_visual_first_association_visual_prior_sigma: 0.35
+
+loss:
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+  w_four_slot_unified: 0.0
+  w_four_slot_visual_first: 0.0
+  w_four_slot_visual_precision: 0.0
+
+  w_four_slot_v14_stage_a: 1.0
+  four_slot_v14_visual_weight: 1.0
+  four_slot_v14_association_weight: 1.0
+  four_slot_v14_representable_min: 0.50
+  four_slot_v14_cluster_delta: 0.10
+  four_slot_v14_cluster_temperature: 0.03
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: corrected_visual_first_association
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.corrected_visual_first_association.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 2000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_association
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_association
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_association
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

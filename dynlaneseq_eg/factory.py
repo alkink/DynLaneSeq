@@ -270,6 +270,39 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_visual_precision_dfl_weight=float(
             loss.get("four_slot_visual_precision_dfl_weight", 1.0)
         ),
+        w_four_slot_v14_stage_a=float(
+            loss.get("w_four_slot_v14_stage_a", 0.0)
+        ),
+        four_slot_v14_visual_weight=float(
+            loss.get("four_slot_v14_visual_weight", 1.0)
+        ),
+        four_slot_v14_association_weight=float(
+            loss.get("four_slot_v14_association_weight", 1.0)
+        ),
+        four_slot_v14_representable_min=float(
+            loss.get("four_slot_v14_representable_min", 0.50)
+        ),
+        four_slot_v14_cluster_delta=float(
+            loss.get("four_slot_v14_cluster_delta", 0.10)
+        ),
+        four_slot_v14_cluster_temperature=float(
+            loss.get("four_slot_v14_cluster_temperature", 0.03)
+        ),
+        w_four_slot_v14_stage_b=float(
+            loss.get("w_four_slot_v14_stage_b", 0.0)
+        ),
+        four_slot_v14_stage_b_point_weight=float(
+            loss.get("four_slot_v14_stage_b_point_weight", 5.0)
+        ),
+        four_slot_v14_stage_b_range_weight=float(
+            loss.get("four_slot_v14_stage_b_range_weight", 1.0)
+        ),
+        four_slot_v14_stage_b_line_iou_weight=float(
+            loss.get("four_slot_v14_stage_b_line_iou_weight", 2.0)
+        ),
+        four_slot_v14_stage_b_dfl_weight=float(
+            loss.get("four_slot_v14_stage_b_dfl_weight", 1.0)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

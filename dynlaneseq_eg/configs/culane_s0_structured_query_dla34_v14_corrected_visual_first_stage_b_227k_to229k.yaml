@@ -1,0 +1,50 @@
+_base_: culane_s0_structured_query_dla34_v14_corrected_visual_first_stage_a_225k_to227k.yaml
+
+output_dir: outputs/diagnostics/v14_corrected_visual_first_stage_ab_225k/stage_b
+
+model:
+  structured_query:
+    set_selection:
+      four_slot_corrected_visual_first_geometry_enabled: true
+      four_slot_corrected_visual_first_geometry_hidden_dim: 256
+      four_slot_corrected_visual_first_geometry_num_heads: 8
+      four_slot_corrected_visual_first_geometry_ff_dim: 512
+      four_slot_corrected_visual_first_geometry_vertical_layers: 2
+      four_slot_corrected_visual_first_geometry_dropout: 0.0
+      four_slot_corrected_visual_first_geometry_delta_offsets_px:
+        [-1600, -1200, -800, -600, -400, -300, -200, -128, -64, -32,
+         0, 32, 64, 128, 200, 300, 400, 600, 800, 1200, 1600]
+      four_slot_corrected_visual_first_geometry_range_offsets_norm:
+        [-1.0, -0.50, -0.25, -0.10, 0.0, 0.10, 0.25, 0.50, 1.0]
+
+loss:
+  w_four_slot_v14_stage_a: 0.0
+  w_four_slot_v14_stage_b: 1.0
+  four_slot_v14_stage_b_point_weight: 5.0
+  four_slot_v14_stage_b_range_weight: 1.0
+  four_slot_v14_stage_b_line_iou_weight: 2.0
+  four_slot_v14_stage_b_dfl_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: corrected_visual_first_geometry
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.corrected_visual_first_geometry.
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 2000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_geometry
+  checkpoint_include_optimizer: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_geometry
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.corrected_visual_first_geometry
