@@ -14,6 +14,7 @@ from .common import (
     sort_range_norm,
 )
 from .v16_candidate_reranker import FourSlotCandidateAlignedReranker
+from .v17_iterative_slot_geometry import FourSlotIterativeMultiScaleGeometry
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -4860,6 +4861,47 @@ class FourSlotLaneSelectionHead(nn.Module):
         candidate_aligned_reranker_min_corridor_px: float = 72.0,
         candidate_aligned_reranker_max_corridor_px: float = 256.0,
         candidate_aligned_reranker_min_overlap_fraction: float = 0.25,
+        iterative_slot_geometry_enabled: bool = False,
+        iterative_slot_geometry_hidden_dim: int | None = None,
+        iterative_slot_geometry_num_heads: int = 8,
+        iterative_slot_geometry_ff_dim: int | None = None,
+        iterative_slot_geometry_num_stages: int = 3,
+        iterative_slot_geometry_vertical_layers_per_stage: int = 1,
+        iterative_slot_geometry_dropout: float = 0.0,
+        iterative_slot_geometry_scale_names: tuple[str, ...] = (
+            "p2",
+            "p3",
+            "p4",
+        ),
+        iterative_slot_geometry_visual_offsets_px: tuple[float, ...] = (
+            -96.0,
+            -64.0,
+            -32.0,
+            -16.0,
+            0.0,
+            16.0,
+            32.0,
+            64.0,
+            96.0,
+        ),
+        iterative_slot_geometry_delta_offsets_px: tuple[float, ...] = (
+            -64.0,
+            -32.0,
+            -16.0,
+            -8.0,
+            0.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+        ),
+        iterative_slot_geometry_range_offsets_norm: tuple[float, ...] = (
+            -0.025,
+            -0.0125,
+            0.0,
+            0.0125,
+            0.025,
+        ),
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -4961,6 +5003,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.candidate_aligned_reranker_enabled = bool(
             candidate_aligned_reranker_enabled
         )
+        self.iterative_slot_geometry_enabled = bool(
+            iterative_slot_geometry_enabled
+        )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
         )
@@ -5057,6 +5102,25 @@ class FourSlotLaneSelectionHead(nn.Module):
                 )
             ):
                 raise ValueError("V16 candidate reranker is exclusive with V9-V15 modules")
+        if self.iterative_slot_geometry_enabled:
+            if not self.factorized_routing:
+                raise ValueError("V17 iterative geometry requires factorized routing")
+            if not self.refinement_enabled:
+                raise ValueError("V17 iterative geometry requires exact V7 anchors")
+            if any(
+                (
+                    self.unified_slot_decoder_enabled,
+                    self.visual_first_association_enabled,
+                    self.corrected_visual_first_association_enabled,
+                    self.corrected_visual_first_geometry_enabled,
+                    self.visual_precision_geometry_enabled,
+                    self.bottom_aware_relational_geometry_enabled,
+                    self.candidate_aligned_reranker_enabled,
+                    self.slot_owned_geometry_enabled,
+                    self.global_visual_geometry_enabled,
+                )
+            ):
+                raise ValueError("V17 iterative geometry is exclusive with V9-V16 modules")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -5121,7 +5185,9 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.visual_precision_geometry_enabled
             or self.bottom_aware_relational_geometry_enabled
             or self.candidate_aligned_reranker_enabled
+            or self.iterative_slot_geometry_enabled
         )
+        self.requires_multi_scale_features = self.iterative_slot_geometry_enabled
 
         # Exact successful probe descriptor:
         # query + range-masked row state + ten geometry scalars + sampled
@@ -5591,6 +5657,47 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.candidate_aligned_reranker_enabled
             else None
         )
+        # V17 keeps exact V7 deployment geometry as its initialization and
+        # performs three bounded, re-centered updates. P2/P3/P4 and all 32
+        # proposal rows are feature context; no proposal coordinate mixture
+        # or proposal ID can own the output curve.
+        self.iterative_slot_geometry = (
+            FourSlotIterativeMultiScaleGeometry(
+                self.dim,
+                input_w=self.input_w,
+                slot_dim=self.hidden_dim,
+                num_slots=self.num_slots,
+                hidden_dim=int(
+                    iterative_slot_geometry_hidden_dim or self.hidden_dim
+                ),
+                num_heads=int(iterative_slot_geometry_num_heads),
+                ff_dim=int(
+                    iterative_slot_geometry_ff_dim
+                    or 2
+                    * int(
+                        iterative_slot_geometry_hidden_dim or self.hidden_dim
+                    )
+                ),
+                num_stages=int(iterative_slot_geometry_num_stages),
+                vertical_layers_per_stage=int(
+                    iterative_slot_geometry_vertical_layers_per_stage
+                ),
+                dropout=float(iterative_slot_geometry_dropout),
+                min_valid_rows=self.min_valid_rows,
+                scale_names=tuple(iterative_slot_geometry_scale_names),
+                visual_offsets_px=tuple(
+                    iterative_slot_geometry_visual_offsets_px
+                ),
+                delta_offsets_px=tuple(
+                    iterative_slot_geometry_delta_offsets_px
+                ),
+                range_offsets_norm=tuple(
+                    iterative_slot_geometry_range_offsets_norm
+                ),
+            )
+            if self.iterative_slot_geometry_enabled
+            else None
+        )
         # V13 is not another proposal selector.  It consumes the proven V12
         # visual lane state, row-wise proposal feature memory and precise local
         # P2 samples, then owns final x/range directly.  V7 remains only the
@@ -5805,6 +5912,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         outputs: dict[str, torch.Tensor],
         *,
         row_value_features: torch.Tensor | None = None,
+        multi_scale_features: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         features = self._proposal_features(outputs)
         candidate_valid = self._candidate_valid(outputs)
@@ -6168,6 +6276,40 @@ class FourSlotLaneSelectionHead(nn.Module):
                     proposal_range_norm=outputs["range_norm"],
                     candidate_valid=candidate_valid,
                     row_value_features=row_value_features,
+                )
+            )
+        if self.iterative_slot_geometry is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V17 iterative geometry requires P2 rows")
+            if not isinstance(multi_scale_features, dict):
+                raise ValueError("V17 iterative geometry requires P2/P3/P4")
+            anchor_x = result.get("selection_slot_pred_x_rows")
+            anchor_range = result.get("selection_slot_range_norm")
+            anchor_valid = result.get("selection_slot_geometry_valid")
+            anchor_active = result.get("selection_slot_active")
+            if not all(
+                isinstance(value, torch.Tensor)
+                for value in (
+                    anchor_x,
+                    anchor_range,
+                    anchor_valid,
+                    anchor_active,
+                )
+            ):
+                raise ValueError("V17 requires the complete exact-V7 anchor")
+            result.update(
+                self.iterative_slot_geometry(
+                    slot_states=slots,
+                    anchor_x_rows=anchor_x,
+                    anchor_range_norm=anchor_range,
+                    anchor_geometry_valid=anchor_valid,
+                    anchor_active=anchor_active,
+                    proposal_row_tokens=outputs["structured_row_tokens"],
+                    proposal_x_rows=outputs["pred_x_rows"],
+                    proposal_range_norm=outputs["range_norm"],
+                    candidate_valid=candidate_valid,
+                    row_value_features=row_value_features,
+                    multi_scale_features=multi_scale_features,
                 )
             )
         if self.visual_precision_geometry is not None:

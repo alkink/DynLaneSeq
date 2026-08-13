@@ -3304,6 +3304,73 @@ class StructuredLaneQueryHead(nn.Module):
                         0.25,
                     )
                 ),
+                iterative_slot_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_enabled", False
+                    )
+                ),
+                iterative_slot_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                iterative_slot_geometry_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                iterative_slot_geometry_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                iterative_slot_geometry_num_stages=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_num_stages", 3
+                    )
+                ),
+                iterative_slot_geometry_vertical_layers_per_stage=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_vertical_layers_per_stage",
+                        1,
+                    )
+                ),
+                iterative_slot_geometry_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_dropout", 0.0
+                    )
+                ),
+                iterative_slot_geometry_scale_names=tuple(
+                    str(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_scale_names",
+                        ("p2", "p3", "p4"),
+                    )
+                ),
+                iterative_slot_geometry_visual_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_visual_offsets_px",
+                        (-96.0, -64.0, -32.0, -16.0, 0.0, 16.0, 32.0, 64.0, 96.0),
+                    )
+                ),
+                iterative_slot_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_delta_offsets_px",
+                        (-64.0, -32.0, -16.0, -8.0, 0.0, 8.0, 16.0, 32.0, 64.0),
+                    )
+                ),
+                iterative_slot_geometry_range_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_iterative_slot_geometry_range_offsets_norm",
+                        (-0.025, -0.0125, 0.0, 0.0125, 0.025),
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
@@ -4169,9 +4236,25 @@ class StructuredLaneQueryHead(nn.Module):
                     False,
                 )
             ):
+                selection_kwargs: dict[str, Any] = {
+                    "row_value_features": row_value_features.detach(),
+                }
+                if bool(
+                    getattr(
+                        self.set_selection_head,
+                        "requires_multi_scale_features",
+                        False,
+                    )
+                ):
+                    if not isinstance(multi_scale_features, dict):
+                        raise ValueError(
+                            "set-selection module requires multi-scale features"
+                        )
+                    selection_kwargs["multi_scale_features"] = (
+                        multi_scale_features
+                    )
                 selection_result = self.set_selection_head(
-                    outputs,
-                    row_value_features=row_value_features.detach(),
+                    outputs, **selection_kwargs
                 )
             else:
                 selection_result = self.set_selection_head(outputs)

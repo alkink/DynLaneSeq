@@ -1,0 +1,137 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v17_iterative_multiscale_geometry_225k
+
+augmentation:
+  horizontal_flip_prob: 0.0
+  color_jitter: false
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.0
+  blur_prob: 0.0
+  affine_prob: 0.0
+  affine_translate_x: 0.0
+  affine_translate_y: 0.0
+  affine_rotate_deg: 0.0
+  affine_scale_min: 1.0
+  affine_scale_max: 1.0
+  random_shadow_prob: 0.0
+
+model:
+  multi_scale_evidence:
+    enabled: true
+    # P4/P5 are the exact frozen V7 semantic path. P3 is new and consumed
+    # only by V17; retaining P5 is required for bit-exact V7 anchors.
+    scales: [p2, p3, p4, p5]
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: false
+      four_slot_visual_first_association_enabled: false
+      four_slot_visual_precision_geometry_enabled: false
+      four_slot_corrected_visual_first_association_enabled: false
+      four_slot_corrected_visual_first_geometry_enabled: false
+      four_slot_bottom_aware_relational_geometry_enabled: false
+      four_slot_candidate_aligned_reranker_enabled: false
+
+      four_slot_iterative_slot_geometry_enabled: true
+      four_slot_iterative_slot_geometry_hidden_dim: 256
+      four_slot_iterative_slot_geometry_num_heads: 8
+      four_slot_iterative_slot_geometry_ff_dim: 512
+      four_slot_iterative_slot_geometry_num_stages: 3
+      four_slot_iterative_slot_geometry_vertical_layers_per_stage: 1
+      four_slot_iterative_slot_geometry_dropout: 0.0
+      four_slot_iterative_slot_geometry_scale_names: [p2, p3, p4]
+      four_slot_iterative_slot_geometry_visual_offsets_px:
+        [-96, -64, -32, -16, 0, 16, 32, 64, 96]
+      four_slot_iterative_slot_geometry_delta_offsets_px:
+        [-64, -32, -16, -8, 0, 8, 16, 32, 64]
+      four_slot_iterative_slot_geometry_range_offsets_norm:
+        [-0.025, -0.0125, 0.0, 0.0125, 0.025]
+
+loss:
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+  w_four_slot_unified: 0.0
+  w_four_slot_visual_first: 0.0
+  w_four_slot_visual_precision: 0.0
+  w_four_slot_v14_stage_a: 0.0
+  w_four_slot_v14_stage_b: 0.0
+  w_four_slot_v15: 0.0
+  w_four_slot_v16: 0.0
+
+  w_four_slot_v17: 1.0
+  four_slot_v17_stage_weights: [0.25, 0.50, 1.0]
+  four_slot_v17_visual_weight: 1.0
+  four_slot_v17_point_weight: 5.0
+  four_slot_v17_range_weight: 1.0
+  four_slot_v17_line_iou_weight: 2.0
+  four_slot_v17_dfl_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  parameter_groups:
+    - name: iterative_slot_geometry
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.iterative_slot_geometry.
+    - name: iterative_multiscale_projection
+      lr: 0.0001
+      prefixes:
+        - encoder.ms_proj.p3.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 5000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.iterative_slot_geometry
+    - encoder.ms_proj.p3
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.iterative_slot_geometry
+    - encoder.ms_proj.p3
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.iterative_slot_geometry
+    - encoder.ms_proj.p3
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
