@@ -3134,6 +3134,120 @@ class StructuredLaneQueryHead(nn.Module):
                         (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 1.0),
                     )
                 ),
+                bottom_aware_relational_geometry_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_enabled",
+                        False,
+                    )
+                ),
+                bottom_aware_relational_geometry_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                bottom_aware_relational_geometry_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                bottom_aware_relational_geometry_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                bottom_aware_relational_geometry_visual_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_visual_vertical_layers",
+                        2,
+                    )
+                ),
+                bottom_aware_relational_geometry_fusion_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_fusion_vertical_layers",
+                        2,
+                    )
+                ),
+                bottom_aware_relational_geometry_slot_interaction_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_slot_interaction_layers",
+                        1,
+                    )
+                ),
+                bottom_aware_relational_geometry_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_dropout",
+                        0.0,
+                    )
+                ),
+                bottom_aware_relational_geometry_visual_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_visual_prior_strength",
+                        0.25,
+                    )
+                ),
+                bottom_aware_relational_geometry_visual_prior_sigma=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_visual_prior_sigma",
+                        0.35,
+                    )
+                ),
+                bottom_aware_relational_geometry_graph_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_graph_prior_strength",
+                        1.0,
+                    )
+                ),
+                bottom_aware_relational_geometry_graph_self_bias=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_graph_self_bias",
+                        1.0,
+                    )
+                ),
+                bottom_aware_relational_geometry_slot_curve_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_slot_curve_prior_strength",
+                        8.0,
+                    )
+                ),
+                bottom_aware_relational_geometry_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_delta_offsets_px",
+                        (
+                            -1600.0,
+                            -1200.0,
+                            -800.0,
+                            -600.0,
+                            -400.0,
+                            -300.0,
+                            -200.0,
+                            -128.0,
+                            -64.0,
+                            -32.0,
+                            0.0,
+                            32.0,
+                            64.0,
+                            128.0,
+                            200.0,
+                            300.0,
+                            400.0,
+                            600.0,
+                            800.0,
+                            1200.0,
+                            1600.0,
+                        ),
+                    )
+                ),
+                bottom_aware_relational_geometry_range_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_bottom_aware_relational_geometry_range_offsets_norm",
+                        (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 1.0),
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
