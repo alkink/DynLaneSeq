@@ -2936,6 +2936,72 @@ class StructuredLaneQueryHead(nn.Module):
                         1.0e-7,
                     )
                 ),
+                visual_first_association_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_enabled",
+                        False,
+                    )
+                ),
+                visual_first_association_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                visual_first_association_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                visual_first_association_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                visual_first_association_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_vertical_layers",
+                        2,
+                    )
+                ),
+                visual_first_association_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_dropout",
+                        0.0,
+                    )
+                ),
+                visual_first_association_proposal_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_proposal_temperature",
+                        1.0,
+                    )
+                ),
+                visual_first_association_sinkhorn_iterations=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_sinkhorn_iterations",
+                        64,
+                    )
+                ),
+                visual_first_association_visual_prior_strength=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_visual_prior_strength",
+                        0.25,
+                    )
+                ),
+                visual_first_association_visual_prior_sigma=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_visual_prior_sigma",
+                        0.35,
+                    )
+                ),
+                visual_first_association_curve_distance_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_visual_first_association_curve_distance_scale",
+                        4.0,
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(

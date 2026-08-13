@@ -243,6 +243,18 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_unified_aux_geometry_weight=float(
             loss.get("four_slot_unified_aux_geometry_weight", 0.25)
         ),
+        w_four_slot_visual_first=float(
+            loss.get("w_four_slot_visual_first", 0.0)
+        ),
+        four_slot_visual_first_first_pass_weight=float(
+            loss.get("four_slot_visual_first_first_pass_weight", 0.5)
+        ),
+        four_slot_visual_first_final_pass_weight=float(
+            loss.get("four_slot_visual_first_final_pass_weight", 1.0)
+        ),
+        four_slot_visual_first_proposal_weight=float(
+            loss.get("four_slot_visual_first_proposal_weight", 1.0)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

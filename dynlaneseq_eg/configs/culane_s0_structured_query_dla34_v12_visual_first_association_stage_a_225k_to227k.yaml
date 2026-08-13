@@ -1,0 +1,101 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v12_visual_first_association_stage_a_225k
+
+# V12 Stage A changes the causal ordering, not the deployed V7 output.  Four
+# V7-anchored slot-row states read the complete P2 grid, interact across slots
+# and rows, and only then associate with all 32 proposal row memories.  The
+# frozen V7 route logits are never added to the new proposal logits.
+model:
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_refinement_enabled: true
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: false
+      four_slot_visual_first_association_enabled: true
+      four_slot_visual_first_association_hidden_dim: 256
+      four_slot_visual_first_association_num_heads: 8
+      four_slot_visual_first_association_ff_dim: 512
+      four_slot_visual_first_association_vertical_layers: 2
+      four_slot_visual_first_association_dropout: 0.0
+      four_slot_visual_first_association_proposal_temperature: 1.0
+      four_slot_visual_first_association_sinkhorn_iterations: 64
+      four_slot_visual_first_association_visual_prior_strength: 0.25
+      four_slot_visual_first_association_visual_prior_sigma: 0.35
+      four_slot_visual_first_association_curve_distance_scale: 4.0
+
+loss:
+  # Freeze all legacy proposal, V7 selection and V7 geometry objectives.  They
+  # still produce the exact deployment tensors used as the stable anchor.
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  w_dynamic_proposal_heatmap: 0.0
+  w_dynamic_proposal_x: 0.0
+  w_dynamic_proposal_range: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+  w_four_slot_unified: 0.0
+
+  # One detached V7-final-geometry Hungarian supervises both visual passes and
+  # the proposal-cluster distribution.  No activity or deployment geometry
+  # loss exists in Stage A.
+  w_four_slot_visual_first: 1.0
+  four_slot_visual_first_first_pass_weight: 0.5
+  four_slot_visual_first_final_pass_weight: 1.0
+  four_slot_visual_first_proposal_weight: 1.0
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.0
+  weight_decay: 0.0001
+  parameter_groups:
+    - name: visual_first_association
+      lr: 0.00010
+      prefixes:
+        - structured_query_head.set_selection_head.visual_first_association.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 2000
+  checkpoint_interval: 500
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.visual_first_association
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.visual_first_association
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.visual_first_association
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true

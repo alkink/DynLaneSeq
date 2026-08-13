@@ -1194,6 +1194,13 @@ class LossConfig:
     four_slot_unified_line_iou_weight: float = 2.0
     four_slot_unified_dfl_weight: float = 1.0
     four_slot_unified_aux_geometry_weight: float = 0.25
+    # V12 Stage A trains image-first row localization and all-proposal
+    # association under one source-stable V7 geometry assignment.  Deployment
+    # geometry/activity remain exact V7 and receive no gradient.
+    w_four_slot_visual_first: float = 0.0
+    four_slot_visual_first_first_pass_weight: float = 0.5
+    four_slot_visual_first_final_pass_weight: float = 1.0
+    four_slot_visual_first_proposal_weight: float = 1.0
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1496,6 +1503,7 @@ class S0Criterion(nn.Module):
             self.cfg.w_four_slot_selection != 0
             or self.cfg.w_four_slot_geometry != 0
             or self.cfg.w_four_slot_unified != 0
+            or self.cfg.w_four_slot_visual_first != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1632,6 +1640,27 @@ class S0Criterion(nn.Module):
                 "mean_target_support_mass": zero,
                 "mean_active_probability": zero,
             }
+        if self.cfg.w_four_slot_visual_first != 0:
+            four_slot_visual_first = (
+                self.compute_four_slot_visual_first_loss(
+                    outputs,
+                    targets,
+                    four_slot_targets,
+                )
+            )
+        else:
+            four_slot_visual_first = {
+                "total": zero,
+                "first_visual": zero,
+                "final_visual": zero,
+                "proposal": zero,
+                "mean_matched": zero,
+                "mean_anchor_quality": zero,
+                "mean_target_support_mass": zero,
+                "mean_target_top1": zero,
+                "mean_first_visual_mae_px": zero,
+                "mean_final_visual_mae_px": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1658,6 +1687,8 @@ class S0Criterion(nn.Module):
             + self.cfg.w_four_slot_selection * four_slot_selection["total"]
             + self.cfg.w_four_slot_geometry * four_slot_geometry["total"]
             + self.cfg.w_four_slot_unified * four_slot_unified["total"]
+            + self.cfg.w_four_slot_visual_first
+            * four_slot_visual_first["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -1796,6 +1827,34 @@ class S0Criterion(nn.Module):
             "four_slot_unified_mean_active_probability": four_slot_unified[
                 "mean_active_probability"
             ],
+            "loss_four_slot_visual_first": four_slot_visual_first["total"],
+            "loss_four_slot_visual_first_first": four_slot_visual_first[
+                "first_visual"
+            ],
+            "loss_four_slot_visual_first_final": four_slot_visual_first[
+                "final_visual"
+            ],
+            "loss_four_slot_visual_first_proposal": four_slot_visual_first[
+                "proposal"
+            ],
+            "four_slot_visual_first_mean_matched": four_slot_visual_first[
+                "mean_matched"
+            ],
+            "four_slot_visual_first_mean_anchor_quality": (
+                four_slot_visual_first["mean_anchor_quality"]
+            ),
+            "four_slot_visual_first_mean_target_support_mass": (
+                four_slot_visual_first["mean_target_support_mass"]
+            ),
+            "four_slot_visual_first_mean_target_top1": (
+                four_slot_visual_first["mean_target_top1"]
+            ),
+            "four_slot_visual_first_mean_first_visual_mae_px": (
+                four_slot_visual_first["mean_first_visual_mae_px"]
+            ),
+            "four_slot_visual_first_mean_final_visual_mae_px": (
+                four_slot_visual_first["mean_final_visual_mae_px"]
+            ),
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
             "weight_row_dfl": zero.new_tensor(row_dfl_weight),
@@ -3146,6 +3205,286 @@ class S0Criterion(nn.Module):
             torch.zeros_like(probability),
         )
         return probability.permute(0, 2, 1), support.permute(0, 2, 1)
+
+    @torch.no_grad()
+    def _match_four_slot_visual_first_anchor(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+        """Match GTs once against frozen V7 final geometry.
+
+        V12 Stage A must not let a fresh visual prediction choose the target
+        that supervises it.  The detached V7 anchor is stable across every
+        new association/visual loss and is independent of V12 parameters.
+        Activity is intentionally absent so an inactive fourth geometry can
+        still represent an annotated lane.
+        """
+
+        anchor_x = outputs.get("selection_slot_v12_anchor_x_rows")
+        anchor_range = outputs.get("selection_slot_v12_anchor_range_norm")
+        geometry_valid = outputs.get("selection_slot_v12_geometry_valid")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (anchor_x, anchor_range, geometry_valid)
+        ):
+            raise ValueError(
+                "visual-first loss requires frozen V7 anchor geometry"
+            )
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=anchor_x.device,
+                dtype=torch.float32,
+                rows=int(anchor_x.shape[-1]),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        quality, slot_valid, gt_valid = (
+            batched_pairwise_range_aware_row_strip_iou(
+                anchor_x.detach().float(),
+                anchor_range.detach().float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        pair_valid = (
+            geometry_valid.bool() & slot_valid
+        ).unsqueeze(-1) & gt_valid.unsqueeze(1)
+        cost_batch = (1.0 - quality).masked_fill(
+            ~pair_valid,
+            torch.inf,
+        ).detach().cpu()
+        cpu_pairs: list[torch.Tensor] = []
+        counts: list[int] = []
+        for cost in cost_batch:
+            finite = torch.isfinite(cost)
+            slot_ids = torch.nonzero(
+                finite.any(dim=1), as_tuple=False
+            ).flatten()
+            gt_ids = torch.nonzero(
+                finite.any(dim=0), as_tuple=False
+            ).flatten()
+            if slot_ids.numel() == 0 or gt_ids.numel() == 0:
+                pairs = torch.empty((0, 2), dtype=torch.long)
+            else:
+                local_cost = cost.index_select(0, slot_ids).index_select(
+                    1, gt_ids
+                )
+                local_slot, local_gt = (
+                    HungarianMatcherS0._linear_sum_assignment(local_cost)
+                )
+                pairs = torch.stack(
+                    (
+                        slot_ids.index_select(0, local_slot),
+                        gt_ids.index_select(0, local_gt),
+                    ),
+                    dim=-1,
+                )
+            cpu_pairs.append(pairs)
+            counts.append(int(pairs.shape[0]))
+        packed = (
+            torch.cat(cpu_pairs, dim=0).to(anchor_x.device)
+            if any(counts)
+            else torch.empty(
+                (0, 2), dtype=torch.long, device=anchor_x.device
+            )
+        )
+        matches: list[dict[str, torch.Tensor]] = []
+        offset = 0
+        for count in counts:
+            pairs = packed[offset : offset + count]
+            offset += count
+            matches.append(
+                {
+                    "pred_indices": pairs[:, 0],
+                    "gt_indices": pairs[:, 1],
+                }
+            )
+        return matches, quality, anchor_x.new_tensor(counts, dtype=torch.float32)
+
+    def _four_slot_visual_distribution_loss(
+        self,
+        logits: torch.Tensor,
+        matches: list[dict[str, torch.Tensor]],
+        padded_gt_x: torch.Tensor,
+        padded_gt_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Linearly interpolated x-bin CE and expected-x MAE."""
+
+        x_bins = int(logits.shape[-1])
+        if x_bins < 2:
+            raise ValueError("visual-first attention needs at least two x bins")
+        losses: list[torch.Tensor] = []
+        errors: list[torch.Tensor] = []
+        x_scale = float(x_bins - 1) / float(max(self.cfg.input_w - 1, 1))
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            gt_ids = match["gt_indices"]
+            if pred_ids.numel() == 0:
+                continue
+            selected_logits = logits[batch_index, pred_ids].float()
+            target_x = padded_gt_x[batch_index, gt_ids].float()
+            valid = padded_gt_valid[batch_index, gt_ids].bool()
+            valid = valid & torch.isfinite(target_x)
+            valid = valid & (target_x >= 0.0)
+            valid = valid & (
+                target_x <= float(max(self.cfg.input_w - 1, 1))
+            )
+            if not bool(valid.any()):
+                continue
+            target_bin = (target_x * x_scale).clamp(0.0, float(x_bins - 1))
+            lower = target_bin.floor().long()
+            upper = (lower + 1).clamp(max=x_bins - 1)
+            upper_weight = target_bin - lower.to(target_bin.dtype)
+            lower_weight = 1.0 - upper_weight
+            log_probability = F.log_softmax(selected_logits, dim=-1)
+            lower_log = log_probability.gather(
+                -1, lower.unsqueeze(-1)
+            ).squeeze(-1)
+            upper_log = log_probability.gather(
+                -1, upper.unsqueeze(-1)
+            ).squeeze(-1)
+            row_loss = -(
+                lower_weight * lower_log + upper_weight * upper_log
+            )
+            losses.append(row_loss[valid])
+            probability = torch.softmax(selected_logits, dim=-1)
+            bin_position = torch.linspace(
+                0.0,
+                float(max(self.cfg.input_w - 1, 1)),
+                x_bins,
+                device=logits.device,
+                dtype=probability.dtype,
+            )
+            expected_x = torch.einsum("mrx,x->mr", probability, bin_position)
+            errors.append((expected_x - target_x).abs()[valid])
+        if not losses:
+            zero = logits.sum() * 0.0
+            return zero, zero.detach()
+        return torch.cat(losses).mean(), torch.cat(errors).mean().detach()
+
+    def compute_four_slot_visual_first_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """V12 Stage-A image-first association objective."""
+
+        first_logits = outputs.get("selection_slot_v12_first_visual_logits")
+        visual_logits = outputs.get("selection_slot_v12_visual_logits")
+        proposal_attention = outputs.get(
+            "selection_slot_v12_proposal_attention"
+        )
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (first_logits, visual_logits, proposal_attention)
+        ):
+            raise ValueError(
+                "w_four_slot_visual_first > 0 requires V12 outputs"
+            )
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=visual_logits.device,
+                dtype=torch.float32,
+                rows=int(visual_logits.shape[-2]),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+        matches, anchor_quality, match_count = (
+            self._match_four_slot_visual_first_anchor(
+                outputs, targets, (padded_gt_x, padded_gt_valid)
+            )
+        )
+        first_visual, first_mae = self._four_slot_visual_distribution_loss(
+            first_logits,
+            matches,
+            padded_gt_x,
+            padded_gt_valid,
+        )
+        final_visual, final_mae = self._four_slot_visual_distribution_loss(
+            visual_logits,
+            matches,
+            padded_gt_x,
+            padded_gt_valid,
+        )
+
+        proposal_target, proposal_support = (
+            self._four_slot_unified_proposal_targets(
+                outputs,
+                targets,
+                (padded_gt_x, padded_gt_valid),
+            )
+        )
+        proposal_losses: list[torch.Tensor] = []
+        support_masses: list[torch.Tensor] = []
+        top1_rows: list[torch.Tensor] = []
+        matched_anchor: list[torch.Tensor] = []
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            gt_ids = match["gt_indices"]
+            if pred_ids.numel() == 0:
+                continue
+            predicted = proposal_attention[batch_index, pred_ids].float()
+            target_probability = proposal_target[
+                batch_index, gt_ids
+            ].to(predicted.dtype)
+            support = proposal_support[batch_index, gt_ids]
+            proposal_losses.append(
+                -(
+                    target_probability
+                    * predicted.clamp_min(1.0e-12).log()
+                ).sum(dim=-1)
+            )
+            support_masses.append(
+                (predicted * support.to(predicted.dtype)).sum(dim=-1)
+            )
+            top1_rows.append(
+                (
+                    predicted.argmax(dim=-1)
+                    == target_probability.argmax(dim=-1)
+                ).float()
+            )
+            matched_anchor.append(
+                anchor_quality[batch_index, pred_ids, gt_ids]
+            )
+        if proposal_losses:
+            proposal_loss = torch.cat(proposal_losses).mean()
+            mean_support_mass = torch.cat(support_masses).mean().detach()
+            mean_target_top1 = torch.cat(top1_rows).mean().detach()
+            mean_anchor_quality = torch.cat(matched_anchor).mean().detach()
+        else:
+            proposal_loss = proposal_attention.sum() * 0.0
+            mean_support_mass = proposal_loss.detach()
+            mean_target_top1 = proposal_loss.detach()
+            mean_anchor_quality = proposal_loss.detach()
+
+        total = (
+            float(self.cfg.four_slot_visual_first_first_pass_weight)
+            * first_visual
+            + float(self.cfg.four_slot_visual_first_final_pass_weight)
+            * final_visual
+            + float(self.cfg.four_slot_visual_first_proposal_weight)
+            * proposal_loss
+        )
+        return {
+            "total": total,
+            "first_visual": first_visual,
+            "final_visual": final_visual,
+            "proposal": proposal_loss,
+            "mean_matched": match_count.mean().detach(),
+            "mean_anchor_quality": mean_anchor_quality,
+            "mean_target_support_mass": mean_support_mass,
+            "mean_target_top1": mean_target_top1,
+            "mean_first_visual_mae_px": first_mae,
+            "mean_final_visual_mae_px": final_mae,
+        }
 
     def compute_four_slot_unified_loss(
         self,
