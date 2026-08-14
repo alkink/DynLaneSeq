@@ -58,6 +58,36 @@ def slot_candidate_action_valid(
     )
 
 
+def official_raster_candidate_valid(
+    candidate_x: torch.Tensor,
+    candidate_range: torch.Tensor,
+    *,
+    min_valid_rows: int = 5,
+) -> torch.Tensor:
+    """Mirror the evaluator's range/finite candidate-validity contract.
+
+    The exact raster target cache excludes curves with fewer than five visible
+    rows.  Applying the same inexpensive test in deployment keeps the learned
+    action space identical to the cached official-target action space.
+    """
+
+    if candidate_x.ndim != 4:
+        raise ValueError("candidate_x must have shape [B,S,N,R]")
+    if candidate_range.shape != (*candidate_x.shape[:3], 2):
+        raise ValueError("candidate range shape mismatch")
+    rows = int(candidate_x.shape[-1])
+    row_fraction = fixed_row_fractions(
+        rows, device=candidate_x.device, dtype=torch.float32
+    ).view(1, 1, 1, rows)
+    ranges = sort_range_norm(candidate_range.detach().float())
+    visible = (
+        (row_fraction >= ranges[..., :1])
+        & (row_fraction <= ranges[..., 1:])
+        & torch.isfinite(candidate_x.detach())
+    )
+    return visible.sum(dim=-1) >= int(min_valid_rows)
+
+
 def _masked_mean(
     value: torch.Tensor,
     mask: torch.Tensor,
@@ -343,6 +373,17 @@ class SlotOwnedSafeReplacementHead(nn.Module):
                 source_x,
                 source_range,
                 input_w=self.input_w,
+            )
+            # Match the exact target cache/evaluator action validity.  The
+            # upstream V19 validity is intentionally retained as an
+            # additional constraint.
+            counterfactual_valid = (
+                counterfactual_valid.detach().bool()
+                & official_raster_candidate_valid(
+                    counterfactual_x,
+                    counterfactual_range,
+                    min_valid_rows=5,
+                )
             )
         own_index = torch.arange(slots, device=state.device).view(
             1, slots, 1, 1, 1

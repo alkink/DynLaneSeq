@@ -323,7 +323,11 @@ def main() -> None:
                 p75=batch["p75"],
                 expected_iou=batch["expected_iou"],
                 legacy_route_logits=batch["legacy_route_logits"],
-                counterfactual_valid=batch["counterfactual_valid"],
+                # The exact cache mask additionally applies the official
+                # five-visible-row raster validity contract.  Feeding that
+                # mask here keeps cached training and deployed action spaces
+                # identical; the full model derives the same mask from x/range.
+                counterfactual_valid=batch["action_valid"],
                 source_route=batch["source_route"],
                 source_active=batch["source_active"],
                 precomputed_relations=batch["curve_relations"],

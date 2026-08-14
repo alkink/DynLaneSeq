@@ -7,6 +7,7 @@ from dynlaneseq_eg.factory import build_model
 from dynlaneseq_eg.modeling.v20_slot_owned_replacement import (
     SlotOwnedSafeReplacementHead,
     complete_curve_relations,
+    official_raster_candidate_valid,
     slot_candidate_action_valid,
 )
 from dynlaneseq_eg.tools.v20_replacement_targets import (
@@ -56,6 +57,16 @@ def test_action_mask_preserves_id_uniqueness_and_excludes_keep() -> None:
             if other != slot:
                 assert not bool(valid[0, slot, other])
         assert bool(valid[0, slot, 4])
+
+
+def test_official_raster_candidate_valid_requires_five_visible_rows() -> None:
+    x = torch.zeros(1, 1, 2, 160)
+    ranges = torch.tensor(
+        [[[[0.0, 3.0 / 160.0], [0.0, 4.0 / 160.0]]]]
+    )
+    valid = official_raster_candidate_valid(x, ranges, min_valid_rows=5)
+    assert not bool(valid[0, 0, 0])
+    assert bool(valid[0, 0, 1])
 
 
 def test_curve_relation_is_zero_for_identical_geometry() -> None:
