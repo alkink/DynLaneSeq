@@ -94,19 +94,90 @@ def _v18_conflict_safe_backward(
         raise ValueError("V18 projection matched no trainable shared parameters")
     parameters = [parameter for _name, parameter in named_parameters]
     scale = 1.0 / float(accumulation_steps)
-    set_gradients = torch.autograd.grad(
-        set_loss * scale,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    protection_gradients = torch.autograd.grad(
-        protection_loss * scale,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    backward_loss.backward()
+    backward_mode = str(
+        contract.get("backward_mode", "reference_three_pass")
+    ).strip().lower()
+    if backward_mode not in {
+        "reference_three_pass",
+        "partitioned_two_pass",
+    }:
+        raise ValueError(
+            "V18 conflict projection backward_mode must be "
+            "reference_three_pass or partitioned_two_pass"
+        )
+
+    if backward_mode == "reference_three_pass":
+        set_gradients = torch.autograd.grad(
+            set_loss * scale,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        protection_gradients = torch.autograd.grad(
+            protection_loss * scale,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        backward_loss.backward()
+    else:
+        # The V18 criterion exposes a complete two-way partition of the
+        # training objective: the mature proposal objective and the complete
+        # V18 objective. Back-propagating those two components once each is
+        # algebraically identical to the historical implementation above,
+        # which evaluated two VJPs and then traversed both graphs a second
+        # time through ``backward_loss.backward()``. Leaf hooks capture only
+        # the current micro-batch contribution, so gradient accumulation is
+        # preserved without cloning pre-existing ``parameter.grad`` values.
+        if not bool(contract.get("complete_loss_partition", False)):
+            raise ValueError(
+                "partitioned_two_pass requires complete_loss_partition=true"
+            )
+
+        protection_by_parameter: dict[int, torch.Tensor] = {}
+        protection_handles = []
+
+        def capture_protection(parameter_id: int):
+            def hook(gradient: torch.Tensor) -> torch.Tensor:
+                protection_by_parameter[parameter_id] = gradient.detach().clone()
+                return gradient
+
+            return hook
+
+        for parameter in parameters:
+            protection_handles.append(
+                parameter.register_hook(capture_protection(id(parameter)))
+            )
+        try:
+            (protection_loss * scale).backward(retain_graph=True)
+        finally:
+            for handle in protection_handles:
+                handle.remove()
+
+        set_by_parameter: dict[int, torch.Tensor] = {}
+        set_handles = []
+
+        def capture_set(parameter_id: int):
+            def hook(gradient: torch.Tensor) -> torch.Tensor:
+                set_by_parameter[parameter_id] = gradient.detach().clone()
+                return gradient
+
+            return hook
+
+        for parameter in parameters:
+            set_handles.append(parameter.register_hook(capture_set(id(parameter))))
+        try:
+            (set_loss * scale).backward()
+        finally:
+            for handle in set_handles:
+                handle.remove()
+
+        set_gradients = tuple(
+            set_by_parameter.get(id(parameter)) for parameter in parameters
+        )
+        protection_gradients = tuple(
+            protection_by_parameter.get(id(parameter)) for parameter in parameters
+        )
 
     device = backward_loss.device
     dot = torch.zeros((), device=device, dtype=torch.float32)

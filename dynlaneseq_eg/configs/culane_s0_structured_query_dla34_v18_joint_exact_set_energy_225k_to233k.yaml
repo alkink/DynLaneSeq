@@ -156,6 +156,11 @@ training:
   check_finite_grad: true
   v18_gradient_conflict_projection:
     enabled: true
+    # loss_total is exactly the sum of the complete V18 arm and the mature
+    # proposal-protection arm. Two backwards preserve the reference projected
+    # gradient while removing its redundant third graph traversal.
+    backward_mode: partitioned_two_pass
+    complete_loss_partition: true
     shared_prefixes:
       - encoder.backbone.
       - encoder.fpn.

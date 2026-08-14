@@ -82,6 +82,122 @@ def test_unordered_reward_marginalizes_unused_members_for_two_gt() -> None:
     assert all(0 in row.tolist() and 1 in row.tolist() for row in best_sets)
 
 
+def test_vectorized_reward_matches_permutation_reference() -> None:
+    torch.manual_seed(184)
+    batch, candidates, max_gt = 4, 7, 4
+    combinations, _permutations, _ordered = build_exact_four_set_tables(
+        candidates
+    )
+    quality = torch.rand(batch, candidates, max_gt)
+    gt_valid = torch.tensor(
+        [
+            [False, False, False, False],
+            [True, False, False, False],
+            [True, False, True, False],
+            [True, True, True, True],
+        ]
+    )
+    candidate_valid = torch.ones(batch, candidates, dtype=torch.bool)
+    candidate_valid[2, -1] = False
+    actual, actual_valid = exact_unordered_set_rewards(
+        quality,
+        gt_valid,
+        candidate_valid,
+        combinations,
+    )
+
+    reference = torch.zeros_like(actual)
+    for batch_index in range(batch):
+        gt_ids = torch.nonzero(gt_valid[batch_index], as_tuple=False).flatten()[:4]
+        gt_count = int(gt_ids.numel())
+        if gt_count == 0:
+            continue
+        set_quality = quality[batch_index, combinations].index_select(-1, gt_ids)
+        assignment_reward = []
+        gt_axis = torch.arange(gt_count)
+        for positions in itertools.permutations(range(4), gt_count):
+            selected = set_quality[:, torch.tensor(positions), gt_axis]
+            lane_reward = (
+                torch.sigmoid((selected - 0.50) / 0.03)
+                + 0.5 * torch.sigmoid((selected - 0.75) / 0.03)
+                + 0.1 * selected
+            )
+            assignment_reward.append(lane_reward.sum(dim=-1))
+        reference[batch_index] = torch.stack(
+            assignment_reward, dim=-1
+        ).amax(dim=-1)
+    reference_valid = candidate_valid[:, combinations].all(dim=-1)
+    assert torch.equal(actual_valid, reference_valid)
+    torch.testing.assert_close(actual, reference, rtol=1.0e-6, atol=1.0e-7)
+
+
+def test_vectorized_listwise_matches_filtered_reference_and_gradient() -> None:
+    torch.manual_seed(185)
+    score = torch.randn(3, 17, requires_grad=True)
+    reference_score = score.detach().clone().requires_grad_(True)
+    reward = torch.rand(3, 17)
+    valid = torch.rand(3, 17) > 0.25
+    valid[2] = False
+
+    actual, actual_diagnostics = masked_unordered_set_listwise_loss(
+        score,
+        reward,
+        valid,
+        support_delta=0.10,
+        target_temperature=0.10,
+        model_temperature=1.0,
+    )
+
+    losses = []
+    entropies = []
+    support_sizes = []
+    regrets = []
+    for batch_index in range(3):
+        batch_valid = valid[batch_index]
+        if not bool(batch_valid.any()):
+            continue
+        batch_score = reference_score[batch_index, batch_valid]
+        batch_reward = reward[batch_index, batch_valid]
+        best_reward = batch_reward.max()
+        support = batch_reward >= best_reward - 0.10
+        target_probability = torch.softmax(batch_reward[support] / 0.10, dim=-1)
+        model_log_probability = torch.log_softmax(batch_score, dim=-1)
+        support_indices = torch.nonzero(support, as_tuple=False).flatten()
+        losses.append(
+            -(target_probability * model_log_probability[support_indices]).sum()
+        )
+        entropies.append(
+            -(
+                target_probability
+                * target_probability.clamp_min(1.0e-12).log()
+            ).sum()
+        )
+        support_sizes.append(support.float().sum())
+        regrets.append(best_reward - batch_reward[batch_score.argmax()])
+    reference_loss = torch.stack(losses).mean()
+    reference_diagnostics = {
+        "target_entropy": torch.stack(entropies).mean(),
+        "support_size": torch.stack(support_sizes).mean(),
+        "chosen_regret": torch.stack(regrets).mean(),
+    }
+    torch.testing.assert_close(actual, reference_loss, rtol=1.0e-6, atol=1.0e-7)
+    for key, value in actual_diagnostics.items():
+        torch.testing.assert_close(
+            value,
+            reference_diagnostics[key],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    actual.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(
+        score.grad,
+        reference_score.grad,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+
+
 def test_zero_residual_exact_parity_and_two_phase_gradient_contract() -> None:
     torch.manual_seed(180)
     batch, candidates, slots, rows, hidden = 1, 32, 4, 8, 32
@@ -353,6 +469,84 @@ def test_conflict_projection_replaces_opposing_shared_v18_component() -> None:
     # The opposing V18 component is projected away; the mature proposal
     # objective remains exactly [-1, -1].
     assert torch.equal(parameter.grad, -torch.ones_like(parameter))
+
+
+def test_partitioned_two_pass_matches_reference_gradient_with_accumulation() -> None:
+    class TinyPartitionedModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = nn.Module()
+            self.encoder.proj = nn.Linear(3, 2, bias=True)
+            self.v18_private = nn.Linear(2, 1, bias=False)
+            self.proposal_private = nn.Parameter(torch.randn(2))
+
+    torch.manual_seed(183)
+    reference = TinyPartitionedModel()
+    optimized = TinyPartitionedModel()
+    optimized.load_state_dict(reference.state_dict())
+    for left, right in zip(reference.parameters(), optimized.parameters()):
+        initial_gradient = torch.randn_like(left)
+        left.grad = initial_gradient.clone()
+        right.grad = initial_gradient.clone()
+
+    inputs = torch.randn(5, 3)
+
+    def losses(model: TinyPartitionedModel) -> tuple[torch.Tensor, torch.Tensor]:
+        shared = model.encoder.proj(inputs)
+        set_loss = model.v18_private(shared).square().mean()
+        protection_loss = (
+            (shared - 0.75).square().mean()
+            + 0.2 * model.proposal_private.square().sum()
+        )
+        return set_loss, protection_loss
+
+    def run(model: TinyPartitionedModel, backward_mode: str):
+        set_loss, protection_loss = losses(model)
+        stats = _v18_conflict_safe_backward(
+            model,
+            {
+                "loss_v18_set_backward": set_loss,
+                "loss_v18_proposal_protection": protection_loss,
+            },
+            (set_loss + protection_loss) / 4.0,
+            {
+                "training": {
+                    "v18_gradient_conflict_projection": {
+                        "enabled": True,
+                        "backward_mode": backward_mode,
+                        "complete_loss_partition": True,
+                        "shared_prefixes": ["encoder.proj."],
+                        "exclude_prefixes": [],
+                    }
+                }
+            },
+            accumulation_steps=4,
+            scaler=None,
+            amp=False,
+        )
+        assert stats is not None
+        return stats
+
+    reference_stats = run(reference, "reference_three_pass")
+    optimized_stats = run(optimized, "partitioned_two_pass")
+    for reference_parameter, optimized_parameter in zip(
+        reference.parameters(), optimized.parameters()
+    ):
+        assert reference_parameter.grad is not None
+        assert optimized_parameter.grad is not None
+        torch.testing.assert_close(
+            optimized_parameter.grad,
+            reference_parameter.grad,
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    for key in reference_stats:
+        torch.testing.assert_close(
+            optimized_stats[key],
+            reference_stats[key],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
 
 
 def _integrated_head() -> FourSlotLaneSelectionHead:

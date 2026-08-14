@@ -10,6 +10,23 @@ from torch.nn import functional as F
 from .common import fixed_row_fractions, sort_range_norm
 
 
+_FOUR_POSITION_PERMUTATIONS_CPU = torch.tensor(
+    tuple(permutations(range(4))), dtype=torch.long
+)
+_FOUR_POSITION_PERMUTATION_CACHE: dict[
+    tuple[str, int | None], torch.Tensor
+] = {}
+
+
+def _four_position_permutations(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    cached = _FOUR_POSITION_PERMUTATION_CACHE.get(key)
+    if cached is None:
+        cached = _FOUR_POSITION_PERMUTATIONS_CPU.to(device=device)
+        _FOUR_POSITION_PERMUTATION_CACHE[key] = cached
+    return cached
+
+
 def _position_basis(values: torch.Tensor) -> torch.Tensor:
     return torch.stack(
         (
@@ -103,8 +120,13 @@ def exact_ordered_set_energies(
         energy = energy + selected.view(batch, set_count, permutation_count)
 
     active_probability = torch.sigmoid(active_logits.detach().float())
-    pairs = slot_pairs.to(device=unary.device)
-    for pair_index, (left, right) in enumerate(pairs.tolist()):
+    if tuple(slot_pairs.shape) != (6, 2):
+        raise ValueError("V18 slot-pair table must have shape [6,2]")
+    # Four slots always induce this fixed lexicographic pair order. Avoid
+    # ``CUDA tensor.tolist()`` here: that tiny-looking conversion forced a
+    # device synchronization on every V18 forward.
+    fixed_slot_pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+    for pair_index, (left, right) in enumerate(fixed_slot_pairs):
         left_index = assignments[..., left].reshape(1, -1).expand(batch, -1)
         right_index = assignments[..., right].reshape(1, -1).expand(batch, -1)
         flat_pair = pair[:, pair_index].float().reshape(batch, candidates * candidates)
@@ -210,34 +232,54 @@ def exact_unordered_set_rewards(
     if tau50 <= 0.0 or tau75 <= 0.0:
         raise ValueError("V18 reward temperatures must be positive")
 
-    for batch_index in range(batch):
-        gt_ids = torch.nonzero(
-            gt_valid[batch_index].bool(), as_tuple=False
-        ).flatten()
-        gt_count = min(int(gt_ids.numel()), 4)
-        if gt_count == 0:
-            continue
-        gt_ids = gt_ids[:gt_count]
-        quality = candidate_gt_quality[batch_index, combos]
-        quality = quality.index_select(-1, gt_ids).float()
-        position_assignments = torch.tensor(
-            tuple(permutations(range(4), gt_count)),
-            dtype=torch.long,
-            device=quality.device,
+    if max_gt == 0:
+        return rewards, valid_set
+
+    # Select the first four valid GT lanes without a per-image CUDA
+    # synchronization. Invalid/padded GT columns sort behind every real lane.
+    gt_axis = torch.arange(max_gt, device=candidate_gt_quality.device)
+    ordering_key = torch.where(
+        gt_valid.bool(),
+        gt_axis.view(1, -1),
+        gt_axis.view(1, -1) + max_gt,
+    )
+    selected_gt = ordering_key.argsort(dim=-1)[:, : min(max_gt, 4)]
+    selected_gt_valid = gt_valid.bool().gather(1, selected_gt)
+    if int(selected_gt.shape[1]) < 4:
+        padding = 4 - int(selected_gt.shape[1])
+        selected_gt = torch.cat(
+            (selected_gt, selected_gt.new_zeros((batch, padding))), dim=-1
         )
-        assignment_rewards: list[torch.Tensor] = []
-        gt_axis = torch.arange(gt_count, device=quality.device)
-        for positions in position_assignments:
-            selected = quality[:, positions, gt_axis]
-            lane_reward = (
-                torch.sigmoid((selected - 0.50) / tau50)
-                + 0.5 * torch.sigmoid((selected - 0.75) / tau75)
-                + 0.1 * selected
-            )
-            assignment_rewards.append(lane_reward.sum(dim=-1))
-        rewards[batch_index] = torch.stack(assignment_rewards, dim=-1).amax(
-            dim=-1
+        selected_gt_valid = torch.cat(
+            (
+                selected_gt_valid,
+                selected_gt_valid.new_zeros((batch, padding)),
+            ),
+            dim=-1,
         )
+
+    quality = candidate_gt_quality[:, combos].float()
+    gather_gt = selected_gt[:, None, None, :].expand(
+        batch, set_count, 4, 4
+    )
+    quality = quality.gather(-1, gather_gt)
+    lane_reward = (
+        torch.sigmoid((quality - 0.50) / tau50)
+        + 0.5 * torch.sigmoid((quality - 0.75) / tau75)
+        + 0.1 * quality
+    )
+    position_assignments = _four_position_permutations(quality.device)
+    permutation_count = int(position_assignments.shape[0])
+    expanded_reward = lane_reward.unsqueeze(2).expand(
+        batch, set_count, permutation_count, 4, 4
+    )
+    gather_position = position_assignments.view(1, 1, permutation_count, 1, 4)
+    gather_position = gather_position.expand(
+        batch, set_count, permutation_count, 1, 4
+    )
+    selected = expanded_reward.gather(3, gather_position).squeeze(3)
+    selected = selected * selected_gt_valid[:, None, None, :].to(selected)
+    rewards = selected.sum(dim=-1).amax(dim=-1)
     return rewards, valid_set
 
 
@@ -258,43 +300,63 @@ def masked_unordered_set_listwise_loss(
         raise ValueError("V18 target support delta must be non-negative")
     if float(target_temperature) <= 0.0 or float(model_temperature) <= 0.0:
         raise ValueError("V18 listwise temperatures must be positive")
-    losses: list[torch.Tensor] = []
-    target_entropies: list[torch.Tensor] = []
-    support_sizes: list[torch.Tensor] = []
-    regrets: list[torch.Tensor] = []
-    for batch_index in range(int(set_scores.shape[0])):
-        valid = valid_set[batch_index].bool()
-        if not bool(valid.any()):
-            continue
-        score = set_scores[batch_index, valid].float()
-        reward = target_reward[batch_index, valid].float()
-        best_reward = reward.max()
-        support = reward >= best_reward - float(support_delta)
-        target_logits = reward[support] / float(target_temperature)
-        target_probability = torch.softmax(target_logits, dim=-1)
-        model_log_probability = torch.log_softmax(
-            score / float(model_temperature), dim=-1
+    valid = valid_set.bool()
+    has_valid = valid.any(dim=-1)
+    # Supply one private fallback element only for empty rows. Those rows are
+    # multiplied out below; the fallback merely keeps both softmax operations
+    # finite without a Python ``bool(CUDA_tensor)`` synchronization.
+    fallback = torch.zeros_like(valid)
+    fallback[:, 0] = ~has_valid
+    safe_valid = valid | fallback
+
+    score = set_scores.float()
+    reward = target_reward.float()
+    negative_infinity = torch.tensor(
+        -torch.inf, device=score.device, dtype=score.dtype
+    )
+    masked_reward = reward.masked_fill(~safe_valid, negative_infinity)
+    best_reward = masked_reward.amax(dim=-1, keepdim=True)
+    support = safe_valid & (
+        reward >= best_reward - float(support_delta)
+    )
+    target_logits = (reward / float(target_temperature)).masked_fill(
+        ~support, negative_infinity
+    )
+    target_probability = torch.softmax(target_logits, dim=-1)
+    model_logits = (score / float(model_temperature)).masked_fill(
+        ~safe_valid, negative_infinity
+    )
+    model_log_probability = torch.log_softmax(model_logits, dim=-1)
+    loss_per_batch = -(
+        target_probability
+        * torch.where(
+            support,
+            model_log_probability,
+            torch.zeros_like(model_log_probability),
         )
-        support_indices = torch.nonzero(support, as_tuple=False).flatten()
-        losses.append(
-            -(target_probability * model_log_probability[support_indices]).sum()
-        )
-        target_entropies.append(
-            -(target_probability * target_probability.clamp_min(1.0e-12).log()).sum()
-        )
-        support_sizes.append(support.float().sum())
-        regrets.append(best_reward - reward[score.argmax()])
-    if not losses:
-        zero = set_scores.sum() * 0.0
-        return zero, {
-            "target_entropy": zero.detach(),
-            "support_size": zero.detach(),
-            "chosen_regret": zero.detach(),
-        }
-    return torch.stack(losses).mean(), {
-        "target_entropy": torch.stack(target_entropies).mean().detach(),
-        "support_size": torch.stack(support_sizes).mean().detach(),
-        "chosen_regret": torch.stack(regrets).mean().detach(),
+    ).sum(dim=-1)
+    target_entropy = -(
+        target_probability
+        * target_probability.clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    support_size = support.float().sum(dim=-1)
+    selected_index = model_logits.argmax(dim=-1, keepdim=True)
+    selected_reward = reward.gather(1, selected_index).squeeze(-1)
+    chosen_regret = best_reward.squeeze(-1) - selected_reward
+
+    valid_weight = has_valid.to(score.dtype)
+    denominator = valid_weight.sum().clamp_min(1.0)
+
+    def valid_mean(value: torch.Tensor) -> torch.Tensor:
+        return (value * valid_weight).sum() / denominator
+
+    # The zero anchor makes the all-invalid result retain an explicit zero
+    # gradient to set_scores, matching the historical implementation.
+    zero_anchor = set_scores.sum() * 0.0
+    return zero_anchor + valid_mean(loss_per_batch), {
+        "target_entropy": valid_mean(target_entropy).detach(),
+        "support_size": valid_mean(support_size).detach(),
+        "chosen_regret": valid_mean(chosen_regret).detach(),
     }
 
 
