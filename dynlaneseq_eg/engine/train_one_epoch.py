@@ -138,7 +138,16 @@ def _v18_conflict_safe_backward(
         protection_handles = []
 
         def capture_protection(parameter_id: int):
-            def hook(gradient: torch.Tensor) -> torch.Tensor:
+            def hook(
+                gradient: torch.Tensor | None,
+            ) -> torch.Tensor | None:
+                # AOTAutograd may invoke a leaf hook with ``None`` for a
+                # parameter that is unused by this partition. Eager autograd
+                # normally skips the hook instead. Treat both forms as the
+                # same absent gradient rather than forcing a materialized
+                # zero tensor.
+                if gradient is None:
+                    return None
                 protection_by_parameter[parameter_id] = gradient.detach().clone()
                 return gradient
 
@@ -158,7 +167,11 @@ def _v18_conflict_safe_backward(
         set_handles = []
 
         def capture_set(parameter_id: int):
-            def hook(gradient: torch.Tensor) -> torch.Tensor:
+            def hook(
+                gradient: torch.Tensor | None,
+            ) -> torch.Tensor | None:
+                if gradient is None:
+                    return None
                 set_by_parameter[parameter_id] = gradient.detach().clone()
                 return gradient
 
