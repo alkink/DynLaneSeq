@@ -3511,6 +3511,29 @@ class StructuredLaneQueryHead(nn.Module):
                         "linear_gather",
                     )
                 ),
+                slot_owned_safe_replacement_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_safe_replacement_enabled", False
+                    )
+                ),
+                slot_owned_safe_replacement_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_safe_replacement_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                slot_owned_safe_replacement_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_safe_replacement_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                slot_owned_safe_replacement_context_mode=str(
+                    self.set_selection_cfg.get(
+                        "four_slot_slot_owned_safe_replacement_context_mode",
+                        "treatment",
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
@@ -4538,6 +4561,26 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_v19_v7_scores",
                 "selection_slot_v19_v7_active_logits",
                 "selection_slot_v19_v7_active",
+                "selection_slot_v19_candidate_state",
+                "selection_slot_v20_action_valid",
+                "selection_slot_v20_policy_logits",
+                "selection_slot_v20_delta50_logits",
+                "selection_slot_v20_delta75_logits",
+                "selection_slot_v20_duplicate_logits",
+                "selection_slot_v20_abandon_logits",
+                "selection_slot_v20_delta_iou",
+                "selection_slot_v20_expected_delta50",
+                "selection_slot_v20_expected_delta75",
+                "selection_slot_v20_set_attention",
+                "selection_slot_v20_replace",
+                "selection_slot_v20_replace_slot",
+                "selection_slot_v20_replace_candidate",
+                "selection_slot_v20_edit_count",
+                "selection_slot_v20_v7_geometry_route_indices",
+                "selection_slot_v20_v7_indices",
+                "selection_slot_v20_v7_scores",
+                "selection_slot_v20_v7_active_logits",
+                "selection_slot_v20_v7_active",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

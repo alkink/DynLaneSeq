@@ -20,6 +20,7 @@ from .v19_counterfactual_fidelity import (
     FourSlotCounterfactualProposalFidelity,
     frozen_v7_counterfactual_anchors,
 )
+from .v20_slot_owned_replacement import SlotOwnedSafeReplacementHead
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -4978,6 +4979,10 @@ class FourSlotLaneSelectionHead(nn.Module):
             32.0,
         ),
         counterfactual_fidelity_sampling_backend: str = "linear_gather",
+        slot_owned_safe_replacement_enabled: bool = False,
+        slot_owned_safe_replacement_hidden_dim: int | None = None,
+        slot_owned_safe_replacement_ff_dim: int | None = None,
+        slot_owned_safe_replacement_context_mode: str = "treatment",
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -5087,6 +5092,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         )
         self.counterfactual_fidelity_enabled = bool(
             counterfactual_fidelity_enabled
+        )
+        self.slot_owned_safe_replacement_enabled = bool(
+            slot_owned_safe_replacement_enabled
         )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
@@ -5244,6 +5252,11 @@ class FourSlotLaneSelectionHead(nn.Module):
                 )
             ):
                 raise ValueError("V19 fidelity is exclusive with V9-V18 modules")
+        if self.slot_owned_safe_replacement_enabled:
+            if not self.counterfactual_fidelity_enabled:
+                raise ValueError("V20 safe replacement requires frozen V19 fidelity")
+            if not self.factorized_routing or not self.refinement_enabled:
+                raise ValueError("V20 safe replacement requires exact factorized V7")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -5918,6 +5931,28 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.counterfactual_fidelity_enabled
             else None
         )
+        # V20 keeps V7 and the learned V19 representation immutable.  It can
+        # make at most one active slot/proposal replacement and explicitly
+        # defaults to exact KEEP.
+        self.slot_owned_safe_replacement = (
+            SlotOwnedSafeReplacementHead(
+                int(counterfactual_fidelity_hidden_dim or self.hidden_dim),
+                hidden_dim=int(
+                    slot_owned_safe_replacement_hidden_dim or self.hidden_dim
+                ),
+                ff_dim=int(
+                    slot_owned_safe_replacement_ff_dim
+                    or 2
+                    * int(
+                        slot_owned_safe_replacement_hidden_dim or self.hidden_dim
+                    )
+                ),
+                input_w=self.input_w,
+                context_mode=str(slot_owned_safe_replacement_context_mode),
+            )
+            if self.slot_owned_safe_replacement_enabled
+            else None
+        )
         # V13 is not another proposal selector.  It consumes the proven V12
         # visual lane state, row-wise proposal feature memory and precise local
         # P2 samples, then owns final x/range directly.  V7 remains only the
@@ -6313,6 +6348,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         v18_v7_selected_scores = result.get("selection_slot_scores")
         v18_v7_active_logits = result.get("selection_slot_active_logits")
         v18_v7_active = slot_active
+        v18_v7_selection_logits = result.get("selection_slot_logits")
+        v18_v7_raw_indices = result.get("selection_slot_raw_indices")
+        v18_v7_route_entropy = result.get("selection_slot_route_entropy")
         if self.counterfactual_fidelity is not None:
             if self.slot_refinement is None:
                 raise RuntimeError("V19 requires the frozen V7 refiner")
@@ -6452,8 +6490,130 @@ class FourSlotLaneSelectionHead(nn.Module):
                         v18_v7_active_logits
                     ),
                     "selection_slot_v19_v7_active": v18_v7_active,
+                    "selection_slot_v19_candidate_state": v19_result[
+                        "candidate_state"
+                    ],
                 }
             )
+            if self.slot_owned_safe_replacement is not None:
+                if not all(
+                    isinstance(value, torch.Tensor)
+                    for value in (
+                        v18_v7_real_route_logits,
+                        v18_v7_geometry_indices,
+                        v18_v7_selected_indices,
+                        v18_v7_selected_scores,
+                        v18_v7_active_logits,
+                        v18_v7_active,
+                        v18_v7_selection_logits,
+                    )
+                ):
+                    raise RuntimeError("V20 requires complete exact V7 state")
+                v20_result = self.slot_owned_safe_replacement(
+                    candidate_state=v19_result["candidate_state"],
+                    p50=v19_result["p50"],
+                    p75=v19_result["p75"],
+                    expected_iou=v19_result["expected_iou"],
+                    legacy_route_logits=v18_v7_real_route_logits,
+                    counterfactual_x=counterfactual["x_rows"],
+                    counterfactual_range=counterfactual["range_norm"],
+                    counterfactual_valid=counterfactual["valid"],
+                    source_route=v18_v7_geometry_indices,
+                    source_active=v18_v7_active,
+                )
+                geometry_indices = v20_result["selected_route"]
+                slot_active = v18_v7_active
+                selected_indices = torch.where(
+                    slot_active,
+                    geometry_indices,
+                    geometry_indices.new_full(geometry_indices.shape, -1),
+                )
+                # The replacement decision must not change V7 cardinality or
+                # writer confidence.  Only the selected proposal identity and
+                # resulting frozen bounded geometry may change.
+                geometry_route_logits = v18_v7_real_route_logits
+                result.update(
+                    {
+                        "selection_slot_logits": v18_v7_selection_logits,
+                        "selection_slot_real_route_logits": (
+                            v18_v7_real_route_logits
+                        ),
+                        "selection_slot_geometry_route_indices": (
+                            geometry_indices
+                        ),
+                        "selection_slot_indices": selected_indices,
+                        "selection_slot_scores": v18_v7_selected_scores,
+                        "selection_slot_raw_indices": (
+                            selected_indices
+                            if v18_v7_raw_indices is None
+                            else torch.where(
+                                v20_result["edit_count"].unsqueeze(-1) > 0,
+                                selected_indices,
+                                v18_v7_raw_indices,
+                            )
+                        ),
+                        "selection_slot_raw_collision_count": (
+                            _count_repeated_real_indices(selected_indices)
+                        ),
+                        "selection_slot_route_entropy": (
+                            v18_v7_route_entropy
+                            if v18_v7_route_entropy is not None
+                            else result["selection_slot_route_entropy"]
+                        ),
+                        "selection_slot_global_repair_count": v20_result[
+                            "edit_count"
+                        ],
+                        "selection_slot_v20_action_valid": v20_result[
+                            "action_valid"
+                        ],
+                        "selection_slot_v20_policy_logits": v20_result[
+                            "policy_logits"
+                        ],
+                        "selection_slot_v20_delta50_logits": v20_result[
+                            "delta50_logits"
+                        ],
+                        "selection_slot_v20_delta75_logits": v20_result[
+                            "delta75_logits"
+                        ],
+                        "selection_slot_v20_duplicate_logits": v20_result[
+                            "duplicate_logits"
+                        ],
+                        "selection_slot_v20_abandon_logits": v20_result[
+                            "abandon_logits"
+                        ],
+                        "selection_slot_v20_delta_iou": v20_result[
+                            "delta_iou"
+                        ],
+                        "selection_slot_v20_expected_delta50": v20_result[
+                            "expected_delta50"
+                        ],
+                        "selection_slot_v20_expected_delta75": v20_result[
+                            "expected_delta75"
+                        ],
+                        "selection_slot_v20_set_attention": v20_result[
+                            "set_attention"
+                        ],
+                        "selection_slot_v20_replace": v20_result["replace"],
+                        "selection_slot_v20_replace_slot": v20_result[
+                            "replace_slot"
+                        ],
+                        "selection_slot_v20_replace_candidate": v20_result[
+                            "replace_candidate"
+                        ],
+                        "selection_slot_v20_edit_count": v20_result[
+                            "edit_count"
+                        ],
+                        "selection_slot_v20_v7_geometry_route_indices": (
+                            v18_v7_geometry_indices
+                        ),
+                        "selection_slot_v20_v7_indices": v18_v7_selected_indices,
+                        "selection_slot_v20_v7_scores": v18_v7_selected_scores,
+                        "selection_slot_v20_v7_active_logits": (
+                            v18_v7_active_logits
+                        ),
+                        "selection_slot_v20_v7_active": v18_v7_active,
+                    }
+                )
         if self.joint_exact_set_energy is not None:
             if not isinstance(row_value_features, torch.Tensor):
                 raise ValueError("V18 exact set energy requires live P2 rows")

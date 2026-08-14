@@ -1,0 +1,80 @@
+_base_: culane_s0_structured_query_dla34_v19_frozen_counterfactual_fidelity_225k_to233k.yaml
+
+output_dir: outputs/diagnostics/v20_slot_owned_safe_replacement_233k
+
+# V20 caches the exact frozen, unaugmented V7/V19 population once.  Cached
+# official-raster labels and cached visual representations must describe the
+# same image, so stochastic augmentation is structurally disabled.
+augmentation:
+  horizontal_flip_prob: 0.0
+  color_jitter: false
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.0
+  blur_prob: 0.0
+  affine_prob: 0.0
+  affine_translate_x: 0.0
+  affine_translate_y: 0.0
+  affine_rotate_deg: 0.0
+  affine_scale_min: 1.0
+  affine_scale_max: 1.0
+  random_shadow_prob: 0.0
+
+model:
+  structured_query:
+    set_selection:
+      four_slot_slot_owned_safe_replacement_enabled: true
+      four_slot_slot_owned_safe_replacement_hidden_dim: 256
+      four_slot_slot_owned_safe_replacement_ff_dim: 512
+      four_slot_slot_owned_safe_replacement_context_mode: treatment
+
+loss:
+  # V19 is loaded at its fixed endpoint and remains immutable.  V20 is
+  # trained from the exact cached action outcome table by its dedicated
+  # trainer, not by the detector criterion.
+  w_four_slot_v19: 0.0
+
+training:
+  seed: 3407
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  max_iters: 8000
+  checkpoint_interval: 1000
+  amp: true
+  amp_dtype: bfloat16
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.slot_owned_safe_replacement
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.slot_owned_safe_replacement
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.slot_owned_safe_replacement
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+
+v20:
+  cache_shard_size: 64
+  cache_dtype: float16
+  policy_iou_support_delta: 0.01
+  max_active_edits: 1
+  context_mode: treatment
+  control_context_mode: masked
+  loss:
+    policy_weight: 1.0
+    replacement_image_weight: 3.0
+    delta50_weight: 1.0
+    delta75_weight: 0.5
+    duplicate_weight: 0.5
+    abandon_weight: 2.0
+    delta_iou_weight: 0.1
+    delta50_class_weights: [2.0, 0.25, 4.0]
+    delta75_class_weights: [2.0, 0.25, 2.0]
+    duplicate_positive_weight: 2.0
+    abandon_positive_weight: 4.0
+
+postprocess:
+  score_mode: four_slot
+  score_thresh: 0.0
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
+

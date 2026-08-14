@@ -1,0 +1,14 @@
+_base_: culane_s0_structured_query_dla34_v20_slot_owned_safe_replacement_233k_to241k.yaml
+
+output_dir: outputs/diagnostics/v20_slot_owned_safe_replacement_control_233k
+
+model:
+  structured_query:
+    set_selection:
+      # Same architecture and parameter count.  Only the other-three-lane
+      # context edge is zeroed to isolate the semantic interaction.
+      four_slot_slot_owned_safe_replacement_context_mode: masked
+
+v20:
+  context_mode: masked
+

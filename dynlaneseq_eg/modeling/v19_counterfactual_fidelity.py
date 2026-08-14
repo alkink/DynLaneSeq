@@ -395,6 +395,10 @@ class FourSlotCounterfactualProposalFidelity(nn.Module):
             ~candidate_valid.detach().bool().unsqueeze(1), -1.0e4
         )
         return {
+            # V20 consumes this complete-curve representation while keeping
+            # every V19 parameter frozen.  Exporting it does not change the
+            # V19 deployment score or checkpoint state.
+            "candidate_state": pooled,
             "quality_logits": logits,
             "p50": torch.sigmoid(logits[..., 0]),
             "p75": torch.sigmoid(logits[..., 1]),
