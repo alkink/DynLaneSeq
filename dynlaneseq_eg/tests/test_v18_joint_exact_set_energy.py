@@ -10,6 +10,7 @@ from dynlaneseq_eg.losses.loss_s0 import LossConfig, S0Criterion
 from dynlaneseq_eg.modeling.four_slot_selection import FourSlotLaneSelectionHead
 from dynlaneseq_eg.modeling.v18_joint_exact_set_energy import (
     FourSlotJointExactSetEnergy,
+    _CandidateAssociationEncoder,
     build_exact_four_set_tables,
     decode_exact_ordered_set,
     exact_ordered_set_energies,
@@ -17,6 +18,44 @@ from dynlaneseq_eg.modeling.v18_joint_exact_set_energy import (
     masked_unordered_set_listwise_loss,
     unordered_set_log_scores,
 )
+
+
+def test_linear_sampler_matches_align_corners_grid_and_feature_gradient() -> None:
+    torch.manual_seed(186)
+    batch, candidates, rows, channels = 2, 4, 5, 3
+    x_rows = torch.rand(batch, candidates, rows) * 19.0
+    row_fraction = torch.linspace(0.0, 1.0, rows)
+    offsets = torch.tensor((-3.0, 0.0, 2.0))
+    for source in (
+        torch.randn(batch, rows, 11, channels),
+        torch.randn(batch, channels, 3, 7),
+    ):
+        grid_feature = source.clone().requires_grad_(True)
+        linear_feature = source.clone().requires_grad_(True)
+        grid = _CandidateAssociationEncoder.sample_feature_grid(
+            grid_feature,
+            x_rows,
+            row_fraction,
+            offsets,
+            input_w=20,
+        )
+        linear = _CandidateAssociationEncoder.sample_feature_linear(
+            linear_feature,
+            x_rows,
+            row_fraction,
+            offsets,
+            input_w=20,
+        )
+        torch.testing.assert_close(linear, grid, rtol=2.0e-5, atol=2.0e-6)
+        probe = torch.randn_like(grid)
+        (grid * probe).sum().backward()
+        (linear * probe).sum().backward()
+        torch.testing.assert_close(
+            linear_feature.grad,
+            grid_feature.grad,
+            rtol=3.0e-5,
+            atol=3.0e-6,
+        )
 
 
 def test_invalid_candidates_are_finite_and_never_decoded() -> None:

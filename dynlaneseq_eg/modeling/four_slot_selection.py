@@ -4952,6 +4952,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         joint_exact_set_energy_permutation_temperature: float = 1.0,
         joint_exact_set_energy_keep_prior_probability: float = 0.997,
         joint_exact_set_energy_detach_association_for_set_loss: bool = False,
+        joint_exact_set_energy_sampling_backend: str = "grid_sample",
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -5827,6 +5828,7 @@ class FourSlotLaneSelectionHead(nn.Module):
                 detach_association_for_set_loss=bool(
                     joint_exact_set_energy_detach_association_for_set_loss
                 ),
+                sampling_backend=str(joint_exact_set_energy_sampling_backend),
             )
             if self.joint_exact_set_energy_enabled
             else None

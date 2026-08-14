@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .common import fixed_row_fractions, sort_range_norm
+from .common import fixed_indices, fixed_row_fractions, sort_range_norm
 
 
 _FOUR_POSITION_PERMUTATIONS_CPU = torch.tensor(
@@ -375,6 +375,7 @@ class _CandidateAssociationEncoder(nn.Module):
         dropout: float,
         scale_names: tuple[str, ...],
         offsets_px: tuple[float, ...],
+        sampling_backend: str,
     ) -> None:
         super().__init__()
         if not scale_names or "p2" not in scale_names:
@@ -386,6 +387,11 @@ class _CandidateAssociationEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.input_w = int(input_w)
         self.scale_names = tuple(str(value) for value in scale_names)
+        self.sampling_backend = str(sampling_backend).strip().lower()
+        if self.sampling_backend not in {"grid_sample", "linear_gather"}:
+            raise ValueError(
+                "V18 sampling_backend must be grid_sample or linear_gather"
+            )
         self.register_buffer(
             "offsets_px", torch.tensor(offsets_px, dtype=torch.float32)
         )
@@ -444,7 +450,7 @@ class _CandidateAssociationEncoder(nn.Module):
         return feature
 
     @classmethod
-    def sample_feature(
+    def sample_feature_grid(
         cls,
         feature: torch.Tensor,
         x_rows: torch.Tensor,
@@ -473,6 +479,123 @@ class _CandidateAssociationEncoder(nn.Module):
         return sampled.view(
             batch, channels, candidates, rows, int(offsets_px.numel())
         ).permute(0, 2, 3, 4, 1).contiguous()
+
+    @classmethod
+    def sample_feature_linear(
+        cls,
+        feature: torch.Tensor,
+        x_rows: torch.Tensor,
+        row_fraction: torch.Tensor,
+        offsets_px: torch.Tensor,
+        *,
+        input_w: int,
+    ) -> torch.Tensor:
+        """Exact row-aligned bilinear sampling without a 2-D FP32 grid.
+
+        V18 queries the same fixed R rows for every candidate. P2 already has
+        R rows; P3/P4 can therefore be vertically interpolated once and then
+        sampled only along x. Bilinear interpolation is separable, so this is
+        the specialized form of the legacy align-corners grid sample while
+        avoiding three large FP32 NCHW/sample tensors per forward.
+        """
+
+        del row_fraction
+        batch, candidates, rows = x_rows.shape
+        if feature.ndim != 4:
+            raise ValueError("V18 image features must be rank four")
+        if int(feature.shape[1]) == rows:
+            row_features = feature
+        else:
+            feature_nchw = cls._as_nchw(feature, rows)
+            row_features = F.interpolate(
+                feature_nchw,
+                size=(rows, int(feature_nchw.shape[-1])),
+                mode="bilinear",
+                align_corners=True,
+            ).permute(0, 2, 3, 1)
+        if int(row_features.shape[0]) != batch or int(row_features.shape[1]) != rows:
+            raise ValueError("V18 linear sampler feature/curve rows do not match")
+        x_bins = int(row_features.shape[2])
+        channels = int(row_features.shape[3])
+
+        device_type = row_features.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            sample_x = x_rows.detach().float().unsqueeze(-1)
+            sample_x = sample_x + offsets_px.float().view(1, 1, 1, -1)
+            sample_x = sample_x.clamp(
+                0.0, float(max(int(input_w) - 1, 1))
+            )
+            feature_x = sample_x * float(max(x_bins - 1, 0)) / float(
+                max(int(input_w) - 1, 1)
+            )
+            left = feature_x.floor().to(dtype=torch.long)
+            right = (left + 1).clamp(max=max(x_bins - 1, 0))
+            alpha = feature_x - left.to(feature_x)
+
+        offsets_count = int(offsets_px.numel())
+        flat_features = row_features.reshape(batch * rows, x_bins, channels)
+        left = left.permute(0, 2, 1, 3).reshape(
+            batch * rows, candidates * offsets_count
+        )
+        right = right.permute(0, 2, 1, 3).reshape(
+            batch * rows, candidates * offsets_count
+        )
+        alpha = alpha.permute(0, 2, 1, 3).reshape(
+            batch * rows, candidates * offsets_count, 1
+        )
+        row_index = fixed_indices(
+            batch * rows,
+            device=row_features.device,
+            dtype=torch.long,
+        ).view(-1, 1)
+        paired_index = torch.stack((left, right), dim=-1).reshape(
+            batch * rows, candidates * offsets_count * 2
+        )
+        paired_value = flat_features[row_index, paired_index].view(
+            batch * rows,
+            candidates * offsets_count,
+            2,
+            channels,
+        )
+        sampled = torch.lerp(
+            paired_value[:, :, 0],
+            paired_value[:, :, 1],
+            alpha.to(row_features.dtype),
+        )
+        return (
+            sampled.view(
+                batch, rows, candidates, offsets_count, channels
+            )
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+
+    @classmethod
+    def sample_feature(
+        cls,
+        feature: torch.Tensor,
+        x_rows: torch.Tensor,
+        row_fraction: torch.Tensor,
+        offsets_px: torch.Tensor,
+        *,
+        input_w: int,
+        sampling_backend: str,
+    ) -> torch.Tensor:
+        if str(sampling_backend).strip().lower() == "linear_gather":
+            return cls.sample_feature_linear(
+                feature,
+                x_rows,
+                row_fraction,
+                offsets_px,
+                input_w=input_w,
+            )
+        return cls.sample_feature_grid(
+            feature,
+            x_rows,
+            row_fraction,
+            offsets_px,
+            input_w=input_w,
+        )
 
     def forward(
         self,
@@ -517,6 +640,7 @@ class _CandidateAssociationEncoder(nn.Module):
                 row_fraction,
                 offsets,
                 input_w=self.input_w,
+                sampling_backend=self.sampling_backend,
             )
             normalized = self.scale_norms[name](sampled)
             keys = self.scale_keys[name](normalized)
@@ -602,12 +726,18 @@ class _OneShotKeepRefineGeometry(nn.Module):
         delta_offsets_px: tuple[float, ...],
         range_offsets_norm: tuple[float, ...],
         keep_prior_probability: float,
+        sampling_backend: str,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.input_w = int(input_w)
         self.num_slots = int(num_slots)
         self.scale_names = tuple(scale_names)
+        self.sampling_backend = str(sampling_backend).strip().lower()
+        if self.sampling_backend not in {"grid_sample", "linear_gather"}:
+            raise ValueError(
+                "V18 sampling_backend must be grid_sample or linear_gather"
+            )
         for label, values in (
             ("visual", visual_offsets_px),
             ("delta", delta_offsets_px),
@@ -834,6 +964,7 @@ class _OneShotKeepRefineGeometry(nn.Module):
                 row_fraction,
                 offsets,
                 input_w=self.input_w,
+                sampling_backend=self.sampling_backend,
             )
             normalized = self.scale_norms[name](sampled)
             key = self.scale_keys[name](normalized)
@@ -992,6 +1123,7 @@ class FourSlotJointExactSetEnergy(nn.Module):
         permutation_temperature: float = 1.0,
         keep_prior_probability: float = 0.997,
         detach_association_for_set_loss: bool = False,
+        sampling_backend: str = "grid_sample",
     ) -> None:
         super().__init__()
         if int(num_slots) != 4 or int(candidate_count) != 32:
@@ -1022,6 +1154,7 @@ class FourSlotJointExactSetEnergy(nn.Module):
             dropout=float(dropout),
             scale_names=tuple(scale_names),
             offsets_px=tuple(association_offsets_px),
+            sampling_backend=str(sampling_backend),
         )
         self.slot_norm = nn.LayerNorm(int(slot_dim))
         self.slot_unary = nn.Linear(int(slot_dim), self.hidden_dim, bias=False)
@@ -1062,6 +1195,7 @@ class FourSlotJointExactSetEnergy(nn.Module):
             delta_offsets_px=tuple(delta_offsets_px),
             range_offsets_norm=tuple(range_offsets_norm),
             keep_prior_probability=float(keep_prior_probability),
+            sampling_backend=str(sampling_backend),
         )
 
     @staticmethod

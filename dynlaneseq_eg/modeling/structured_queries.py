@@ -3452,6 +3452,12 @@ class StructuredLaneQueryHead(nn.Module):
                         False,
                     )
                 ),
+                joint_exact_set_energy_sampling_backend=str(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_sampling_backend",
+                        "grid_sample",
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
