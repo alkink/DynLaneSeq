@@ -11,7 +11,10 @@ from dynlaneseq_eg.tools.v19_semantic_coverage_core import (
     _unique_candidate_tuples,
     evaluate_routes,
     exact_injective_routes,
+    exact_joint_injective_routes,
     select_unique_by_score,
+    select_source_slot_conditioned_routes,
+    source_slot_gt_ownership,
 )
 
 
@@ -142,3 +145,124 @@ def test_unique_tuple_population_is_ordered_without_repeated_ids() -> None:
     values = _unique_candidate_tuples(5, 4)
     assert values.shape == (5 * 4 * 3 * 2, 4)
     assert all(len(set(row.tolist())) == 4 for row in values)
+
+
+def test_source_slot_conditioned_oracle_preserves_lane_ownership() -> None:
+    quality = torch.zeros(2, 2, 3)
+    quality[:, 0, 0] = torch.tensor([0.80, 0.05])
+    quality[:, 0, 1] = torch.tensor([0.95, 0.05])
+    quality[:, 0, 2] = torch.tensor([0.10, 0.20])
+    quality[:, 1, 0] = torch.tensor([0.10, 0.20])
+    quality[:, 1, 1] = torch.tensor([0.40, 0.30])
+    quality[:, 1, 2] = torch.tensor([0.05, 0.90])
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    source = torch.tensor([0, 2])
+    active = torch.ones(2, dtype=torch.bool)
+
+    ownership = source_slot_gt_ownership(quality, valid, source, active)
+    route, returned_ownership = select_source_slot_conditioned_routes(
+        quality, valid, source, active
+    )
+    assert ownership.tolist() == [0, 1]
+    assert returned_ownership.tolist() == [0, 1]
+    assert route.tolist() == [1, 2]
+
+
+def test_joint_oracle_prioritizes_tp50_before_tp75() -> None:
+    # With two candidates and two active slots, distinct-ID search has only
+    # routes [0,1] and [1,0].  [0,1] has two .50 hits but no .75 hit;
+    # [1,0] has one .50 hit and one .75 hit.  The joint contract chooses
+    # the former because .50 TP is the primary objective.
+    quality = torch.zeros(2, 2, 2)
+    quality[0, 0, 0] = 0.60
+    quality[0, 0, 1] = 0.90
+    quality[1, 1, 0] = 0.40
+    quality[1, 1, 1] = 0.60
+    valid = torch.ones(2, 2, dtype=torch.bool)
+    active = torch.ones(2, dtype=torch.bool)
+    source = torch.tensor([1, 0])
+
+    search = exact_joint_injective_routes(
+        quality, valid, active, source, chunk_size=1
+    )
+    assert search.best.routes == (0, 1)
+    assert search.best.hit_count_50 == 2
+    assert search.best.hit_count_75 == 0
+
+
+def test_joint_minimum_edit_curve_recovers_lane_with_one_replacement() -> None:
+    quality = torch.zeros(2, 2, 3)
+    quality[:, 0, 0] = torch.tensor([0.90, 0.05])
+    # Candidate 1 is geometrically equivalent to candidate 0 for slot 0,
+    # creating a two-edit tie that must lose to the one-edit route.
+    quality[:, 0, 1] = torch.tensor([0.90, 0.05])
+    quality[:, 1, 1] = torch.tensor([0.85, 0.05])
+    quality[:, 1, 2] = torch.tensor([0.10, 0.80])
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    active = torch.ones(2, dtype=torch.bool)
+    source = torch.tensor([0, 1])
+
+    search = exact_joint_injective_routes(
+        quality, valid, active, source, chunk_size=2
+    )
+    assert search.by_max_edits[0].routes == (0, 1)
+    assert search.by_max_edits[0].hit_count_50 == 1
+    assert search.by_max_edits[1].routes == (0, 2)
+    assert search.by_max_edits[1].hit_count_50 == 2
+    assert search.by_max_edits[1].hit_count_75 == 2
+    assert search.best.routes == (0, 2)
+    assert search.best.edit_count == 1
+
+
+def test_joint_oracle_and_edit_budgets_match_bruteforce() -> None:
+    torch.manual_seed(2020)
+    quality = torch.rand(3, 3, 5)
+    valid = torch.ones(3, 5, dtype=torch.bool)
+    valid[1, 4] = False
+    active = torch.ones(3, dtype=torch.bool)
+    source = torch.tensor([0, 1, 2])
+
+    expected: dict[int, tuple[int, int, float, int]] = {}
+    for route in permutations(range(5), 3):
+        if any(not bool(valid[slot, candidate]) for slot, candidate in enumerate(route)):
+            continue
+        matrix = torch.stack(
+            [quality[:, slot, candidate] for slot, candidate in enumerate(route)],
+            dim=1,
+        )
+        assignment = evaluator_hungarian_assignment(
+            matrix,
+            range(3),
+            threshold=-1.0,
+        )
+        matched = [float(matrix[gt, prediction]) for gt, prediction in assignment.pairs]
+        edits = sum(candidate != int(source[slot]) for slot, candidate in enumerate(route))
+        key = (
+            sum(value > 0.50 for value in matched),
+            sum(value > 0.75 for value in matched),
+            sum(matched),
+            -edits,
+        )
+        for budget in range(edits, 4):
+            previous = expected.get(budget)
+            if previous is None or key > previous:
+                expected[budget] = key
+
+    search = exact_joint_injective_routes(
+        quality,
+        valid,
+        active,
+        source,
+        chunk_size=7,
+    )
+    for budget in range(4):
+        observed = search.by_max_edits[budget]
+        observed_key = (
+            observed.hit_count_50,
+            observed.hit_count_75,
+            observed.official_total_iou,
+            -observed.edit_count,
+        )
+        assert observed_key[:2] == expected[budget][:2]
+        assert abs(observed_key[2] - expected[budget][2]) <= 1.0e-6
+        assert observed_key[3] == expected[budget][3]

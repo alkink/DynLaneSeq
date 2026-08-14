@@ -30,6 +30,8 @@ from dynlaneseq_eg.tools.v19_semantic_coverage_core import (
     RouteEvaluation,
     evaluate_routes,
     exact_injective_routes,
+    exact_joint_injective_routes,
+    select_source_slot_conditioned_routes,
     select_unique_by_score,
 )
 
@@ -42,13 +44,20 @@ FIXED_POLICIES = (
     "predicted_iou_only",
     "v7_plus_predicted_iou_logit",
 )
+EDIT_BUDGETS = (0, 1, 2, 3, 4)
+CONSOLIDATED_POLICIES = (
+    "source_slot_conditioned",
+    "joint_lexicographic",
+    *(f"joint_edit_budget_{budget}" for budget in EDIT_BUDGETS),
+)
+ALL_POLICIES = FIXED_POLICIES + CONSOLIDATED_POLICIES
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Training-free exact V19 route-change, independent-fidelity and "
-            "injective semantic-coverage autopsy."
+            "joint/slot-conditioned/minimum-edit semantic-coverage autopsy."
         )
     )
     parser.add_argument("--config", required=True)
@@ -454,7 +463,7 @@ def main() -> None:
     )
     policy_rows = {
         policy: _new_policy_accumulator()
-        for policy in FIXED_POLICIES
+        for policy in ALL_POLICIES
     }
     policy_rows.update(
         {
@@ -471,6 +480,12 @@ def main() -> None:
     }
     oracle_assignment_counts: Counter[int] = Counter()
     route_activity = Counter()
+    source_slot_ownership = Counter()
+    source_slot_edit_histogram: Counter[int] = Counter()
+    joint_selected_edit_histogram: Counter[int] = Counter()
+    budget_edit_histograms = {
+        budget: Counter() for budget in EDIT_BUDGETS
+    }
 
     iterator = zip(records, evaluated)
     for item, result in tqdm(
@@ -517,6 +532,25 @@ def main() -> None:
         else:
             independent_score = torch.zeros(slots, candidates)
         predicted_iou = item["predicted_iou"].clamp(1.0e-6, 1.0 - 1.0e-6)
+        slot_conditioned_route, ownership = (
+            select_source_slot_conditioned_routes(
+                quality,
+                valid,
+                item["v7_route"],
+                active,
+            )
+        )
+        owned = (ownership >= 0) & active
+        source_slot_ownership["active_slots"] += int(active.sum())
+        source_slot_ownership["owned_slots"] += int(owned.sum())
+        source_slot_ownership["unowned_slots"] += int((active & ~owned).sum())
+        source_slot_ownership["images_with_unowned_slot"] += int(
+            bool((active & ~owned).any())
+        )
+        source_slot_edits = int(
+            ((slot_conditioned_route != item["v7_route"]) & active).sum()
+        )
+        source_slot_edit_histogram[source_slot_edits] += 1
         routes = {
             "source_v7": item["v7_route"],
             "v19_deployed": item["v19_route"],
@@ -531,6 +565,7 @@ def main() -> None:
                 valid,
                 active,
             ),
+            "source_slot_conditioned": slot_conditioned_route,
         }
         injective = exact_injective_routes(
             quality,
@@ -543,6 +578,25 @@ def main() -> None:
         oracle_assignment_counts[
             injective[THRESHOLDS[0]].assignments_evaluated
         ] += 1
+        joint = exact_joint_injective_routes(
+            quality,
+            valid,
+            active,
+            item["v7_route"],
+            device=args.oracle_device,
+            chunk_size=int(args.oracle_chunk_size),
+        )
+        routes["joint_lexicographic"] = torch.tensor(
+            joint.best.routes, dtype=torch.long
+        )
+        joint_selected_edit_histogram[joint.best.edit_count] += 1
+        active_count = int(active.sum())
+        for budget in EDIT_BUDGETS:
+            result_for_budget = joint.by_max_edits[min(budget, active_count)]
+            routes[f"joint_edit_budget_{budget}"] = torch.tensor(
+                result_for_budget.routes, dtype=torch.long
+            )
+            budget_edit_histograms[budget][result_for_budget.edit_count] += 1
 
         evaluations: dict[str, dict[float, RouteEvaluation]] = {}
         for policy, route in routes.items():
@@ -558,7 +612,7 @@ def main() -> None:
             }
         for threshold in THRESHOLDS:
             source_result = evaluations["source_v7"][threshold]
-            for policy in FIXED_POLICIES:
+            for policy in ALL_POLICIES:
                 _accumulate_policy(
                     policy_rows[policy],
                     evaluations[policy][threshold],
@@ -620,6 +674,29 @@ def main() -> None:
                 injective_tp - independent_tp
             ),
             "perfect_injective_minus_source_tp": injective_tp - source_tp,
+            "source_slot_conditioned_minus_source_tp": (
+                int(metrics["source_slot_conditioned"][threshold]["tp"])
+                - source_tp
+            ),
+            "joint_lexicographic_minus_source_tp": (
+                int(metrics["joint_lexicographic"][threshold]["tp"])
+                - source_tp
+            ),
+            "joint_minus_source_slot_conditioned_tp": (
+                int(metrics["joint_lexicographic"][threshold]["tp"])
+                - int(metrics["source_slot_conditioned"][threshold]["tp"])
+            ),
+            "joint_edit_budget_minus_source_tp": {
+                str(budget): (
+                    int(
+                        metrics[f"joint_edit_budget_{budget}"][threshold][
+                            "tp"
+                        ]
+                    )
+                    - source_tp
+                )
+                for budget in EDIT_BUDGETS
+            },
         }
 
     reference = _reference_reproduction(actual_metrics, args.reference_json)
@@ -669,6 +746,26 @@ def main() -> None:
             "inactive_changed_fraction": int(route_activity["inactive_changed"])
             / max(int(route_activity["inactive_slots"]), 1),
         },
+        "source_slot_ownership": {
+            **dict(source_slot_ownership),
+            "owned_fraction": int(source_slot_ownership["owned_slots"])
+            / max(int(source_slot_ownership["active_slots"]), 1),
+            "route_edit_histogram": {
+                str(key): value
+                for key, value in sorted(source_slot_edit_histogram.items())
+            },
+        },
+        "joint_selected_edit_histogram": {
+            str(key): value
+            for key, value in sorted(joint_selected_edit_histogram.items())
+        },
+        "joint_edit_budget_usage": {
+            str(budget): {
+                str(key): value
+                for key, value in sorted(histogram.items())
+            }
+            for budget, histogram in budget_edit_histograms.items()
+        },
         "oracle_assignments_evaluated_histogram": {
             str(key): value
             for key, value in sorted(oracle_assignment_counts.items())
@@ -688,6 +785,20 @@ def main() -> None:
             "v7_plus_predicted_iou_logit": (
                 "Immutable V7 unary plus unit-scale expected-IoU logit; "
                 "diagnostic only, no scale sweep."
+            ),
+            "source_slot_conditioned": (
+                "Source V7 active slots are assigned injectively to GT by "
+                "maximum total official IoU; each slot then chooses the best "
+                "valid proposal only for its fixed owned GT."
+            ),
+            "joint_lexicographic": (
+                "One deployable route per image selected by exact TP@.50, "
+                "then TP@.75, then total official IoU, then minimum active "
+                "route edits relative to V7. GT-conditioned diagnostic only."
+            ),
+            "joint_edit_budget": (
+                "Exact joint-lexicographic oracle constrained to at most K "
+                "active V7 route replacements; no inactive edits are counted."
             ),
         },
         "optimizer_steps_during_audit": 0,

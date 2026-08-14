@@ -36,6 +36,23 @@ class ExactInjectiveResult:
     assignments_evaluated: int
 
 
+@dataclass(frozen=True)
+class JointInjectiveResult:
+    routes: tuple[int, ...]
+    hit_count_50: int
+    hit_count_75: int
+    official_total_iou: float
+    edit_count: int
+    assignments_evaluated: int
+
+
+@dataclass(frozen=True)
+class JointInjectiveSearch:
+    best: JointInjectiveResult
+    by_exact_edits: dict[int, JointInjectiveResult]
+    by_max_edits: dict[int, JointInjectiveResult]
+
+
 def select_unique_by_score(
     score: torch.Tensor,
     valid: torch.Tensor,
@@ -144,6 +161,76 @@ def evaluate_routes(
         slot_gt_pairs=slot_gt_pairs,
         semantic_collision_excess=int(collision_excess),
     )
+
+
+def source_slot_gt_ownership(
+    quality: torch.Tensor,
+    valid: torch.Tensor,
+    routes: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    """Assign source active slots injectively to GT by maximum total IoU."""
+
+    if quality.ndim != 3:
+        raise ValueError("quality must have shape [G,S,N]")
+    gt_count, slots, candidates = quality.shape
+    if valid.shape != (slots, candidates):
+        raise ValueError("valid must have shape [S,N]")
+    if routes.shape != (slots,) or active.shape != (slots,):
+        raise ValueError("routes and active must have shape [S]")
+    ownership = torch.full((slots,), -1, dtype=torch.long)
+    active_slots: list[int] = []
+    selected: list[torch.Tensor] = []
+    for slot in torch.nonzero(active.bool(), as_tuple=False).flatten().tolist():
+        candidate = int(routes[slot])
+        if 0 <= candidate < candidates and bool(valid[slot, candidate]):
+            active_slots.append(int(slot))
+            selected.append(quality[:, slot, candidate])
+    if gt_count == 0 or not selected:
+        return ownership
+    matrix = torch.stack(selected, dim=1).detach().float().cpu().numpy()
+    gt_ids, local_slot_ids = linear_sum_assignment(1.0 - matrix)
+    for gt, local_slot in zip(gt_ids.tolist(), local_slot_ids.tolist()):
+        ownership[active_slots[local_slot]] = int(gt)
+    return ownership
+
+
+def select_source_slot_conditioned_routes(
+    quality: torch.Tensor,
+    valid: torch.Tensor,
+    source_routes: torch.Tensor,
+    active: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose the best candidate for each source-owned GT lane.
+
+    Active source slots are first assigned injectively to GT lanes.  Each
+    owned slot is then scored only against that fixed GT.  If there are more
+    active slots than GT lanes, unowned slots are forced to preserve their
+    source route.  Proposal-ID uniqueness remains enforced globally.
+    """
+
+    ownership = source_slot_gt_ownership(
+        quality, valid, source_routes, active
+    )
+    gt_count, slots, candidates = quality.shape
+    score = torch.zeros((slots, candidates), dtype=torch.float32)
+    allowed = valid.detach().bool().cpu().clone()
+    quality_cpu = quality.detach().float().cpu()
+    source_cpu = source_routes.detach().long().cpu()
+    active_cpu = active.detach().bool().cpu()
+    for slot in range(slots):
+        if not bool(active_cpu[slot]):
+            continue
+        gt = int(ownership[slot])
+        if 0 <= gt < gt_count:
+            score[slot] = quality_cpu[gt, slot]
+            continue
+        candidate = int(source_cpu[slot])
+        if 0 <= candidate < candidates and bool(allowed[slot, candidate]):
+            allowed[slot].fill_(False)
+            allowed[slot, candidate] = True
+    routes = select_unique_by_score(score, allowed, active_cpu)
+    return routes, ownership
 
 
 @lru_cache(maxsize=None)
@@ -326,3 +413,136 @@ def exact_injective_routes(
             assignments_evaluated=evaluated,
         )
     return result
+
+
+def _joint_key(result: JointInjectiveResult) -> tuple[int, int, float, int]:
+    return (
+        int(result.hit_count_50),
+        int(result.hit_count_75),
+        float(result.official_total_iou),
+        -int(result.edit_count),
+    )
+
+
+def exact_joint_injective_routes(
+    quality: torch.Tensor,
+    valid: torch.Tensor,
+    active: torch.Tensor,
+    source_routes: torch.Tensor,
+    *,
+    device: str | torch.device = "cpu",
+    chunk_size: int = 262_144,
+) -> JointInjectiveSearch:
+    """Search the joint .50 -> .75 -> IoU -> minimum-edit objective.
+
+    The same route is evaluated at both thresholds.  All distinct proposal-ID
+    assignments are searched exactly.  Results are returned for each exact
+    active-route edit count and for every cumulative maximum-edit budget.
+    """
+
+    if quality.ndim != 3:
+        raise ValueError("quality must have shape [G,S,N]")
+    gt_count, slots, candidates = quality.shape
+    if valid.shape != (slots, candidates):
+        raise ValueError("valid must have shape [S,N]")
+    if active.shape != (slots,) or source_routes.shape != (slots,):
+        raise ValueError("active and source_routes must have shape [S]")
+    active_slots = torch.nonzero(active.bool(), as_tuple=False).flatten().tolist()
+    active_count = len(active_slots)
+    if active_count == 0:
+        empty = JointInjectiveResult(
+            tuple(-1 for _ in range(slots)), 0, 0, 0.0, 0, 1
+        )
+        return JointInjectiveSearch(empty, {0: empty}, {0: empty})
+
+    tuples = _unique_candidate_tuples(int(candidates), active_count)
+    oracle_device = torch.device(device)
+    quality_device = quality.detach().float().to(oracle_device)
+    valid_cpu = valid.detach().bool().cpu()
+    source_active = source_routes.detach().long().cpu()[active_slots]
+    best_exact: dict[int, JointInjectiveResult] = {}
+    evaluated = 0
+    chunk_size = max(int(chunk_size), 1)
+
+    for start in range(0, int(tuples.shape[0]), chunk_size):
+        candidate_tuple = tuples[start : start + chunk_size]
+        usable = torch.ones(candidate_tuple.shape[0], dtype=torch.bool)
+        for column, slot in enumerate(active_slots):
+            usable &= valid_cpu[slot, candidate_tuple[:, column]]
+        candidate_tuple = candidate_tuple[usable]
+        if candidate_tuple.numel() == 0:
+            continue
+        evaluated += int(candidate_tuple.shape[0])
+        edit_count = (candidate_tuple != source_active.view(1, -1)).sum(dim=1)
+        candidate_device = candidate_tuple.to(oracle_device)
+        quality_sets = torch.stack(
+            [
+                quality_device[:, slot, candidate_device[:, column]].transpose(0, 1)
+                for column, slot in enumerate(active_slots)
+            ],
+            dim=-1,
+        )
+        matched, official_total = _official_matched_values(quality_sets)
+        hits_50 = (matched > 0.50).sum(dim=-1).cpu()
+        hits_75 = (matched > 0.75).sum(dim=-1).cpu()
+        official_total_cpu = official_total.detach().float().cpu()
+
+        for edits in torch.unique(edit_count).tolist():
+            mask = edit_count == int(edits)
+            local_50 = hits_50[mask]
+            max_50 = int(local_50.max())
+            eligible = mask & (hits_50 == max_50)
+            max_75 = int(hits_75[eligible].max())
+            eligible &= hits_75 == max_75
+            max_total = float(official_total_cpu[eligible].max())
+            eligible &= official_total_cpu >= max_total - 1.0e-12
+            local = int(torch.nonzero(eligible, as_tuple=False)[0])
+            full_route = [-1 for _ in range(slots)]
+            for slot, candidate in zip(
+                active_slots, candidate_tuple[local].tolist()
+            ):
+                full_route[slot] = int(candidate)
+            candidate_result = JointInjectiveResult(
+                routes=tuple(full_route),
+                hit_count_50=max_50,
+                hit_count_75=max_75,
+                official_total_iou=max_total,
+                edit_count=int(edits),
+                assignments_evaluated=0,
+            )
+            previous = best_exact.get(int(edits))
+            if previous is None or _joint_key(candidate_result) > _joint_key(previous):
+                best_exact[int(edits)] = candidate_result
+
+    if evaluated == 0 or not best_exact:
+        raise RuntimeError("no valid distinct proposal assignment exists")
+    best_exact = {
+        edits: JointInjectiveResult(
+            routes=result.routes,
+            hit_count_50=result.hit_count_50,
+            hit_count_75=result.hit_count_75,
+            official_total_iou=result.official_total_iou,
+            edit_count=result.edit_count,
+            assignments_evaluated=evaluated,
+        )
+        for edits, result in best_exact.items()
+    }
+    by_max_edits: dict[int, JointInjectiveResult] = {}
+    running: JointInjectiveResult | None = None
+    for budget in range(active_count + 1):
+        candidate = best_exact.get(budget)
+        if candidate is not None and (
+            running is None or _joint_key(candidate) > _joint_key(running)
+        ):
+            running = candidate
+        if running is None:
+            raise RuntimeError(
+                f"no valid assignment exists for edit budget <= {budget}"
+            )
+        by_max_edits[budget] = running
+    best = by_max_edits[active_count]
+    return JointInjectiveSearch(
+        best=best,
+        by_exact_edits=best_exact,
+        by_max_edits=by_max_edits,
+    )
