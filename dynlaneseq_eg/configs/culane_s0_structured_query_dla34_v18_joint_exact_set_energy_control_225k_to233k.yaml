@@ -1,0 +1,10 @@
+_base_: culane_s0_structured_query_dla34_v18_joint_exact_set_energy_225k_to233k.yaml
+
+output_dir: outputs/diagnostics/v18_joint_exact_set_energy_control_225k
+
+model:
+  structured_query:
+    set_selection:
+      # Forward values and parameter count are identical to treatment. Only
+      # the exact-set loss edge into the live association state is removed.
+      four_slot_joint_exact_set_energy_detach_association_for_set_loss: true

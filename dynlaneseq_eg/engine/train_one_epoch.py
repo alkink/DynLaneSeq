@@ -44,6 +44,112 @@ def clip_optimizer_gradients(model, optimizer, max_norm: float, mode: str = "glo
     return torch.linalg.vector_norm(torch.stack(group_norms))
 
 
+def _v18_conflict_safe_backward(
+    model,
+    loss_dict: dict[str, torch.Tensor],
+    backward_loss: torch.Tensor,
+    cfg: dict[str, Any],
+    *,
+    accumulation_steps: int,
+    scaler,
+    amp: bool,
+) -> dict[str, torch.Tensor] | None:
+    """Project the conflicting complete-V18 gradient on shared image tensors.
+
+    The normal backward is retained for every private V18 parameter and every
+    proposal objective. On configured shared prefixes, the raw V18 component is
+    subtracted and its projection orthogonal to a conflicting proposal-
+    protection gradient is inserted. BF16 needs no GradScaler; FP16 scaling is
+    rejected here rather than silently mixing scaled and unscaled gradients.
+    """
+
+    contract = cfg.get("training", {}).get(
+        "v18_gradient_conflict_projection", {}
+    )
+    if not bool(contract.get("enabled", False)):
+        return None
+    if scaler is not None and amp:
+        raise ValueError(
+            "V18 conflict projection requires BF16 or FP32 without GradScaler"
+        )
+    set_loss = loss_dict.get("loss_v18_set_backward")
+    protection_loss = loss_dict.get("loss_v18_proposal_protection")
+    if not isinstance(set_loss, torch.Tensor) or not isinstance(
+        protection_loss, torch.Tensor
+    ):
+        raise ValueError("V18 projection requires explicit criterion components")
+    prefixes = tuple(str(value) for value in contract.get("shared_prefixes", ()))
+    excludes = tuple(str(value) for value in contract.get("exclude_prefixes", ()))
+    if not prefixes:
+        raise ValueError("V18 projection requires shared parameter prefixes")
+    root_model = getattr(model, "_orig_mod", model)
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in root_model.named_parameters()
+        if parameter.requires_grad
+        and any(name.startswith(prefix) for prefix in prefixes)
+        and not any(name.startswith(prefix) for prefix in excludes)
+    ]
+    if not named_parameters:
+        raise ValueError("V18 projection matched no trainable shared parameters")
+    parameters = [parameter for _name, parameter in named_parameters]
+    scale = 1.0 / float(accumulation_steps)
+    set_gradients = torch.autograd.grad(
+        set_loss * scale,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    protection_gradients = torch.autograd.grad(
+        protection_loss * scale,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    backward_loss.backward()
+
+    device = backward_loss.device
+    dot = torch.zeros((), device=device, dtype=torch.float32)
+    set_norm_sq = torch.zeros_like(dot)
+    protection_norm_sq = torch.zeros_like(dot)
+    for set_gradient, protection_gradient in zip(
+        set_gradients, protection_gradients
+    ):
+        if set_gradient is not None:
+            set_norm_sq = set_norm_sq + set_gradient.detach().float().square().sum()
+        if protection_gradient is not None:
+            protection_norm_sq = protection_norm_sq + protection_gradient.detach().float().square().sum()
+        if set_gradient is not None and protection_gradient is not None:
+            dot = dot + (
+                set_gradient.detach().float()
+                * protection_gradient.detach().float()
+            ).sum()
+    coefficient = torch.where(
+        (dot < 0.0) & (protection_norm_sq > 0.0),
+        dot / protection_norm_sq.clamp_min(1.0e-20),
+        torch.zeros_like(dot),
+    )
+    for parameter, set_gradient, protection_gradient in zip(
+        parameters, set_gradients, protection_gradients
+    ):
+        if set_gradient is None or protection_gradient is None:
+            continue
+        correction = -coefficient.to(protection_gradient) * protection_gradient
+        if parameter.grad is None:
+            parameter.grad = correction.to(parameter)
+        else:
+            parameter.grad.add_(correction.to(parameter.grad))
+    cosine = dot / (
+        set_norm_sq.sqrt() * protection_norm_sq.sqrt()
+    ).clamp_min(1.0e-20)
+    return {
+        "v18_shared_set_grad_norm": set_norm_sq.sqrt().detach(),
+        "v18_shared_protection_grad_norm": protection_norm_sq.sqrt().detach(),
+        "v18_shared_gradient_cosine": cosine.detach(),
+        "v18_shared_projection_active": (coefficient != 0.0).float().detach(),
+    }
+
+
 def _sampler_alpha(cfg: dict[str, Any], iteration: int) -> float:
     sched = cfg.get("sampler_curriculum", {})
     warmup = int(sched.get("warmup_iters", 1000))
@@ -446,10 +552,22 @@ def train_one_epoch(
                 iteration += 1
                 continue
             backward_loss = loss / float(accumulation_steps)
-            if scaler is not None and amp:
-                scaler.scale(backward_loss).backward()
+            v18_projection_stats = _v18_conflict_safe_backward(
+                model,
+                loss_dict,
+                backward_loss,
+                cfg,
+                accumulation_steps=accumulation_steps,
+                scaler=scaler,
+                amp=amp,
+            )
+            if v18_projection_stats is None:
+                if scaler is not None and amp:
+                    scaler.scale(backward_loss).backward()
+                else:
+                    backward_loss.backward()
             else:
-                backward_loss.backward()
+                loss_dict.update(v18_projection_stats)
             micro_in_step += 1
             if micro_in_step < accumulation_steps:
                 continue

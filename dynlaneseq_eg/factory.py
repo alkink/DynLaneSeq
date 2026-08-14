@@ -360,6 +360,61 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_v17_dfl_weight=float(
             loss.get("four_slot_v17_dfl_weight", 1.0)
         ),
+        w_four_slot_v18=float(loss.get("w_four_slot_v18", 0.0)),
+        four_slot_v18_set_weight=float(
+            loss.get("four_slot_v18_set_weight", 1.0)
+        ),
+        four_slot_v18_active_weight=float(
+            loss.get("four_slot_v18_active_weight", 1.0)
+        ),
+        four_slot_v18_visual_weight=float(
+            loss.get("four_slot_v18_visual_weight", 1.0)
+        ),
+        four_slot_v18_point_weight=float(
+            loss.get("four_slot_v18_point_weight", 5.0)
+        ),
+        four_slot_v18_range_weight=float(
+            loss.get("four_slot_v18_range_weight", 1.0)
+        ),
+        four_slot_v18_line_iou_weight=float(
+            loss.get("four_slot_v18_line_iou_weight", 2.0)
+        ),
+        four_slot_v18_dfl_weight=float(
+            loss.get("four_slot_v18_dfl_weight", 1.0)
+        ),
+        four_slot_v18_uncertainty_weight=float(
+            loss.get("four_slot_v18_uncertainty_weight", 0.5)
+        ),
+        four_slot_v18_policy_weight=float(
+            loss.get("four_slot_v18_policy_weight", 1.0)
+        ),
+        four_slot_v18_soft_f1_50_weight=float(
+            loss.get("four_slot_v18_soft_f1_50_weight", 1.0)
+        ),
+        four_slot_v18_soft_f1_75_weight=float(
+            loss.get("four_slot_v18_soft_f1_75_weight", 0.5)
+        ),
+        four_slot_v18_nondegradation_weight=float(
+            loss.get("four_slot_v18_nondegradation_weight", 1.0)
+        ),
+        four_slot_v18_target_support_delta=float(
+            loss.get("four_slot_v18_target_support_delta", 0.10)
+        ),
+        four_slot_v18_target_temperature=float(
+            loss.get("four_slot_v18_target_temperature", 0.10)
+        ),
+        four_slot_v18_model_temperature=float(
+            loss.get("four_slot_v18_model_temperature", 1.0)
+        ),
+        four_slot_v18_reward_temperature_50=float(
+            loss.get("four_slot_v18_reward_temperature_50", 0.03)
+        ),
+        four_slot_v18_reward_temperature_75=float(
+            loss.get("four_slot_v18_reward_temperature_75", 0.03)
+        ),
+        four_slot_v18_policy_margin=float(
+            loss.get("four_slot_v18_policy_margin", 0.01)
+        ),
         w_centerline=float(loss.get("w_centerline", 0.0)),
         w_row_dfl=float(loss.get("w_row_dfl", 0.0)),
         row_dfl_warmup_iters=int(loss.get("row_dfl_warmup_iters", 0)),

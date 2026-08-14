@@ -15,6 +15,7 @@ from .common import (
 )
 from .v16_candidate_reranker import FourSlotCandidateAlignedReranker
 from .v17_iterative_slot_geometry import FourSlotIterativeMultiScaleGeometry
+from .v18_joint_exact_set_energy import FourSlotJointExactSetEnergy
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -4902,6 +4903,55 @@ class FourSlotLaneSelectionHead(nn.Module):
             0.0125,
             0.025,
         ),
+        joint_exact_set_energy_enabled: bool = False,
+        joint_exact_set_energy_hidden_dim: int | None = None,
+        joint_exact_set_energy_num_heads: int = 8,
+        joint_exact_set_energy_ff_dim: int | None = None,
+        joint_exact_set_energy_dropout: float = 0.0,
+        joint_exact_set_energy_scale_names: tuple[str, ...] = (
+            "p2",
+            "p3",
+            "p4",
+        ),
+        joint_exact_set_energy_association_offsets_px: tuple[float, ...] = (
+            -32.0,
+            -16.0,
+            -8.0,
+            0.0,
+            8.0,
+            16.0,
+            32.0,
+        ),
+        joint_exact_set_energy_visual_offsets_px: tuple[float, ...] = (
+            -64.0,
+            -32.0,
+            -16.0,
+            0.0,
+            16.0,
+            32.0,
+            64.0,
+        ),
+        joint_exact_set_energy_delta_offsets_px: tuple[float, ...] = (
+            -64.0,
+            -32.0,
+            -16.0,
+            -8.0,
+            0.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+        ),
+        joint_exact_set_energy_range_offsets_norm: tuple[float, ...] = (
+            -0.025,
+            -0.0125,
+            0.0,
+            0.0125,
+            0.025,
+        ),
+        joint_exact_set_energy_permutation_temperature: float = 1.0,
+        joint_exact_set_energy_keep_prior_probability: float = 0.997,
+        joint_exact_set_energy_detach_association_for_set_loss: bool = False,
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -5005,6 +5055,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         )
         self.iterative_slot_geometry_enabled = bool(
             iterative_slot_geometry_enabled
+        )
+        self.joint_exact_set_energy_enabled = bool(
+            joint_exact_set_energy_enabled
         )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
@@ -5121,6 +5174,26 @@ class FourSlotLaneSelectionHead(nn.Module):
                 )
             ):
                 raise ValueError("V17 iterative geometry is exclusive with V9-V16 modules")
+        if self.joint_exact_set_energy_enabled:
+            if not self.factorized_routing:
+                raise ValueError("V18 exact set energy requires factorized routing")
+            if not self.refinement_enabled:
+                raise ValueError("V18 exact set energy requires the V7 bounded anchor")
+            if any(
+                (
+                    self.unified_slot_decoder_enabled,
+                    self.visual_first_association_enabled,
+                    self.corrected_visual_first_association_enabled,
+                    self.corrected_visual_first_geometry_enabled,
+                    self.visual_precision_geometry_enabled,
+                    self.bottom_aware_relational_geometry_enabled,
+                    self.candidate_aligned_reranker_enabled,
+                    self.iterative_slot_geometry_enabled,
+                    self.slot_owned_geometry_enabled,
+                    self.global_visual_geometry_enabled,
+                )
+            ):
+                raise ValueError("V18 exact set energy is exclusive with V9-V17 modules")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -5186,8 +5259,18 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.bottom_aware_relational_geometry_enabled
             or self.candidate_aligned_reranker_enabled
             or self.iterative_slot_geometry_enabled
+            or self.joint_exact_set_energy_enabled
         )
-        self.requires_multi_scale_features = self.iterative_slot_geometry_enabled
+        self.requires_multi_scale_features = (
+            self.iterative_slot_geometry_enabled
+            or self.joint_exact_set_energy_enabled
+        )
+        # V18 must receive a live P2 tensor. Candidate coordinates remain
+        # detached inside the module, while image/proposal representations are
+        # deliberately reachable from the exact final-set objective.
+        self.requires_live_row_value_features = (
+            self.joint_exact_set_energy_enabled
+        )
 
         # Exact successful probe descriptor:
         # query + range-masked row state + ten geometry scalars + sampled
@@ -5698,6 +5781,56 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.iterative_slot_geometry_enabled
             else None
         )
+        # V18 replaces independent unary routing with an exact higher-order
+        # score over every 32P4 assignment.  The existing V7 refiner remains
+        # the parity anchor; one new branch proposes a single alternative and
+        # a categorical KEEP/REFINE policy decides whether to deploy it.
+        self.joint_exact_set_energy = (
+            FourSlotJointExactSetEnergy(
+                self.dim,
+                feature_dim=self.dim,
+                slot_dim=self.hidden_dim,
+                hidden_dim=int(
+                    joint_exact_set_energy_hidden_dim or self.hidden_dim
+                ),
+                input_w=self.input_w,
+                candidate_count=32,
+                num_slots=self.num_slots,
+                num_heads=int(joint_exact_set_energy_num_heads),
+                ff_dim=int(
+                    joint_exact_set_energy_ff_dim
+                    or 2
+                    * int(
+                        joint_exact_set_energy_hidden_dim or self.hidden_dim
+                    )
+                ),
+                dropout=float(joint_exact_set_energy_dropout),
+                scale_names=tuple(joint_exact_set_energy_scale_names),
+                association_offsets_px=tuple(
+                    joint_exact_set_energy_association_offsets_px
+                ),
+                visual_offsets_px=tuple(
+                    joint_exact_set_energy_visual_offsets_px
+                ),
+                delta_offsets_px=tuple(
+                    joint_exact_set_energy_delta_offsets_px
+                ),
+                range_offsets_norm=tuple(
+                    joint_exact_set_energy_range_offsets_norm
+                ),
+                permutation_temperature=float(
+                    joint_exact_set_energy_permutation_temperature
+                ),
+                keep_prior_probability=float(
+                    joint_exact_set_energy_keep_prior_probability
+                ),
+                detach_association_for_set_loss=bool(
+                    joint_exact_set_energy_detach_association_for_set_loss
+                ),
+            )
+            if self.joint_exact_set_energy_enabled
+            else None
+        )
         # V13 is not another proposal selector.  It consumes the proven V12
         # visual lane state, row-wise proposal feature memory and precise local
         # P2 samples, then owns final x/range directly.  V7 remains only the
@@ -6080,6 +6213,134 @@ class FourSlotLaneSelectionHead(nn.Module):
                 "selection_slot_scores": decoded["scores"],
                 "selection_slot_global_repair_count": decoded["repair_count"],
             }
+        v18_route_result: dict[str, torch.Tensor] | None = None
+        v18_image_features: dict[str, torch.Tensor] | None = None
+        # Preserve the already-computed V7 deployment tensors from this exact
+        # forward.  Gate 0 compares against these values rather than against a
+        # second numerically non-deterministic CPU/GPU replay.
+        v18_v7_real_route_logits = result.get(
+            "selection_slot_real_route_logits"
+        )
+        v18_v7_geometry_indices = geometry_indices
+        v18_v7_selected_indices = result.get("selection_slot_indices")
+        v18_v7_selected_scores = result.get("selection_slot_scores")
+        v18_v7_active_logits = result.get("selection_slot_active_logits")
+        v18_v7_active = slot_active
+        if self.joint_exact_set_energy is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V18 exact set energy requires live P2 rows")
+            if not isinstance(multi_scale_features, dict):
+                raise ValueError("V18 exact set energy requires P2/P3/P4")
+            v18_image_features = {"p2": row_value_features}
+            for scale_name in self.joint_exact_set_energy.association.scale_names:
+                if scale_name == "p2":
+                    continue
+                scale_value = multi_scale_features.get(scale_name)
+                if not isinstance(scale_value, torch.Tensor):
+                    raise ValueError(
+                        f"V18 exact set energy requires projected {scale_name}"
+                    )
+                v18_image_features[scale_name] = scale_value
+            v18_route_result = self.joint_exact_set_energy.route(
+                slot_states=slots,
+                legacy_route_logits=real_route_logits,
+                legacy_active_logits=active_logits,
+                proposal_rows=outputs["structured_row_tokens"],
+                proposal_x=outputs["pred_x_rows"],
+                proposal_range=outputs["range_norm"],
+                candidate_valid=candidate_valid,
+                image_features=v18_image_features,
+            )
+            geometry_indices = v18_route_result["indices"]
+            # Geometry through a hard exact route cannot train the discrete
+            # set choice.  Detaching this surrogate makes that contract
+            # explicit: only the unordered listwise set loss trains routing.
+            # The mature bounded V7 refiner keeps its original geometry-logit
+            # tensor; its hard forward depends on V18's indices, while the
+            # zero-scaled soft gradient surrogate must not introduce a second
+            # floating-point implementation at initialization.
+            slot_active = (active_logits >= 0.0) & (geometry_indices >= 0)
+            selected_indices = torch.where(
+                slot_active,
+                geometry_indices,
+                geometry_indices.new_full(geometry_indices.shape, -1),
+            )
+            v18_probability = F.log_softmax(
+                v18_route_result["unary"].float(), dim=-1
+            ).exp()
+            safe_route = geometry_indices.clamp(min=0)
+            selected_scores = v18_probability.gather(
+                -1, safe_route.unsqueeze(-1)
+            ).squeeze(-1) * torch.sigmoid(active_logits.float())
+            selected_scores = torch.where(
+                slot_active,
+                selected_scores,
+                torch.sigmoid(-active_logits.float()),
+            )
+            v18_log_probability = F.log_softmax(
+                v18_route_result["unary"].float(), dim=-1
+            )
+            result.update(
+                {
+                    "selection_slot_logits": torch.cat(
+                        (
+                            F.logsigmoid(active_logits.float()).unsqueeze(-1)
+                            + v18_log_probability,
+                            F.logsigmoid(-active_logits.float()).unsqueeze(-1),
+                        ),
+                        dim=-1,
+                    ),
+                    # This public legacy tensor keeps its historical meaning.
+                    # The trainable V18 unary is exported separately below.
+                    "selection_slot_real_route_logits": real_route_logits,
+                    "selection_slot_geometry_route_indices": geometry_indices,
+                    "selection_slot_indices": selected_indices,
+                    "selection_slot_scores": selected_scores,
+                    "selection_slot_v18_unary_residual": v18_route_result[
+                        "unary_residual"
+                    ],
+                    "selection_slot_v18_unary": v18_route_result["unary"],
+                    "selection_slot_v18_pair_energy": v18_route_result[
+                        "pair_energy"
+                    ],
+                    "selection_slot_v18_unordered_set_scores": v18_route_result[
+                        "set_scores"
+                    ],
+                    "selection_slot_v18_valid_set": v18_route_result[
+                        "valid_set"
+                    ],
+                    "selection_slot_v18_combination_indices": (
+                        self.joint_exact_set_energy.combination_table
+                    ),
+                    "selection_slot_v18_set_index": v18_route_result[
+                        "set_index"
+                    ],
+                    "selection_slot_v18_permutation_index": v18_route_result[
+                        "permutation_index"
+                    ],
+                    "selection_slot_v18_set_margin": v18_route_result[
+                        "set_margin"
+                    ],
+                    "selection_slot_v18_candidate_state": v18_route_result[
+                        "candidate_state"
+                    ],
+                    "selection_slot_v18_association_visual_attention": (
+                        v18_route_result["association_visual_attention"]
+                    ),
+                    "selection_slot_v18_v7_real_route_logits": (
+                        v18_v7_real_route_logits
+                    ),
+                    "selection_slot_v18_v7_geometry_route_indices": (
+                        v18_v7_geometry_indices
+                    ),
+                    "selection_slot_v18_v7_indices": v18_v7_selected_indices,
+                    "selection_slot_v18_v7_scores": v18_v7_selected_scores,
+                    "selection_slot_v18_v7_active_logits": (
+                        v18_v7_active_logits
+                    ),
+                    "selection_slot_v18_v7_active": v18_v7_active,
+                }
+            )
         if self.slot_refinement is not None:
             if not isinstance(row_value_features, torch.Tensor):
                 raise ValueError(
@@ -6097,6 +6358,110 @@ class FourSlotLaneSelectionHead(nn.Module):
                     slot_active=slot_active,
                     row_value_features=row_value_features,
                 )
+            )
+        if self.joint_exact_set_energy is not None:
+            if v18_route_result is None or v18_image_features is None:
+                raise RuntimeError("V18 route state was not constructed")
+            anchor_x = result.get("selection_slot_pred_x_rows")
+            anchor_range = result.get("selection_slot_range_norm")
+            geometry_valid = result.get("selection_slot_geometry_valid")
+            if not all(
+                isinstance(value, torch.Tensor)
+                for value in (anchor_x, anchor_range, geometry_valid)
+            ):
+                raise ValueError("V18 requires the complete V7 bounded anchor")
+            v18_refine = self.joint_exact_set_energy.refine(
+                route_result=v18_route_result,
+                slot_states=slots,
+                anchor_x=anchor_x,
+                anchor_range=anchor_range,
+                geometry_valid=geometry_valid,
+                proposal_rows=outputs["structured_row_tokens"],
+                proposal_x=outputs["pred_x_rows"],
+                proposal_range=outputs["range_norm"],
+                candidate_valid=candidate_valid,
+                image_features=v18_image_features,
+                legacy_active_logits=active_logits,
+            )
+            final_active_logits = v18_refine["active_logits"]
+            final_active = (final_active_logits >= 0.0) & (
+                geometry_indices >= 0
+            )
+            final_indices = torch.where(
+                final_active,
+                geometry_indices,
+                geometry_indices.new_full(geometry_indices.shape, -1),
+            )
+            v18_probability = F.log_softmax(
+                v18_route_result["unary"].float(), dim=-1
+            ).exp()
+            safe_route = geometry_indices.clamp(min=0)
+            final_scores = v18_probability.gather(
+                -1, safe_route.unsqueeze(-1)
+            ).squeeze(-1) * torch.sigmoid(final_active_logits)
+            final_scores = torch.where(
+                final_active,
+                final_scores,
+                torch.sigmoid(-final_active_logits),
+            )
+            v18_log_probability = F.log_softmax(
+                v18_route_result["unary"].float(), dim=-1
+            )
+            result.update(
+                {
+                    "selection_slot_logits": torch.cat(
+                        (
+                            F.logsigmoid(final_active_logits).unsqueeze(-1)
+                            + v18_log_probability,
+                            F.logsigmoid(-final_active_logits).unsqueeze(-1),
+                        ),
+                        dim=-1,
+                    ),
+                    "selection_slot_active_logits": final_active_logits,
+                    "selection_slot_indices": final_indices,
+                    "selection_slot_scores": final_scores,
+                    "selection_slot_active": final_active,
+                    "selection_slot_pred_x_rows": v18_refine["final_x"],
+                    "selection_slot_range_norm": v18_refine["final_range"],
+                    "selection_slot_v18_anchor_x_rows": anchor_x,
+                    "selection_slot_v18_anchor_range_norm": anchor_range,
+                    "selection_slot_v18_refined_x_rows": v18_refine[
+                        "refined_x"
+                    ],
+                    "selection_slot_v18_refined_range_norm": v18_refine[
+                        "refined_range"
+                    ],
+                    "selection_slot_v18_delta_x_rows": v18_refine["delta"],
+                    "selection_slot_v18_delta_logits": v18_refine[
+                        "delta_logits"
+                    ],
+                    "selection_slot_v18_delta_offsets_px": (
+                        self.joint_exact_set_energy.refiner.delta_offsets_px
+                    ),
+                    "selection_slot_v18_range_logits": v18_refine[
+                        "range_logits"
+                    ],
+                    "selection_slot_v18_range_offsets_norm": (
+                        self.joint_exact_set_energy.refiner.range_offsets_norm
+                    ),
+                    "selection_slot_v18_log_sigma": v18_refine["log_sigma"],
+                    "selection_slot_v18_policy_logits": v18_refine[
+                        "policy_logits"
+                    ],
+                    "selection_slot_v18_policy": v18_refine["policy"],
+                    "selection_slot_v18_visual_logits": v18_refine[
+                        "visual_logits"
+                    ],
+                    "selection_slot_v18_visual_offsets_px": (
+                        self.joint_exact_set_energy.refiner.visual_offsets_px
+                    ),
+                    "selection_slot_v18_visual_attention": v18_refine[
+                        "visual_attention"
+                    ],
+                    "selection_slot_v18_proposal_attention": v18_refine[
+                        "proposal_attention"
+                    ],
+                }
             )
         if self.slot_owned_geometry is not None:
             if not isinstance(row_value_features, torch.Tensor):

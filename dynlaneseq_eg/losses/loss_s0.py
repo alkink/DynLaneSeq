@@ -9,6 +9,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from dynlaneseq_eg.modeling.common import fixed_indices, sort_range_norm
+from dynlaneseq_eg.modeling.v18_joint_exact_set_energy import (
+    exact_unordered_set_rewards,
+    masked_unordered_set_listwise_loss,
+)
 from .matcher_s0 import HungarianMatcherS0
 from .range_aware_iou import (
     batched_pairwise_range_aware_row_strip_iou,
@@ -1252,6 +1256,28 @@ class LossConfig:
     four_slot_v17_range_weight: float = 1.0
     four_slot_v17_line_iou_weight: float = 2.0
     four_slot_v17_dfl_weight: float = 1.0
+    # V18 scores the complete unordered physical four-set while retaining an
+    # exact ordered deployment decode.  Its one-shot alternative is trained
+    # independently of the categorical KEEP/REFINE deployment decision.
+    w_four_slot_v18: float = 0.0
+    four_slot_v18_set_weight: float = 1.0
+    four_slot_v18_active_weight: float = 1.0
+    four_slot_v18_visual_weight: float = 1.0
+    four_slot_v18_point_weight: float = 5.0
+    four_slot_v18_range_weight: float = 1.0
+    four_slot_v18_line_iou_weight: float = 2.0
+    four_slot_v18_dfl_weight: float = 1.0
+    four_slot_v18_uncertainty_weight: float = 0.5
+    four_slot_v18_policy_weight: float = 1.0
+    four_slot_v18_soft_f1_50_weight: float = 1.0
+    four_slot_v18_soft_f1_75_weight: float = 0.5
+    four_slot_v18_nondegradation_weight: float = 1.0
+    four_slot_v18_target_support_delta: float = 0.10
+    four_slot_v18_target_temperature: float = 0.10
+    four_slot_v18_model_temperature: float = 1.0
+    four_slot_v18_reward_temperature_50: float = 0.03
+    four_slot_v18_reward_temperature_75: float = 0.03
+    four_slot_v18_policy_margin: float = 0.01
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1561,6 +1587,7 @@ class S0Criterion(nn.Module):
             or self.cfg.w_four_slot_v15 != 0
             or self.cfg.w_four_slot_v16 != 0
             or self.cfg.w_four_slot_v17 != 0
+            or self.cfg.w_four_slot_v18 != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1842,6 +1869,34 @@ class S0Criterion(nn.Module):
                 "mean_quality_gain": zero,
                 "mean_abs_delta_px": zero,
             }
+        if self.cfg.w_four_slot_v18 != 0:
+            four_slot_v18 = self.compute_four_slot_v18_loss(
+                outputs,
+                targets,
+                four_slot_targets,
+            )
+        else:
+            four_slot_v18 = {
+                "total": zero,
+                "set": zero,
+                "active": zero,
+                "visual": zero,
+                "point": zero,
+                "range": zero,
+                "line_iou": zero,
+                "dfl": zero,
+                "uncertainty": zero,
+                "policy": zero,
+                "soft_f1_50": zero,
+                "soft_f1_75": zero,
+                "nondegradation": zero,
+                "target_entropy": zero,
+                "target_support_size": zero,
+                "chosen_set_regret": zero,
+                "mean_anchor_quality": zero,
+                "mean_refined_quality": zero,
+                "mean_refine_probability": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1879,14 +1934,38 @@ class S0Criterion(nn.Module):
             + self.cfg.w_four_slot_v15 * four_slot_v15["total"]
             + self.cfg.w_four_slot_v16 * four_slot_v16["total"]
             + self.cfg.w_four_slot_v17 * four_slot_v17["total"]
+            + self.cfg.w_four_slot_v18 * four_slot_v18["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
             + self.cfg.w_dynamic_proposal_x * dynamic_proposal_losses["x"]
             + self.cfg.w_dynamic_proposal_range * dynamic_proposal_losses["range"]
         )
+        # The V18 training loop projects the complete new-objective gradient
+        # (set membership, geometry, policy, activity and threshold-aware
+        # terms) when it conflicts with the mature proposal objective on
+        # shared image parameters.  Protecting only the listwise term would
+        # leave the much larger geometry path free to damage proposal oracle
+        # capacity.  Private V18 parameters are never projected.
+        v18_set_backward = (
+            float(self.cfg.w_four_slot_v18)
+            * four_slot_v18["total"]
+        )
+        v18_proposal_protection = (
+            self.cfg.w_exist * loss_exist
+            + self.cfg.w_point * loss_point
+            + self.cfg.w_range * loss_range
+            + self.cfg.w_smooth * loss_smooth
+            + self.cfg.w_line_iou * loss_line_iou
+            + self.cfg.w_seg * loss_seg
+            + self.cfg.w_quality * loss_quality
+            + self.cfg.w_centerline * loss_centerline
+            + row_dfl_weight * loss_row_dfl
+        )
         out = {
             "loss_total": total,
+            "loss_v18_set_backward": v18_set_backward,
+            "loss_v18_proposal_protection": v18_proposal_protection,
             "loss_exist": loss_exist,
             "loss_point": loss_point,
             "loss_range": loss_range,
@@ -2198,6 +2277,37 @@ class S0Criterion(nn.Module):
             ],
             "four_slot_v17_mean_abs_delta_px": four_slot_v17[
                 "mean_abs_delta_px"
+            ],
+            "loss_four_slot_v18": four_slot_v18["total"],
+            "loss_four_slot_v18_set": four_slot_v18["set"],
+            "loss_four_slot_v18_active": four_slot_v18["active"],
+            "loss_four_slot_v18_visual": four_slot_v18["visual"],
+            "loss_four_slot_v18_point": four_slot_v18["point"],
+            "loss_four_slot_v18_range": four_slot_v18["range"],
+            "loss_four_slot_v18_line_iou": four_slot_v18["line_iou"],
+            "loss_four_slot_v18_dfl": four_slot_v18["dfl"],
+            "loss_four_slot_v18_uncertainty": four_slot_v18["uncertainty"],
+            "loss_four_slot_v18_policy": four_slot_v18["policy"],
+            "loss_four_slot_v18_soft_f1_50": four_slot_v18["soft_f1_50"],
+            "loss_four_slot_v18_soft_f1_75": four_slot_v18["soft_f1_75"],
+            "loss_four_slot_v18_nondegradation": four_slot_v18[
+                "nondegradation"
+            ],
+            "four_slot_v18_target_entropy": four_slot_v18["target_entropy"],
+            "four_slot_v18_target_support_size": four_slot_v18[
+                "target_support_size"
+            ],
+            "four_slot_v18_chosen_set_regret": four_slot_v18[
+                "chosen_set_regret"
+            ],
+            "four_slot_v18_mean_anchor_quality": four_slot_v18[
+                "mean_anchor_quality"
+            ],
+            "four_slot_v18_mean_refined_quality": four_slot_v18[
+                "mean_refined_quality"
+            ],
+            "four_slot_v18_mean_refine_probability": four_slot_v18[
+                "mean_refine_probability"
             ],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
@@ -4520,6 +4630,307 @@ class S0Criterion(nn.Module):
             "mean_final_quality": mean_final,
             "mean_quality_gain": (mean_final - mean_anchor).detach(),
             "mean_abs_delta_px": mean_delta,
+        }
+
+    def compute_four_slot_v18_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Exact physical-set supervision plus one KEEP/REFINE alternative.
+
+        The route term trains only the set-energy graph. Geometry terms train
+        the selected alternative after the non-differentiable exact decode;
+        they are intentionally not reported as route gradients.
+        """
+
+        set_scores = outputs.get("selection_slot_v18_unordered_set_scores")
+        valid_set = outputs.get("selection_slot_v18_valid_set")
+        combination_table = outputs.get(
+            "selection_slot_v18_combination_indices"
+        )
+        refined = outputs.get("selection_slot_v18_refined_x_rows")
+        refined_range = outputs.get("selection_slot_v18_refined_range_norm")
+        anchor_x = outputs.get("selection_slot_v18_anchor_x_rows")
+        anchor_range = outputs.get("selection_slot_v18_anchor_range_norm")
+        delta_logits = outputs.get("selection_slot_v18_delta_logits")
+        delta_offsets = outputs.get("selection_slot_v18_delta_offsets_px")
+        visual_logits = outputs.get("selection_slot_v18_visual_logits")
+        visual_offsets = outputs.get("selection_slot_v18_visual_offsets_px")
+        policy_logits = outputs.get("selection_slot_v18_policy_logits")
+        log_sigma = outputs.get("selection_slot_v18_log_sigma")
+        active_logits = outputs.get("selection_slot_active_logits")
+        geometry_valid = outputs.get("selection_slot_geometry_valid")
+        required = (
+            set_scores,
+            valid_set,
+            combination_table,
+            refined,
+            refined_range,
+            anchor_x,
+            anchor_range,
+            delta_logits,
+            delta_offsets,
+            visual_logits,
+            visual_offsets,
+            policy_logits,
+            log_sigma,
+            active_logits,
+            geometry_valid,
+        )
+        if not all(isinstance(value, torch.Tensor) for value in required):
+            raise ValueError("w_four_slot_v18 requires complete V18 outputs")
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=refined.device,
+                dtype=torch.float32,
+                rows=int(refined.shape[-1]),
+            )
+            padded_targets = (padded_gt_x, padded_gt_valid)
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+
+        proposal_quality, quality_candidate_valid, gt_valid = (
+            batched_pairwise_range_aware_row_strip_iou(
+                outputs["pred_x_rows"].detach().float(),
+                outputs["range_norm"].detach().float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        route_candidate_valid = outputs[
+            "selection_slot_candidate_valid"
+        ].detach().bool()
+        target_reward, target_valid_set = exact_unordered_set_rewards(
+            proposal_quality.detach(),
+            gt_valid.detach(),
+            route_candidate_valid & quality_candidate_valid,
+            combination_table,
+            threshold_50_temperature=float(
+                self.cfg.four_slot_v18_reward_temperature_50
+            ),
+            threshold_75_temperature=float(
+                self.cfg.four_slot_v18_reward_temperature_75
+            ),
+        )
+        effective_valid_set = valid_set.bool() & target_valid_set
+        set_loss, set_diagnostics = masked_unordered_set_listwise_loss(
+            set_scores,
+            target_reward,
+            effective_valid_set,
+            support_delta=float(self.cfg.four_slot_v18_target_support_delta),
+            target_temperature=float(
+                self.cfg.four_slot_v18_target_temperature
+            ),
+            model_temperature=float(self.cfg.four_slot_v18_model_temperature),
+        )
+
+        # One detached current-output assignment is shared by activity,
+        # alternative geometry, regret policy, uncertainty and soft-F1.
+        matches, deployed_quality, match_count = (
+            self._match_four_slot_unified_final(
+                outputs,
+                targets,
+                padded_targets,
+            )
+        )
+        alternative_outputs = {
+            "pred_x_rows": refined,
+            "range_norm": refined_range,
+            "row_x_logits": delta_logits,
+            "row_x_offsets_px": delta_offsets,
+            "input_reference_x_rows": anchor_x,
+        }
+        point = self.compute_point_loss(alternative_outputs, targets, matches)
+        range_loss = self.compute_range_loss(
+            alternative_outputs, targets, matches
+        )
+        line_iou = self.compute_line_iou_loss(
+            alternative_outputs, targets, matches
+        )
+        dfl = self.compute_row_dfl_loss(
+            alternative_outputs, targets, matches
+        )
+        visual_outputs = {
+            "pred_x_rows": anchor_x,
+            "range_norm": anchor_range,
+            "row_x_logits": visual_logits,
+            "row_x_offsets_px": visual_offsets,
+            "input_reference_x_rows": anchor_x,
+        }
+        visual = self.compute_row_dfl_loss(
+            visual_outputs, targets, matches
+        )
+
+        active_target = torch.zeros_like(active_logits, dtype=torch.float32)
+        for batch_index, match in enumerate(matches):
+            if match["pred_indices"].numel():
+                active_target[batch_index, match["pred_indices"]] = 1.0
+        active = F.binary_cross_entropy_with_logits(
+            active_logits.float(), active_target
+        )
+
+        anchor_quality, _anchor_valid, _ = (
+            batched_pairwise_range_aware_row_strip_iou(
+                anchor_x.detach().float(),
+                anchor_range.detach().float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        refined_quality, _refined_valid, _ = (
+            batched_pairwise_range_aware_row_strip_iou(
+                refined.float(),
+                refined_range.float(),
+                padded_gt_x,
+                padded_gt_valid,
+                input_h=int(self.cfg.input_h),
+                line_width=float(self.cfg.four_slot_line_width),
+                min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+            )
+        )
+        policy_target = torch.zeros_like(active_logits, dtype=torch.long)
+        matched_mask = torch.zeros_like(active_logits, dtype=torch.bool)
+        anchor_rows: list[torch.Tensor] = []
+        refined_rows: list[torch.Tensor] = []
+        nondegradation_rows: list[torch.Tensor] = []
+        uncertainty_rows: list[torch.Tensor] = []
+        soft_quality_50 = torch.zeros_like(active_logits, dtype=torch.float32)
+        soft_quality_75 = torch.zeros_like(active_logits, dtype=torch.float32)
+        refine_probability = torch.softmax(policy_logits.float(), dim=-1)[..., 1]
+        row_count = int(refined.shape[-1])
+        row_fraction = fixed_indices(
+            row_count, device=refined.device, dtype=torch.float32
+        ) / float(max(row_count - 1, 1))
+        for batch_index, match in enumerate(matches):
+            pred_ids = match["pred_indices"]
+            gt_ids = match["gt_indices"]
+            if pred_ids.numel() == 0:
+                continue
+            matched_mask[batch_index, pred_ids] = True
+            q0 = anchor_quality[batch_index, pred_ids, gt_ids]
+            q1 = refined_quality[batch_index, pred_ids, gt_ids]
+            anchor_rows.append(q0.detach())
+            refined_rows.append(q1.detach())
+            policy_target[batch_index, pred_ids] = (
+                q1.detach()
+                > q0.detach() + float(self.cfg.four_slot_v18_policy_margin)
+            ).long()
+            protection_weight = 1.0 + (q0.detach() >= 0.50).float()
+            protection_weight = protection_weight + 2.0 * (
+                q0.detach() >= 0.75
+            ).float()
+            nondegradation_rows.append(
+                protection_weight * F.relu(q0.detach() - q1)
+            )
+
+            target_x = padded_gt_x[batch_index, gt_ids].float()
+            target_valid = padded_gt_valid[batch_index, gt_ids].bool()
+            target_valid = target_valid & torch.isfinite(target_x)
+            selected_x = refined[batch_index, pred_ids].float()
+            selected_log_sigma = log_sigma[batch_index, pred_ids].float()
+            selected_range = refined_range[batch_index, pred_ids].float()
+            range_visible = (
+                (row_fraction.view(1, -1) >= selected_range[:, :1])
+                & (row_fraction.view(1, -1) <= selected_range[:, 1:])
+            )
+            nll_valid = target_valid & range_visible
+            if bool(nll_valid.any()):
+                absolute_error = (selected_x - target_x).abs()
+                uncertainty_rows.append(
+                    (
+                        absolute_error * torch.exp(-selected_log_sigma)
+                        + selected_log_sigma
+                    )[nll_valid]
+                )
+
+            p_refine = refine_probability[batch_index, pred_ids]
+            expected_quality = (1.0 - p_refine) * q0.detach() + p_refine * q1
+            soft_quality_50[batch_index, pred_ids] = torch.sigmoid(
+                (expected_quality - 0.50)
+                / float(self.cfg.four_slot_v18_reward_temperature_50)
+            )
+            soft_quality_75[batch_index, pred_ids] = torch.sigmoid(
+                (expected_quality - 0.75)
+                / float(self.cfg.four_slot_v18_reward_temperature_75)
+            )
+
+        policy = F.cross_entropy(
+            policy_logits.float().reshape(-1, 2),
+            policy_target.reshape(-1),
+        )
+        uncertainty = (
+            torch.cat(uncertainty_rows).mean()
+            if uncertainty_rows
+            else log_sigma.sum() * 0.0
+        )
+        nondegradation = (
+            torch.cat(nondegradation_rows).mean()
+            if nondegradation_rows
+            else refined.sum() * 0.0
+        )
+
+        active_probability = torch.sigmoid(active_logits.float())
+        gt_count = gt_valid.float().sum()
+
+        def soft_f1_loss(quality_probability: torch.Tensor) -> torch.Tensor:
+            soft_tp = (active_probability * quality_probability).sum()
+            soft_prediction = active_probability.sum()
+            denominator = (soft_prediction + gt_count).clamp_min(1.0e-6)
+            return 1.0 - 2.0 * soft_tp / denominator
+
+        soft_f1_50 = soft_f1_loss(soft_quality_50)
+        soft_f1_75 = soft_f1_loss(soft_quality_75)
+
+        total = (
+            float(self.cfg.four_slot_v18_set_weight) * set_loss
+            + float(self.cfg.four_slot_v18_active_weight) * active
+            + float(self.cfg.four_slot_v18_visual_weight) * visual
+            + float(self.cfg.four_slot_v18_point_weight) * point
+            + float(self.cfg.four_slot_v18_range_weight) * range_loss
+            + float(self.cfg.four_slot_v18_line_iou_weight) * line_iou
+            + float(self.cfg.four_slot_v18_dfl_weight) * dfl
+            + float(self.cfg.four_slot_v18_uncertainty_weight) * uncertainty
+            + float(self.cfg.four_slot_v18_policy_weight) * policy
+            + float(self.cfg.four_slot_v18_soft_f1_50_weight) * soft_f1_50
+            + float(self.cfg.four_slot_v18_soft_f1_75_weight) * soft_f1_75
+            + float(self.cfg.four_slot_v18_nondegradation_weight)
+            * nondegradation
+        )
+        zero = total.detach() * 0.0
+        return {
+            "total": total,
+            "set": set_loss,
+            "active": active,
+            "visual": visual,
+            "point": point,
+            "range": range_loss,
+            "line_iou": line_iou,
+            "dfl": dfl,
+            "uncertainty": uncertainty,
+            "policy": policy,
+            "soft_f1_50": soft_f1_50,
+            "soft_f1_75": soft_f1_75,
+            "nondegradation": nondegradation,
+            "target_entropy": set_diagnostics["target_entropy"],
+            "target_support_size": set_diagnostics["support_size"],
+            "chosen_set_regret": set_diagnostics["chosen_regret"],
+            "mean_anchor_quality": (
+                torch.cat(anchor_rows).mean() if anchor_rows else zero
+            ),
+            "mean_refined_quality": (
+                torch.cat(refined_rows).mean() if refined_rows else zero
+            ),
+            "mean_refine_probability": refine_probability.mean().detach(),
+            "mean_matched": match_count.mean().detach(),
         }
 
     def compute_four_slot_v17_loss(

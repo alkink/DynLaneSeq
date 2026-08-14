@@ -1,0 +1,171 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v18_joint_exact_set_energy_225k
+
+model:
+  multi_scale_evidence:
+    enabled: true
+    # P5 is retained for exact V7 proposal semantics. V18 consumes P2/P3/P4.
+    scales: [p2, p3, p4, p5]
+  structured_query:
+    # The existing final proposal objective remains active, but duplicate
+    # intermediate assignments are not part of this causal gate.
+    intermediate_supervision: false
+    set_selection:
+      four_slot_refinement_route_gradient_scale: 0.0
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: false
+      four_slot_visual_first_association_enabled: false
+      four_slot_visual_precision_geometry_enabled: false
+      four_slot_corrected_visual_first_association_enabled: false
+      four_slot_corrected_visual_first_geometry_enabled: false
+      four_slot_bottom_aware_relational_geometry_enabled: false
+      four_slot_candidate_aligned_reranker_enabled: false
+      four_slot_iterative_slot_geometry_enabled: false
+
+      four_slot_joint_exact_set_energy_enabled: true
+      four_slot_joint_exact_set_energy_hidden_dim: 256
+      four_slot_joint_exact_set_energy_num_heads: 8
+      four_slot_joint_exact_set_energy_ff_dim: 512
+      four_slot_joint_exact_set_energy_dropout: 0.0
+      four_slot_joint_exact_set_energy_scale_names: [p2, p3, p4]
+      four_slot_joint_exact_set_energy_association_offsets_px:
+        [-32, -16, -8, 0, 8, 16, 32]
+      four_slot_joint_exact_set_energy_visual_offsets_px:
+        [-64, -32, -16, 0, 16, 32, 64]
+      four_slot_joint_exact_set_energy_delta_offsets_px:
+        [-64, -32, -16, -8, 0, 8, 16, 32, 64]
+      four_slot_joint_exact_set_energy_range_offsets_norm:
+        [-0.025, -0.0125, 0.0, 0.0125, 0.025]
+      four_slot_joint_exact_set_energy_permutation_temperature: 1.0
+      four_slot_joint_exact_set_energy_keep_prior_probability: 0.997
+      four_slot_joint_exact_set_energy_detach_association_for_set_loss: false
+
+loss:
+  # Preserve the mature 32-proposal coverage task while learning V18.
+  w_exist: 2.0
+  w_intermediate_exist: 0.0
+  w_point: 5.0
+  w_range: 1.0
+  w_smooth: 0.0
+  w_line_iou: 2.0
+  w_row_dfl: 0.5
+  w_seg: 1.0
+  w_centerline: 0.25
+  # Lock every inherited auxiliary branch off explicitly.  V18 keeps the
+  # mature proposal objective plus one final-set objective; it must not pick
+  # up a hidden coarse/draft/auxiliary assignment from a parent config.
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+
+  # Legacy four-slot losses must not teach an independent unary route or
+  # alter the frozen V7 bounded anchor in this experiment.
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+  w_four_slot_unified: 0.0
+  w_four_slot_visual_first: 0.0
+  w_four_slot_visual_precision: 0.0
+  w_four_slot_v14_stage_a: 0.0
+  w_four_slot_v14_stage_b: 0.0
+  w_four_slot_v15: 0.0
+  w_four_slot_v16: 0.0
+  w_four_slot_v17: 0.0
+
+  w_four_slot_v18: 1.0
+  four_slot_v18_set_weight: 1.0
+  four_slot_v18_active_weight: 1.0
+  four_slot_v18_visual_weight: 1.0
+  four_slot_v18_point_weight: 5.0
+  four_slot_v18_range_weight: 1.0
+  four_slot_v18_line_iou_weight: 2.0
+  four_slot_v18_dfl_weight: 1.0
+  four_slot_v18_uncertainty_weight: 0.5
+  four_slot_v18_policy_weight: 1.0
+  four_slot_v18_soft_f1_50_weight: 1.0
+  four_slot_v18_soft_f1_75_weight: 0.5
+  four_slot_v18_nondegradation_weight: 1.0
+  four_slot_v18_target_support_delta: 0.10
+  four_slot_v18_target_temperature: 0.10
+  four_slot_v18_model_temperature: 1.0
+  four_slot_v18_reward_temperature_50: 0.03
+  four_slot_v18_reward_temperature_75: 0.03
+  four_slot_v18_policy_margin: 0.01
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.00001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  parameter_groups:
+    - name: v18_joint_set
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.joint_exact_set_energy.
+    - name: v18_new_p3_projection
+      lr: 0.0001
+      prefixes:
+        - encoder.ms_proj.p3.
+    - name: v18_shared_fpn
+      lr: 0.00001
+      prefixes:
+        - encoder.fpn.
+        - encoder.proj.
+        - encoder.ms_proj.p4.
+    - name: v18_shared_backbone
+      lr: 0.00001
+      prefixes:
+        - encoder.backbone.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 8000
+  checkpoint_interval: 1000
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.joint_exact_set_energy
+    - encoder.backbone
+    - encoder.fpn
+    - encoder.proj
+    - encoder.ms_proj.p3
+    - encoder.ms_proj.p4
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: false
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.joint_exact_set_energy
+    - encoder.backbone
+    - encoder.fpn
+    - encoder.proj
+    - encoder.ms_proj.p3
+    - encoder.ms_proj.p4
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
+  v18_gradient_conflict_projection:
+    enabled: true
+    shared_prefixes:
+      - encoder.backbone.
+      - encoder.fpn.
+      - encoder.proj.
+      - encoder.ms_proj.p4.
+    exclude_prefixes: []
+
+postprocess:
+  score_mode: four_slot
+  score_thresh: 0.0
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4

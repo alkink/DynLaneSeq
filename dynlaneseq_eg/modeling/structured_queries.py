@@ -3371,6 +3371,87 @@ class StructuredLaneQueryHead(nn.Module):
                         (-0.025, -0.0125, 0.0, 0.0125, 0.025),
                     )
                 ),
+                joint_exact_set_energy_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_enabled", False
+                    )
+                ),
+                joint_exact_set_energy_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                joint_exact_set_energy_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                joint_exact_set_energy_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                joint_exact_set_energy_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_dropout", 0.0
+                    )
+                ),
+                joint_exact_set_energy_scale_names=tuple(
+                    str(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_scale_names",
+                        ("p2", "p3", "p4"),
+                    )
+                ),
+                joint_exact_set_energy_association_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_association_offsets_px",
+                        (-32.0, -16.0, -8.0, 0.0, 8.0, 16.0, 32.0),
+                    )
+                ),
+                joint_exact_set_energy_visual_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_visual_offsets_px",
+                        (-64.0, -32.0, -16.0, 0.0, 16.0, 32.0, 64.0),
+                    )
+                ),
+                joint_exact_set_energy_delta_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_delta_offsets_px",
+                        (-64.0, -32.0, -16.0, -8.0, 0.0, 8.0, 16.0, 32.0, 64.0),
+                    )
+                ),
+                joint_exact_set_energy_range_offsets_norm=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_range_offsets_norm",
+                        (-0.025, -0.0125, 0.0, 0.0125, 0.025),
+                    )
+                ),
+                joint_exact_set_energy_permutation_temperature=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_permutation_temperature",
+                        1.0,
+                    )
+                ),
+                joint_exact_set_energy_keep_prior_probability=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_keep_prior_probability",
+                        0.997,
+                    )
+                ),
+                joint_exact_set_energy_detach_association_for_set_loss=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_exact_set_energy_detach_association_for_set_loss",
+                        False,
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
@@ -4236,8 +4317,17 @@ class StructuredLaneQueryHead(nn.Module):
                     False,
                 )
             ):
+                selection_row_features = row_value_features
+                if not bool(
+                    getattr(
+                        self.set_selection_head,
+                        "requires_live_row_value_features",
+                        False,
+                    )
+                ):
+                    selection_row_features = selection_row_features.detach()
                 selection_kwargs: dict[str, Any] = {
-                    "row_value_features": row_value_features.detach(),
+                    "row_value_features": selection_row_features,
                 }
                 if bool(
                     getattr(
@@ -4342,6 +4432,37 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_unified_activity_residual",
                 "selection_slot_unified_base_x_rows",
                 "selection_slot_unified_base_range_norm",
+                "selection_slot_v18_unary_residual",
+                "selection_slot_v18_unary",
+                "selection_slot_v18_pair_energy",
+                "selection_slot_v18_unordered_set_scores",
+                "selection_slot_v18_valid_set",
+                "selection_slot_v18_combination_indices",
+                "selection_slot_v18_set_index",
+                "selection_slot_v18_permutation_index",
+                "selection_slot_v18_set_margin",
+                "selection_slot_v18_anchor_x_rows",
+                "selection_slot_v18_anchor_range_norm",
+                "selection_slot_v18_refined_x_rows",
+                "selection_slot_v18_refined_range_norm",
+                "selection_slot_v18_delta_x_rows",
+                "selection_slot_v18_delta_logits",
+                "selection_slot_v18_delta_offsets_px",
+                "selection_slot_v18_range_logits",
+                "selection_slot_v18_range_offsets_norm",
+                "selection_slot_v18_log_sigma",
+                "selection_slot_v18_policy_logits",
+                "selection_slot_v18_policy",
+                "selection_slot_v18_visual_logits",
+                "selection_slot_v18_visual_offsets_px",
+                "selection_slot_v18_visual_attention",
+                "selection_slot_v18_proposal_attention",
+                "selection_slot_v18_v7_real_route_logits",
+                "selection_slot_v18_v7_geometry_route_indices",
+                "selection_slot_v18_v7_indices",
+                "selection_slot_v18_v7_scores",
+                "selection_slot_v18_v7_active_logits",
+                "selection_slot_v18_v7_active",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]
