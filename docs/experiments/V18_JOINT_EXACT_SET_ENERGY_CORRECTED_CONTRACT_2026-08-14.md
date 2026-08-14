@@ -222,6 +222,25 @@ treatment must beat the paired detach-control. If either domain or the causal
 comparison fails, V18 stops. No checkpoint selection, continuation or metric
 tuning is authorized.
 
+## Verified execution path
+
+The first non-scientific throughput pilot was stopped and archived at
+iteration 225900; it is never resumed or interpreted as a model result. On the
+target PyTorch 2.11 / RTX 5090 environment the original three-pass gradient
+projection path sustained 9.4 img/s. An arithmetic-equivalent partitioned
+two-pass backward, vectorized exact reward/listwise construction, and removal
+of host synchronizations raised eager execution to 13.1 img/s. Unit tests
+compare every trainable gradient and the projection statistics against the
+reference path, including pre-existing accumulated gradients.
+
+Compiling the same full model raised post-warmup throughput to 19.5 img/s at
+physical batch 4 / accumulation 4. The alternative row-aligned linear sampler
+was slower end-to-end (12.8 versus 13.1 img/s eager), so the official path
+retains FP32 `grid_sample`. Treatment and control both use the same compiled
+execution. Compilation, benchmark checkpoints, and the stopped pilot do not
+alter the fixed data order, objective, endpoint, or checkpoint-selection
+contract.
+
 ## Stop rule
 
 When the V18 fixed endpoint and its causal audit are complete, stop. Do not

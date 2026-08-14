@@ -209,7 +209,10 @@ train_arm() {
     --grad-accum "${GRAD_ACCUM}"
     --num-workers "${NUM_WORKERS}"
     --seg-aux-amp-dtype "${AMP_DTYPE}"
-    --compile-model false
+    # PyTorch 2.11/RTX 5090 steady-state A/B: 19.5 img/s compiled versus
+    # 13.1 img/s eager after the arithmetic-preserving V18 optimizations.
+    # Treatment and control both use the same compiled execution path.
+    --compile-model true
     --resume-safe-data true
     --train-list "${TRAIN_LIST}"
   )
