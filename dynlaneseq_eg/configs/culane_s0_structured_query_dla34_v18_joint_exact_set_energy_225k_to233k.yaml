@@ -30,9 +30,10 @@ model:
       four_slot_joint_exact_set_energy_ff_dim: 512
       four_slot_joint_exact_set_energy_dropout: 0.0
       four_slot_joint_exact_set_energy_scale_names: [p2, p3, p4]
-      # All V18 queries use the fixed 160 row grid. The specialized separable
-      # bilinear sampler avoids three general FP32 grid_sample calls.
-      four_slot_joint_exact_set_energy_sampling_backend: linear_gather
+      # End-to-end RTX 5090 timing favored the numerically established
+      # grid_sample path (13.1 versus 12.8 img/s for linear_gather). Keep the
+      # alternative implementation available only as a diagnostic backend.
+      four_slot_joint_exact_set_energy_sampling_backend: grid_sample
       four_slot_joint_exact_set_energy_association_offsets_px:
         [-32, -16, -8, 0, 8, 16, 32]
       four_slot_joint_exact_set_energy_visual_offsets_px:
