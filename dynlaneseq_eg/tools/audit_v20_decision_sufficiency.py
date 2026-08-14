@@ -63,6 +63,18 @@ def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
     return 0.0 if float(denominator) == 0.0 else float(numerator) / float(denominator)
 
 
+def _positive_prevalence(labels: torch.Tensor) -> float:
+    labels = labels.detach().bool().flatten()
+    return float(labels.float().mean()) if labels.numel() else float("nan")
+
+
+def _ap_lift(average_precision_value: float, labels: torch.Tensor) -> float:
+    prevalence = _positive_prevalence(labels)
+    if not math.isfinite(prevalence) or prevalence <= 0.0:
+        return float("nan")
+    return float(average_precision_value) / prevalence
+
+
 def _score_summary(values: torch.Tensor) -> dict[str, float | int]:
     values = values.detach().float().flatten().cpu()
     finite = values[torch.isfinite(values)]
@@ -128,8 +140,15 @@ def _slot_candidate_decomposition(
     predicted_slot = slot_scores.argmax(dim=1)
     positive_slot = positive.any(dim=2)
     slot_hit = positive_slot.gather(1, predicted_slot.unsqueeze(1)).squeeze(1)
+    valid_slot = action_valid.any(dim=2)
+    random_slot_hit = (
+        positive_slot.sum(dim=1).float()
+        / valid_slot.sum(dim=1).float().clamp_min(1.0)
+    )
 
     ranks: list[int] = []
+    random_candidate_top1: list[float] = []
+    random_candidate_top5: list[float] = []
     for image in torch.nonzero(opportunity, as_tuple=False).flatten().tolist():
         for slot in torch.nonzero(positive_slot[image], as_tuple=False).flatten().tolist():
             valid = action_valid[image, slot]
@@ -149,6 +168,20 @@ def _slot_candidate_decomposition(
             ).flatten()
             if positive_positions.numel():
                 ranks.append(int(positive_positions[0]) + 1)
+                valid_count = int(candidate_ids.numel())
+                positive_count = int(positives[candidate_ids].sum())
+                random_candidate_top1.append(
+                    _safe_ratio(positive_count, valid_count)
+                )
+                sample_count = min(5, valid_count)
+                misses = valid_count - positive_count
+                miss_probability = (
+                    0.0
+                    if misses < sample_count
+                    else float(math.comb(misses, sample_count))
+                    / float(math.comb(valid_count, sample_count))
+                )
+                random_candidate_top5.append(1.0 - miss_probability)
     rank_tensor = torch.tensor(ranks, dtype=torch.float32)
     return {
         "opportunity_images": int(opportunity.sum()),
@@ -157,9 +190,24 @@ def _slot_candidate_decomposition(
             if bool(opportunity.any())
             else float("nan")
         ),
+        "slot_uniform_random_top1_hit": (
+            float(random_slot_hit[opportunity].mean())
+            if bool(opportunity.any())
+            else float("nan")
+        ),
         "candidate_cases": len(ranks),
         "candidate_top1_hit": _safe_ratio(sum(rank == 1 for rank in ranks), len(ranks)),
         "candidate_top5_recall": _safe_ratio(sum(rank <= 5 for rank in ranks), len(ranks)),
+        "candidate_uniform_random_top1_hit": (
+            sum(random_candidate_top1) / len(random_candidate_top1)
+            if random_candidate_top1
+            else float("nan")
+        ),
+        "candidate_uniform_random_top5_recall": (
+            sum(random_candidate_top5) / len(random_candidate_top5)
+            if random_candidate_top5
+            else float("nan")
+        ),
         "candidate_mean_best_positive_rank": (
             float(rank_tensor.mean()) if rank_tensor.numel() else float("nan")
         ),
@@ -253,6 +301,13 @@ def decision_metrics(
         "harmful": _score_summary(flat_scores[flat_harmful]),
         "neutral": _score_summary(flat_scores[flat_neutral]),
     }
+    beneficial_ap = average_precision(flat_scores, flat_beneficial)
+    policy_ap = average_precision(flat_scores, flat_policy)
+    edit_ap = average_precision(best_replacement_score, opportunity)
+    delta50_ap = average_precision(flat_delta50_score, flat_delta50_positive)
+    delta75_ap = average_precision(flat_delta75_score, flat_delta75_positive)
+    duplicate_ap = average_precision(flat_duplicate_score, flat_duplicate_target)
+    abandon_ap = average_precision(flat_abandon_score, flat_abandon_target)
     return {
         "population": {
             "images": images,
@@ -264,11 +319,15 @@ def decision_metrics(
             "policy_target_actions": int(flat_policy.sum()),
         },
         "action_ranking": {
-            "beneficial_average_precision": average_precision(
-                flat_scores, flat_beneficial
+            "beneficial_average_precision": beneficial_ap,
+            "beneficial_prevalence": _positive_prevalence(flat_beneficial),
+            "beneficial_average_precision_lift": _ap_lift(
+                beneficial_ap, flat_beneficial
             ),
-            "policy_target_average_precision": average_precision(
-                flat_scores, flat_policy
+            "policy_target_average_precision": policy_ap,
+            "policy_target_prevalence": _positive_prevalence(flat_policy),
+            "policy_target_average_precision_lift": _ap_lift(
+                policy_ap, flat_policy
             ),
             "top1_beneficial_precision_all_images": float(
                 raw_best_beneficial.float().mean()
@@ -284,26 +343,40 @@ def decision_metrics(
             "score_groups": score_groups,
         },
         "individual_head_separability": {
-            "policy_logit_beneficial_average_precision": average_precision(
-                flat_scores, flat_beneficial
+            "policy_logit_beneficial_average_precision": beneficial_ap,
+            "delta50_positive_average_precision": delta50_ap,
+            "delta50_positive_prevalence": _positive_prevalence(
+                flat_delta50_positive
             ),
-            "delta50_positive_average_precision": average_precision(
-                flat_delta50_score, flat_delta50_positive
+            "delta50_positive_average_precision_lift": _ap_lift(
+                delta50_ap, flat_delta50_positive
             ),
-            "delta75_positive_average_precision": average_precision(
-                flat_delta75_score, flat_delta75_positive
+            "delta75_positive_average_precision": delta75_ap,
+            "delta75_positive_prevalence": _positive_prevalence(
+                flat_delta75_positive
             ),
-            "duplicate_risk_average_precision": average_precision(
-                flat_duplicate_score, flat_duplicate_target
+            "delta75_positive_average_precision_lift": _ap_lift(
+                delta75_ap, flat_delta75_positive
             ),
-            "abandon_risk_average_precision": average_precision(
-                flat_abandon_score, flat_abandon_target
+            "duplicate_risk_average_precision": duplicate_ap,
+            "duplicate_risk_prevalence": _positive_prevalence(
+                flat_duplicate_target
+            ),
+            "duplicate_risk_average_precision_lift": _ap_lift(
+                duplicate_ap, flat_duplicate_target
+            ),
+            "abandon_risk_average_precision": abandon_ap,
+            "abandon_risk_prevalence": _positive_prevalence(
+                flat_abandon_target
+            ),
+            "abandon_risk_average_precision_lift": _ap_lift(
+                abandon_ap, flat_abandon_target
             ),
         },
         "edit_detection": {
-            "average_precision": average_precision(
-                best_replacement_score, opportunity
-            ),
+            "average_precision": edit_ap,
+            "positive_prevalence": _positive_prevalence(opportunity),
+            "average_precision_lift": _ap_lift(edit_ap, opportunity),
             "raw_keep_zero_rule": {
                 "selected": int(raw_edit.sum()),
                 "precision": _safe_ratio(
