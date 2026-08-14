@@ -194,7 +194,7 @@ on the target CUDA environment before training.
 
 ```text
 source:             exact V7 iteration 225000
-train:              fixed 8192 images / 1024 clips
+train:              fixed 8192 images / 640 clips (12/13 balanced)
 held-out:           fixed clip-disjoint 256
 validation:         fixed uniform 256
 optimizer steps:    8000
@@ -209,6 +209,13 @@ Top-K:              4
 NMS:                0
 test/full val:      closed
 ```
+
+The original 1024-clip proposal is impossible for the checked CULane list:
+there are only 705 path-level clips in total, of which 704 have the 13-frame
+capacity required here. Sixty-four clips are reserved for the disjoint held-out
+domain; 640 deterministic train clips retain the full 8192-image budget with a
+balanced 12/13 image allocation. This correction is explicit in the list
+protocol and provenance.
 
 Both domains must independently satisfy the predeclared official gate, and
 treatment must beat the paired detach-control. If either domain or the causal

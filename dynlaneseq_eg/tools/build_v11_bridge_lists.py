@@ -20,6 +20,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--train-clips", type=int, default=512)
     parser.add_argument("--train-images", type=int, default=4096)
+    parser.add_argument(
+        "--balanced-train-remainder",
+        action="store_true",
+        help=(
+            "Allow train-images not divisible by train-clips and distribute "
+            "the remainder deterministically, at most one extra image/clip."
+        ),
+    )
     parser.add_argument("--seen-images", type=int, default=256)
     parser.add_argument("--same-clip-unseen-images", type=int, default=256)
     parser.add_argument("--heldout-clips", type=int, default=64)
@@ -124,13 +132,19 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     train_by_clip = _group(train_lines)
     val_by_clip = _group(val_lines)
 
-    if int(args.train_images) % int(args.train_clips):
+    per_train_clip, train_remainder = divmod(
+        int(args.train_images), int(args.train_clips)
+    )
+    balanced_remainder = bool(
+        getattr(args, "balanced_train_remainder", False)
+    )
+    if train_remainder and not balanced_remainder:
         raise ValueError("train-images must divide evenly across train-clips")
-    per_train_clip = int(args.train_images) // int(args.train_clips)
+    max_train_per_clip = per_train_clip + int(train_remainder > 0)
     eligible_train_clips = [
         clip
         for clip, lines in train_by_clip.items()
-        if len(lines) >= per_train_clip
+        if len(lines) >= max_train_per_clip
     ]
     ordered_train_clips = _ordered(
         eligible_train_clips,
@@ -152,10 +166,11 @@ def build(args: argparse.Namespace) -> dict[str, object]:
 
     train_subset: list[str] = []
     selected_by_clip: dict[str, list[str]] = {}
-    for clip in selected_train_clips:
+    for clip_index, clip in enumerate(selected_train_clips):
+        clip_image_count = per_train_clip + int(clip_index < train_remainder)
         chosen = _choose_lines(
             train_by_clip[clip],
-            per_train_clip,
+            clip_image_count,
             seed=args.seed,
             namespace=f"train-frames:{clip}",
         )
@@ -334,6 +349,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         "parameters": {
             "train_clips": int(args.train_clips),
             "train_images": int(args.train_images),
+            "balanced_train_remainder": balanced_remainder,
+            "train_images_per_clip_base": per_train_clip,
+            "train_clips_with_one_extra_image": train_remainder,
             "seen_images": int(args.seen_images),
             "same_clip_unseen_images": int(args.same_clip_unseen_images),
             "heldout_clips": int(args.heldout_clips),

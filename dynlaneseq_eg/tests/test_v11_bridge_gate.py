@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
+
+import pytest
 
 from dynlaneseq_eg.tools.build_v11_bridge_lists import build
 from dynlaneseq_eg.tools import summarize_v11_bridge_gate
@@ -74,6 +77,63 @@ def test_bridge_list_builder_is_deterministic_and_clip_disjoint(tmp_path: Path):
     assert _clips(same_paths) <= _clips(train_paths)
     assert not (_clips(heldout_paths) & _clips(train_paths))
     assert not (_clips(val_paths) & _clips(train_paths))
+
+
+def test_bridge_list_builder_balances_a_nondivisible_train_budget(
+    tmp_path: Path,
+):
+    train = tmp_path / "train_gt.txt"
+    val = tmp_path / "val.txt"
+    train.write_text(
+        "\n".join(
+            f"/driver_train/clip_{clip:02d}/{frame:04d}.jpg "
+            f"/seg/{clip:02d}_{frame:04d}.png 1 1 0 0"
+            for clip in range(8)
+            for frame in range(6)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    val.write_text(
+        "\n".join(
+            f"/driver_val/clip_{clip:02d}/{frame:04d}.jpg"
+            for clip in range(2)
+            for frame in range(4)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    arguments = dict(
+        train_list=str(train),
+        val_list=str(val),
+        output_dir=str(tmp_path / "balanced"),
+        seed=3407,
+        train_clips=5,
+        train_images=13,
+        seen_images=2,
+        same_clip_unseen_images=2,
+        heldout_clips=2,
+        heldout_images=4,
+        val_images=4,
+        output_json=str(tmp_path / "balanced" / "protocol.json"),
+    )
+    with pytest.raises(ValueError, match="divide evenly"):
+        build(argparse.Namespace(**arguments))
+
+    report = build(
+        argparse.Namespace(**arguments, balanced_train_remainder=True)
+    )
+    assert report["passed"] is True
+    assert report["parameters"]["train_images_per_clip_base"] == 2
+    assert report["parameters"]["train_clips_with_one_extra_image"] == 3
+    train_lines = Path(report["lists"]["train"]["path"]).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    per_clip = Counter(
+        "/".join(line.split()[0].split("/")[:-1]) for line in train_lines
+    )
+    assert sorted(per_clip.values()) == [2, 2, 3, 3, 3]
 
 
 def _metric(tp: int, fp: int, fn: int, mean_selected: float = 3.0):
