@@ -1278,6 +1278,16 @@ class LossConfig:
     four_slot_v18_reward_temperature_50: float = 0.03
     four_slot_v18_reward_temperature_75: float = 0.03
     four_slot_v18_policy_margin: float = 0.01
+    # V19 trains only proposal-level counterfactual fidelity on a completely
+    # frozen/eval V7 detector.  Its online row-strip target is audited against
+    # the exact raster evaluator; deployment PASS never uses this surrogate.
+    w_four_slot_v19: float = 0.0
+    four_slot_v19_p50_weight: float = 1.0
+    four_slot_v19_p75_weight: float = 0.5
+    four_slot_v19_iou_weight: float = 1.0
+    four_slot_v19_rank_weight: float = 1.0
+    four_slot_v19_rank_temperature: float = 0.10
+    four_slot_v19_rank_min_gap: float = 0.02
     w_centerline: float = 0.0
     w_row_dfl: float = 0.0
     row_dfl_warmup_iters: int = 0
@@ -1588,6 +1598,7 @@ class S0Criterion(nn.Module):
             or self.cfg.w_four_slot_v16 != 0
             or self.cfg.w_four_slot_v17 != 0
             or self.cfg.w_four_slot_v18 != 0
+            or self.cfg.w_four_slot_v19 != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1897,6 +1908,29 @@ class S0Criterion(nn.Module):
                 "mean_refined_quality": zero,
                 "mean_refine_probability": zero,
             }
+        if self.cfg.w_four_slot_v19 != 0:
+            four_slot_v19 = self.compute_four_slot_v19_loss(
+                outputs,
+                targets,
+                four_slot_targets,
+            )
+        else:
+            four_slot_v19 = {
+                "total": zero,
+                "p50": zero,
+                "p75": zero,
+                "iou": zero,
+                "rank": zero,
+                "mean_target_iou": zero,
+                "pearson": zero,
+                "pair_accuracy": zero,
+                "threshold_pair_accuracy": zero,
+                "selected_quality": zero,
+                "v7_selected_quality": zero,
+                "oracle_quality": zero,
+                "selected_regret": zero,
+                "v7_regret": zero,
+            }
         loss_centerline = self.compute_centerline_loss(raw_outputs, targets) if self.cfg.w_centerline != 0 else zero
         row_dfl_weight = self.row_dfl_weight()
         loss_row_dfl = self.compute_row_dfl_loss(outputs, targets, matches, matched_lanes) if row_dfl_weight != 0 else zero
@@ -1935,6 +1969,7 @@ class S0Criterion(nn.Module):
             + self.cfg.w_four_slot_v16 * four_slot_v16["total"]
             + self.cfg.w_four_slot_v17 * four_slot_v17["total"]
             + self.cfg.w_four_slot_v18 * four_slot_v18["total"]
+            + self.cfg.w_four_slot_v19 * four_slot_v19["total"]
             + self.cfg.w_centerline * loss_centerline
             + row_dfl_weight * loss_row_dfl
             + self.cfg.w_dynamic_proposal_heatmap * dynamic_proposal_losses["heatmap"]
@@ -2309,6 +2344,34 @@ class S0Criterion(nn.Module):
             "four_slot_v18_mean_refine_probability": four_slot_v18[
                 "mean_refine_probability"
             ],
+            "loss_four_slot_v19": four_slot_v19["total"],
+            "loss_four_slot_v19_p50": four_slot_v19["p50"],
+            "loss_four_slot_v19_p75": four_slot_v19["p75"],
+            "loss_four_slot_v19_iou": four_slot_v19["iou"],
+            "loss_four_slot_v19_rank": four_slot_v19["rank"],
+            "four_slot_v19_mean_target_iou": four_slot_v19[
+                "mean_target_iou"
+            ],
+            "four_slot_v19_pearson": four_slot_v19["pearson"],
+            "four_slot_v19_pair_accuracy": four_slot_v19[
+                "pair_accuracy"
+            ],
+            "four_slot_v19_threshold_pair_accuracy": four_slot_v19[
+                "threshold_pair_accuracy"
+            ],
+            "four_slot_v19_selected_quality": four_slot_v19[
+                "selected_quality"
+            ],
+            "four_slot_v19_v7_selected_quality": four_slot_v19[
+                "v7_selected_quality"
+            ],
+            "four_slot_v19_oracle_quality": four_slot_v19[
+                "oracle_quality"
+            ],
+            "four_slot_v19_selected_regret": four_slot_v19[
+                "selected_regret"
+            ],
+            "four_slot_v19_v7_regret": four_slot_v19["v7_regret"],
             "loss_centerline": loss_centerline,
             "loss_row_dfl": loss_row_dfl,
             "weight_row_dfl": zero.new_tensor(row_dfl_weight),
@@ -4630,6 +4693,237 @@ class S0Criterion(nn.Module):
             "mean_final_quality": mean_final,
             "mean_quality_gain": (mean_final - mean_anchor).detach(),
             "mean_abs_delta_px": mean_delta,
+        }
+
+    def compute_four_slot_v19_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Supervise frozen-V7 counterfactual fidelity candidate by candidate.
+
+        V19 deliberately avoids an inter-candidate encoder.  Each of the
+        ``S x N`` counterfactual frozen-V7 anchors receives a detached
+        range-aware row-strip IoU target.  Binary threshold heads learn the
+        two official decision boundaries while a continuous head and a
+        same-GT pairwise loss calibrate the ordering inside each proposal
+        population.  The online target remains a differentiable-surrogate
+        geometry definition; the predeclared deployment gate uses only the
+        exact CULane raster evaluator.
+        """
+
+        quality_logits = outputs.get("selection_slot_v19_quality_logits")
+        fidelity_delta = outputs.get("selection_slot_v19_fidelity_delta")
+        counterfactual_x = outputs.get(
+            "selection_slot_v19_counterfactual_x_rows"
+        )
+        counterfactual_range = outputs.get(
+            "selection_slot_v19_counterfactual_range_norm"
+        )
+        counterfactual_valid = outputs.get(
+            "selection_slot_v19_counterfactual_valid"
+        )
+        candidate_valid = outputs.get("selection_slot_candidate_valid")
+        selected_indices = outputs.get("selection_slot_indices")
+        v7_indices = outputs.get("selection_slot_v19_v7_indices")
+        required = (
+            quality_logits,
+            fidelity_delta,
+            counterfactual_x,
+            counterfactual_range,
+            counterfactual_valid,
+            candidate_valid,
+            selected_indices,
+            v7_indices,
+        )
+        if not all(isinstance(value, torch.Tensor) for value in required):
+            raise ValueError("w_four_slot_v19 requires complete V19 outputs")
+        if quality_logits.ndim != 4 or quality_logits.shape[-1] != 3:
+            raise ValueError("V19 quality logits must have shape [B,S,N,3]")
+
+        batch, slots, candidates, rows = counterfactual_x.shape
+        if quality_logits.shape[:3] != (batch, slots, candidates):
+            raise ValueError("V19 quality and counterfactual shapes disagree")
+        if counterfactual_range.shape != (batch, slots, candidates, 2):
+            raise ValueError("V19 counterfactual range shape mismatch")
+        if padded_targets is None:
+            padded_gt_x, padded_gt_valid = _padded_lane_targets(
+                targets,
+                device=counterfactual_x.device,
+                dtype=torch.float32,
+                rows=int(rows),
+            )
+        else:
+            padded_gt_x, padded_gt_valid = padded_targets
+
+        flat_x = counterfactual_x.detach().float().reshape(
+            batch, slots * candidates, rows
+        )
+        flat_range = counterfactual_range.detach().float().reshape(
+            batch, slots * candidates, 2
+        )
+        with torch.no_grad():
+            pairwise_quality, geometry_valid, gt_valid = (
+                batched_pairwise_range_aware_row_strip_iou(
+                    flat_x,
+                    flat_range,
+                    padded_gt_x,
+                    padded_gt_valid,
+                    input_h=int(self.cfg.input_h),
+                    line_width=float(self.cfg.four_slot_line_width),
+                    min_valid_rows=int(self.cfg.four_slot_min_valid_rows),
+                )
+            )
+            pairwise_quality = pairwise_quality.reshape(
+                batch, slots, candidates, -1
+            )
+            geometry_valid = geometry_valid.reshape(batch, slots, candidates)
+            if pairwise_quality.shape[-1] > 0:
+                target_iou, best_gt = pairwise_quality.max(dim=-1)
+            else:
+                target_iou = flat_x.new_zeros((batch, slots, candidates))
+                best_gt = torch.full(
+                    (batch, slots, candidates),
+                    -1,
+                    dtype=torch.long,
+                    device=flat_x.device,
+                )
+            has_gt = gt_valid.any(dim=-1).view(batch, 1, 1)
+            effective_valid = (
+                geometry_valid
+                & counterfactual_valid.detach().bool()
+                & candidate_valid.detach().bool().unsqueeze(1)
+                & has_gt
+            )
+
+        logits = quality_logits.float()
+        valid_float = effective_valid.float()
+        valid_count = valid_float.sum().clamp_min(1.0)
+
+        def masked_bce(channel: int, threshold: float) -> torch.Tensor:
+            target = (target_iou >= float(threshold)).float()
+            element = F.binary_cross_entropy_with_logits(
+                logits[..., channel], target, reduction="none"
+            )
+            return (element * valid_float).sum() / valid_count
+
+        p50 = masked_bce(0, 0.50)
+        p75 = masked_bce(1, 0.75)
+        predicted_iou = torch.sigmoid(logits[..., 2])
+        iou_element = F.smooth_l1_loss(
+            predicted_iou,
+            target_iou,
+            reduction="none",
+        )
+        iou = (iou_element * valid_float).sum() / valid_count
+
+        # Candidate pairs are compared only when their independently best GT
+        # identity agrees.  This teaches P10>P12-like within-lane ordering
+        # without turning proposal IDs into semantic classes.
+        quality_i = target_iou.unsqueeze(-1)
+        quality_j = target_iou.unsqueeze(-2)
+        quality_gap = quality_i - quality_j
+        same_gt = best_gt.unsqueeze(-1) == best_gt.unsqueeze(-2)
+        pair_valid = effective_valid.unsqueeze(-1) & effective_valid.unsqueeze(-2)
+        upper = torch.triu(
+            torch.ones(
+                (candidates, candidates),
+                dtype=torch.bool,
+                device=logits.device,
+            ),
+            diagonal=1,
+        ).view(1, 1, candidates, candidates)
+        pair_valid = (
+            pair_valid
+            & same_gt
+            & upper
+            & (quality_gap.abs() >= float(self.cfg.four_slot_v19_rank_min_gap))
+        )
+        score_gap = fidelity_delta.float().unsqueeze(-1) - fidelity_delta.float().unsqueeze(-2)
+        signed_score_gap = quality_gap.sign() * score_gap
+        threshold_crossing = (
+            ((quality_i >= 0.50) != (quality_j >= 0.50)).float()
+            + 0.5 * ((quality_i >= 0.75) != (quality_j >= 0.75)).float()
+        )
+        pair_weight = quality_gap.abs() * (1.0 + threshold_crossing)
+        if bool(pair_valid.any()):
+            rank_element = F.softplus(
+                -signed_score_gap
+                / float(self.cfg.four_slot_v19_rank_temperature)
+            )
+            rank = (rank_element[pair_valid] * pair_weight[pair_valid]).sum()
+            rank = rank / pair_weight[pair_valid].sum().clamp_min(1.0e-6)
+        else:
+            rank = fidelity_delta.sum() * 0.0
+
+        total = (
+            float(self.cfg.four_slot_v19_p50_weight) * p50
+            + float(self.cfg.four_slot_v19_p75_weight) * p75
+            + float(self.cfg.four_slot_v19_iou_weight) * iou
+            + float(self.cfg.four_slot_v19_rank_weight) * rank
+        )
+
+        with torch.no_grad():
+            valid_target = target_iou[effective_valid]
+            valid_prediction = predicted_iou[effective_valid]
+            if valid_target.numel() >= 2:
+                centered_target = valid_target - valid_target.mean()
+                centered_prediction = valid_prediction - valid_prediction.mean()
+                pearson = (
+                    (centered_target * centered_prediction).sum()
+                    / (
+                        centered_target.square().sum().sqrt()
+                        * centered_prediction.square().sum().sqrt()
+                    ).clamp_min(1.0e-12)
+                )
+            else:
+                pearson = total.detach() * 0.0
+            pair_accuracy = (
+                (signed_score_gap[pair_valid] > 0).float().mean()
+                if bool(pair_valid.any())
+                else total.detach() * 0.0
+            )
+            crossing_valid = pair_valid & (threshold_crossing > 0)
+            threshold_pair_accuracy = (
+                (signed_score_gap[crossing_valid] > 0).float().mean()
+                if bool(crossing_valid.any())
+                else total.detach() * 0.0
+            )
+
+            def gathered_quality(indices: torch.Tensor) -> torch.Tensor:
+                safe = indices.detach().long().clamp(min=0, max=candidates - 1)
+                value = target_iou.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+                valid_index = indices.detach() >= 0
+                return (value * valid_index.float()).sum() / valid_index.float().sum().clamp_min(1.0)
+
+            selected_quality = gathered_quality(selected_indices)
+            v7_selected_quality = gathered_quality(v7_indices)
+            masked_target = target_iou.masked_fill(~effective_valid, -1.0)
+            oracle_per_slot = masked_target.max(dim=-1).values.clamp_min(0.0)
+            slot_has_candidate = effective_valid.any(dim=-1)
+            oracle_quality = (
+                (oracle_per_slot * slot_has_candidate.float()).sum()
+                / slot_has_candidate.float().sum().clamp_min(1.0)
+            )
+
+        return {
+            "total": total,
+            "p50": p50,
+            "p75": p75,
+            "iou": iou,
+            "rank": rank,
+            "mean_target_iou": (
+                (target_iou * valid_float).sum() / valid_count
+            ).detach(),
+            "pearson": pearson.detach(),
+            "pair_accuracy": pair_accuracy.detach(),
+            "threshold_pair_accuracy": threshold_pair_accuracy.detach(),
+            "selected_quality": selected_quality.detach(),
+            "v7_selected_quality": v7_selected_quality.detach(),
+            "oracle_quality": oracle_quality.detach(),
+            "selected_regret": (oracle_quality - selected_quality).detach(),
+            "v7_regret": (oracle_quality - v7_selected_quality).detach(),
         }
 
     def compute_four_slot_v18_loss(

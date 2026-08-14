@@ -1,0 +1,131 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v19_frozen_counterfactual_fidelity_225k
+
+model:
+  # P2 is the mature row-aligned V7 tensor. P4/P5 are the already-trained V7
+  # semantic projections. We intentionally do not instantiate V18's new P3
+  # projection: every detector tensor feeding V19 must come from the exact
+  # source checkpoint and remain frozen in evaluation mode.
+  multi_scale_evidence:
+    enabled: true
+    scales: [p2, p4, p5]
+  structured_query:
+    intermediate_supervision: false
+    set_selection:
+      four_slot_refinement_route_gradient_scale: 0.0
+      four_slot_slot_owned_geometry_enabled: false
+      four_slot_global_visual_geometry_enabled: false
+      four_slot_unified_slot_decoder_enabled: false
+      four_slot_visual_first_association_enabled: false
+      four_slot_visual_precision_geometry_enabled: false
+      four_slot_corrected_visual_first_association_enabled: false
+      four_slot_corrected_visual_first_geometry_enabled: false
+      four_slot_bottom_aware_relational_geometry_enabled: false
+      four_slot_candidate_aligned_reranker_enabled: false
+      four_slot_iterative_slot_geometry_enabled: false
+      four_slot_joint_exact_set_energy_enabled: false
+
+      # V19 is candidate-independent. It evaluates every frozen V7
+      # slot/proposal counterfactual with vertical/intra attention only.
+      four_slot_counterfactual_fidelity_enabled: true
+      four_slot_counterfactual_fidelity_hidden_dim: 256
+      four_slot_counterfactual_fidelity_num_heads: 8
+      four_slot_counterfactual_fidelity_ff_dim: 512
+      four_slot_counterfactual_fidelity_vertical_layers: 1
+      four_slot_counterfactual_fidelity_dropout: 0.0
+      four_slot_counterfactual_fidelity_scale_names: [p2, p4, p5]
+      four_slot_counterfactual_fidelity_evidence_offsets_px:
+        [-32, -16, -8, 0, 8, 16, 32]
+      four_slot_counterfactual_fidelity_sampling_backend: linear_gather
+
+loss:
+  # The detector/proposal/legacy-slot objectives are all closed. Their
+  # parameters and buffers are immutable; only the V19 quality objective is
+  # constructed for backward.
+  w_exist: 0.0
+  w_intermediate_exist: 0.0
+  w_point: 0.0
+  w_range: 0.0
+  w_smooth: 0.0
+  w_line_iou: 0.0
+  w_row_dfl: 0.0
+  w_seg: 0.0
+  w_centerline: 0.0
+  w_quality: 0.0
+  w_cardinality: 0.0
+  w_score_margin: 0.0
+  w_set_selection: 0.0
+  w_pointer_selection: 0.0
+  lambda_coarse: 0.0
+  lambda_geometry_draft: 0.0
+  lambda_intermediate: 0.0
+  lambda_training_auxiliary: 0.0
+
+  w_four_slot_selection: 0.0
+  w_four_slot_geometry: 0.0
+  w_four_slot_unified: 0.0
+  w_four_slot_visual_first: 0.0
+  w_four_slot_visual_precision: 0.0
+  w_four_slot_v14_stage_a: 0.0
+  w_four_slot_v14_stage_b: 0.0
+  w_four_slot_v15: 0.0
+  w_four_slot_v16: 0.0
+  w_four_slot_v17: 0.0
+  w_four_slot_v18: 0.0
+
+  w_four_slot_v19: 1.0
+  four_slot_v19_p50_weight: 1.0
+  four_slot_v19_p75_weight: 0.5
+  four_slot_v19_iou_weight: 1.0
+  four_slot_v19_rank_weight: 1.0
+  four_slot_v19_rank_temperature: 0.10
+  four_slot_v19_rank_min_gap: 0.02
+
+optimizer:
+  base_lr: 0.0001
+  evidence_lr: 0.0001
+  backbone_lr: 0.00001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  parameter_groups:
+    - name: v19_counterfactual_fidelity
+      lr: 0.0001
+      prefixes:
+        - structured_query_head.set_selection_head.counterfactual_fidelity.
+
+scheduler:
+  name: constant
+
+training:
+  seed: 3407
+  # The 128 complete counterfactual lanes are memory-heavy. One physical
+  # image with deterministic accumulation preserves the declared batch 16.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  max_iters: 8000
+  checkpoint_interval: 1000
+  checkpoint_model_prefixes:
+    - structured_query_head.set_selection_head.counterfactual_fidelity
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  frozen_detector_eval: true
+  trainable_parameter_prefixes:
+    - structured_query_head.set_selection_head.counterfactual_fidelity
+  trainable_module_prefixes:
+    - structured_query_head.set_selection_head.counterfactual_fidelity
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
+
+postprocess:
+  score_mode: four_slot
+  score_thresh: 0.0
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4

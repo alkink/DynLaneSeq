@@ -3458,6 +3458,59 @@ class StructuredLaneQueryHead(nn.Module):
                         "grid_sample",
                     )
                 ),
+                counterfactual_fidelity_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_enabled", False
+                    )
+                ),
+                counterfactual_fidelity_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_hidden_dim",
+                        self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                counterfactual_fidelity_num_heads=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_num_heads",
+                        self.set_selection_cfg.get("num_heads", num_heads),
+                    )
+                ),
+                counterfactual_fidelity_ff_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_ff_dim",
+                        2 * self.set_selection_cfg.get("hidden_dim", self.dim),
+                    )
+                ),
+                counterfactual_fidelity_vertical_layers=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_vertical_layers", 1
+                    )
+                ),
+                counterfactual_fidelity_dropout=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_dropout", 0.0
+                    )
+                ),
+                counterfactual_fidelity_scale_names=tuple(
+                    str(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_scale_names",
+                        ("p2", "p3", "p4"),
+                    )
+                ),
+                counterfactual_fidelity_evidence_offsets_px=tuple(
+                    float(value)
+                    for value in self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_evidence_offsets_px",
+                        (-32.0, -16.0, -8.0, 0.0, 8.0, 16.0, 32.0),
+                    )
+                ),
+                counterfactual_fidelity_sampling_backend=str(
+                    self.set_selection_cfg.get(
+                        "four_slot_counterfactual_fidelity_sampling_backend",
+                        "linear_gather",
+                    )
+                ),
                 visual_precision_geometry_enabled=bool(
                     self.set_selection_cfg.get(
                         "four_slot_visual_precision_geometry_enabled",
@@ -4469,6 +4522,22 @@ class StructuredLaneQueryHead(nn.Module):
                 "selection_slot_v18_v7_scores",
                 "selection_slot_v18_v7_active_logits",
                 "selection_slot_v18_v7_active",
+                "selection_slot_v19_quality_logits",
+                "selection_slot_v19_p50",
+                "selection_slot_v19_p75",
+                "selection_slot_v19_expected_iou",
+                "selection_slot_v19_fidelity_delta",
+                "selection_slot_v19_calibrated_route_logits",
+                "selection_slot_v19_counterfactual_x_rows",
+                "selection_slot_v19_counterfactual_range_norm",
+                "selection_slot_v19_counterfactual_valid",
+                "selection_slot_v19_visual_attention",
+                "selection_slot_v19_v7_real_route_logits",
+                "selection_slot_v19_v7_geometry_route_indices",
+                "selection_slot_v19_v7_indices",
+                "selection_slot_v19_v7_scores",
+                "selection_slot_v19_v7_active_logits",
+                "selection_slot_v19_v7_active",
             ):
                 if name in outputs:
                     inference_outputs[name] = outputs[name]

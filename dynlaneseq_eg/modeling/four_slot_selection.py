@@ -16,6 +16,10 @@ from .common import (
 from .v16_candidate_reranker import FourSlotCandidateAlignedReranker
 from .v17_iterative_slot_geometry import FourSlotIterativeMultiScaleGeometry
 from .v18_joint_exact_set_energy import FourSlotJointExactSetEnergy
+from .v19_counterfactual_fidelity import (
+    FourSlotCounterfactualProposalFidelity,
+    frozen_v7_counterfactual_anchors,
+)
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -4953,6 +4957,27 @@ class FourSlotLaneSelectionHead(nn.Module):
         joint_exact_set_energy_keep_prior_probability: float = 0.997,
         joint_exact_set_energy_detach_association_for_set_loss: bool = False,
         joint_exact_set_energy_sampling_backend: str = "grid_sample",
+        counterfactual_fidelity_enabled: bool = False,
+        counterfactual_fidelity_hidden_dim: int | None = None,
+        counterfactual_fidelity_num_heads: int = 8,
+        counterfactual_fidelity_ff_dim: int | None = None,
+        counterfactual_fidelity_vertical_layers: int = 1,
+        counterfactual_fidelity_dropout: float = 0.0,
+        counterfactual_fidelity_scale_names: tuple[str, ...] = (
+            "p2",
+            "p3",
+            "p4",
+        ),
+        counterfactual_fidelity_evidence_offsets_px: tuple[float, ...] = (
+            -32.0,
+            -16.0,
+            -8.0,
+            0.0,
+            8.0,
+            16.0,
+            32.0,
+        ),
+        counterfactual_fidelity_sampling_backend: str = "linear_gather",
         visual_precision_geometry_enabled: bool = False,
         visual_precision_geometry_hidden_dim: int | None = None,
         visual_precision_geometry_num_heads: int = 8,
@@ -5059,6 +5084,9 @@ class FourSlotLaneSelectionHead(nn.Module):
         )
         self.joint_exact_set_energy_enabled = bool(
             joint_exact_set_energy_enabled
+        )
+        self.counterfactual_fidelity_enabled = bool(
+            counterfactual_fidelity_enabled
         )
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
@@ -5195,6 +5223,27 @@ class FourSlotLaneSelectionHead(nn.Module):
                 )
             ):
                 raise ValueError("V18 exact set energy is exclusive with V9-V17 modules")
+        if self.counterfactual_fidelity_enabled:
+            if not self.factorized_routing:
+                raise ValueError("V19 fidelity requires factorized V7 routing")
+            if not self.refinement_enabled:
+                raise ValueError("V19 fidelity requires the frozen V7 refiner")
+            if any(
+                (
+                    self.unified_slot_decoder_enabled,
+                    self.visual_first_association_enabled,
+                    self.corrected_visual_first_association_enabled,
+                    self.corrected_visual_first_geometry_enabled,
+                    self.visual_precision_geometry_enabled,
+                    self.bottom_aware_relational_geometry_enabled,
+                    self.candidate_aligned_reranker_enabled,
+                    self.iterative_slot_geometry_enabled,
+                    self.joint_exact_set_energy_enabled,
+                    self.slot_owned_geometry_enabled,
+                    self.global_visual_geometry_enabled,
+                )
+            ):
+                raise ValueError("V19 fidelity is exclusive with V9-V18 modules")
         if self.visual_precision_geometry_enabled:
             if not self.visual_first_association_enabled:
                 raise ValueError(
@@ -5261,10 +5310,12 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.candidate_aligned_reranker_enabled
             or self.iterative_slot_geometry_enabled
             or self.joint_exact_set_energy_enabled
+            or self.counterfactual_fidelity_enabled
         )
         self.requires_multi_scale_features = (
             self.iterative_slot_geometry_enabled
             or self.joint_exact_set_energy_enabled
+            or self.counterfactual_fidelity_enabled
         )
         # V18 must receive a live P2 tensor. Candidate coordinates remain
         # detached inside the module, while image/proposal representations are
@@ -5833,6 +5884,40 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.joint_exact_set_energy_enabled
             else None
         )
+        # V19 leaves the complete V7 detector, activity and bounded refiner in
+        # evaluation mode.  It learns only the counterfactual final-geometry
+        # fidelity of each slot/proposal pair; candidates never interact.
+        self.counterfactual_fidelity = (
+            FourSlotCounterfactualProposalFidelity(
+                self.dim,
+                feature_dim=self.dim,
+                slot_dim=self.hidden_dim,
+                hidden_dim=int(
+                    counterfactual_fidelity_hidden_dim or self.hidden_dim
+                ),
+                input_w=self.input_w,
+                num_slots=self.num_slots,
+                num_heads=int(counterfactual_fidelity_num_heads),
+                ff_dim=int(
+                    counterfactual_fidelity_ff_dim
+                    or 2
+                    * int(
+                        counterfactual_fidelity_hidden_dim or self.hidden_dim
+                    )
+                ),
+                vertical_layers=int(counterfactual_fidelity_vertical_layers),
+                dropout=float(counterfactual_fidelity_dropout),
+                scale_names=tuple(counterfactual_fidelity_scale_names),
+                evidence_offsets_px=tuple(
+                    counterfactual_fidelity_evidence_offsets_px
+                ),
+                sampling_backend=str(
+                    counterfactual_fidelity_sampling_backend
+                ),
+            )
+            if self.counterfactual_fidelity_enabled
+            else None
+        )
         # V13 is not another proposal selector.  It consumes the proven V12
         # visual lane state, row-wise proposal feature memory and precise local
         # P2 samples, then owns final x/range directly.  V7 remains only the
@@ -6228,6 +6313,147 @@ class FourSlotLaneSelectionHead(nn.Module):
         v18_v7_selected_scores = result.get("selection_slot_scores")
         v18_v7_active_logits = result.get("selection_slot_active_logits")
         v18_v7_active = slot_active
+        if self.counterfactual_fidelity is not None:
+            if self.slot_refinement is None:
+                raise RuntimeError("V19 requires the frozen V7 refiner")
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V19 fidelity requires frozen P2 rows")
+            if not isinstance(multi_scale_features, dict):
+                raise ValueError("V19 fidelity requires frozen P2/P3/P4")
+            image_features: dict[str, torch.Tensor] = {
+                "p2": row_value_features.detach()
+            }
+            for scale_name in self.counterfactual_fidelity.scale_names:
+                if scale_name == "p2":
+                    continue
+                scale_value = multi_scale_features.get(scale_name)
+                if not isinstance(scale_value, torch.Tensor):
+                    raise ValueError(
+                        f"V19 fidelity requires projected {scale_name}"
+                    )
+                image_features[scale_name] = scale_value.detach()
+            counterfactual = frozen_v7_counterfactual_anchors(
+                self.slot_refinement,
+                slot_states=slots,
+                proposal_row_tokens=outputs["structured_row_tokens"],
+                proposal_x_rows=outputs["pred_x_rows"],
+                proposal_range_norm=outputs["range_norm"],
+                candidate_valid=candidate_valid,
+                row_value_features=row_value_features,
+            )
+            v19_result = self.counterfactual_fidelity(
+                slot_states=slots,
+                legacy_route_logits=real_route_logits,
+                proposal_rows=outputs["structured_row_tokens"],
+                proposal_x=outputs["pred_x_rows"],
+                proposal_range=outputs["range_norm"],
+                candidate_valid=candidate_valid,
+                counterfactual_x=counterfactual["x_rows"],
+                counterfactual_range=counterfactual["range_norm"],
+                counterfactual_valid=counterfactual["valid"],
+                image_features=image_features,
+            )
+            calibrated_logits = v19_result["calibrated_route_logits"]
+            calibrated_decoded = decode_unique_real_slot_routes(
+                calibrated_logits,
+                candidate_valid,
+                self._real_route_combinations,
+            )
+            geometry_indices = calibrated_decoded["indices"]
+            # V19 is selection-only.  Cardinality is the exact frozen V7
+            # decision even when the calibrated member identity changes.
+            slot_active = v18_v7_active & (geometry_indices >= 0)
+            selected_indices = torch.where(
+                slot_active,
+                geometry_indices,
+                geometry_indices.new_full(geometry_indices.shape, -1),
+            )
+            calibrated_log_probability = F.log_softmax(
+                calibrated_logits.float(), dim=-1
+            )
+            calibrated_probability = calibrated_log_probability.exp()
+            safe_route = geometry_indices.clamp(min=0)
+            selected_scores = calibrated_probability.gather(
+                -1, safe_route.unsqueeze(-1)
+            ).squeeze(-1) * torch.sigmoid(active_logits.float())
+            selected_scores = torch.where(
+                slot_active,
+                selected_scores,
+                torch.sigmoid(-active_logits.float()),
+            )
+            raw_indices = calibrated_decoded["raw_indices"]
+            raw_indices = torch.where(
+                slot_active,
+                raw_indices,
+                raw_indices.new_full(raw_indices.shape, -1),
+            )
+            route_entropy = -(
+                calibrated_probability
+                * calibrated_probability.clamp_min(1.0e-12).log()
+            ).sum(dim=-1)
+            geometry_route_logits = calibrated_logits
+            result.update(
+                {
+                    "selection_slot_logits": torch.cat(
+                        (
+                            F.logsigmoid(active_logits.float()).unsqueeze(-1)
+                            + calibrated_log_probability,
+                            F.logsigmoid(-active_logits.float()).unsqueeze(-1),
+                        ),
+                        dim=-1,
+                    ),
+                    "selection_slot_real_route_logits": calibrated_logits,
+                    "selection_slot_geometry_route_indices": geometry_indices,
+                    "selection_slot_indices": selected_indices,
+                    "selection_slot_scores": selected_scores,
+                    "selection_slot_raw_indices": raw_indices,
+                    "selection_slot_raw_collision_count": (
+                        _count_repeated_real_indices(raw_indices)
+                    ),
+                    "selection_slot_route_entropy": route_entropy,
+                    "selection_slot_global_repair_count": (
+                        (selected_indices != raw_indices).sum(dim=-1)
+                    ),
+                    "selection_slot_v19_quality_logits": v19_result[
+                        "quality_logits"
+                    ],
+                    "selection_slot_v19_p50": v19_result["p50"],
+                    "selection_slot_v19_p75": v19_result["p75"],
+                    "selection_slot_v19_expected_iou": v19_result[
+                        "expected_iou"
+                    ],
+                    "selection_slot_v19_fidelity_delta": v19_result[
+                        "fidelity_delta"
+                    ],
+                    "selection_slot_v19_calibrated_route_logits": (
+                        calibrated_logits
+                    ),
+                    "selection_slot_v19_counterfactual_x_rows": (
+                        counterfactual["x_rows"]
+                    ),
+                    "selection_slot_v19_counterfactual_range_norm": (
+                        counterfactual["range_norm"]
+                    ),
+                    "selection_slot_v19_counterfactual_valid": (
+                        counterfactual["valid"]
+                    ),
+                    "selection_slot_v19_visual_attention": v19_result[
+                        "visual_attention"
+                    ],
+                    "selection_slot_v19_v7_real_route_logits": (
+                        v18_v7_real_route_logits
+                    ),
+                    "selection_slot_v19_v7_geometry_route_indices": (
+                        v18_v7_geometry_indices
+                    ),
+                    "selection_slot_v19_v7_indices": v18_v7_selected_indices,
+                    "selection_slot_v19_v7_scores": v18_v7_selected_scores,
+                    "selection_slot_v19_v7_active_logits": (
+                        v18_v7_active_logits
+                    ),
+                    "selection_slot_v19_v7_active": v18_v7_active,
+                }
+            )
         if self.joint_exact_set_energy is not None:
             if not isinstance(row_value_features, torch.Tensor):
                 raise ValueError("V18 exact set energy requires live P2 rows")
