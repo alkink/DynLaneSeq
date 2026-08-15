@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -12,10 +13,15 @@ from dynlaneseq_eg.modeling.v22_field_utilization import (
     source_seeded_field_path,
 )
 from dynlaneseq_eg.tools.audit_v22_lane_field_utilization import (
+    METRIC_THREAD_ENV,
     _metric_worker,
     _one_edit_outcomes,
 )
 from dynlaneseq_eg.modeling.common import fixed_y_rows
+
+
+def test_metric_worker_blas_threads_are_process_bounded() -> None:
+    assert all(os.environ[name] == "1" for name in METRIC_THREAD_ENV)
 
 
 def _outputs(rows: int, bins: int) -> dict[str, torch.Tensor]:

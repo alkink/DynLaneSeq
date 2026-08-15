@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+import os
+
+# The exact-raster metric workers import NumPy/SciPy in spawned processes.
+# BLAS libraries otherwise inherit the host default (64 threads on the remote
+# runner), so a 12-process pool attempts to create hundreds of threads and
+# fails before producing any scientific output.  This audit is process-level
+# parallel, therefore one BLAS thread per process is the fixed execution
+# contract rather than a performance-tuning choice.
+METRIC_THREAD_ENV = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+for _thread_env_name in METRIC_THREAD_ENV:
+    os.environ[_thread_env_name] = "1"
+
 import argparse
 from collections import Counter, defaultdict, deque
 from concurrent.futures import Future, ProcessPoolExecutor
