@@ -263,10 +263,6 @@ def main() -> None:
     curve_samples = min(int(args.curve_samples), total_rows)
     row_indices = torch.linspace(0, total_rows - 1, curve_samples).round().long().to(device)
     offsets_px = torch.tensor(offsets, device=device, dtype=torch.float32)
-    channels_last = bool(
-        cfg.get("training", {}).get("channels_last", False) and device.type == "cuda"
-    )
-
     captured: dict[str, torch.Tensor] = {}
 
     def capture_level1(_module, _inputs, output):
@@ -326,9 +322,6 @@ def main() -> None:
         )
         images = images.to(device, non_blocking=True)
         wrong_images = wrong_images.to(device, non_blocking=True)
-        if channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
-            wrong_images = wrong_images.contiguous(memory_format=torch.channels_last)
         captured.clear()
         # Match the V20 exact-raster cache producer bit-for-bit: its frozen
         # forward is FP32 even though the original training config enables AMP.
