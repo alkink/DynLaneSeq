@@ -263,7 +263,6 @@ def main() -> None:
     curve_samples = min(int(args.curve_samples), total_rows)
     row_indices = torch.linspace(0, total_rows - 1, curve_samples).round().long().to(device)
     offsets_px = torch.tensor(offsets, device=device, dtype=torch.float32)
-    use_amp = bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda")
     channels_last = bool(
         cfg.get("training", {}).get("channels_last", False) and device.type == "cuda"
     )
@@ -331,26 +330,18 @@ def main() -> None:
             images = images.contiguous(memory_format=torch.channels_last)
             wrong_images = wrong_images.contiguous(memory_format=torch.channels_last)
         captured.clear()
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_amp,
-        ):
-            outputs = model(images)
+        # Match the V20 exact-raster cache producer bit-for-bit: its frozen
+        # forward is FP32 even though the original training config enables AMP.
+        outputs = model(images)
         correct_level1 = captured.get("level1")
         if not isinstance(correct_level1, torch.Tensor):
             raise RuntimeError("V21A failed to capture DLA stride-2 features")
         captured.clear()
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_amp,
-        ):
-            wrong_level1 = model.encoder.backbone.level1(
-                model.encoder.backbone.level0(
-                    model.encoder.backbone.base_layer(wrong_images)
-                )
+        wrong_level1 = model.encoder.backbone.level1(
+            model.encoder.backbone.level0(
+                model.encoder.backbone.base_layer(wrong_images)
             )
+        )
 
         cached = {
             name: value[start:stop].to(device, non_blocking=True)
