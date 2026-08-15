@@ -10,8 +10,8 @@ NUM_WORKERS="${NUM_WORKERS:-12}"
 METRIC_WORKERS="${METRIC_WORKERS:-12}"
 SEED=3407
 STEPS=10000
-BATCH_SIZE=4
-GRADIENT_ACCUMULATION_STEPS=4
+BATCH_SIZE=8
+GRADIENT_ACCUMULATION_STEPS=2
 
 FIELD_CONFIG="${FIELD_CONFIG:-dynlaneseq_eg/configs/culane_v22_lane_field_stage_a.yaml}"
 V20_CONFIG="${V20_CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v20_slot_owned_safe_replacement_233k_to241k.yaml}"

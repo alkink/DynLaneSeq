@@ -23,8 +23,8 @@ from dynlaneseq_eg.tools.v22_official_protocol import official_culane_list_contr
 
 
 FIXED_STEPS = 10_000
-FIXED_PHYSICAL_BATCH = 4
-FIXED_GRAD_ACCUMULATION = 4
+FIXED_PHYSICAL_BATCH = 8
+FIXED_GRAD_ACCUMULATION = 2
 FIXED_SEED = 3407
 
 

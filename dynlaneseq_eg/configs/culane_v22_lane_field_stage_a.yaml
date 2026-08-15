@@ -41,8 +41,8 @@ dataloader:
 
 training:
   seed: 3407
-  batch_size: 4
-  gradient_accumulation_steps: 4
+  batch_size: 8
+  gradient_accumulation_steps: 2
   max_iters: 10000
   amp: true
   amp_dtype: bfloat16

@@ -54,23 +54,25 @@ class V22LaneFieldStageA(nn.Module):
         )
         groups = _group_count(int(hidden_dim))
         self.field_trunk = nn.Sequential(
-            nn.Conv2d(int(fpn_channels), int(hidden_dim), 3, padding=1, bias=False),
+            # The student encoder remains full-resolution and trainable, but
+            # the hidden field is decoded on native stride-4 P2. Only the
+            # three scalar output maps are resized from 400 to 800 columns.
+            # Keeping a 128-channel tensor at 800 columns doubled compute
+            # without adding image evidence beyond P2's native sampling.
+            nn.Conv2d(int(fpn_channels), int(hidden_dim), 1, bias=False),
             nn.GroupNorm(groups, int(hidden_dim)),
             nn.GELU(),
-            # P2 is [num_rows, x_bins/2] for the production 1600x640 input.
-            # Learned horizontal upsampling preserves the native 160 rows and
-            # exposes a 2-pixel-wide field grid instead of a fixed interpolation.
-            nn.ConvTranspose2d(
+            nn.Conv2d(
                 int(hidden_dim),
                 int(hidden_dim),
-                kernel_size=(1, 4),
-                stride=(1, 2),
-                padding=(0, 1),
+                kernel_size=3,
+                padding=1,
+                groups=int(hidden_dim),
                 bias=False,
             ),
             nn.GroupNorm(groups, int(hidden_dim)),
             nn.GELU(),
-            nn.Conv2d(int(hidden_dim), int(hidden_dim), 3, padding=1, bias=False),
+            nn.Conv2d(int(hidden_dim), int(hidden_dim), 1, bias=False),
             nn.GroupNorm(groups, int(hidden_dim)),
             nn.GELU(),
         )
@@ -118,17 +120,32 @@ class V22LaneFieldStageA(nn.Module):
         features = self.backbone(images)
         p2 = self.fpn(features)
         field = self.field_trunk(p2)
-        if field.shape[-2:] != (self.num_rows, self.x_bins):
-            field = F.interpolate(
-                field,
+        centerline_logits = self.centerline_head(field)
+        distance_raw = self.distance_head(field)
+        support_logits = self.support_head(field)
+        if centerline_logits.shape[-2:] != (self.num_rows, self.x_bins):
+            centerline_logits = F.interpolate(
+                centerline_logits,
+                size=(self.num_rows, self.x_bins),
+                mode="bilinear",
+                align_corners=False,
+            )
+            distance_raw = F.interpolate(
+                distance_raw,
+                size=(self.num_rows, self.x_bins),
+                mode="bilinear",
+                align_corners=False,
+            )
+            support_logits = F.interpolate(
+                support_logits,
                 size=(self.num_rows, self.x_bins),
                 mode="bilinear",
                 align_corners=False,
             )
         return {
-            "centerline_logits": self.centerline_head(field),
-            "distance_raw": self.distance_head(field),
-            "support_logits": self.support_head(field),
+            "centerline_logits": centerline_logits,
+            "distance_raw": distance_raw,
+            "support_logits": support_logits,
             "field_features": field,
         }
 
