@@ -14,6 +14,7 @@ from dynlaneseq_eg.modeling.v22_field_utilization import (
 )
 from dynlaneseq_eg.tools.audit_v22_lane_field_utilization import (
     METRIC_THREAD_ENV,
+    _dataset_relative_image_id,
     _metric_worker,
     _one_edit_outcomes,
 )
@@ -22,6 +23,23 @@ from dynlaneseq_eg.modeling.common import fixed_y_rows
 
 def test_metric_worker_blas_threads_are_process_bounded() -> None:
     assert all(os.environ[name] == "1" for name in METRIC_THREAD_ENV)
+
+
+def test_dataset_relative_image_id_ignores_only_mount_root() -> None:
+    cached = _dataset_relative_image_id(
+        "/home/alki/projects/CULane/driver_23/00020.jpg",
+        "/home/alki/projects/CULane",
+    )
+    remote = _dataset_relative_image_id(
+        "/workspace/CULane/driver_23/00020.jpg",
+        "/workspace/CULane",
+    )
+    different = _dataset_relative_image_id(
+        "/workspace/CULane/driver_23/00050.jpg",
+        "/workspace/CULane",
+    )
+    assert cached == remote == "driver_23/00020.jpg"
+    assert different != cached
 
 
 def _outputs(rows: int, bins: int) -> dict[str, torch.Tensor]:

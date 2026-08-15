@@ -86,6 +86,26 @@ CONTINUOUS_POLICIES = (
 CANDIDATE_VARIANTS = ("raw", "distance_step1", "distance_step2")
 
 
+def _dataset_relative_image_id(value: str, dataset_root: str | Path) -> str:
+    """Normalize cache/loader IDs without hiding list ordering differences.
+
+    The immutable V20 cache was produced with ``/home/alki/projects/CULane``
+    while the remote official-data mount is ``/workspace/CULane``.  Absolute
+    paths therefore differ for every image even though the untouched official
+    ``val.txt`` rows are identical.  Comparing each path relative to the root
+    recorded by its own data source preserves ordering/identity checks while
+    making the check independent of the machine's mount point.
+    """
+
+    path = Path(str(value)).expanduser().resolve(strict=False)
+    root = Path(dataset_root).expanduser().resolve(strict=False)
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        # Do not silently coerce a path outside its declared dataset root.
+        return path.as_posix()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -774,9 +794,15 @@ def main() -> None:
         for images, targets, metas in progress:
             batch = int(images.shape[0])
             start, stop = global_index, global_index + batch
-            expected_ids = [str(value) for value in cache_manifest["image_ids"][start:stop]]
+            expected_ids = [
+                _dataset_relative_image_id(value, cache_manifest["dataset_root"])
+                for value in cache_manifest["image_ids"][start:stop]
+            ]
             actual_ids = [
-                _image_id(meta, f"v22_util_{start + item:06d}")
+                _dataset_relative_image_id(
+                    _image_id(meta, f"v22_util_{start + item:06d}"),
+                    args.dataset_root,
+                )
                 for item, meta in enumerate(metas)
             ]
             contract["image_id_mismatch"] += sum(
