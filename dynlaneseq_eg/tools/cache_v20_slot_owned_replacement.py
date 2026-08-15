@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--finalize-existing",
+        action="store_true",
+        help=(
+            "Reuse already written exact-raster shards, replay only the cheap "
+            "zero-step model contract, and write the missing manifest."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -222,6 +230,47 @@ def _write_shard(
     }
 
 
+def _validated_existing_shards(
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    paths = sorted(output_dir.glob("shard_*.pt"))
+    if not paths:
+        raise FileNotFoundError(
+            f"no existing exact-raster shards found in {output_dir}"
+        )
+    shards: list[dict[str, Any]] = []
+    image_ids: list[str] = []
+    for index, path in enumerate(paths):
+        expected_name = f"shard_{index:04d}.pt"
+        if path.name != expected_name:
+            raise ValueError(
+                f"non-contiguous cache shards: expected {expected_name}, "
+                f"found {path.name}"
+            )
+        payload = torch.load(path, map_location="cpu")
+        shard_ids = [str(value) for value in payload.get("image_ids", [])]
+        if not shard_ids:
+            raise ValueError(f"empty or missing image_ids in {path}")
+        for name in FEATURE_FIELDS + TARGET_FIELDS:
+            value = payload.get(name)
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"missing tensor {name} in {path}")
+            if int(value.shape[0]) != len(shard_ids):
+                raise ValueError(
+                    f"cache batch mismatch for {name} in {path}: "
+                    f"{value.shape[0]} vs {len(shard_ids)}"
+                )
+        image_ids.extend(shard_ids)
+        shards.append(
+            {
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+                "images": len(shard_ids),
+            }
+        )
+    return shards, image_ids
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
@@ -235,7 +284,7 @@ def main() -> None:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     for stale in output_dir.glob("shard_*.pt"):
-        if args.overwrite:
+        if args.overwrite and not args.finalize_existing:
             stale.unlink()
 
     model = build_model(cfg).to(device)
@@ -257,11 +306,16 @@ def main() -> None:
     )
     workers = max(int(args.metric_workers), 0)
     raw_buffer: list[dict[str, Any]] = []
-    shards: list[dict[str, Any]] = []
+    if args.finalize_existing:
+        shards, cached_image_ids = _validated_existing_shards(output_dir)
+    else:
+        shards, cached_image_ids = [], []
+    replayed_image_ids: list[str] = []
     contract = {
         "nonzero_zero_step_edits": 0,
         "route_mismatch": 0,
         "active_mismatch": 0,
+        "cache_population_order_mismatch": 0,
     }
 
     metric_executor = (
@@ -269,7 +323,7 @@ def main() -> None:
             max_workers=workers,
             mp_context=mp.get_context("spawn"),
         )
-        if workers > 1
+        if workers > 1 and not args.finalize_existing
         else None
     )
 
@@ -298,8 +352,13 @@ def main() -> None:
         raw_buffer.clear()
 
     try:
+        description = (
+            "V20 cache zero-step finalization"
+            if args.finalize_existing
+            else "V20 frozen feature cache"
+        )
         for batch_index, (images, _targets, metas) in enumerate(
-            tqdm(loader, desc="V20 frozen feature cache", ncols=90)
+            tqdm(loader, desc=description, ncols=90)
         ):
             images = images.to(device, non_blocking=True)
             outputs = model(images)
@@ -322,6 +381,12 @@ def main() -> None:
             contract["active_mismatch"] += int(
                 (source_active != deployed_active).sum().cpu()
             )
+            if args.finalize_existing:
+                replayed_image_ids.extend(
+                    _image_id(meta, f"v20_cache_{batch_index:06d}_{item}")
+                    for item, meta in enumerate(metas)
+                )
+                continue
             for item, meta in enumerate(metas):
                 raw_buffer.append(
                     {
@@ -360,10 +425,15 @@ def main() -> None:
                 )
                 if len(raw_buffer) >= shard_size:
                     flush()
-        flush()
+        if args.finalize_existing:
+            contract["cache_population_order_mismatch"] = int(
+                replayed_image_ids != cached_image_ids
+            )
+        else:
+            flush()
     finally:
         if metric_executor is not None:
-            metric_executor.shutdown(wait=True, cancel_futures=True)
+            metric_executor.shutdown(wait=True)
     passed = all(int(value) == 0 for value in contract.values())
     manifest = {
         "experiment": "V20 frozen exact-raster slot-owned replacement cache",
@@ -376,6 +446,7 @@ def main() -> None:
         "list_path": str(Path(args.list_path).resolve()),
         "list_sha256": sha256_file(args.list_path),
         "images": sum(int(item["images"]) for item in shards),
+        "existing_shards_reused": bool(args.finalize_existing),
         "cache_dtype": dtype_name,
         "augmentation": "exactly_disabled",
         "official_raster": {
