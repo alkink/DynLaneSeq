@@ -181,8 +181,8 @@ def _write_shard(
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
-    if int(args.batch_size) < 2:
-        raise ValueError("V21A paired correct/wrong cache requires batch_size >= 2")
+    if int(args.batch_size) < 1:
+        raise ValueError("V21A cache batch_size must be positive")
     if int(args.curve_samples) < 5:
         raise ValueError("V21A requires at least five curve rows")
     offsets = tuple(float(value) for value in args.offsets_px)
