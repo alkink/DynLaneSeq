@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import subprocess
 from pathlib import Path
 
+import mmcv
 from mmengine.config import Config
 import torch
 
@@ -22,6 +24,7 @@ EXPECTED = {
     "threshold": 0.41,
     "epochs": 15,
     "nms_patch_sha256": "0635c02f18d53a08007902f9369a57b2fb8b6c98229c534e7aa606c7f768ec61",
+    "mmcv_shim_sha256": "f5e22597f563b837b4ab0e7bfc05c6ea43b961285b328d098946fda3ad2a1b8e",
 }
 
 
@@ -44,6 +47,7 @@ def main() -> None:
     parser.add_argument("--clrernet-root", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--nms-patch", type=Path, required=True)
+    parser.add_argument("--mmcv-shim", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -66,6 +70,7 @@ def main() -> None:
 
     train_ds = cfg.train_dataloader.dataset
     val_ds = cfg.val_dataloader.dataset
+    installed_mmcv_shim = Path(mmcv.__file__).resolve().parent / "_ext.py"
     facts = {
         "upstream_commit": commit,
         "config": str(args.config.resolve()),
@@ -89,6 +94,12 @@ def main() -> None:
         "torch_cuda_version": torch.version.cuda,
         "nms_patch": str(args.nms_patch.resolve()),
         "nms_patch_sha256": sha256(args.nms_patch),
+        "mmcv_version": mmcv.__version__,
+        "mmcv_distribution": importlib.metadata.version("mmcv-lite"),
+        "mmcv_shim_source": str(args.mmcv_shim.resolve()),
+        "mmcv_shim_source_sha256": sha256(args.mmcv_shim),
+        "mmcv_shim_installed": str(installed_mmcv_shim),
+        "mmcv_shim_installed_sha256": sha256(installed_mmcv_shim),
         "modified_upstream_sources": modified_sources,
         "test_invoked": False,
         "deduplication": False,
@@ -115,6 +126,12 @@ def main() -> None:
                 "libs/models/layers/nms/src/nms.cpp",
                 "libs/models/layers/nms/src/nms_kernel.cu",
             ]
+        ),
+        "mmcv_import_shim_exact": (
+            facts["mmcv_version"] == "2.1.0"
+            and facts["mmcv_distribution"] == "2.1.0"
+            and facts["mmcv_shim_source_sha256"] == EXPECTED["mmcv_shim_sha256"]
+            and facts["mmcv_shim_installed_sha256"] == EXPECTED["mmcv_shim_sha256"]
         ),
         "fixed_endpoint": (
             facts["epochs"] == EXPECTED["epochs"]
