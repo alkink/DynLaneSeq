@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import json
+import multiprocessing as mp
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,25 @@ def _label_record(
     }
 
 
+def _label_record_process(
+    payload: tuple[dict[str, Any], float],
+) -> dict[str, Any]:
+    """Process-isolated exact raster labeling.
+
+    SciPy/FITPACK's spline interpolation serializes competing Python threads.
+    V20 has 128 counterfactual curves per image, so the former thread pool
+    behaved almost exactly like one worker.  Spawned processes preserve the
+    evaluator bit path while allowing independent images to use separate CPU
+    cores.  Explicit one-thread settings prevent nested BLAS/OpenCV
+    oversubscription.
+    """
+
+    cv2.setNumThreads(1)
+    torch.set_num_threads(1)
+    raw, policy_iou_support_delta = payload
+    return _label_record(raw, policy_iou_support_delta)
+
+
 def _write_shard(
     records: list[dict[str, Any]],
     output: Path,
@@ -244,20 +264,29 @@ def main() -> None:
         "active_mismatch": 0,
     }
 
+    metric_executor = (
+        ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context("spawn"),
+        )
+        if workers > 1
+        else None
+    )
+
     def flush() -> None:
         if not raw_buffer:
             return
         previous = cv2.getNumThreads()
         cv2.setNumThreads(1)
         try:
-            if workers > 1:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    labeled = list(
-                        executor.map(
-                            lambda record: _label_record(record, policy_delta),
-                            raw_buffer,
-                        )
+            if metric_executor is not None:
+                labeled = list(
+                    metric_executor.map(
+                        _label_record_process,
+                        ((record, policy_delta) for record in raw_buffer),
+                        chunksize=1,
                     )
+                )
             else:
                 labeled = [
                     _label_record(record, policy_delta) for record in raw_buffer
@@ -268,66 +297,73 @@ def main() -> None:
         shards.append(_write_shard(labeled, shard_path, dtype=dtype))
         raw_buffer.clear()
 
-    for batch_index, (images, _targets, metas) in enumerate(
-        tqdm(loader, desc="V20 frozen feature cache", ncols=90)
-    ):
-        images = images.to(device, non_blocking=True)
-        outputs = model(images)
-        source_route = _required(
-            outputs, "selection_slot_v20_v7_geometry_route_indices"
-        )
-        source_active = _required(outputs, "selection_slot_v20_v7_active").bool()
-        deployed_route = _required(
-            outputs, "selection_slot_geometry_route_indices"
-        )
-        deployed_active = _required(outputs, "selection_slot_active").bool()
-        contract["nonzero_zero_step_edits"] += int(
-            _required(outputs, "selection_slot_v20_edit_count").sum().cpu()
-        )
-        contract["route_mismatch"] += int(
-            (source_route != deployed_route).sum().cpu()
-        )
-        contract["active_mismatch"] += int(
-            (source_active != deployed_active).sum().cpu()
-        )
-        for item, meta in enumerate(metas):
-            raw_buffer.append(
-                {
-                    "image_id": _image_id(
-                        meta, f"v20_cache_{batch_index:06d}_{item}"
-                    ),
-                    "meta": _plain_meta(meta),
-                    "candidate_state": _required(
-                        outputs, "selection_slot_v19_candidate_state"
-                    )[item].float().cpu(),
-                    "p50": _required(outputs, "selection_slot_v19_p50")[
-                        item
-                    ].float().cpu(),
-                    "p75": _required(outputs, "selection_slot_v19_p75")[
-                        item
-                    ].float().cpu(),
-                    "expected_iou": _required(
-                        outputs, "selection_slot_v19_expected_iou"
-                    )[item].float().cpu(),
-                    "legacy_route_logits": _required(
-                        outputs, "selection_slot_v19_v7_real_route_logits"
-                    )[item].float().cpu(),
-                    "counterfactual_x": _required(
-                        outputs, "selection_slot_v19_counterfactual_x_rows"
-                    )[item].float().cpu(),
-                    "counterfactual_range": _required(
-                        outputs, "selection_slot_v19_counterfactual_range_norm"
-                    )[item].float().cpu(),
-                    "counterfactual_valid": _required(
-                        outputs, "selection_slot_v19_counterfactual_valid"
-                    )[item].bool().cpu(),
-                    "source_route": source_route[item].long().cpu(),
-                    "source_active": source_active[item].bool().cpu(),
-                }
+    try:
+        for batch_index, (images, _targets, metas) in enumerate(
+            tqdm(loader, desc="V20 frozen feature cache", ncols=90)
+        ):
+            images = images.to(device, non_blocking=True)
+            outputs = model(images)
+            source_route = _required(
+                outputs, "selection_slot_v20_v7_geometry_route_indices"
             )
-            if len(raw_buffer) >= shard_size:
-                flush()
-    flush()
+            source_active = _required(
+                outputs, "selection_slot_v20_v7_active"
+            ).bool()
+            deployed_route = _required(
+                outputs, "selection_slot_geometry_route_indices"
+            )
+            deployed_active = _required(outputs, "selection_slot_active").bool()
+            contract["nonzero_zero_step_edits"] += int(
+                _required(outputs, "selection_slot_v20_edit_count").sum().cpu()
+            )
+            contract["route_mismatch"] += int(
+                (source_route != deployed_route).sum().cpu()
+            )
+            contract["active_mismatch"] += int(
+                (source_active != deployed_active).sum().cpu()
+            )
+            for item, meta in enumerate(metas):
+                raw_buffer.append(
+                    {
+                        "image_id": _image_id(
+                            meta, f"v20_cache_{batch_index:06d}_{item}"
+                        ),
+                        "meta": _plain_meta(meta),
+                        "candidate_state": _required(
+                            outputs, "selection_slot_v19_candidate_state"
+                        )[item].float().cpu(),
+                        "p50": _required(outputs, "selection_slot_v19_p50")[
+                            item
+                        ].float().cpu(),
+                        "p75": _required(outputs, "selection_slot_v19_p75")[
+                            item
+                        ].float().cpu(),
+                        "expected_iou": _required(
+                            outputs, "selection_slot_v19_expected_iou"
+                        )[item].float().cpu(),
+                        "legacy_route_logits": _required(
+                            outputs, "selection_slot_v19_v7_real_route_logits"
+                        )[item].float().cpu(),
+                        "counterfactual_x": _required(
+                            outputs, "selection_slot_v19_counterfactual_x_rows"
+                        )[item].float().cpu(),
+                        "counterfactual_range": _required(
+                            outputs,
+                            "selection_slot_v19_counterfactual_range_norm",
+                        )[item].float().cpu(),
+                        "counterfactual_valid": _required(
+                            outputs, "selection_slot_v19_counterfactual_valid"
+                        )[item].bool().cpu(),
+                        "source_route": source_route[item].long().cpu(),
+                        "source_active": source_active[item].bool().cpu(),
+                    }
+                )
+                if len(raw_buffer) >= shard_size:
+                    flush()
+        flush()
+    finally:
+        if metric_executor is not None:
+            metric_executor.shutdown(wait=True, cancel_futures=True)
     passed = all(int(value) == 0 for value in contract.values())
     manifest = {
         "experiment": "V20 frozen exact-raster slot-owned replacement cache",

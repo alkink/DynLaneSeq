@@ -752,6 +752,75 @@ def _raster_lane_mask(
     return mask
 
 
+def _raster_lane_crop(
+    lane: list[tuple[float, float]],
+    image_h: int,
+    image_w: int,
+    width: int,
+) -> tuple[np.ndarray, int, int]:
+    """Rasterize a lane in a tight ROI with full-canvas pixel parity.
+
+    The official CULane comparison only needs mask areas and pairwise
+    intersections.  Allocating a full ``image_h x image_w`` canvas for every
+    one of the 4x32 counterfactual lanes is needlessly expensive.  OpenCV's
+    integer LINE_8 rasterizer is translation invariant, so drawing the same
+    rounded polyline inside a crop that contains the complete stroke produces
+    exactly the non-zero pixels of the full canvas.
+
+    ``width + 2`` is deliberately more conservative than the half-thickness
+    actually required by ``cv2.line``.  It also keeps clipping identical for
+    curves touching an image boundary.
+    """
+
+    points = interp(lane, n=5)
+    if len(points) < 2:
+        return np.zeros((0, 0), dtype=np.uint8), 0, 0
+    points = np.rint(points).astype(np.int32)
+    margin = int(width) + 2
+    left = max(int(points[:, 0].min()) - margin, 0)
+    right = min(int(points[:, 0].max()) + margin + 1, int(image_w))
+    top = max(int(points[:, 1].min()) - margin, 0)
+    bottom = min(int(points[:, 1].max()) + margin + 1, int(image_h))
+    if right <= left or bottom <= top:
+        return np.zeros((0, 0), dtype=np.uint8), top, left
+    mask = np.zeros((bottom - top, right - left), dtype=np.uint8)
+    shifted = points - np.asarray([left, top], dtype=np.int32)
+    for p1, p2 in zip(shifted[:-1], shifted[1:]):
+        cv2.line(mask, tuple(p1), tuple(p2), color=1, thickness=int(width))
+    return mask, top, left
+
+
+def _crop_intersection_count(
+    first: tuple[np.ndarray, int, int],
+    second: tuple[np.ndarray, int, int],
+) -> int:
+    first_mask, first_top, first_left = first
+    second_mask, second_top, second_left = second
+    if first_mask.size == 0 or second_mask.size == 0:
+        return 0
+    top = max(int(first_top), int(second_top))
+    left = max(int(first_left), int(second_left))
+    bottom = min(
+        int(first_top) + int(first_mask.shape[0]),
+        int(second_top) + int(second_mask.shape[0]),
+    )
+    right = min(
+        int(first_left) + int(first_mask.shape[1]),
+        int(second_left) + int(second_mask.shape[1]),
+    )
+    if bottom <= top or right <= left:
+        return 0
+    first_view = first_mask[
+        top - int(first_top) : bottom - int(first_top),
+        left - int(first_left) : right - int(first_left),
+    ]
+    second_view = second_mask[
+        top - int(second_top) : bottom - int(second_top),
+        left - int(second_left) : right - int(second_left),
+    ]
+    return int(cv2.countNonZero(cv2.bitwise_and(first_view, second_view)))
+
+
 def official_proposal_gt_iou_matrix(
     record: dict[str, Any],
     stage_name: str,
@@ -777,17 +846,19 @@ def official_proposal_gt_iou_matrix(
     if not gt_lanes or not pred_lanes:
         return matrix, candidate_valid
 
-    gt_masks = [_raster_lane_mask(lane, image_h, image_w, width) for lane in gt_lanes]
-    gt_counts = [int(mask.sum()) for mask in gt_masks]
+    gt_masks = [
+        _raster_lane_crop(lane, image_h, image_w, width) for lane in gt_lanes
+    ]
+    gt_counts = [int(mask[0].sum()) for mask in gt_masks]
     for proposal_idx, lane in enumerate(pred_lanes):
         if not bool(candidate_valid[proposal_idx]):
             continue
-        pred_mask = _raster_lane_mask(lane, image_h, image_w, width)
-        pred_count = int(pred_mask.sum())
+        pred_mask = _raster_lane_crop(lane, image_h, image_w, width)
+        pred_count = int(pred_mask[0].sum())
         if pred_count == 0:
             continue
         for gt_idx, gt_mask in enumerate(gt_masks):
-            intersection = int(cv2.countNonZero(cv2.bitwise_and(pred_mask, gt_mask)))
+            intersection = _crop_intersection_count(pred_mask, gt_mask)
             union = pred_count + gt_counts[gt_idx] - intersection
             matrix[gt_idx, proposal_idx] = 0.0 if union <= 0 else float(intersection) / float(union)
     return matrix, candidate_valid
