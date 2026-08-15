@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from dynlaneseq_eg.modeling.v22_field_utilization import (
+    build_owned_gt_operator_fields,
     candidate_field_component_scores,
     correct_curves_from_distance,
     equal_rank_ensemble,
@@ -17,6 +18,9 @@ from dynlaneseq_eg.tools.audit_v22_lane_field_utilization import (
     _dataset_relative_image_id,
     _metric_worker,
     _one_edit_outcomes,
+)
+from dynlaneseq_eg.tools.audit_v22_exact_gt_operator_oracle import (
+    _metric_worker as _exact_operator_metric_worker,
 )
 from dynlaneseq_eg.modeling.common import fixed_y_rows
 
@@ -89,6 +93,104 @@ def test_distance_correction_applies_exactly_one_and_two_closed_form_steps() -> 
     )
     torch.testing.assert_close(first, torch.full_like(first, 60.0), atol=2e-3, rtol=0)
     torch.testing.assert_close(second, torch.full_like(second, 40.0), atol=4e-3, rtol=0)
+
+
+def test_exact_owned_gt_distance_uses_unchanged_sampler_and_update() -> None:
+    rows, bins = 8, 64
+    target = {
+        "x_rows": torch.stack(
+            (torch.full((rows,), 20.5), torch.full((rows,), 50.5))
+        ),
+        "valid_mask": torch.ones(2, rows, dtype=torch.bool),
+    }
+    built = build_owned_gt_operator_fields(
+        [target],
+        ownership=torch.tensor([[0, 1]]),
+        slots=2,
+        rows=rows,
+        x_bins=bins,
+        input_w=64,
+        distance_limit_px=16.0,
+        centerline_sigma_px=3.0,
+        device=torch.device("cpu"),
+    )
+    source = torch.stack(
+        (torch.full((rows,), 28.5), torch.full((rows,), 42.5))
+    ).unsqueeze(1)
+    ranges = torch.tensor([[[0.0, 1.0]], [[0.0, 1.0]]])
+    corrected = correct_curves_from_distance(
+        built["distance_outputs"],
+        x_rows=source,
+        range_norm=ranges,
+        input_w=64,
+        distance_limit_px=16.0,
+        steps=1,
+    )[0]
+    expected = torch.stack(
+        (torch.full((rows,), 20.5), torch.full((rows,), 50.5))
+    ).unsqueeze(1)
+    torch.testing.assert_close(corrected, expected, atol=2e-3, rtol=0)
+
+
+def test_exact_owned_gt_distance_respects_fixed_support_limit() -> None:
+    rows, bins = 8, 64
+    target = {
+        "x_rows": torch.full((1, rows), 20.5),
+        "valid_mask": torch.ones(1, rows, dtype=torch.bool),
+    }
+    built = build_owned_gt_operator_fields(
+        [target],
+        ownership=torch.tensor([[0]]),
+        slots=1,
+        rows=rows,
+        x_bins=bins,
+        input_w=64,
+        distance_limit_px=16.0,
+        centerline_sigma_px=3.0,
+        device=torch.device("cpu"),
+    )
+    source = torch.full((1, 1, rows), 40.5)
+    ranges = torch.tensor([[[0.0, 1.0]]])
+    corrected = correct_curves_from_distance(
+        built["distance_outputs"],
+        x_rows=source,
+        range_norm=ranges,
+        input_w=64,
+        distance_limit_px=16.0,
+        steps=1,
+    )[0]
+    torch.testing.assert_close(corrected, source)
+
+
+def test_exact_owned_gt_heatmap_uses_unchanged_viterbi_path() -> None:
+    rows, bins = 8, 64
+    target = {
+        "x_rows": torch.full((1, rows), 20.5),
+        "valid_mask": torch.ones(1, rows, dtype=torch.bool),
+    }
+    built = build_owned_gt_operator_fields(
+        [target],
+        ownership=torch.tensor([[0]]),
+        slots=1,
+        rows=rows,
+        x_bins=bins,
+        input_w=64,
+        distance_limit_px=16.0,
+        centerline_sigma_px=1.0,
+        device=torch.device("cpu"),
+    )
+    source = torch.full((1, 1, rows), 28.5)
+    ranges = torch.tensor([[[0.0, 1.0]]])
+    path = source_seeded_field_path(
+        built["path_outputs"],
+        source_x=source,
+        source_range=ranges,
+        input_w=64,
+        distance_limit_px=16.0,
+        offset_step_px=4.0,
+        transition_scale_px=8.0,
+    )
+    torch.testing.assert_close(path, torch.full_like(path, 20.5))
 
 
 def test_equal_rank_ensemble_is_component_scale_invariant() -> None:
@@ -231,3 +333,44 @@ def test_metric_worker_rasterizes_all_fixed_curve_layouts(tmp_path: Path) -> Non
     assert result["continuous"]["source_v7"]["tp75"] == 1
     assert result["raw_cache_outcome_mismatch"] == 0
     assert result["semantics"]["synthetic"]["outcome_neutral"] == 1
+
+
+def test_exact_operator_metric_worker_rasterizes_every_policy(tmp_path: Path) -> None:
+    rows = 8
+    y = fixed_y_rows(rows, 64).tolist()
+    annotation = tmp_path / "operator.lines.txt"
+    annotation.write_text(
+        " ".join(f"20.5 {value}" for value in y) + "\n",
+        encoding="utf-8",
+    )
+    curve = torch.full((1, rows), 20.5)
+    ranges = torch.tensor([[0.0, 1.0]])
+    policies = (
+        "source_v7",
+        "exact_owned_gt_curve",
+        "exact_owned_distance_step1",
+        "exact_owned_centerline_path",
+    )
+    result = _exact_operator_metric_worker(
+        {
+            "meta": {
+                "anno_path": str(annotation),
+                "input_h": 64,
+                "input_w": 64,
+                "orig_h": 64,
+                "orig_w": 64,
+                "scale_x": 1.0,
+                "scale_y": 1.0,
+                "crop_x": 0.0,
+                "crop_y": 0.0,
+            },
+            "curves": {name: curve for name in policies},
+            "ranges": {name: ranges for name in policies},
+            "source_active": torch.tensor([True]),
+            "gt_count": 1,
+        }
+    )
+    for name in policies:
+        assert result["policies"][name]["tp50"] == 1
+        assert result["policies"][name]["tp75"] == 1
+    assert result["gt_count_cache_mismatch"] == 0

@@ -18,6 +18,119 @@ def _weighted_row_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
 
 
 @torch.no_grad()
+def build_owned_gt_operator_fields(
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    ownership: torch.Tensor,
+    slots: int,
+    rows: int,
+    x_bins: int,
+    input_w: int,
+    distance_limit_px: float,
+    centerline_sigma_px: float,
+    device: torch.device,
+) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Build slot-specific exact-GT fields for operator parity diagnostics.
+
+    Each ``(image, slot)`` becomes an independent one-lane field.  This is
+    intentionally different from the Stage-A nearest-lane union target: the
+    cached training-only ownership selects exactly one GT lane, so another GT
+    cannot capture the displacement or path.  The returned tensors can be fed
+    through the *unchanged* Stage-A sampler/update/Viterbi implementations.
+
+    This function is diagnostic-only and must never be used at inference.
+    """
+
+    batch = len(targets)
+    if ownership.shape != (batch, int(slots)):
+        raise ValueError("owned-GT field ownership shape mismatch")
+    if rows <= 1 or x_bins <= 1 or input_w <= 1:
+        raise ValueError("owned-GT field dimensions must exceed one")
+    if distance_limit_px <= 0.0 or centerline_sigma_px <= 0.0:
+        raise ValueError("owned-GT field scales must be positive")
+    field_batch = batch * int(slots)
+    shape = (field_batch, 1, int(rows), int(x_bins))
+    centerline_logits = torch.full(shape, -20.0, device=device)
+    distance_raw = torch.zeros(shape, device=device)
+    support_logits = torch.full(shape, -20.0, device=device)
+    owned_x = torch.full((batch, int(slots), int(rows)), float("nan"), device=device)
+    owned_valid = torch.zeros((batch, int(slots), int(rows)), dtype=torch.bool, device=device)
+
+    bin_width = float(input_w) / float(x_bins)
+    x_grid = (
+        (torch.arange(int(x_bins), device=device, dtype=torch.float32) + 0.5)
+        * bin_width
+    )
+    probability_floor = 1.0e-6
+    raw_limit = 1.0 - 1.0e-6
+    for item, target in enumerate(targets):
+        gt_x = target["x_rows"].to(device=device, dtype=torch.float32)
+        gt_valid = target["valid_mask"].to(device=device).bool()
+        local_rows = min(
+            int(rows),
+            int(gt_x.shape[-1]) if gt_x.ndim == 2 else 0,
+        )
+        for slot in range(int(slots)):
+            owned = int(ownership[item, slot])
+            if owned < 0 or owned >= int(gt_x.shape[0]) or local_rows <= 0:
+                continue
+            value = gt_x[owned, :local_rows]
+            valid = (
+                gt_valid[owned, :local_rows]
+                & torch.isfinite(value)
+                & (value >= 0.0)
+                & (value < float(input_w))
+            )
+            owned_x[item, slot, :local_rows] = value
+            owned_valid[item, slot, :local_rows] = valid
+            flat_index = item * int(slots) + slot
+            signed = value.unsqueeze(-1) - x_grid.view(1, int(x_bins))
+            absolute = signed.abs()
+            row_valid = valid.unsqueeze(-1)
+            support = row_valid & (absolute <= float(distance_limit_px))
+            normalized = torch.where(
+                support,
+                signed.clamp(-float(distance_limit_px), float(distance_limit_px))
+                / float(distance_limit_px),
+                torch.zeros_like(signed),
+            )
+            distance_raw[flat_index, 0, :local_rows] = torch.atanh(
+                normalized.clamp(-raw_limit, raw_limit)
+            )
+            support_logits[flat_index, 0, :local_rows] = torch.where(
+                support,
+                torch.full_like(signed, 20.0),
+                torch.full_like(signed, -20.0),
+            )
+            center_probability = torch.exp(
+                -0.5 * (absolute / float(centerline_sigma_px)).pow(2)
+            ) * row_valid.float()
+            center_probability = center_probability.clamp(
+                probability_floor, 1.0 - probability_floor
+            )
+            centerline_logits[flat_index, 0, :local_rows] = torch.logit(
+                center_probability
+            )
+
+    distance_outputs = {
+        "centerline_logits": torch.zeros_like(centerline_logits),
+        "distance_raw": distance_raw,
+        "support_logits": support_logits,
+    }
+    path_outputs = {
+        "centerline_logits": centerline_logits,
+        "distance_raw": torch.zeros_like(distance_raw),
+        "support_logits": support_logits,
+    }
+    return {
+        "distance_outputs": distance_outputs,
+        "path_outputs": path_outputs,
+        "owned_x": owned_x,
+        "owned_valid": owned_valid,
+    }
+
+
+@torch.no_grad()
 def candidate_field_component_scores(
     outputs: dict[str, torch.Tensor],
     *,
