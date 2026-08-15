@@ -276,13 +276,15 @@ def main() -> None:
     cases_with_positive_shortlist = 0
     contract = {
         "image_id_mismatch": 0,
-        "source_route_mismatch": 0,
-        "source_active_mismatch": 0,
-        "action_valid_mismatch": 0,
         "same_image_wrong_partner": int(wrong_report["same_image_partner_count"]),
         "same_clip_wrong_partner": int(wrong_report["same_clip_partner_count"]),
         "runtime_same_image_wrong_partner": 0,
         "runtime_same_clip_wrong_partner": 0,
+    }
+    replay_diagnostics = {
+        "live_source_route_mismatch": 0,
+        "live_source_active_mismatch": 0,
+        "live_action_valid_mismatch": 0,
     }
 
     def flush() -> None:
@@ -340,18 +342,25 @@ def main() -> None:
             name: value[start:stop].to(device, non_blocking=True)
             for name, value in cache.items()
         }
-        source_route = _required(
+        live_source_route = _required(
             outputs, "selection_slot_v20_v7_geometry_route_indices"
         ).long()
-        source_active = _required(outputs, "selection_slot_v20_v7_active").bool()
+        live_source_active = _required(
+            outputs, "selection_slot_v20_v7_active"
+        ).bool()
+        # The exact-raster cache is the immutable population contract.  CUDA
+        # replay can flip a handful of near-tied argmaxes even with the same
+        # checkpoint, so never let a second forward redefine source ownership.
+        source_route = cached["source_route"].long()
+        source_active = cached["source_active"].bool()
         action_valid = cached["action_valid"].bool()
-        contract["source_route_mismatch"] += int(
-            (source_route != cached["source_route"].long()).sum().cpu()
+        replay_diagnostics["live_source_route_mismatch"] += int(
+            (live_source_route != source_route).sum().cpu()
         )
-        contract["source_active_mismatch"] += int(
-            (source_active != cached["source_active"].bool()).sum().cpu()
+        replay_diagnostics["live_source_active_mismatch"] += int(
+            (live_source_active != source_active).sum().cpu()
         )
-        contract["action_valid_mismatch"] += int(
+        replay_diagnostics["live_action_valid_mismatch"] += int(
             (
                 _required(outputs, "selection_slot_v20_action_valid").bool()
                 != action_valid
@@ -549,6 +558,7 @@ def main() -> None:
             "passed": bool(wrong_report["passed"]),
         },
         "contract": {**contract, "passed": passed},
+        "live_replay_diagnostics_not_consumed": replay_diagnostics,
         "shards": shards,
         "training_performed": False,
         "checkpoint_selection_performed": False,

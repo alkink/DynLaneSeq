@@ -71,8 +71,12 @@ cache_domain() {
   local source_list="$3"
   local v20_cache="$4"
   local output_dir="${OUTPUT_ROOT}/cache/${name}"
+  local overwrite=()
   if [[ -f "${output_dir}/manifest.json" ]]; then
-    return
+    if "${PYTHON}" -c 'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1])).get("contract",{}).get("passed") is True else 1)' "${output_dir}/manifest.json"; then
+      return
+    fi
+    overwrite=(--overwrite)
   fi
   "${PYTHON}" -u -m dynlaneseq_eg.tools.cache_v21a_pairwise_visual_verification \
     --config "${CONFIG}" \
@@ -90,7 +94,8 @@ cache_domain() {
     --num-workers "${NUM_WORKERS}" \
     --shard-size "${CACHE_SHARD_SIZE}" \
     --curve-samples 24 \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${overwrite[@]}"
 }
 
 if [[ "${RUN_CACHE}" == "1" ]]; then
