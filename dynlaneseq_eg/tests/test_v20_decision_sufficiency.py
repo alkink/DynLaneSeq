@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from dynlaneseq_eg.tools.audit_v20_decision_sufficiency import (
+    _combined_shortlist_coverage,
     average_precision,
     context_comparison,
     decision_metrics,
@@ -92,3 +93,28 @@ def test_context_comparison_flattens_slot_candidate_outputs() -> None:
     )
     assert result["valid_action_mean_absolute_policy_delta"] == 0.25
     assert result["deployed_action_changed_fraction"] == 1.0
+
+
+def test_combined_shortlist_separates_top1_and_top2_slot_coverage() -> None:
+    scores = torch.tensor(
+        [[
+            [3.0, 2.0, 1.0],
+            [0.3, 0.2, 0.1],
+        ]]
+    )
+    valid = torch.ones(1, 2, 3, dtype=torch.bool)
+    positive = torch.zeros(1, 7, dtype=torch.bool)
+    positive[0, 1 + 1 * 3 + 2] = True
+    result = _combined_shortlist_coverage(scores, valid, positive)
+
+    assert result["oracle_positive_slot_top5_coverage"] == 1.0
+    assert (
+        result["retrieved_slot_shortlists"]["top1_slot_top5"]
+        ["coverage_on_opportunity_images"]
+        == 0.0
+    )
+    assert (
+        result["retrieved_slot_shortlists"]["top2_slot_top5"]
+        ["coverage_on_opportunity_images"]
+        == 1.0
+    )

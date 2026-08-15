@@ -17,6 +17,8 @@ from dynlaneseq_eg.tools.train_v20_cached_replacement import _load_cache
 
 
 FIXED_RISK_COVERAGE = (0.01, 0.02, 0.05, 0.10, 0.20)
+FIXED_SHORTLIST_SLOT_COUNTS = (1, 2)
+FIXED_SHORTLIST_CANDIDATE_COUNT = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,6 +219,74 @@ def _slot_candidate_decomposition(
     }
 
 
+def _combined_shortlist_coverage(
+    replacement_scores: torch.Tensor,
+    action_valid: torch.Tensor,
+    positive_actions: torch.Tensor,
+) -> dict[str, Any]:
+    """Measure fixed slot-retrieval and candidate-shortlist coverage.
+
+    This is a capacity diagnostic, not a deployment policy.  Slot counts and
+    candidate count are fixed constants rather than values selected from the
+    resulting metrics.
+    """
+
+    batch, slots, candidates = replacement_scores.shape
+    positive = positive_actions[:, 1:].reshape(batch, slots, candidates).bool()
+    opportunity = positive.flatten(1).any(dim=1)
+    masked_scores = replacement_scores.masked_fill(~action_valid, -1.0e4)
+    candidate_count = min(FIXED_SHORTLIST_CANDIDATE_COUNT, candidates)
+    candidate_ids = torch.topk(
+        masked_scores, k=candidate_count, dim=2
+    ).indices
+    candidate_positive = positive.gather(2, candidate_ids)
+    candidate_valid = action_valid.gather(2, candidate_ids)
+
+    oracle_slot_hit = (candidate_positive & candidate_valid).flatten(1).any(dim=1)
+    result: dict[str, Any] = {
+        "opportunity_images": int(opportunity.sum()),
+        "candidate_count": int(candidate_count),
+        "oracle_positive_slot_top5_coverage": (
+            float(oracle_slot_hit[opportunity].float().mean())
+            if bool(opportunity.any())
+            else float("nan")
+        ),
+        "retrieved_slot_shortlists": {},
+    }
+
+    slot_scores = masked_scores.max(dim=2).values
+    for requested_slot_count in FIXED_SHORTLIST_SLOT_COUNTS:
+        slot_count = min(int(requested_slot_count), slots)
+        slot_ids = torch.topk(slot_scores, k=slot_count, dim=1).indices
+        gather_index = slot_ids.unsqueeze(-1).expand(
+            batch, slot_count, candidate_count
+        )
+        selected_positive = candidate_positive.gather(1, gather_index)
+        selected_valid = candidate_valid.gather(1, gather_index)
+        selected_hit = (selected_positive & selected_valid).flatten(1).any(dim=1)
+        valid_actions = selected_valid.flatten(1).sum(dim=1)
+        positive_actions_per_image = (
+            selected_positive & selected_valid
+        ).flatten(1).sum(dim=1)
+        result["retrieved_slot_shortlists"][f"top{slot_count}_slot_top5"] = {
+            "coverage_on_opportunity_images": (
+                float(selected_hit[opportunity].float().mean())
+                if bool(opportunity.any())
+                else float("nan")
+            ),
+            "covered_opportunity_images": int(
+                (selected_hit & opportunity).sum()
+            ),
+            "mean_valid_actions_per_image": float(valid_actions.float().mean()),
+            "mean_positive_actions_per_opportunity_image": (
+                float(positive_actions_per_image[opportunity].float().mean())
+                if bool(opportunity.any())
+                else float("nan")
+            ),
+        }
+    return result
+
+
 def decision_metrics(
     cache: dict[str, torch.Tensor],
     scored: dict[str, torch.Tensor],
@@ -407,6 +477,14 @@ def decision_metrics(
                 replacement_scores, action_valid, beneficial
             ),
             "exact_policy_target": _slot_candidate_decomposition(
+                replacement_scores, action_valid, policy_positive
+            ),
+        },
+        "combined_shortlist_coverage": {
+            "any_beneficial_action": _combined_shortlist_coverage(
+                replacement_scores, action_valid, beneficial
+            ),
+            "exact_policy_target": _combined_shortlist_coverage(
                 replacement_scores, action_valid, policy_positive
             ),
         },
@@ -655,6 +733,12 @@ def main() -> None:
         "treatment_iteration": treatment_iteration,
         "control_iteration": control_iteration,
         "fixed_risk_coverage": list(FIXED_RISK_COVERAGE),
+        "fixed_shortlist_contract": {
+            "slot_counts": list(FIXED_SHORTLIST_SLOT_COUNTS),
+            "candidate_count": FIXED_SHORTLIST_CANDIDATE_COUNT,
+            "oracle_slot_top5_minimum_both_unseen": 0.80,
+            "top2_slot_top5_minimum_both_unseen": 0.65,
+        },
         "contract": {
             "training_performed": False,
             "checkpoint_selection_performed": False,
