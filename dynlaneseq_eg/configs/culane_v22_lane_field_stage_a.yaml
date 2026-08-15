@@ -1,0 +1,68 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v22_lane_field_stage_a
+
+# Stage A is trained online from the untouched official CULane training list:
+# CULane/list/train_gt.txt (88,880 rows). No row, clip, repeated entry, or
+# image is removed. The full official CULane/list/val.txt population (9,675
+# rows) is the only primary Stage-A evaluation population.
+augmentation:
+  cut_height: 270
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.2
+  blur_prob: 0.1
+  affine_prob: 0.2
+  affine_translate_x: 0.03
+  affine_translate_y: 0.02
+  affine_rotate_deg: 2.0
+  affine_scale_min: 0.95
+  affine_scale_max: 1.05
+  random_shadow_prob: 0.2
+  random_shadow_min_opacity: 0.20
+  random_shadow_max_opacity: 0.55
+  random_shadow_min_vertices: 3
+  random_shadow_max_vertices: 6
+  random_shadow_roi_start_y: 0.25
+
+model:
+  # The separate field encoder is copied from V7 before optimization. Avoid a
+  # second network download while constructing the warm-start source model.
+  pretrained_backbone: false
+  require_pretrained_backbone: false
+
+dataloader:
+  num_workers: 12
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  resume_safe: true
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 10000
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  clip_grad_norm: 1.0
+  log_interval: 50
+
+v22_stage_a:
+  hidden_dim: 128
+  distance_limit_px: 96.0
+  centerline_sigma_px: 3.0
+  centerline_positive_weight: 16.0
+  freeze_batch_norm_stats: true
+  optimizer:
+    backbone_lr: 0.00005
+    field_lr: 0.0002
+    weight_decay: 0.0001
+    warmup_steps: 500
+    minimum_lr_ratio: 0.1
+  fixed_gate:
+    conditional_top1_minimum: 0.65
+    correct_over_wrong_minimum_points: 0.10
+    correct_over_geometry_minimum_points: 0.10
