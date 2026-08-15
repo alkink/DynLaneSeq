@@ -15,7 +15,7 @@ from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.v20_slot_owned_replacement import _gather_candidate
 from dynlaneseq_eg.tools.audit_v11_causal_replay import _image_id
 from dynlaneseq_eg.tools.audit_v19_counterfactual_fidelity_official import _required
-from dynlaneseq_eg.tools.audit_v20_decision_sufficiency import score_cache
+from dynlaneseq_eg.tools.audit_v20_decision_sufficiency import _load_head, score_cache
 from dynlaneseq_eg.tools.probe_curve_aligned_visual_verification import (
     sample_curve_aligned_profiles,
     sampled_range_weights,
@@ -56,7 +56,16 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--geometry-checkpoint",
+        required=True,
+        help="Exact frozen V20 initialization used to build the official cache.",
+    )
+    parser.add_argument(
+        "--scoring-checkpoint",
+        required=True,
+        help="V20 treatment endpoint used only to rank each slot's shortlist.",
+    )
     parser.add_argument("--v20-cache-manifest", required=True)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--split", choices=("train", "val"), required=True)
@@ -214,11 +223,13 @@ def main() -> None:
         raise ValueError("V21A source list does not match the V20 exact cache")
 
     model = build_model(cfg).to(device)
-    iteration = int(load_checkpoint(args.checkpoint, model, strict=False))
+    geometry_iteration = int(
+        load_checkpoint(args.geometry_checkpoint, model, strict=False)
+    )
     model.requires_grad_(False).eval()
-    head = model.structured_query_head.set_selection_head.slot_owned_safe_replacement
-    if head is None:
-        raise ValueError("V21A requires the V20 treatment replacement head")
+    head, scoring_iteration = _load_head(
+        args.config, args.scoring_checkpoint, device
+    )
     scored = score_cache(
         head,
         cache,
@@ -505,9 +516,16 @@ def main() -> None:
     manifest = {
         "experiment": "V21A oracle-slot top5 pairwise visual verification cache",
         "config": str(Path(args.config).expanduser().resolve()),
-        "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
-        "checkpoint_sha256": sha256_file(args.checkpoint),
-        "iteration": iteration,
+        "geometry_checkpoint": str(
+            Path(args.geometry_checkpoint).expanduser().resolve()
+        ),
+        "geometry_checkpoint_sha256": sha256_file(args.geometry_checkpoint),
+        "geometry_iteration": geometry_iteration,
+        "scoring_checkpoint": str(
+            Path(args.scoring_checkpoint).expanduser().resolve()
+        ),
+        "scoring_checkpoint_sha256": sha256_file(args.scoring_checkpoint),
+        "scoring_iteration": scoring_iteration,
         "v20_cache_manifest": str(v20_manifest_path),
         "v20_cache_manifest_sha256": sha256_file(v20_manifest_path),
         "dataset_root": str(Path(args.dataset_root).expanduser().resolve()),

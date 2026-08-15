@@ -18,6 +18,7 @@ RUN_TRAIN="${RUN_TRAIN:-1}"
 CONFIG="${CONFIG:-dynlaneseq_eg/configs/culane_s0_structured_query_dla34_v20_slot_owned_safe_replacement_233k_to241k.yaml}"
 V20_ROOT="${V20_ROOT:-outputs/diagnostics/v20_slot_owned_safe_replacement_233k}"
 V20_AUDIT_ROOT="${V20_AUDIT_ROOT:-outputs/diagnostics/v20_decision_sufficiency_autopsy_241k}"
+V20_INITIAL="${V20_INITIAL:-${V20_ROOT}/initialization/treatment_iter_0233000.pt}"
 V20_ENDPOINT="${V20_ENDPOINT:-${V20_ROOT}/train_treatment/iter_0241000.pt}"
 LIST_ROOT="${LIST_ROOT:-${V20_ROOT}/lists}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/diagnostics/v21a_pairwise_visual_verification_241k}"
@@ -35,7 +36,7 @@ VAL_V20_CACHE="${V20_AUDIT_ROOT}/cache/validation256_exact_raster/manifest.json"
 mkdir -p "${OUTPUT_ROOT}/lists" "${OUTPUT_ROOT}/cache" "${OUTPUT_ROOT}/train"
 
 for required in \
-  "${CONFIG}" "${V20_ENDPOINT}" \
+  "${CONFIG}" "${V20_INITIAL}" "${V20_ENDPOINT}" \
   "${TRAIN_LIST}" "${SAMECLIP_LIST}" "${HELDOUT_LIST}" "${VAL_LIST}" \
   "${TRAIN_V20_CACHE}" "${SAMECLIP_V20_CACHE}" \
   "${HELDOUT_V20_CACHE}" "${VAL_V20_CACHE}"; do
@@ -75,7 +76,8 @@ cache_domain() {
   fi
   "${PYTHON}" -u -m dynlaneseq_eg.tools.cache_v21a_pairwise_visual_verification \
     --config "${CONFIG}" \
-    --checkpoint "${V20_ENDPOINT}" \
+    --geometry-checkpoint "${V20_INITIAL}" \
+    --scoring-checkpoint "${V20_ENDPOINT}" \
     --v20-cache-manifest "${v20_cache}" \
     --dataset-root "${DATA_ROOT}" \
     --split "${split}" \
