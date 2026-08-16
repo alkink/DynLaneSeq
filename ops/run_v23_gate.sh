@@ -20,9 +20,9 @@ args=(
   --dataset-root /workspace/CULane
   --output-dir "${output}"
   --device cuda
-  # Full-resolution online augmentation was starving the GPU with four
-  # workers on the 32-core remote host.
-  --num-workers 12
+  # A measured 12-worker control was slower because full-resolution workers
+  # increased IPC/cache pressure. Four gave the best sustained throughput.
+  --num-workers 4
   --mode gate
   --log-interval 25
   --resume-interval 500
