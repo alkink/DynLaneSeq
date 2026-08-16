@@ -16,3 +16,7 @@ v25:
     visibility: 0.5
     proposal_coverage: 1.0
     proposal_groups: 4
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2

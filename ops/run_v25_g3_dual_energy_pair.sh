@@ -49,6 +49,23 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export DYNLANESEQ_DLA34_WEIGHTS=/root/.cache/torch/hub/checkpoints/dla34-ba72cf86.pth
 
+smoke=${project}/outputs/diagnostics/v25_g3_dual_energy_smoke
+if [[ ! -f "${smoke}/component_smoke.pt" ]]; then
+  "${python}" -m dynlaneseq_eg.tools.train_v25_component_gate \
+    --config dynlaneseq_eg/configs/culane_v25_g3_dual_energy_treatment_025ep.yaml \
+    --init-checkpoint "${parent}/component_endpoint.pt" \
+    --allow-advanced-init \
+    --expected-init-iteration "${parent_iteration}" \
+    --dataset-root /workspace/CULane \
+    --output-dir "${smoke}" \
+    --component-name g3_dual_energy_smoke \
+    --device cuda \
+    --num-workers 2 \
+    --mode smoke \
+    --smoke-steps 1 \
+    --log-interval 1
+fi
+
 run_arm() {
   local name=$1
   local config=$2
