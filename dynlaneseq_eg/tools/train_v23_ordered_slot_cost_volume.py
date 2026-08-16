@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--smoke-steps", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=25)
+    parser.add_argument("--resume", default="")
+    parser.add_argument("--resume-interval", type=int, default=500)
     return parser.parse_args()
 
 
@@ -223,13 +225,13 @@ def _gate_zero(
             (
                 output["pred_x_rows"].float()
                 - teacher_output["selection_slot_pred_x_rows"].float()
-            ).abs().max()
+            ).abs().max().detach()
         ),
         "range_norm": float(
             (
                 output["range_norm"].float()
                 - teacher_output["selection_slot_range_norm"].float()
-            ).abs().max()
+            ).abs().max().detach()
         ),
     }
     teacher_gradient_tensors = sum(
@@ -310,6 +312,7 @@ def main() -> None:
     if not isinstance(model, DynLaneSeqV23):
         raise TypeError("factory did not construct DynLaneSeqV23")
     v7_iteration = int(load_checkpoint(args.v7_checkpoint, model.teacher, strict=True))
+    v7_teacher_digest = _state_digest(model.teacher)
     v22 = _make_v22(cfg)
     v22_iteration = int(load_checkpoint(args.v22_checkpoint, v22, strict=True))
     warm_start = model.student.copy_v22_encoder_(v22)
@@ -321,7 +324,33 @@ def main() -> None:
     if channels_last:
         model.to(memory_format=torch.channels_last)
 
-    loader = build_dataloader(cfg, split="train", training=True)
+    weights = _loss_weights(cfg)
+    optimizer = _optimizer(model, cfg)
+    start_step = 0
+    resumed_from = ""
+    if args.resume:
+        resume_path = Path(args.resume).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(resume_path)
+        start_step = int(
+            load_checkpoint(
+                resume_path,
+                model,
+                optimizer=optimizer,
+                strict=True,
+                restore_rng_state=True,
+            )
+        )
+        if not 0 < start_step < steps:
+            raise ValueError(
+                f"resume iteration must be in (0,{steps}), got {start_step}"
+            )
+        resumed_from = str(resume_path)
+        if _state_digest(model.teacher) != v7_teacher_digest:
+            raise RuntimeError("resume checkpoint changed the exact V7 teacher state")
+    loader = build_dataloader(
+        cfg, split="train", training=True, start_iteration=start_step
+    )
     if len(loader.dataset) != int(train_population["expected_nonempty_rows"]):
         raise ValueError(
             "V23 loader altered the official train.txt population: "
@@ -329,31 +358,46 @@ def main() -> None:
             f"found {len(loader.dataset)}"
         )
     iterator = iter(loader)
-    gate_batch, iterator = _next_batch(loader, iterator)
-    weights = _loss_weights(cfg)
-    gate_zero = _gate_zero(
-        model,
-        gate_batch,
-        device=device,
-        cfg=cfg,
-        weights=weights,
-    )
-    if not gate_zero["passed"]:
-        raise RuntimeError("V23 Gate 0 failed: " + json.dumps(gate_zero, sort_keys=True))
+    if start_step == 0:
+        gate_batch, iterator = _next_batch(loader, iterator)
+        gate_zero = _gate_zero(
+            model,
+            gate_batch,
+            device=device,
+            cfg=cfg,
+            weights=weights,
+        )
+        if not gate_zero["passed"]:
+            raise RuntimeError(
+                "V23 Gate 0 failed: " + json.dumps(gate_zero, sort_keys=True)
+            )
+        # Gate 0 is diagnostic only. Rewind the resume-safe stream so no
+        # official training image is consumed without an optimizer update.
+        iterator = iter(loader)
+    else:
+        gate_zero = {
+            "passed": True,
+            "reused_from_resume": resumed_from,
+            "zero_step_contract_was_executed_before_optimization": True,
+        }
 
-    optimizer = _optimizer(model, cfg)
     opt_cfg = cfg["v23"]["optimizer"]
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "train_metrics.jsonl"
-    metrics_handle = metrics_path.open("w", encoding="utf-8")
+    metrics_handle = metrics_path.open(
+        "a" if start_step > 0 else "w", encoding="utf-8"
+    )
     amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
     accumulation_steps = int(cfg["training"]["gradient_accumulation_steps"])
     start_time = time.perf_counter()
-    images_seen = 0
+    images_seen = start_step * int(cfg["training"]["batch_size"]) * int(
+        cfg["training"]["gradient_accumulation_steps"]
+    )
     final_diagnostics: dict[str, float] = {}
     model.train()
-    for step in range(1, steps + 1):
+    resume_checkpoint = output_dir / "resume_latest.pt"
+    for step in range(start_step + 1, steps + 1):
         lr_ratio = _set_learning_rate(
             optimizer,
             step=step,
@@ -417,6 +461,20 @@ def main() -> None:
             print(text, flush=True)
             metrics_handle.write(text + "\n")
             metrics_handle.flush()
+        if (
+            args.mode == "gate"
+            and int(args.resume_interval) > 0
+            and step < steps
+            and step % int(args.resume_interval) == 0
+        ):
+            save_checkpoint(
+                resume_checkpoint,
+                model,
+                optimizer=optimizer,
+                iteration=step,
+                cfg=cfg,
+                include_rng_state=True,
+            )
     metrics_handle.close()
 
     checkpoint_path = output_dir / (
@@ -433,9 +491,16 @@ def main() -> None:
         "scientific_gate": args.mode == "gate",
         "iteration": steps,
         "images_seen": images_seen,
+        "start_iteration": start_step,
+        "resumed_from": resumed_from,
         "complete_official_train_epochs_seen": float(images_seen)
         / float(train_population["expected_nonempty_rows"]),
         "elapsed_seconds": time.perf_counter() - start_time,
+        "maximum_cuda_memory_allocated_bytes": (
+            int(torch.cuda.max_memory_allocated(device))
+            if device.type == "cuda"
+            else 0
+        ),
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "config": str(Path(args.config).expanduser().resolve()),
@@ -451,6 +516,9 @@ def main() -> None:
         "model_contract": v23_model_contract(model.student),
         "warm_start": warm_start,
         "gate_zero": gate_zero,
+        "teacher_state_sha256_at_endpoint": _state_digest(model.teacher),
+        "teacher_state_still_exact": _state_digest(model.teacher)
+        == v7_teacher_digest,
         "official_train_population_contract": train_population,
         "official_val_population_contract": val_population,
         "final_training_diagnostics": final_diagnostics,
