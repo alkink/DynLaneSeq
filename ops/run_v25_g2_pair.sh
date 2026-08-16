@@ -5,12 +5,18 @@ project=/workspace/DynLaneSeq_v25
 python=/venv/clrernet/bin/python
 g0=${project}/outputs/diagnostics/v25_g0_direct_four_lane_objects_1ep
 g0_eval=${project}/outputs/diagnostics/v25_g0_g1_official_val/g0_g1_official_val_report.json
+g1b_eval=${project}/outputs/diagnostics/v25_g1b_multi_path_capacity/g1b_multi_path_capacity_report.json
 control=${project}/outputs/diagnostics/v25_g2_control_025ep
 treatment=${project}/outputs/diagnostics/v25_g2_image_ownership_025ep
 evaluation=${project}/outputs/diagnostics/v25_g2_official_val
 
 while [[ ! -f "${g0_eval}" ]]; do
   echo "Waiting for V25 G0/G1 report..."
+  sleep 60
+done
+
+while [[ ! -f "${g1b_eval}" ]]; do
+  echo "Waiting for V25 G1B multi-path report..."
   sleep 60
 done
 

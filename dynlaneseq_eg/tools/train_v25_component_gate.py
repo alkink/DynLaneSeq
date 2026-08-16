@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from pathlib import Path
@@ -43,9 +44,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--init-checkpoint", required=True)
+    parser.add_argument(
+        "--allow-advanced-init",
+        action="store_true",
+        help="Load every shared G0/G2 tensor exactly and initialize only new dual-energy modules.",
+    )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--component-name", required=True)
+    parser.add_argument(
+        "--expected-init-iteration",
+        type=int,
+        default=0,
+        help="Exact parent iteration; 0 means the one-epoch G0 endpoint.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--mode", choices=("gate", "smoke"), default="gate")
@@ -90,10 +102,43 @@ def main() -> None:
     if not isinstance(model, DynLaneSeqV25):
         raise TypeError("factory did not construct DynLaneSeqV25")
     init_checkpoint = Path(args.init_checkpoint).expanduser().resolve()
-    init_iteration = int(load_checkpoint(init_checkpoint, model, strict=True))
-    if init_iteration != full_epoch_steps:
+    if args.allow_advanced_init:
+        base_cfg = copy.deepcopy(cfg)
+        base_cfg.setdefault("v25", {})["enable_dual_energy_multi_path"] = False
+        base_model = build_model(base_cfg)
+        base_iteration = int(load_checkpoint(init_checkpoint, base_model, strict=True))
+        init_iteration = int(load_checkpoint(init_checkpoint, model, strict=False))
+        advanced_state = model.state_dict()
+        shared_mismatch = [
+            name
+            for name, value in base_model.state_dict().items()
+            if name not in advanced_state
+            or tuple(advanced_state[name].shape) != tuple(value.shape)
+            or not torch.equal(advanced_state[name].cpu(), value.cpu())
+        ]
+        if base_iteration != init_iteration or shared_mismatch:
+            raise ValueError(
+                "advanced V25 initialization did not preserve every shared tensor: "
+                + json.dumps(
+                    {
+                        "base_iteration": base_iteration,
+                        "advanced_iteration": init_iteration,
+                        "mismatch_count": len(shared_mismatch),
+                        "first_mismatches": shared_mismatch[:10],
+                    }
+                )
+            )
+        del base_model
+    else:
+        init_iteration = int(load_checkpoint(init_checkpoint, model, strict=True))
+    expected_init_iteration = (
+        int(args.expected_init_iteration)
+        if int(args.expected_init_iteration) > 0
+        else full_epoch_steps
+    )
+    if init_iteration != expected_init_iteration:
         raise ValueError(
-            f"V25 component init must be G0 iteration {full_epoch_steps}, "
+            f"V25 component init must be iteration {expected_init_iteration}, "
             f"got {init_iteration}"
         )
     model.to(device)
@@ -248,6 +293,7 @@ def main() -> None:
         "scientific_gate": args.mode == "gate",
         "initial_checkpoint": str(init_checkpoint),
         "initial_checkpoint_sha256": sha256_file(init_checkpoint),
+        "advanced_partial_init": bool(args.allow_advanced_init),
         "initial_iteration": init_iteration,
         "component_steps": component_steps,
         "final_iteration": final_iteration,

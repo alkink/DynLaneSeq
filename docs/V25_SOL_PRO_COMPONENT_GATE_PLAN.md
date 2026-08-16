@@ -100,12 +100,33 @@ Required mechanism evidence:
 - correct-image advantage is retained;
 - full-validation F1@.50 and F1@.75 are not materially worse than control.
 
-### G3 — Auxiliary 32-proposal coverage branch and proposal memory
+### G1B — Diverse coherent-path capacity (training-free)
+
+From the same fixed G0 unary tensor, extract the exact MAP path and two
+suppression-diversified coherent alternatives per final slot.  Compare the
+single-MAP writer, deterministic `(K + dustbin)^4` energy/set decode, and a
+GT-only capacity oracle.  The oracle is diagnostic and is never deployed.
+
+Required evidence before a learned multi-path selector is considered:
+
+- path 0 is bit-exact with the G1 hard-Viterbi result;
+- alternative paths are spatially distinct rather than numerical copies;
+- deterministic set decode does not materially regress single-MAP F1;
+- multi-path official oracle adds at least `+0.30` F1@.50 to justify retaining
+  the extra hypotheses, and at least `+0.80` to authorize a learned selector.
+
+### G3 — Auxiliary proposals, dual energy, and multi-path set decode
 
 First test the auxiliary branch alone for proposal coverage.  Then continue a
-paired control/treatment for the same quarter epoch.  Proposal tensors enter
-the final branch only as a droppable spatial prior/memory.  They never own
-writer coordinates and never form a coordinate weighted average.
+paired control/treatment for the same quarter epoch.  Both arms train the same
+32-proposal one-to-many coverage branch and row-visibility/reliability heads.
+Control keeps image-only final energy; treatment enables a calibrated
+log-mixture of separate image and proposal spatial energies. Proposal tensors
+enter the final branch only as a droppable spatial prior/memory. They never own
+writer coordinates and never form a coordinate weighted average. Inference
+preserves three coherent paths per final lane and performs an exact
+`(K + dustbin)^4` deterministic set decode from the trained spatial energy,
+existence evidence, and explicit order/duplicate costs.
 
 Required mechanism evidence:
 
@@ -114,6 +135,11 @@ Required mechanism evidence:
 - a synthetic target outside the proposal cloud remains reachable;
 - proposal treatment does not reduce unique final-lane coverage or official
   validation F1 relative to its paired control.
+- image/proposal modes remain spatially distinct when they disagree; no
+  coordinate expectation is allowed between them;
+- final writer paths are exact members of the coherent hypothesis bank;
+- row-level visibility and entropy/margin-aware q50/q75 heads receive finite
+  nonzero gradients from the same final lane-object state.
 
 ### G4 — Training-only denoising lane queries
 
@@ -139,7 +165,10 @@ Combine every mechanism that passed its own causal contract:
 - 32 one-to-many proposals as auxiliary coverage memory;
 - four one-to-one final lane-row objects as the only output owner;
 - vertical intra-lane reasoning and coherent hard path inference;
+- separate image/proposal energy distributions and calibrated log-mixture;
+- multiple diverse coherent path hypotheses with exact small-set decode;
 - image-mediated ridge ownership competition;
+- row-level visibility and posterior-aware q50/q75 reliability;
 - deterministic order/non-crossing/duplicate constraints;
 - proposal/GT denoising supervision;
 - direct geometry, range, existence, quality, soft strip-IoU, and candidate

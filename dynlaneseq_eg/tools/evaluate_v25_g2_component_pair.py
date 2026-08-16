@@ -41,6 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--treatment-config", required=True)
     parser.add_argument("--treatment-checkpoint", required=True)
     parser.add_argument("--treatment-report", required=True)
+    parser.add_argument("--control-component", default="g2_control")
+    parser.add_argument("--treatment-component", default="g2_image_ownership")
+    parser.add_argument(
+        "--experiment-name",
+        default="V25 G2 image-mediated ridge ownership paired gate",
+    )
+    parser.add_argument("--report-filename", default="g2_official_val_report.json")
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--wrong-image-list", required=True)
     parser.add_argument("--wrong-image-report", required=True)
@@ -228,12 +235,12 @@ def main() -> None:
     control_contract, control_report = _endpoint_contract(
         control_checkpoint,
         Path(args.control_report).expanduser().resolve(),
-        expected_component="g2_control",
+        expected_component=args.control_component,
     )
     treatment_contract, treatment_report = _endpoint_contract(
         treatment_checkpoint,
         Path(args.treatment_report).expanduser().resolve(),
-        expected_component="g2_image_ownership",
+        expected_component=args.treatment_component,
     )
     if control_report["initial_checkpoint_sha256"] != treatment_report["initial_checkpoint_sha256"]:
         raise ValueError("G2 control/treatment did not start from identical G0 endpoint")
@@ -347,7 +354,7 @@ def main() -> None:
         > int(metrics["image_ownership_wrong_image"]["0.75"]["TP"]),
     }
     report = {
-        "experiment": "V25 G2 image-mediated ridge ownership paired gate",
+        "experiment": args.experiment_name,
         "control_endpoint_contract": control_contract,
         "treatment_endpoint_contract": treatment_contract,
         "official_validation_population_contract": population,
@@ -369,7 +376,7 @@ def main() -> None:
         },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "g2_official_val_report.json").write_text(
+    (output_dir / args.report_filename).write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(report, indent=2, sort_keys=True), flush=True)

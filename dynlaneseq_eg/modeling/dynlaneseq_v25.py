@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .v25_dual_energy_multi_path import V25DualEnergyMultiPath
 from .v25_image_mediated_lane_objects import V25ImageMediatedLaneObjects
 
 
@@ -15,7 +16,12 @@ class DynLaneSeqV25(nn.Module):
         super().__init__()
         model_cfg = cfg.get("model", cfg)
         v25 = cfg.get("v25", {})
-        self.detector = V25ImageMediatedLaneObjects(
+        detector_type = (
+            V25DualEnergyMultiPath
+            if bool(v25.get("enable_dual_energy_multi_path", False))
+            else V25ImageMediatedLaneObjects
+        )
+        common_kwargs = dict(
             input_h=int(model_cfg.get("input_h", 640)),
             input_w=int(model_cfg.get("input_w", 1600)),
             num_rows=int(model_cfg.get("num_rows", 160)),
@@ -49,6 +55,27 @@ class DynLaneSeqV25(nn.Module):
                 v25.get("freeze_batch_norm_stats", True)
             ),
         )
+        if detector_type is V25DualEnergyMultiPath:
+            common_kwargs.update(
+                num_path_hypotheses=int(v25.get("num_path_hypotheses", 3)),
+                path_suppression_radius_bins=int(
+                    v25.get("path_suppression_radius_bins", 5)
+                ),
+                path_suppression_penalty=float(
+                    v25.get("path_suppression_penalty", 8.0)
+                ),
+                proposal_count=int(v25.get("proposal_count", 32)),
+                proposal_groups=int(v25.get("proposal_groups", 4)),
+                proposal_dropout=float(v25.get("proposal_dropout", 0.25)),
+                enable_proposal_fusion=bool(
+                    v25.get("enable_proposal_fusion", True)
+                ),
+                exact_set_selection=bool(v25.get("exact_set_selection", True)),
+                minimum_spacing_px=float(
+                    v25.get("loss", {}).get("minimum_spacing_px", 12.0)
+                ),
+            )
+        self.detector = detector_type(**common_kwargs)
         self.supports_inference_only = True
 
     def prepare_for_inference(self) -> None:

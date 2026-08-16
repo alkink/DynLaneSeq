@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 import math
 from typing import Any
 
@@ -26,6 +27,9 @@ class V25LossWeights:
     smoothness: float = 0.25
     order: float = 0.25
     duplicate: float = 0.25
+    visibility: float = 0.0
+    proposal_coverage: float = 0.0
+    proposal_groups: int = 4
     line_width: float = 30.0
     minimum_valid_rows: int = 5
     minimum_spacing_px: float = 12.0
@@ -719,6 +723,73 @@ def v25_lane_object_loss(
         if duplicate_terms
         else soft_x.new_zeros(())
     )
+    if "row_visibility_logits" in outputs:
+        visibility_target = valid.float()
+        visibility = F.binary_cross_entropy_with_logits(
+            outputs["row_visibility_logits"].float(),
+            visibility_target,
+            reduction="mean",
+        )
+    else:
+        visibility = soft_x.new_zeros(())
+
+    proposal_coverage = soft_x.new_zeros(())
+    if "proposal_unary_logits" in outputs and weights.proposal_coverage > 0.0:
+        proposal_logits = outputs["proposal_unary_logits"]
+        proposal_x = outputs["proposal_x_normalized"].float() * float(input_w)
+        proposal_count = int(proposal_logits.shape[1])
+        groups = int(weights.proposal_groups)
+        if groups < 1 or proposal_count % groups:
+            raise ValueError("V25 proposal groups do not divide proposal count")
+        group_size = proposal_count // groups
+        proposal_terms: list[torch.Tensor] = []
+        for batch_index in range(batch):
+            target_count = int(ordered["counts"][batch_index].item())
+            if target_count < 1:
+                continue
+            target_x = ordered["x_rows"][batch_index, :target_count]
+            target_valid = valid[batch_index, :target_count]
+            for group in range(groups):
+                start = group * group_size
+                stop = start + group_size
+                group_x = proposal_x[batch_index, start:stop]
+                order = group_x[:, -1].argsort(stable=True)
+                sorted_x = group_x[order]
+                cost = []
+                for target_index in range(target_count):
+                    mask = target_valid[target_index]
+                    distance = (
+                        sorted_x[:, mask] - target_x[target_index, mask].view(1, -1)
+                    ).abs().mean(dim=-1)
+                    cost.append(distance)
+                cost_matrix = torch.stack(cost, dim=-1)
+                candidates = torch.tensor(
+                    list(combinations(range(group_size), target_count)),
+                    device=soft_x.device,
+                    dtype=torch.long,
+                )
+                assignment_cost = torch.stack(
+                    [
+                        cost_matrix[candidates[:, target_index], target_index]
+                        for target_index in range(target_count)
+                    ],
+                    dim=-1,
+                ).sum(dim=-1)
+                chosen_sorted = candidates[assignment_cost.argmin()]
+                chosen = order[chosen_sorted] + start
+                selected_logits = proposal_logits[
+                    batch_index, chosen
+                ].unsqueeze(0)
+                proposal_terms.append(
+                    _row_distribution_loss(
+                        selected_logits,
+                        target_x.unsqueeze(0),
+                        target_valid.unsqueeze(0),
+                        input_w=input_w,
+                    )
+                )
+        if proposal_terms:
+            proposal_coverage = torch.stack(proposal_terms).mean()
     total = (
         weights.existence * existence
         + weights.row_distribution * row
@@ -730,6 +801,8 @@ def v25_lane_object_loss(
         + weights.smoothness * smoothness
         + weights.order * order_loss
         + weights.duplicate * duplicate
+        + weights.visibility * visibility
+        + weights.proposal_coverage * proposal_coverage
     )
     diagnostics = {
         "loss_total": total.detach(),
@@ -743,6 +816,8 @@ def v25_lane_object_loss(
         "loss_smoothness": smoothness.detach(),
         "loss_order": order_loss.detach(),
         "loss_duplicate": duplicate.detach(),
+        "loss_visibility": visibility.detach(),
+        "loss_proposal_coverage": proposal_coverage.detach(),
         "mean_soft_iou": (iou * active.float()).sum().detach()
         / active.sum().clamp_min(1).float(),
         "active_lane_fraction": active.float().mean().detach(),
@@ -775,4 +850,16 @@ def v25_model_contract(model: V25ImageMediatedLaneObjects) -> dict[str, Any]:
         "slot_interaction_enabled": any(
             block.enable_slot_interaction for block in model.decoder
         ),
+        "dual_energy_enabled": bool(
+            getattr(model, "enable_proposal_fusion", False)
+        ),
+        "auxiliary_proposal_memory_present": hasattr(model, "proposal_memory"),
+        "proposal_memory_owns_geometry": False,
+        "num_path_hypotheses": int(
+            getattr(model, "num_path_hypotheses", 1)
+        ),
+        "exact_small_set_selection": bool(
+            getattr(model, "exact_set_selection", False)
+        ),
+        "row_visibility_present": hasattr(model, "row_visibility_head"),
     }

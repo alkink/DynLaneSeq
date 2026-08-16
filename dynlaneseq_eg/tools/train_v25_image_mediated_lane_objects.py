@@ -98,6 +98,9 @@ def _loss_weights(cfg: dict[str, Any]) -> V25LossWeights:
         smoothness=float(raw["smoothness"]),
         order=float(raw["order"]),
         duplicate=float(raw["duplicate"]),
+        visibility=float(raw.get("visibility", 0.0)),
+        proposal_coverage=float(raw.get("proposal_coverage", 0.0)),
+        proposal_groups=int(raw.get("proposal_groups", 4)),
         line_width=float(raw["line_width"]),
         minimum_valid_rows=int(raw["minimum_valid_rows"]),
         minimum_spacing_px=float(raw["minimum_spacing_px"]),
@@ -181,15 +184,33 @@ def _to_host(
 
 
 def _gradient_contract(model: DynLaneSeqV25) -> dict[str, Any]:
-    prefixes = (
+    prefixes = [
         "detector.backbone",
         "detector.fpn",
         "detector.fine_stem",
         "detector.decoder",
         "detector.exist_head",
         "detector.range_head",
-        "detector.quality_head",
-    )
+    ]
+    detector = model.detector
+    if hasattr(detector, "reliability_head"):
+        prefixes.extend(
+            (
+                "detector.reliability_head",
+                "detector.row_visibility_head",
+                "detector.proposal_memory",
+            )
+        )
+        if bool(getattr(detector, "enable_proposal_fusion", False)):
+            prefixes.extend(
+                (
+                    "detector.energy_mixture",
+                    "detector.slot_proposal_query",
+                    "detector.proposal_key",
+                )
+            )
+    else:
+        prefixes.append("detector.quality_head")
     result: dict[str, Any] = {}
     named = list(model.named_parameters())
     for prefix in prefixes:
