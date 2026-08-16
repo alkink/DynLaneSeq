@@ -25,6 +25,7 @@ EXPECTED = {
     "epochs": 15,
     "nms_patch_sha256": "0635c02f18d53a08007902f9369a57b2fb8b6c98229c534e7aa606c7f768ec61",
     "mmcv_shim_sha256": "f5e22597f563b837b4ab0e7bfc05c6ea43b961285b328d098946fda3ad2a1b8e",
+    "dla_pretrained_sha256": "ba72cf86426e6333d9e8c6c7a8cae5549879212e48ae3aaad4bc8a7d009c34e1",
 }
 
 
@@ -48,6 +49,7 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--nms-patch", type=Path, required=True)
     parser.add_argument("--mmcv-shim", type=Path, required=True)
+    parser.add_argument("--dla-pretrained", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -100,6 +102,8 @@ def main() -> None:
         "mmcv_shim_source_sha256": sha256(args.mmcv_shim),
         "mmcv_shim_installed": str(installed_mmcv_shim),
         "mmcv_shim_installed_sha256": sha256(installed_mmcv_shim),
+        "dla_pretrained": str(args.dla_pretrained.resolve()),
+        "dla_pretrained_sha256": sha256(args.dla_pretrained),
         "modified_upstream_sources": modified_sources,
         "test_invoked": False,
         "deduplication": False,
@@ -132,6 +136,9 @@ def main() -> None:
             and facts["mmcv_distribution"] == "2.1.0"
             and facts["mmcv_shim_source_sha256"] == EXPECTED["mmcv_shim_sha256"]
             and facts["mmcv_shim_installed_sha256"] == EXPECTED["mmcv_shim_sha256"]
+        ),
+        "dla_pretrained_exact": (
+            facts["dla_pretrained_sha256"] == EXPECTED["dla_pretrained_sha256"]
         ),
         "fixed_endpoint": (
             facts["epochs"] == EXPECTED["epochs"]
