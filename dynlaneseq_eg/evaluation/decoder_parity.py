@@ -43,7 +43,7 @@ DECODER_VARIANTS: tuple[DecoderVariant, ...] = (
     ),
     DecoderVariant(
         "C_clr_range",
-        "Only CLRNet-style bottom extension from the predicted upper endpoint is enabled.",
+        "Only CLRNet-style contiguous extension below the predicted lower endpoint is enabled.",
         range_mode="clr_bottom_extend",
     ),
     DecoderVariant(
@@ -79,11 +79,12 @@ def candidate_geometry(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[Lane]]:
     """Build fixed-row candidate geometry for a decoder treatment.
 
-    CLRNet predicts an upper endpoint and permits the curve to extend toward
-    the image bottom while its sampled x values remain in frame.  DynLaneSeq
-    predicts both endpoints.  ``clr_bottom_extend`` is the smallest faithful
-    adaptation: preserve DynLaneSeq's predicted upper endpoint and ignore its
-    lower endpoint, retaining the contiguous in-frame bottom extension.
+    CLRNet predicts a start index and length.  If its start is above the image
+    bottom, decoding retains the contiguous in-frame samples below that start.
+    DynLaneSeq predicts both range endpoints.  ``clr_bottom_extend`` is the
+    smallest faithful adaptation: preserve its predicted segment and upper
+    endpoint, but replace lower-end truncation with a contiguous in-frame
+    extension toward the image bottom.
     """
 
     raw_x = stage["pred_x_rows"].float()

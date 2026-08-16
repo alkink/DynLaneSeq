@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-python-tp50", type=int, default=25484)
     parser.add_argument("--expected-python-fp50", type=int, default=3777)
     parser.add_argument("--expected-python-fn50", type=int, default=7198)
+    parser.add_argument("--reuse-written-predictions", action="store_true")
+    parser.add_argument("--reuse-official-results", action="store_true")
     return parser.parse_args()
 
 
@@ -187,6 +189,7 @@ def run_official_evaluator(
     output_root: Path,
     data_root: Path,
     list_path: Path,
+    reuse_existing: bool = False,
 ) -> dict[str, dict[str, dict[str, float | int]]]:
     results: dict[str, dict[str, dict[str, float | int]]] = {}
     for variant in variants:
@@ -194,6 +197,13 @@ def run_official_evaluator(
         for threshold in THRESHOLDS:
             result_path = output_root / "official" / f"{variant.name}_iou{threshold:.2f}.txt"
             result_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path = result_path.with_suffix(".log")
+            if reuse_existing and result_path.is_file() and log_path.is_file():
+                log_text = log_path.read_text(encoding="utf-8")
+                if "list images num: 9675" not in log_text:
+                    raise RuntimeError(f"Existing official result did not evaluate all 9675 images: {log_path}")
+                variant_results[f"{threshold:.2f}"] = parse_official_output(result_path)
+                continue
             command = [
                 str(evaluator),
                 "-a",
@@ -220,7 +230,6 @@ def run_official_evaluator(
                 str(result_path),
             ]
             completed = subprocess.run(command, check=False, capture_output=True, text=True)
-            log_path = result_path.with_suffix(".log")
             log_path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
             if completed.returncode != 0:
                 raise RuntimeError(f"Official evaluator failed ({completed.returncode}); see {log_path}")
@@ -305,6 +314,10 @@ def markdown_report(payload: dict[str, Any]) -> str:
         f"- List SHA-256: `{payload['protocol']['list_sha256']}`",
         "- No image exclusion, deduplication, checkpoint selection, or threshold sweep.",
         "- Official C evaluator was forced to `-p 1`; its local 20-thread fork drops remainder images.",
+        f"- Current-writer serialization ΔTP/FP/FN @.50: "
+        f"`{payload['serialization_effect']['delta_tp50']:+d}/"
+        f"{payload['serialization_effect']['delta_fp50']:+d}/"
+        f"{payload['serialization_effect']['delta_fn50']:+d}`.",
         "",
         "| Variant | Official F1@.50 | Δ | Official F1@.75 | Δ |",
         "|---|---:|---:|---:|---:|",
@@ -362,20 +375,35 @@ def main() -> None:
     if observed != expected:
         raise RuntimeError(f"Cached baseline parity failed: expected={expected}, observed={observed}")
 
-    selection_summary = write_all_predictions(
-        records,
-        DECODER_VARIANTS,
-        output_root,
-        input_h=input_h,
-        input_w=input_w,
-        score_thresh=args.score_thresh,
-        quality_power=args.quality_power,
-        current_nms_distance=args.current_nms_distance_px,
-        nms_overlap=args.nms_min_overlap_points,
-        min_valid_rows=args.min_valid_rows,
-        top_k=args.top_k,
-        cached_current_selections=cached_selections,
-    )
+    if args.reuse_written_predictions:
+        expected_paths = [prediction_relative_path(record["meta"]) for record in records]
+        for variant in DECODER_VARIANTS:
+            missing = [
+                str(relative)
+                for relative in expected_paths
+                if not (output_root / "predictions" / variant.name / relative).is_file()
+            ]
+            if missing:
+                raise RuntimeError(f"Cannot reuse {variant.name}: {len(missing)} prediction files are missing")
+        selection_summary = {
+            "reused_existing_predictions": True,
+            "validated_prediction_files_per_variant": len(expected_paths),
+        }
+    else:
+        selection_summary = write_all_predictions(
+            records,
+            DECODER_VARIANTS,
+            output_root,
+            input_h=input_h,
+            input_w=input_w,
+            score_thresh=args.score_thresh,
+            quality_power=args.quality_power,
+            current_nms_distance=args.current_nms_distance_px,
+            nms_overlap=args.nms_min_overlap_points,
+            min_valid_rows=args.min_valid_rows,
+            top_k=args.top_k,
+            cached_current_selections=cached_selections,
+        )
 
     if not args.official_evaluator:
         raise RuntimeError("--official-evaluator is required for this audit")
@@ -386,11 +414,23 @@ def main() -> None:
         output_root,
         Path(args.data_root).expanduser().resolve(),
         list_path,
+        reuse_existing=args.reuse_official_results,
     )
     python_metrics, paired = run_paired_python_metrics(records, DECODER_VARIANTS, output_root, args.workers)
     python_a = python_metrics["A_current"]["0.50"]
-    if (python_a["TP"], python_a["FP"], python_a["FN"]) != expected:
-        raise RuntimeError(f"Written A_current Python parity failed: expected={expected}, observed={python_a}")
+    written = (int(python_a["TP"]), int(python_a["FP"]), int(python_a["FN"]))
+    serialization_effect = {
+        "cached_in_memory_tp50": expected[0],
+        "cached_in_memory_fp50": expected[1],
+        "cached_in_memory_fn50": expected[2],
+        "written_reloaded_tp50": written[0],
+        "written_reloaded_fp50": written[1],
+        "written_reloaded_fn50": written[2],
+        "delta_tp50": written[0] - expected[0],
+        "delta_fp50": written[1] - expected[1],
+        "delta_fn50": written[2] - expected[2],
+        "exact_parity": written == expected,
+    }
 
     payload = {
         "protocol": {
@@ -416,6 +456,7 @@ def main() -> None:
         "official_c": official,
         "python_raster": python_metrics,
         "paired": paired,
+        "serialization_effect": serialization_effect,
     }
     json_path = output_root / "decoder_parity_audit.json"
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
