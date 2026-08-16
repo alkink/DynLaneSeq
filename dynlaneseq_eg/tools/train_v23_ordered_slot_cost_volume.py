@@ -394,6 +394,7 @@ def main() -> None:
     images_seen = start_step * int(cfg["training"]["batch_size"]) * int(
         cfg["training"]["gradient_accumulation_steps"]
     )
+    run_images_seen = 0
     final_diagnostics: dict[str, float] = {}
     model.train()
     resume_checkpoint = output_dir / "resume_latest.pt"
@@ -410,6 +411,7 @@ def main() -> None:
         for _micro in range(accumulation_steps):
             (images, targets, _metas), iterator = _next_batch(loader, iterator)
             images_seen += int(images.shape[0])
+            run_images_seen += int(images.shape[0])
             images = images.to(device, non_blocking=True)
             if channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
@@ -450,7 +452,11 @@ def main() -> None:
                 "step": step,
                 "mode": args.mode,
                 "images_seen": images_seen,
-                "images_per_second": float(images_seen) / elapsed,
+                # Resume starts a new wall-clock interval. Including images
+                # processed by an earlier process made its live throughput
+                # estimate severely misleading.
+                "run_images_seen": run_images_seen,
+                "images_per_second": float(run_images_seen) / elapsed,
                 "gradient_norm": gradient_norm,
                 "learning_rate_ratio": lr_ratio,
                 "backbone_lr": float(optimizer.param_groups[0]["lr"]),
