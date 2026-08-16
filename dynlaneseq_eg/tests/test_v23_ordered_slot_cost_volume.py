@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from dynlaneseq_eg.modeling.v23_ordered_slot_cost_volume import (
     V23OrderedSlotCostVolume,
+    _shifted_transition,
     build_v23_owned_targets,
     canonicalize_v7_slots,
     soft_viterbi_marginals,
@@ -133,6 +135,30 @@ def test_soft_viterbi_prefers_coherent_path() -> None:
         unary, transition_radius_bins=2, transition_penalty=1.0
     )
     assert marginal[0, 0, 3].argmax().item() == 5
+
+
+def test_vectorized_transition_matches_offset_reference() -> None:
+    torch.manual_seed(11)
+    value = torch.randn(2, 4, 31)
+    radius = 4
+    transition_penalty = 0.17
+    candidates = []
+    bins = int(value.shape[-1])
+    for offset in range(-radius, radius + 1):
+        if offset < 0:
+            shifted = F.pad(value[..., -offset:], (0, -offset), value=-1.0e4)
+        elif offset > 0:
+            shifted = F.pad(value[..., : bins - offset], (offset, 0), value=-1.0e4)
+        else:
+            shifted = value
+        candidates.append(shifted - transition_penalty * abs(offset))
+    reference = torch.logsumexp(torch.stack(candidates, dim=-2), dim=-2)
+    vectorized = _shifted_transition(
+        value,
+        radius=radius,
+        transition_penalty=transition_penalty,
+    )
+    torch.testing.assert_close(vectorized, reference, rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_official_v23_protocol_requires_train_txt(tmp_path: Path) -> None:

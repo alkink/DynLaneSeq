@@ -140,25 +140,28 @@ def _canonical_target_lanes(
     return x_rows, valid, ranges
 
 
-def _mean_common_row_distance(
+def _pairwise_common_row_distance(
     source_x: torch.Tensor,
     source_range: torch.Tensor,
     target_x: torch.Tensor,
     target_valid: torch.Tensor,
     *,
     input_h: int,
-) -> float:
+) -> torch.Tensor:
+    """Vectorized slot/GT distance matrix without per-pair CUDA syncs."""
+
     rows = int(source_x.shape[-1])
     y = fixed_y_rows(rows, input_h, device=source_x.device, dtype=torch.float32)
     source_valid = (
         torch.isfinite(source_x)
-        & (y >= source_range[0] * float(input_h))
-        & (y <= source_range[1] * float(input_h))
+        & (y.view(1, rows) >= source_range[:, 0:1] * float(input_h))
+        & (y.view(1, rows) <= source_range[:, 1:2] * float(input_h))
     )
-    common = source_valid & target_valid
-    if int(common.sum()) == 0:
-        return 1.0e6
-    return float((source_x[common] - target_x[common]).abs().mean().detach().cpu())
+    common = source_valid[:, None, :] & target_valid[None, :, :]
+    count = common.sum(dim=-1)
+    distance = (source_x[:, None, :] - target_x[None, :, :]).abs()
+    mean = (distance * common.float()).sum(dim=-1) / count.clamp_min(1).float()
+    return torch.where(count > 0, mean, torch.full_like(mean, 1.0e6))
 
 
 def _monotonic_owned_assignment(
@@ -177,19 +180,20 @@ def _monotonic_owned_assignment(
     assignment = [-1] * int(active.shape[0])
     if not active_ids or gt_count == 0:
         return assignment
-    pair_cost = [
-        [
-            _mean_common_row_distance(
-                source_x[slot],
-                source_range[slot],
-                target_x[gt],
-                target_valid[gt],
-                input_h=input_h,
-            )
-            for gt in range(gt_count)
-        ]
-        for slot in active_ids
-    ]
+    # One small device-to-host transfer replaces one synchronizing .cpu()
+    # operation for every active-slot/GT pair.
+    pair_cost = (
+        _pairwise_common_row_distance(
+            source_x[active_ids],
+            source_range[active_ids],
+            target_x,
+            target_valid,
+            input_h=input_h,
+        )
+        .detach()
+        .cpu()
+        .tolist()
+    )
     best_cost = float("inf")
     best_pairs: tuple[tuple[int, int], ...] = tuple()
     if len(active_ids) <= gt_count:
@@ -272,17 +276,24 @@ def _shifted_transition(
     radius: int,
     transition_penalty: float,
 ) -> torch.Tensor:
-    candidates: list[torch.Tensor] = []
-    bins = int(value.shape[-1])
-    for offset in range(-int(radius), int(radius) + 1):
-        if offset < 0:
-            shifted = F.pad(value[..., -offset:], (0, -offset), value=-1.0e4)
-        elif offset > 0:
-            shifted = F.pad(value[..., : bins - offset], (offset, 0), value=-1.0e4)
-        else:
-            shifted = value
-        candidates.append(shifted - float(transition_penalty) * abs(offset))
-    return torch.logsumexp(torch.stack(candidates, dim=-2), dim=-2)
+    radius = int(radius)
+    if radius < 0:
+        raise ValueError("transition radius must be non-negative")
+    if radius == 0:
+        return value
+    # The previous implementation launched one slice, pad, subtraction and
+    # stack input for every offset at every one of 319 recurrent row steps.
+    # A padded sliding window contains exactly the same predecessor states and
+    # preserves the original log-sum-exp transition while issuing one batched
+    # GPU operation per row.
+    window = 2 * radius + 1
+    neighbours = F.pad(value, (radius, radius), value=-1.0e4).unfold(
+        -1, window, 1
+    )
+    penalty = (
+        fixed_indices(window, device=value.device, dtype=value.dtype) - radius
+    ).abs() * float(transition_penalty)
+    return torch.logsumexp(neighbours - penalty, dim=-1)
 
 
 def soft_viterbi_marginals(
