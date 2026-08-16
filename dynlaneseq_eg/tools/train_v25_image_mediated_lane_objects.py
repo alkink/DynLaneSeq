@@ -224,17 +224,24 @@ def _gate_zero(
     cfg: dict[str, Any],
     weights: V25LossWeights,
     channels_last: bool,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> dict[str, Any]:
     images, targets, _metas = batch
     images = _move_images(images, device=device, channels_last=channels_last)
     model.zero_grad(set_to_none=True)
-    output = model(images)
-    loss, diagnostics = v25_lane_object_loss(
-        output,
-        targets,
-        input_w=int(cfg["model"]["input_w"]),
-        weights=weights,
-    )
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=amp_enabled,
+    ):
+        output = model(images)
+        loss, diagnostics = v25_lane_object_loss(
+            output,
+            targets,
+            input_w=int(cfg["model"]["input_w"]),
+            weights=weights,
+        )
     _assert_finite(loss, "V25 Gate 0 produced a non-finite loss")
     loss.backward()
     gradients = _gradient_contract(model)
@@ -272,8 +279,14 @@ def main() -> None:
     if int(cfg["training"].get("seed", -1)) != 3407:
         raise ValueError("V25 component gates use fixed seed 3407")
     batch_size = int(cfg["training"]["batch_size"])
+    accumulation_steps = int(
+        cfg["training"].get("gradient_accumulation_steps", 1)
+    )
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    effective_batch = batch_size * accumulation_steps
     expected_steps = math.ceil(
-        int(train_population["expected_nonempty_rows"]) / batch_size
+        int(train_population["expected_nonempty_rows"]) / effective_batch
     )
     steps = expected_steps if args.mode == "gate" else int(args.smoke_steps)
     if args.mode == "gate" and int(cfg["training"]["max_iters"]) != expected_steps:
@@ -295,6 +308,11 @@ def main() -> None:
         model.to(memory_format=torch.channels_last)
     weights = _loss_weights(cfg)
     optimizer = _optimizer(model, cfg)
+    amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
+    amp_dtype_name = str(cfg["training"].get("amp_dtype", "bfloat16"))
+    amp_torch_dtype = (
+        torch.bfloat16 if amp_dtype_name == "bfloat16" else torch.float16
+    )
     start_step = 0
     resumed_from = ""
     if args.resume:
@@ -326,6 +344,8 @@ def main() -> None:
             cfg=cfg,
             weights=weights,
             channels_last=channels_last,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_torch_dtype,
         )
         if not gate_zero["passed"]:
             raise RuntimeError("V25 Gate 0 failed: " + json.dumps(gate_zero))
@@ -337,13 +357,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "train_metrics.jsonl"
     metrics = metrics_path.open("a" if start_step else "w", encoding="utf-8")
-    amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
-    amp_dtype = str(cfg["training"].get("amp_dtype", "bfloat16"))
-    amp_torch_dtype = torch.bfloat16 if amp_dtype == "bfloat16" else torch.float16
     clip_norm = float(cfg["training"].get("clip_grad_norm", 5.0))
     opt_cfg = cfg["v25"]["optimizer"]
     start_time = time.perf_counter()
-    images_seen = start_step * batch_size
+    images_seen = start_step * effective_batch
     run_images_seen = 0
     final_diagnostics: dict[str, float] = {}
     clipped_log_steps = 0
@@ -358,25 +375,35 @@ def main() -> None:
             warmup_steps=min(int(opt_cfg["warmup_steps"]), max(steps // 10, 1)),
             minimum_ratio=float(opt_cfg["minimum_lr_ratio"]),
         )
-        (images, targets, _metas), iterator = _next_batch(loader, iterator)
-        images_seen += int(images.shape[0])
-        run_images_seen += int(images.shape[0])
-        images = _move_images(images, device=device, channels_last=channels_last)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=amp_torch_dtype,
-            enabled=amp_enabled,
-        ):
-            output = model(images)
-            loss, diagnostics = v25_lane_object_loss(
-                output,
-                targets,
-                input_w=int(cfg["model"]["input_w"]),
-                weights=weights,
+        accumulated: dict[str, torch.Tensor] = {}
+        for _micro_step in range(accumulation_steps):
+            (images, targets, _metas), iterator = _next_batch(loader, iterator)
+            images_seen += int(images.shape[0])
+            run_images_seen += int(images.shape[0])
+            images = _move_images(
+                images, device=device, channels_last=channels_last
             )
-        _assert_finite(loss, f"non-finite V25 loss at step {step}")
-        loss.backward()
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_torch_dtype,
+                enabled=amp_enabled,
+            ):
+                output = model(images)
+                loss, diagnostics = v25_lane_object_loss(
+                    output,
+                    targets,
+                    input_w=int(cfg["model"]["input_w"]),
+                    weights=weights,
+                )
+                scaled_loss = loss / float(accumulation_steps)
+            _assert_finite(
+                scaled_loss, f"non-finite V25 loss at step {step}"
+            )
+            scaled_loss.backward()
+            for name, value in diagnostics.items():
+                detached = value.detach() / float(accumulation_steps)
+                accumulated[name] = accumulated.get(name, 0.0) + detached
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=clip_norm
         )
@@ -384,7 +411,7 @@ def main() -> None:
         optimizer.step()
         should_log = step == 1 or step % int(args.log_interval) == 0 or step == steps
         if should_log:
-            host = _to_host(diagnostics, extra={"gradient_norm": gradient_norm})
+            host = _to_host(accumulated, extra={"gradient_norm": gradient_norm})
             gradient_value = host.pop("gradient_norm")
             clipped = gradient_value > clip_norm
             clipped_log_steps += int(clipped)
@@ -433,6 +460,9 @@ def main() -> None:
         "scientific_gate": args.mode == "gate",
         "iteration": steps,
         "images_seen": images_seen,
+        "physical_batch_size": batch_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "effective_batch_size": effective_batch,
         "complete_official_train_epochs_seen": float(images_seen)
         / float(train_population["expected_nonempty_rows"]),
         "elapsed_seconds": elapsed,
