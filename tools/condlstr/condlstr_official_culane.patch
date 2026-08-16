@@ -1,0 +1,115 @@
+diff --git a/data/datasets/lane/culane/culane.py b/data/datasets/lane/culane/culane.py
+index 3c5ae10..443ca6d 100755
+--- a/data/datasets/lane/culane/culane.py
++++ b/data/datasets/lane/culane/culane.py
+@@ -28 +28 @@ class CULaneDataset(Dataset):
+-        self.test_mode = self.split == 'test'
++        self.test_mode = self.split != 'train'
+@@ -69,0 +70 @@ class CULaneDataset(Dataset):
++            lane_attris=info.get('lane_attris', [0 for _ in info['lane_points']]),
+diff --git a/data/datasets/lane/culane/preprocess.py b/data/datasets/lane/culane/preprocess.py
+index 69e1a8a..8668422 100755
+--- a/data/datasets/lane/culane/preprocess.py
++++ b/data/datasets/lane/culane/preprocess.py
+@@ -13,2 +13 @@ DATASETS_TRAIN = {
+-    'train': 'train_gt.txt',
+-    'val': 'val.txt',
++    'train': 'list/train.txt',
+@@ -18 +17 @@ DATASETS_VAL = {
+-    'test': 'test.txt',
++    'val': 'list/val.txt',
+@@ -142,0 +142 @@ class INfoProcessor(object):
++            'lane_attris': [0 for _ in lanes],
+diff --git a/data/transforms/lane/culane.py b/data/transforms/lane/culane.py
+index 87bd569..7ae2bf5 100755
+--- a/data/transforms/lane/culane.py
++++ b/data/transforms/lane/culane.py
+@@ -0,0 +1,2 @@
++from functools import partial
++
+@@ -9 +11 @@ def culane_transforms(train=True, version='v1.0', **kwargs):
+-    keys = ['img', 'img_mask']
++    keys = ['img', 'img_mask', 'lane_points', 'lane_attris']
+@@ -66 +68,4 @@ def culane_transforms(train=True, version='v1.0', **kwargs):
+-    return data_transforms, collate_fn_padded
++    # Lane-instance counts vary per image (including zero on official empty
++    # frames), so keep img_mask as a per-image list.  Only dense images are
++    # safe to stack/pad across the batch.
++    return data_transforms, partial(collate_fn_padded, keys=['img'])
+diff --git a/data/transforms/lane/transforms.py b/data/transforms/lane/transforms.py
+index 5604ce1..9c91201 100755
+--- a/data/transforms/lane/transforms.py
++++ b/data/transforms/lane/transforms.py
+@@ -68,9 +68,16 @@ class GenerateLaneLine2D(object):
+-        line_strings_org = self.lane_to_linestrings(lane_points)
+-        line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
+-
+-        img, line_strings = self.transform(
+-            image=img_org.copy().astype(np.uint8),
+-            line_strings=line_strings_org,
+-        )
+-        # line_strings.clip_out_of_image_()
+-        lane_points = self.linestrings_to_lanes(line_strings)
++        if lane_points:
++            line_strings_org = self.lane_to_linestrings(lane_points)
++            line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
++            img, line_strings = self.transform(
++                image=img_org.copy().astype(np.uint8),
++                line_strings=line_strings_org,
++            )
++            # line_strings.clip_out_of_image_()
++            lane_points = self.linestrings_to_lanes(line_strings)
++        else:
++            # imgaug 0.4.0 can segfault when passed an empty
++            # LineStringsOnImage.  Official CULane contains many empty-label
++            # frames, so keep the frame and run exactly the same image
++            # augmentation without a line_strings argument.
++            img = self.transform(image=img_org.copy().astype(np.uint8))
++            lane_points = []
+@@ -78,9 +85,8 @@ class GenerateLaneLine2D(object):
+-        if len(lane_points) > 0:
+-            img_mask = np.zeros((len(lane_points), img.shape[0], img.shape[1]), dtype=np.uint8)
+-            for i, points in enumerate(lane_points):
+-                for p_curr, p_next in zip(points[:-1], points[1:]):
+-                    pt1 = (int(round(p_curr[0])), int(round(p_curr[1])))
+-                    pt2 = (int(round(p_next[0])), int(round(p_next[1])))
+-                    img_mask[i] = cv2.line(img_mask[i], pt1, pt2, color=(1,), thickness=self.thickness)
+-            img_mask = img_mask.transpose((1, 2, 0))
+-            results['img_mask'] = img_mask
++        img_mask = np.zeros((len(lane_points), img.shape[0], img.shape[1]), dtype=np.uint8)
++        for i, points in enumerate(lane_points):
++            for p_curr, p_next in zip(points[:-1], points[1:]):
++                pt1 = (int(round(p_curr[0])), int(round(p_curr[1])))
++                pt2 = (int(round(p_next[0])), int(round(p_next[1])))
++                img_mask[i] = cv2.line(img_mask[i], pt1, pt2, color=(1,), thickness=self.thickness)
++        img_mask = img_mask.transpose((1, 2, 0))
++        results['img_mask'] = img_mask
+diff --git a/data/transforms/transforms.py b/data/transforms/transforms.py
+index edbc169..419b077 100755
+--- a/data/transforms/transforms.py
++++ b/data/transforms/transforms.py
+@@ -1527 +1527,14 @@ class Pad(object):
+-            if self.size is not None:
++            source = results[key]
++            if key == 'img_mask' and source.ndim == 3 and source.shape[-1] == 0:
++                # OpenCV/mmcv segfaults while padding an HxWx0 array.  Keep
++                # the zero-instance channel dimension and pad spatially with
++                # an explicitly allocated empty tensor.
++                if self.size is not None:
++                    target_h, target_w = self.size
++                elif self.size_divisor is not None:
++                    target_h = int(math.ceil(source.shape[0] / self.size_divisor)) * self.size_divisor
++                    target_w = int(math.ceil(source.shape[1] / self.size_divisor)) * self.size_divisor
++                else:
++                    target_h, target_w = source.shape[:2]
++                img = np.zeros((target_h, target_w, 0), dtype=source.dtype)
++            elif self.size is not None:
+@@ -1529 +1542 @@ class Pad(object):
+-                    results[key], shape=self.size, pad_val=self.pad_val)
++                    source, shape=self.size, pad_val=self.pad_val)
+@@ -1532 +1545 @@ class Pad(object):
+-                    results[key], self.size_divisor, pad_val=self.pad_val)
++                    source, self.size_divisor, pad_val=self.pad_val)
+@@ -1534 +1547 @@ class Pad(object):
+-                img = results[key]
++                img = source
