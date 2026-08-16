@@ -20,8 +20,11 @@ v23:
   vertical_layers: 2
   num_heads: 4
   ff_dim: 256
-  teacher_prior_sigma_px: 18.0
-  teacher_prior_weight: 1.0
+  # The deployment gate already gives exact zero-step V7 parity. Keep this
+  # prior deliberately broad/weak so a far owned lane remains reachable by
+  # the full-width image cost volume instead of paying hundreds of NLL units.
+  teacher_prior_sigma_px: 64.0
+  teacher_prior_weight: 0.25
   transition_radius_bins: 8
   transition_penalty: 0.15
   freeze_batch_norm_stats: true
