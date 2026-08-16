@@ -1,0 +1,9 @@
+_base_: culane_v25_g0_direct_four_lane_objects_1ep.yaml
+
+output_dir: outputs/diagnostics/v25_g2_image_ownership_025ep
+
+v25:
+  enable_competition: true
+  enable_slot_interaction: true
+  competition_weight: 2.0
+

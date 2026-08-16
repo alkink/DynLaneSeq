@@ -1,0 +1,8 @@
+_base_: culane_v25_g0_direct_four_lane_objects_1ep.yaml
+
+output_dir: outputs/diagnostics/v25_g2_control_025ep
+
+v25:
+  enable_competition: false
+  enable_slot_interaction: false
+
