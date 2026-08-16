@@ -285,9 +285,8 @@ def _gate_zero(
     images, targets, _metas = batch
     channels_last = bool(cfg["training"].get("channels_last", False))
     images = _move_images(
-        images[:1], device=device, channels_last=channels_last
+        images, device=device, channels_last=channels_last
     )
-    targets = targets[:1]
     model.train()
     model.zero_grad(set_to_none=True)
     teacher_versions_before = _state_versions(model.teacher)
@@ -299,7 +298,10 @@ def _gate_zero(
         dtype=torch.bfloat16,
         enabled=amp_enabled,
     ):
-        output = model(images)
+        # Reuse the exact teacher result checked above. Calling the wrapper
+        # here ran V7 twice and autotuned batch-one kernels that were never
+        # used by the fixed batch-eight training loop.
+        output = model.student(images, teacher_output)
         total, diagnostics = v23_ordered_cost_volume_loss(
             output,
             targets,
