@@ -77,10 +77,10 @@ dataloader:
 
 training:
   seed: 3407
-  # RTX 5080 smoke measured only ~2.7/16.3 GiB at physical batch one. Batch
-  # four uses the device without changing the predeclared effective batch 8.
-  batch_size: 4
-  gradient_accumulation_steps: 2
+  # RTX 5080 smoke measured 6.55/16.3 GiB at physical batch four. Physical
+  # batch eight removes accumulation while preserving effective batch 8.
+  batch_size: 8
+  gradient_accumulation_steps: 1
   max_iters: 8000
   amp: true
   amp_dtype: bfloat16
