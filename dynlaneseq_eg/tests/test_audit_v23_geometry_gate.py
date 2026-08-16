@@ -3,7 +3,9 @@ from __future__ import annotations
 import torch
 
 from dynlaneseq_eg.tools.audit_v23_geometry_gate import (
+    _duplicate_teacher_batch,
     _interpret,
+    _split_student_batch,
     raw_student_public_output,
 )
 
@@ -25,6 +27,25 @@ def test_raw_student_is_restored_to_public_v7_slot_order() -> None:
     assert public["pred_x_rows"].tolist() == [
         [[20.0, 21.0], [40.0, 41.0], [10.0, 11.0], [30.0, 31.0]]
     ]
+
+
+def test_paired_student_helpers_repeat_teacher_and_split_outputs() -> None:
+    teacher = {
+        "rows": torch.tensor([[1.0], [2.0]]),
+        "constant": torch.tensor(3.0),
+    }
+    repeated = _duplicate_teacher_batch(teacher, 2)
+    assert repeated["rows"].flatten().tolist() == [1.0, 2.0, 1.0, 2.0]
+    assert repeated["constant"].item() == 3.0
+    correct, wrong = _split_student_batch(
+        {
+            "student_x_rows": torch.arange(8).reshape(4, 1, 2),
+            "geometry_gate": torch.arange(4).reshape(4, 1, 1),
+        },
+        2,
+    )
+    assert correct["student_x_rows"].flatten().tolist() == [0, 1, 2, 3]
+    assert wrong["student_x_rows"].flatten().tolist() == [4, 5, 6, 7]
 
 
 def _metric(f1, tp):

@@ -586,6 +586,8 @@ class V23OrderedSlotCostVolume(nn.Module):
         self,
         images: torch.Tensor,
         teacher_outputs: dict[str, torch.Tensor],
+        *,
+        include_proposal_scores: bool = True,
     ) -> dict[str, torch.Tensor]:
         source = canonicalize_v7_slots(teacher_outputs)
         # Clone the detached teacher state so a caller may safely obtain it
@@ -703,7 +705,11 @@ class V23OrderedSlotCostVolume(nn.Module):
         }
         proposal_x = teacher_outputs.get("pred_x_rows")
         proposal_range = teacher_outputs.get("range_norm")
-        if isinstance(proposal_x, torch.Tensor) and isinstance(proposal_range, torch.Tensor):
+        if (
+            include_proposal_scores
+            and isinstance(proposal_x, torch.Tensor)
+            and isinstance(proposal_range, torch.Tensor)
+        ):
             proposal_x = proposal_x.detach().to(device=images.device, dtype=torch.float32)
             proposal_range = proposal_range.detach().to(device=images.device, dtype=torch.float32)
             proposal_scores, proposal_valid = self._proposal_scores(
