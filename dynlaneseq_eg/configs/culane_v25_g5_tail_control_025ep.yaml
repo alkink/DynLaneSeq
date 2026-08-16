@@ -1,0 +1,12 @@
+_base_: culane_v25_g4_denoising_control_025ep.yaml
+
+output_dir: outputs/diagnostics/v25_g5_tail_control_025ep
+
+v25:
+  denoising:
+    enabled: false
+  loss:
+    tail_emphasis: 0.0
+    tail_iou_threshold: 0.60
+    tail_max_weight: 2.0
+

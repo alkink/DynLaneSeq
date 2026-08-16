@@ -13,7 +13,11 @@ from dynlaneseq_eg.engine.checkpoint import load_checkpoint, save_checkpoint
 from dynlaneseq_eg.evaluation.candidate_diagnostics import sha256_file
 from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.dynlaneseq_v25 import DynLaneSeqV25
+from dynlaneseq_eg.modeling.v25_denoising import (
+    build_denoising_query_anchors,
+)
 from dynlaneseq_eg.modeling.v25_image_mediated_lane_objects import (
+    build_ordered_lane_targets,
     v25_lane_object_loss,
     v25_model_contract,
 )
@@ -146,6 +150,11 @@ def main() -> None:
     if channels_last:
         model.to(memory_format=torch.channels_last)
     weights = _loss_weights(cfg)
+    denoising_cfg = cfg["v25"].get("denoising", {})
+    denoising_enabled = bool(denoising_cfg.get("enabled", False))
+    denoising_weight = float(denoising_cfg.get("loss_weight", 1.0))
+    if denoising_enabled and denoising_weight <= 0.0:
+        raise ValueError("enabled denoising requires a positive loss_weight")
     optimizer = _optimizer(model, cfg)
     local_start = 0
     global_start = init_iteration
@@ -216,7 +225,7 @@ def main() -> None:
         )
         optimizer.zero_grad(set_to_none=True)
         accumulated: dict[str, torch.Tensor] = {}
-        for _micro in range(accumulation):
+        for micro_index in range(accumulation):
             (images, targets, _metas), iterator = _next_batch(loader, iterator)
             run_images += int(images.shape[0])
             images = _move_images(
@@ -237,6 +246,80 @@ def main() -> None:
             scaled.backward()
             for name, value in diagnostics.items():
                 accumulated[name] = accumulated.get(name, 0.0) + value.detach() / float(accumulation)
+            if denoising_enabled:
+                ordered = build_ordered_lane_targets(
+                    targets,
+                    device=device,
+                    slots=model.detector.num_slots,
+                    rows=model.detector.num_rows,
+                    input_w=int(cfg["model"]["input_w"]),
+                    minimum_valid_rows=weights.minimum_valid_rows,
+                )
+                denoising_seed = (
+                    FIXED_SEED * 1_000_003
+                    + global_step * 97
+                    + micro_index
+                )
+                anchors = build_denoising_query_anchors(
+                    ordered,
+                    input_w=int(cfg["model"]["input_w"]),
+                    seed=denoising_seed,
+                    held_out=False,
+                )
+                cuda_devices = []
+                if device.type == "cuda":
+                    cuda_devices = [
+                        device.index
+                        if device.index is not None
+                        else torch.cuda.current_device()
+                    ]
+                # The auxiliary stochastic forward must not alter the RNG
+                # sequence seen by the next clean paired-control minibatch.
+                with torch.random.fork_rng(devices=cuda_devices):
+                    torch.manual_seed(denoising_seed)
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed_all(denoising_seed)
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=amp_enabled,
+                    ):
+                        denoising_output = model(
+                            images,
+                            query_anchor_x_rows=anchors.anchors_normalized,
+                        )
+                        denoising_loss, denoising_diagnostics = (
+                            v25_lane_object_loss(
+                                denoising_output,
+                                targets,
+                                input_w=int(cfg["model"]["input_w"]),
+                                weights=weights,
+                            )
+                        )
+                        scaled_denoising = (
+                            denoising_weight
+                            * denoising_loss
+                            / float(accumulation)
+                        )
+                    _assert_finite(
+                        scaled_denoising,
+                        f"non-finite V25 denoising loss at {local_step}",
+                    )
+                    scaled_denoising.backward()
+                accumulated["loss_denoising"] = (
+                    accumulated.get("loss_denoising", 0.0)
+                    + denoising_loss.detach() / float(accumulation)
+                )
+                accumulated["denoising_anchor_mean_abs_px"] = (
+                    accumulated.get("denoising_anchor_mean_abs_px", 0.0)
+                    + anchors.mean_absolute_perturbation_px.detach()
+                    / float(accumulation)
+                )
+                accumulated["denoising_mean_soft_iou"] = (
+                    accumulated.get("denoising_mean_soft_iou", 0.0)
+                    + denoising_diagnostics["mean_soft_iou"].detach()
+                    / float(accumulation)
+                )
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=clip_norm
         )
@@ -304,6 +387,14 @@ def main() -> None:
         "config": str(Path(args.config).expanduser().resolve()),
         "config_sha256": sha256_file(args.config),
         "model_contract": v25_model_contract(model.detector),
+        "denoising_contract": {
+            "enabled": denoising_enabled,
+            "loss_weight": denoising_weight,
+            "training_shifts_px": [8, 16, 32, 64],
+            "row_dropout_probability": 0.15,
+            "occlusion_rows": 14,
+            "inference_queries_present": False,
+        },
         "gate_zero": gate_zero,
         "official_train_population_contract": train_population,
         "official_val_population_contract": val_population,

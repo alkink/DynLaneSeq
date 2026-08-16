@@ -379,8 +379,16 @@ class V25DualEnergyMultiPath(V25ImageMediatedLaneObjects):
             raise RuntimeError("proposal prior has no components")
         return prior.to(dtype=lane_state.dtype), affinity
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        output = super().forward(images)
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        query_anchor_x_rows: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        output = super().forward(
+            images,
+            query_anchor_x_rows=query_anchor_x_rows,
+        )
         proposal = self.proposal_memory(output["image_features"])
         proposal_prior, proposal_affinity = self._proposal_prior(
             output["lane_object_state"], proposal

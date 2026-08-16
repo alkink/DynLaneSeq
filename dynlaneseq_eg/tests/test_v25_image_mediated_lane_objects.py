@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import torch
 
+from dynlaneseq_eg.modeling.v25_denoising import (
+    build_denoising_query_anchors,
+)
 from dynlaneseq_eg.modeling.v25_image_mediated_lane_objects import (
     V25ImageMediatedLaneObjects,
     V25LossWeights,
@@ -165,3 +168,92 @@ def test_v25_cost_volume_depends_on_the_correct_image() -> None:
     second = model(torch.ones(1, 3, 64, 128))["unary_logits"]
     assert not torch.equal(first, second)
     assert float((first - second).detach().abs().mean()) > 1.0e-6
+
+
+def test_denoising_anchors_are_stateless_distinct_and_change_the_shared_decoder() -> None:
+    torch.manual_seed(19)
+    rows, bins, width = 8, 32, 128
+    targets = [_target(rows, [torch.linspace(22.0, 34.0, rows)])]
+    ordered = build_ordered_lane_targets(
+        targets,
+        device=torch.device("cpu"),
+        slots=4,
+        rows=rows,
+        input_w=width,
+        minimum_valid_rows=2,
+    )
+    rng_before = torch.random.get_rng_state().clone()
+    first = build_denoising_query_anchors(
+        ordered, input_w=width, seed=101, held_out=False
+    )
+    second = build_denoising_query_anchors(
+        ordered, input_w=width, seed=101, held_out=False
+    )
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert torch.equal(first.anchors_normalized, second.anchors_normalized)
+    assert first.mean_absolute_perturbation_px > 0
+
+    model = V25ImageMediatedLaneObjects(
+        input_h=64,
+        input_w=width,
+        num_rows=rows,
+        x_bins=bins,
+        fpn_channels=32,
+        hidden_dim=32,
+        decoder_layers=1,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        transition_radius_bins=2,
+        pretrained_backbone=False,
+        require_pretrained_backbone=False,
+    ).train()
+    images = torch.randn(1, 3, 64, width)
+    clean = model(images)["unary_logits"]
+    anchored = model(
+        images, query_anchor_x_rows=first.anchors_normalized
+    )["unary_logits"]
+    assert not torch.equal(clean, anchored)
+
+
+def test_tail_emphasis_is_capped_and_adds_geometry_loss() -> None:
+    torch.manual_seed(29)
+    rows, bins, width = 8, 32, 128
+    model = V25ImageMediatedLaneObjects(
+        input_h=64,
+        input_w=width,
+        num_rows=rows,
+        x_bins=bins,
+        fpn_channels=32,
+        hidden_dim=32,
+        decoder_layers=1,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        transition_radius_bins=2,
+        pretrained_backbone=False,
+        require_pretrained_backbone=False,
+    ).train()
+    output = model(torch.randn(1, 3, 64, width))
+    targets = [_target(rows, [torch.linspace(8.0, 18.0, rows)])]
+    base, _ = v25_lane_object_loss(
+        output,
+        targets,
+        input_w=width,
+        weights=V25LossWeights(minimum_valid_rows=2),
+    )
+    emphasized, diagnostics = v25_lane_object_loss(
+        output,
+        targets,
+        input_w=width,
+        weights=V25LossWeights(
+            minimum_valid_rows=2,
+            tail_emphasis=1.0,
+            tail_iou_threshold=0.60,
+            tail_max_weight=2.0,
+        ),
+    )
+    assert emphasized >= base
+    assert diagnostics["loss_tail_emphasis"] >= 0
+    assert diagnostics["mean_tail_lane_weight"] >= 1
+    assert diagnostics["maximum_tail_lane_weight"] <= 2.0

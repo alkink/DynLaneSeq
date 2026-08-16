@@ -30,6 +30,9 @@ class V25LossWeights:
     visibility: float = 0.0
     proposal_coverage: float = 0.0
     proposal_groups: int = 4
+    tail_emphasis: float = 0.0
+    tail_iou_threshold: float = 0.60
+    tail_max_weight: float = 2.0
     line_width: float = 30.0
     minimum_valid_rows: int = 5
     minimum_spacing_px: float = 12.0
@@ -429,16 +432,37 @@ class V25ImageMediatedLaneObjects(nn.Module):
         fine = F.interpolate(fine, size=size, mode="bilinear", align_corners=False)
         return self.image_fusion(torch.cat((coarse, fine), dim=1))
 
-    def _initial_query(self, batch: int, *, device: torch.device) -> torch.Tensor:
+    def _initial_query(
+        self,
+        batch: int,
+        *,
+        device: torch.device,
+        query_anchor_x_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         rows = fixed_row_fractions(
             self.num_rows, device=device, dtype=torch.float32
         ).view(1, 1, self.num_rows)
-        centres = self.canonical_slot_centres.to(device=device).view(
-            1, self.num_slots, 1
-        )
+        if query_anchor_x_rows is None:
+            centres = self.canonical_slot_centres.to(device=device).view(
+                1, self.num_slots, 1
+            ).expand(batch, self.num_slots, self.num_rows)
+        else:
+            if query_anchor_x_rows.shape != (
+                batch,
+                self.num_slots,
+                self.num_rows,
+            ):
+                raise ValueError(
+                    "query anchors must have shape "
+                    f"[{batch},{self.num_slots},{self.num_rows}]"
+                )
+            centres = query_anchor_x_rows.to(device=device, dtype=torch.float32)
+            if not torch.isfinite(centres).all():
+                raise ValueError("query anchors contain non-finite values")
+            centres = centres.clamp(0.0, 1.0)
         geometry = torch.stack(
             (
-                centres.expand(batch, self.num_slots, self.num_rows),
+                centres,
                 rows.expand(batch, self.num_slots, self.num_rows),
             ),
             dim=-1,
@@ -503,12 +527,21 @@ class V25ImageMediatedLaneObjects(nn.Module):
             "path_posterior": posterior,
         }
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        query_anchor_x_rows: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         batch = int(images.shape[0])
         features = self._image_features(images)
         keys = self.key_projection(features)
         values = self.value_projection(features)
-        query = self._initial_query(batch, device=images.device).to(dtype=features.dtype)
+        query = self._initial_query(
+            batch,
+            device=images.device,
+            query_anchor_x_rows=query_anchor_x_rows,
+        ).to(dtype=features.dtype)
         prior = self._anchor_prior(batch, device=images.device).to(dtype=features.dtype)
         final_layer_logits: torch.Tensor | None = None
         final_other_coverage: torch.Tensor | None = None
@@ -670,6 +703,73 @@ def v25_lane_object_loss(
         line_width=weights.line_width,
     )
     strip_iou = ((1.0 - iou) * active.float()).sum() / active.sum().clamp_min(1).float()
+
+    tail_emphasis = soft_x.new_zeros(())
+    tail_lane_fraction = soft_x.new_zeros(())
+    mean_tail_lane_weight = soft_x.new_ones(())
+    maximum_tail_lane_weight = soft_x.new_ones(())
+    if weights.tail_emphasis > 0.0:
+        if weights.tail_iou_threshold <= 0.0:
+            raise ValueError("tail_iou_threshold must be positive")
+        if weights.tail_max_weight < 1.0:
+            raise ValueError("tail_max_weight must be at least one")
+        hardness = (
+            (float(weights.tail_iou_threshold) - iou.detach())
+            / float(weights.tail_iou_threshold)
+        ).clamp(0.0, 1.0)
+        lane_weight = 1.0 + hardness * (float(weights.tail_max_weight) - 1.0)
+        extra_weight = (lane_weight - 1.0) * active.float()
+        per_lane_valid = valid.sum(dim=-1).clamp_min(1).float()
+        per_lane_point = (point_error * valid.float()).sum(dim=-1) / per_lane_valid
+        per_lane_row_position = (
+            ordered["x_rows"].float() / (float(input_w) / float(outputs["unary_logits"].shape[-1]))
+            - 0.5
+        )
+        per_lane_lower = per_lane_row_position.floor().long().clamp(
+            0, int(outputs["unary_logits"].shape[-1]) - 1
+        )
+        per_lane_upper = (per_lane_lower + 1).clamp(
+            max=int(outputs["unary_logits"].shape[-1]) - 1
+        )
+        per_lane_upper_weight = (
+            per_lane_row_position - per_lane_lower.float()
+        ).clamp(0.0, 1.0)
+        per_lane_log_probability = outputs["unary_logits"].float().log_softmax(
+            dim=-1
+        )
+        per_lane_lower_loss = -per_lane_log_probability.gather(
+            -1, per_lane_lower.unsqueeze(-1)
+        ).squeeze(-1)
+        per_lane_upper_loss = -per_lane_log_probability.gather(
+            -1, per_lane_upper.unsqueeze(-1)
+        ).squeeze(-1)
+        per_lane_row = (
+            (
+                per_lane_lower_loss * (1.0 - per_lane_upper_weight)
+                + per_lane_upper_loss * per_lane_upper_weight
+            )
+            * valid.float()
+        ).sum(dim=-1) / per_lane_valid
+        per_lane_geometry = (
+            weights.row_distribution * per_lane_row
+            + weights.point * per_lane_point
+            + weights.strip_iou * (1.0 - iou)
+        )
+        tail_emphasis = (
+            per_lane_geometry * extra_weight
+        ).sum() / active.sum().clamp_min(1).float()
+        tail_lane_fraction = (
+            ((hardness > 0.0) & active).float().sum()
+            / active.sum().clamp_min(1).float()
+        )
+        mean_tail_lane_weight = (
+            lane_weight * active.float()
+        ).sum() / active.sum().clamp_min(1).float()
+        maximum_tail_lane_weight = torch.where(
+            active,
+            lane_weight,
+            torch.ones_like(lane_weight),
+        ).amax()
     quality50 = F.binary_cross_entropy_with_logits(
         outputs["quality50_logits"].float(),
         ((iou.detach() >= 0.50) & active).float(),
@@ -803,6 +903,7 @@ def v25_lane_object_loss(
         + weights.duplicate * duplicate
         + weights.visibility * visibility
         + weights.proposal_coverage * proposal_coverage
+        + weights.tail_emphasis * tail_emphasis
     )
     diagnostics = {
         "loss_total": total.detach(),
@@ -818,6 +919,10 @@ def v25_lane_object_loss(
         "loss_duplicate": duplicate.detach(),
         "loss_visibility": visibility.detach(),
         "loss_proposal_coverage": proposal_coverage.detach(),
+        "loss_tail_emphasis": tail_emphasis.detach(),
+        "tail_lane_fraction": tail_lane_fraction.detach(),
+        "mean_tail_lane_weight": mean_tail_lane_weight.detach(),
+        "maximum_tail_lane_weight": maximum_tail_lane_weight.detach(),
         "mean_soft_iou": (iou * active.float()).sum().detach()
         / active.sum().clamp_min(1).float(),
         "active_lane_fraction": active.float().mean().detach(),

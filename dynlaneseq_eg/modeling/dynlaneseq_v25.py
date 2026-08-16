@@ -87,9 +87,13 @@ class DynLaneSeqV25(nn.Module):
         targets=None,
         return_features: bool = False,
         inference_only: bool = False,
+        query_anchor_x_rows: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         del targets, return_features
-        output = self.detector(images)
+        output = self.detector(
+            images,
+            query_anchor_x_rows=query_anchor_x_rows,
+        )
         if not inference_only:
             return output
         keep = {"exist_logits", "pred_x_rows", "range_norm", "quality_logits"}
