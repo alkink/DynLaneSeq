@@ -11,10 +11,10 @@ if [[ -f "${report}" ]]; then
   echo "V25 G0/G1 report already exists: ${report}"
   exit 0
 fi
-if [[ ! -f "${train_output}/v25_g0_endpoint.pt" ]]; then
-  echo "V25 G0 endpoint does not exist yet" >&2
-  exit 2
-fi
+while [[ ! -f "${train_output}/v25_g0_endpoint.pt" ]]; do
+  echo "Waiting for V25 G0 endpoint..."
+  sleep 60
+done
 
 cd "${project}"
 export PYTHONPATH="${project}${PYTHONPATH:+:${PYTHONPATH}}"
