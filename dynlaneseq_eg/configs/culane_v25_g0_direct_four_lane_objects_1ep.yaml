@@ -1,0 +1,99 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v25_g0_direct_four_lane_objects_1ep
+
+dataset:
+  lists:
+    train: list/train.txt
+    val: list/val.txt
+
+model:
+  name: DynLaneSeqV25
+  pretrained_backbone: true
+  require_pretrained_backbone: true
+
+v25:
+  hidden_dim: 96
+  decoder_layers: 3
+  num_heads: 4
+  ff_dim: 256
+  dropout: 0.1
+  transition_radius_bins: 8
+  transition_penalty: 0.15
+  enable_competition: false
+  enable_slot_interaction: false
+  competition_weight: 2.0
+  anchor_prior_weight: 0.10
+  anchor_prior_sigma: 0.28
+  decode_mode: hard_path
+  freeze_batch_norm_stats: true
+  loss:
+    existence: 2.0
+    row_distribution: 5.0
+    point: 1.0
+    strip_iou: 2.0
+    range: 1.0
+    quality50: 0.5
+    quality75: 0.25
+    smoothness: 0.25
+    order: 0.25
+    duplicate: 0.25
+    line_width: 30.0
+    minimum_valid_rows: 5
+    minimum_spacing_px: 12.0
+  optimizer:
+    backbone_lr: 0.00005
+    detector_lr: 0.00020
+    weight_decay: 0.0001
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+
+augmentation:
+  cut_height: 270
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.2
+  blur_prob: 0.1
+  affine_prob: 0.2
+  affine_translate_x: 0.03
+  affine_translate_y: 0.02
+  affine_rotate_deg: 2.0
+  affine_scale_min: 0.95
+  affine_scale_max: 1.05
+  random_shadow_prob: 0.2
+  random_shadow_min_opacity: 0.20
+  random_shadow_max_opacity: 0.55
+  random_shadow_min_vertices: 3
+  random_shadow_max_vertices: 6
+  random_shadow_roi_start_y: 0.25
+
+dataloader:
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  resume_safe: true
+  eval_batch_size: 8
+
+training:
+  seed: 3407
+  cpu_threads: 8
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  # 88,880 official rows / batch 8 = one exact complete train-list epoch.
+  max_iters: 11110
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  clip_grad_norm: 5.0
+  cudnn_benchmark: true
+  tf32: true
+  log_interval: 25
+
+postprocess:
+  score_mode: exist
+  score_thresh: 0.5
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
