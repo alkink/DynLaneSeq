@@ -20,7 +20,9 @@ args=(
   --dataset-root /workspace/CULane
   --output-dir "${output}"
   --device cuda
-  --num-workers 4
+  # Full-resolution online augmentation was starving the GPU with four
+  # workers on the 32-core remote host.
+  --num-workers 12
   --mode gate
   --log-interval 25
   --resume-interval 500
