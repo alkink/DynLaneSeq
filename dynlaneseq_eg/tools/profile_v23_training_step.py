@@ -19,8 +19,12 @@ from dynlaneseq_eg.modeling.v23_ordered_slot_cost_volume import (
 from dynlaneseq_eg.tools.train import seed_everything
 from dynlaneseq_eg.tools.train_v23_ordered_slot_cost_volume import (
     FIXED_SEED,
+    _configure_cuda_runtime,
     _configured,
     _loss_weights,
+    _move_images,
+    _next_batch,
+    _optimizer,
 )
 from dynlaneseq_eg.tools.v23_official_protocol import (
     official_v23_culane_list_contract,
@@ -33,8 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", required=True)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--profiler-rows", type=int, default=30)
+    parser.add_argument("--loop-steps", type=int, default=20)
     return parser.parse_args()
 
 
@@ -76,14 +81,32 @@ def main() -> None:
         official_train_list=str(train_population["list_path"]),
         official_val_list=str(val_population["list_path"]),
     )
+    _configure_cuda_runtime(cfg, device)
     model = build_model(cfg)
     if not isinstance(model, DynLaneSeqV23):
         raise TypeError("profile tool requires DynLaneSeqV23")
-    iteration = int(load_checkpoint(args.resume, model, strict=True))
     model.to(device)
     channels_last = bool(cfg["training"].get("channels_last", False))
     if channels_last:
         model.to(memory_format=torch.channels_last)
+    optimizer = _optimizer(model, cfg)
+    try:
+        # Current V23 resume files intentionally exclude the immutable V7
+        # teacher.  Keep a legacy fallback so this diagnostic can still
+        # profile the pre-optimization step-1000 checkpoint.
+        iteration = int(
+            load_checkpoint(
+                args.resume,
+                model.student,
+                optimizer=optimizer,
+                strict=True,
+            )
+        )
+    except RuntimeError:
+        optimizer = _optimizer(model, cfg)
+        iteration = int(
+            load_checkpoint(args.resume, model, optimizer=optimizer, strict=True)
+        )
     model.train()
 
     loader = build_dataloader(
@@ -93,30 +116,36 @@ def main() -> None:
     images, targets, _metas = next(iter(loader))
     loader_ms = 1_000.0 * (time.perf_counter() - load_start)
     transfer_start = time.perf_counter()
-    images = images.to(device, non_blocking=True)
-    if channels_last:
-        images = images.contiguous(memory_format=torch.channels_last)
+    images = _move_images(
+        images, device=device, channels_last=channels_last
+    )
     _synchronize(device)
     transfer_ms = 1_000.0 * (time.perf_counter() - transfer_start)
     weights = _loss_weights(cfg)
     amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
 
-    # Warm up all kernels and allocator state before reporting timings.
-    model.zero_grad(set_to_none=True)
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
-    ):
-        warm_output = model(images)
-        warm_loss, _ = v23_ordered_cost_volume_loss(
-            warm_output,
-            targets,
-            input_h=int(cfg["model"]["input_h"]),
-            input_w=int(cfg["model"]["input_w"]),
-            weights=weights,
+    # Warm up convolution selection and allocator state before reporting.
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
+        ):
+            warm_output = model(images)
+            warm_loss, _ = v23_ordered_cost_volume_loss(
+                warm_output,
+                targets,
+                input_h=int(cfg["model"]["input_h"]),
+                input_w=int(cfg["model"]["input_w"]),
+                weights=weights,
+            )
+        warm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.student.parameters(),
+            max_norm=float(cfg["training"]["clip_grad_norm"]),
         )
-    warm_loss.backward()
-    model.zero_grad(set_to_none=True)
-    del warm_output, warm_loss
+        optimizer.step()
+        del warm_output, warm_loss
+    optimizer.zero_grad(set_to_none=True)
     _synchronize(device)
 
     teacher_output, teacher_ms = _timed(
@@ -158,7 +187,15 @@ def main() -> None:
 
     (loss, _diagnostics), loss_ms = _timed(device, loss_forward)
     _unused, backward_ms = _timed(device, lambda: loss.backward())
-    model.zero_grad(set_to_none=True)
+    _gradient_norm, gradient_clip_ms = _timed(
+        device,
+        lambda: torch.nn.utils.clip_grad_norm_(
+            model.student.parameters(),
+            max_norm=float(cfg["training"]["clip_grad_norm"]),
+        ),
+    )
+    _unused, optimizer_step_ms = _timed(device, optimizer.step)
+    optimizer.zero_grad(set_to_none=True)
 
     detached_unary = output["unary_logits"].detach()
 
@@ -172,13 +209,50 @@ def main() -> None:
 
     _path, path_forward_only_ms = _timed(device, path_only)
 
+    # Measure the real steady training loop as well as isolated components.
+    # This includes online augmentation, worker IPC, H2D/layout, forward,
+    # target construction, backward, clipping and AdamW.
+    loop_iterator = iter(loader)
+    loop_images = 0
+    _synchronize(device)
+    loop_start = time.perf_counter()
+    for _ in range(max(int(args.loop_steps), 0)):
+        (loop_batch, loop_iterator) = _next_batch(loader, loop_iterator)
+        loop_input, loop_targets, _loop_metas = loop_batch
+        loop_input = _move_images(
+            loop_input, device=device, channels_last=channels_last
+        )
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=amp_enabled,
+        ):
+            loop_output = model(loop_input)
+            loop_loss, _ = v23_ordered_cost_volume_loss(
+                loop_output,
+                loop_targets,
+                input_h=int(cfg["model"]["input_h"]),
+                input_w=int(cfg["model"]["input_w"]),
+                weights=weights,
+            )
+        loop_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.student.parameters(),
+            max_norm=float(cfg["training"]["clip_grad_norm"]),
+        )
+        optimizer.step()
+        loop_images += int(loop_input.shape[0])
+    _synchronize(device)
+    loop_seconds = time.perf_counter() - loop_start
+
     # A userspace torch profile identifies both the many-small-kernel path and
     # host synchronisation without needing unavailable kernel perf/eBPF access.
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device.type == "cuda":
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     model.zero_grad(set_to_none=True)
-    with torch.profiler.profile(activities=activities) as profile:
+    with torch.profiler.profile(activities=activities, record_shapes=True) as profile:
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
@@ -191,6 +265,11 @@ def main() -> None:
                 weights=weights,
             )
         profiled_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.student.parameters(),
+            max_norm=float(cfg["training"]["clip_grad_norm"]),
+        )
+        optimizer.step()
     _synchronize(device)
 
     report = {
@@ -203,11 +282,35 @@ def main() -> None:
         "owned_target_build_ms": target_build_ms,
         "complete_loss_forward_ms_including_target_build": loss_ms,
         "backward_ms": backward_ms,
+        "gradient_clip_ms": gradient_clip_ms,
+        "optimizer_step_ms": optimizer_step_ms,
         "soft_viterbi_forward_only_ms": path_forward_only_ms,
-        "measured_compute_step_ms": teacher_ms + student_ms + loss_ms + backward_ms,
+        "measured_compute_step_ms": (
+            teacher_ms
+            + student_ms
+            + loss_ms
+            + backward_ms
+            + gradient_clip_ms
+            + optimizer_step_ms
+        ),
         "measured_compute_images_per_second": (
             float(images.shape[0])
-            / ((teacher_ms + student_ms + loss_ms + backward_ms) / 1_000.0)
+            / (
+                (
+                    teacher_ms
+                    + student_ms
+                    + loss_ms
+                    + backward_ms
+                    + gradient_clip_ms
+                    + optimizer_step_ms
+                )
+                / 1_000.0
+            )
+        ),
+        "steady_loop_steps": int(args.loop_steps),
+        "steady_loop_seconds": loop_seconds,
+        "steady_loop_images_per_second": (
+            float(loop_images) / loop_seconds if loop_seconds > 0.0 else 0.0
         ),
     }
     print(json.dumps(report, indent=2, sort_keys=True), flush=True)
@@ -219,6 +322,13 @@ def main() -> None:
         flush=True,
     )
     if device.type == "cuda":
+        print(
+            profile.key_averages(group_by_input_shape=True).table(
+                sort_by="self_cuda_time_total",
+                row_limit=int(args.profiler_rows),
+            ),
+            flush=True,
+        )
         print(
             profile.key_averages().table(
                 sort_by="self_cpu_time_total", row_limit=int(args.profiler_rows)

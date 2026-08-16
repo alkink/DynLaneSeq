@@ -140,7 +140,7 @@ def _canonical_target_lanes(
     return x_rows, valid, ranges
 
 
-def _pairwise_common_row_distance(
+def _batched_pairwise_common_row_distance(
     source_x: torch.Tensor,
     source_range: torch.Tensor,
     target_x: torch.Tensor,
@@ -148,64 +148,45 @@ def _pairwise_common_row_distance(
     *,
     input_h: int,
 ) -> torch.Tensor:
-    """Vectorized slot/GT distance matrix without per-pair CUDA syncs."""
+    """Vectorized [B,S,G] slot/GT distance without per-image syncs."""
 
     rows = int(source_x.shape[-1])
     y = fixed_y_rows(rows, input_h, device=source_x.device, dtype=torch.float32)
     source_valid = (
         torch.isfinite(source_x)
-        & (y.view(1, rows) >= source_range[:, 0:1] * float(input_h))
-        & (y.view(1, rows) <= source_range[:, 1:2] * float(input_h))
+        & (y.view(1, 1, rows) >= source_range[..., 0:1] * float(input_h))
+        & (y.view(1, 1, rows) <= source_range[..., 1:2] * float(input_h))
     )
-    common = source_valid[:, None, :] & target_valid[None, :, :]
+    common = source_valid[:, :, None, :] & target_valid[:, None, :, :]
     count = common.sum(dim=-1)
-    distance = (source_x[:, None, :] - target_x[None, :, :]).abs()
+    distance = (source_x[:, :, None, :] - target_x[:, None, :, :]).abs()
     mean = (distance * common.float()).sum(dim=-1) / count.clamp_min(1).float()
     return torch.where(count > 0, mean, torch.full_like(mean, 1.0e6))
 
 
-def _monotonic_owned_assignment(
-    source_x: torch.Tensor,
-    source_range: torch.Tensor,
-    active: torch.Tensor,
-    target_x: torch.Tensor,
-    target_valid: torch.Tensor,
-    *,
-    input_h: int,
+def _monotonic_assignment_from_cost(
+    pair_cost: list[list[float]],
+    active: list[bool],
+    gt_count: int,
 ) -> list[int]:
     """Assign ordered V7 slots to ordered GT without crossing identities."""
 
-    active_ids = active.nonzero(as_tuple=False).flatten().tolist()
-    gt_count = int(target_x.shape[0])
-    assignment = [-1] * int(active.shape[0])
+    active_ids = [index for index, is_active in enumerate(active) if is_active]
+    assignment = [-1] * len(active)
     if not active_ids or gt_count == 0:
         return assignment
-    # One small device-to-host transfer replaces one synchronizing .cpu()
-    # operation for every active-slot/GT pair.
-    pair_cost = (
-        _pairwise_common_row_distance(
-            source_x[active_ids],
-            source_range[active_ids],
-            target_x,
-            target_valid,
-            input_h=input_h,
-        )
-        .detach()
-        .cpu()
-        .tolist()
-    )
     best_cost = float("inf")
     best_pairs: tuple[tuple[int, int], ...] = tuple()
     if len(active_ids) <= gt_count:
         for gt_ids in combinations(range(gt_count), len(active_ids)):
             pairs = tuple(zip(range(len(active_ids)), gt_ids))
-            cost = sum(pair_cost[a][g] for a, g in pairs)
+            cost = sum(pair_cost[active_ids[a]][g] for a, g in pairs)
             if cost < best_cost:
                 best_cost, best_pairs = cost, pairs
     else:
         for active_positions in combinations(range(len(active_ids)), gt_count):
             pairs = tuple(zip(active_positions, range(gt_count)))
-            cost = sum(pair_cost[a][g] for a, g in pairs)
+            cost = sum(pair_cost[active_ids[a]][g] for a, g in pairs)
             if cost < best_cost:
                 best_cost, best_pairs = cost, pairs
     for active_position, gt in best_pairs:
@@ -233,33 +214,81 @@ def build_v23_owned_targets(
     batch, slots, rows = source_x.shape
     if slots != 4 or len(targets) != batch:
         raise ValueError("V23 owned-target batch/slot mismatch")
-    owned_x = source_x.new_zeros((batch, slots, rows), dtype=torch.float32)
-    owned_valid = torch.zeros((batch, slots, rows), dtype=torch.bool, device=source_x.device)
-    owned_range = source_x.new_zeros((batch, slots, 2), dtype=torch.float32)
-    owned_index = torch.full((batch, slots), -1, dtype=torch.long, device=source_x.device)
+    # Targets arrive as a CPU list with at most four lanes. Canonicalize and
+    # pad there, then perform one batched host-to-device copy instead of two
+    # tiny transfers plus two synchronizations for every image.
+    canonical_x_cpu = torch.zeros((batch, slots, rows), dtype=torch.float32)
+    canonical_valid_cpu = torch.zeros((batch, slots, rows), dtype=torch.bool)
+    canonical_range_cpu = torch.zeros((batch, slots, 2), dtype=torch.float32)
+    target_counts: list[int] = []
     for batch_index, target in enumerate(targets):
         target_x, target_valid, target_range = _canonical_target_lanes(
             target,
-            device=source_x.device,
+            device=torch.device("cpu"),
             rows=rows,
             input_w=input_w,
             minimum_valid_rows=minimum_valid_rows,
         )
-        assignment = _monotonic_owned_assignment(
-            source_x[batch_index].detach().float(),
-            source_range[batch_index].detach().float(),
-            source_active[batch_index].detach().bool(),
-            target_x,
-            target_valid,
-            input_h=input_h,
+        target_count = int(target_x.shape[0])
+        target_counts.append(target_count)
+        if target_count:
+            canonical_x_cpu[batch_index, :target_count] = target_x
+            canonical_valid_cpu[batch_index, :target_count] = target_valid
+            canonical_range_cpu[batch_index, :target_count] = target_range
+
+    canonical_x = canonical_x_cpu.to(device=source_x.device, non_blocking=True)
+    canonical_valid = canonical_valid_cpu.to(
+        device=source_x.device, non_blocking=True
+    )
+    canonical_range = canonical_range_cpu.to(
+        device=source_x.device, non_blocking=True
+    )
+    pair_cost = _batched_pairwise_common_row_distance(
+        source_x.detach().float(),
+        source_range.detach().float(),
+        canonical_x,
+        canonical_valid,
+        input_h=input_h,
+    )
+    # Copy the complete 4x4 cost matrices and four activity flags together.
+    # This is the only GPU-to-CPU synchronization in ownership construction.
+    assignment_payload = torch.cat(
+        (pair_cost.reshape(batch, -1), source_active.detach().float()), dim=-1
+    ).cpu().tolist()
+    assignment_rows: list[list[int]] = []
+    for batch_index, payload in enumerate(assignment_payload):
+        flat_cost = payload[: slots * slots]
+        cost = [
+            flat_cost[row * slots : (row + 1) * slots]
+            for row in range(slots)
+        ]
+        active = [bool(value) for value in payload[slots * slots :]]
+        assignment_rows.append(
+            _monotonic_assignment_from_cost(
+                cost,
+                active,
+                target_counts[batch_index],
+            )
         )
-        for slot, gt_index in enumerate(assignment):
-            if gt_index < 0:
-                continue
-            owned_x[batch_index, slot] = target_x[gt_index]
-            owned_valid[batch_index, slot] = target_valid[gt_index]
-            owned_range[batch_index, slot] = target_range[gt_index]
-            owned_index[batch_index, slot] = int(gt_index)
+    owned_index = torch.tensor(
+        assignment_rows, dtype=torch.long, device=source_x.device
+    )
+    has_target = owned_index >= 0
+    safe_index = owned_index.clamp_min(0)
+    owned_x = canonical_x.gather(
+        1, safe_index.unsqueeze(-1).expand(batch, slots, rows)
+    )
+    owned_valid = canonical_valid.gather(
+        1, safe_index.unsqueeze(-1).expand(batch, slots, rows)
+    )
+    owned_range = canonical_range.gather(
+        1, safe_index.unsqueeze(-1).expand(batch, slots, 2)
+    )
+    owned_x = torch.where(has_target.unsqueeze(-1), owned_x, torch.zeros_like(owned_x))
+    owned_valid = owned_valid & has_target.unsqueeze(-1)
+    owned_range = torch.where(
+        has_target.unsqueeze(-1), owned_range, torch.zeros_like(owned_range)
+    )
     matched = (owned_index >= 0) & source_active.bool()
     return {
         "x_rows": owned_x,
@@ -275,6 +304,7 @@ def _shifted_transition(
     *,
     radius: int,
     transition_penalty: float,
+    penalty_vector: torch.Tensor | None = None,
 ) -> torch.Tensor:
     radius = int(radius)
     if radius < 0:
@@ -290,9 +320,11 @@ def _shifted_transition(
     neighbours = F.pad(value, (radius, radius), value=-1.0e4).unfold(
         -1, window, 1
     )
-    penalty = (
-        fixed_indices(window, device=value.device, dtype=value.dtype) - radius
-    ).abs() * float(transition_penalty)
+    penalty = penalty_vector
+    if penalty is None:
+        penalty = (
+            fixed_indices(window, device=value.device, dtype=value.dtype) - radius
+        ).abs() * float(transition_penalty)
     return torch.logsumexp(neighbours - penalty, dim=-1)
 
 
@@ -306,14 +338,22 @@ def soft_viterbi_marginals(
 
     if unary_logits.ndim != 4:
         raise ValueError("V23 path decoder expects [B,S,R,X] unary logits")
+    if int(transition_radius_bins) < 0:
+        raise ValueError("transition radius must be non-negative")
     unary = unary_logits.float()
     rows = int(unary.shape[-2])
+    window = 2 * int(transition_radius_bins) + 1
+    penalty_vector = (
+        fixed_indices(window, device=unary.device, dtype=unary.dtype)
+        - int(transition_radius_bins)
+    ).abs() * float(transition_penalty)
     forward: list[torch.Tensor] = [unary[..., 0, :]]
     for row in range(1, rows):
         message = _shifted_transition(
             forward[-1],
             radius=transition_radius_bins,
             transition_penalty=transition_penalty,
+            penalty_vector=penalty_vector,
         )
         state = unary[..., row, :] + message
         forward.append(state - torch.logsumexp(state, dim=-1, keepdim=True))
@@ -324,8 +364,11 @@ def soft_viterbi_marginals(
             next_state,
             radius=transition_radius_bins,
             transition_penalty=transition_penalty,
+            penalty_vector=penalty_vector,
         )
-        backward.append(message - torch.logsumexp(message, dim=-1, keepdim=True))
+        backward.append(
+            message - torch.logsumexp(message, dim=-1, keepdim=True)
+        )
     backward.reverse()
     forward_tensor = torch.stack(forward, dim=-2)
     backward_tensor = torch.stack(backward, dim=-2)
@@ -504,7 +547,10 @@ class V23OrderedSlotCostVolume(nn.Module):
         proposals = int(proposal_x.shape[1])
         if proposal_x.shape != (batch, proposals, rows):
             raise ValueError("V23 proposal rows mismatch")
-        log_probability = path_logits.log_softmax(dim=-1)
+        # soft_viterbi_marginals already returns normalized log-probability.
+        # Re-normalizing this full [B,S,R,X] tensor here duplicated a costly
+        # reduction and only changed round-off at the 1e-6 scale.
+        log_probability = path_logits.float()
         position = proposal_x.float() / (float(self.input_w) / float(bins)) - 0.5
         lower = position.floor().long().clamp(0, bins - 1)
         upper = (lower + 1).clamp(max=bins - 1)
@@ -577,8 +623,9 @@ class V23OrderedSlotCostVolume(nn.Module):
             + self.geometry_projection(geometry)
         )
         scale = 1.0 / math.sqrt(float(query.shape[-1]))
+        teacher_prior = self._teacher_prior(source_x)
         initial_image_logits = torch.einsum("bsrc,bcrx->bsrx", query, keys) * scale
-        initial_logits = initial_image_logits + self.teacher_prior_weight * self._teacher_prior(source_x)
+        initial_logits = initial_image_logits + self.teacher_prior_weight * teacher_prior
         initial_probability = initial_logits.softmax(dim=-1)
         context = torch.einsum("bsrx,bcrx->bsrc", initial_probability, image_features)
         query = query + self.context_projection(context)
@@ -596,7 +643,7 @@ class V23OrderedSlotCostVolume(nn.Module):
         unary_logits = (
             initial_image_logits
             + refined_image_logits
-            + self.teacher_prior_weight * self._teacher_prior(source_x)
+            + self.teacher_prior_weight * teacher_prior
         )
         path_logits = soft_viterbi_marginals(
             unary_logits,
@@ -716,7 +763,9 @@ def _row_distribution_loss(
     lower = position.floor().long().clamp(0, bins - 1)
     upper = (lower + 1).clamp(max=bins - 1)
     fraction = (position - lower.float()).clamp(0.0, 1.0)
-    log_probability = logits.float().log_softmax(dim=-1)
+    # V23's path decoder contract is normalized log-probability. Avoid a
+    # second full-width log_softmax on every row during loss construction.
+    log_probability = logits.float()
     lower_value = log_probability.gather(-1, lower.unsqueeze(-1)).squeeze(-1)
     upper_value = log_probability.gather(-1, upper.unsqueeze(-1)).squeeze(-1)
     nll = -((1.0 - fraction) * lower_value + fraction * upper_value)

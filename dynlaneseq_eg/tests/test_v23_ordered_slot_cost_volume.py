@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.modeling.v23_ordered_slot_cost_volume import (
     V23OrderedSlotCostVolume,
     _shifted_transition,
@@ -96,6 +97,44 @@ def test_owned_assignment_preserves_order_when_counts_differ() -> None:
     assert owned["target_indices"][0, :3].tolist() == [0, 2, 3]
 
 
+def test_owned_assignment_batches_different_lane_counts() -> None:
+    source = canonicalize_v7_slots(_teacher(batch=2))
+    rows = int(source["x_rows"].shape[-1])
+    source["active"][1] = torch.tensor([True, True, False, False])
+    four_targets = torch.stack(
+        [torch.linspace(x, x + 10.0, rows) for x in (11.0, 36.0, 66.0, 96.0)]
+    )
+    two_targets = torch.stack(
+        [torch.linspace(x, x + 10.0, rows) for x in (11.0, 66.0)]
+    )
+    targets = [
+        {
+            "x_rows": four_targets,
+            "valid_mask": torch.ones_like(four_targets, dtype=torch.bool),
+        },
+        {
+            "x_rows": two_targets,
+            "valid_mask": torch.ones_like(two_targets, dtype=torch.bool),
+        },
+    ]
+    owned = build_v23_owned_targets(
+        targets,
+        source_x=source["x_rows"],
+        source_range=source["range_norm"],
+        source_active=source["active"],
+        input_h=64,
+        input_w=128,
+    )
+    assert owned["target_indices"].tolist() == [
+        [0, 2, 3, -1],
+        [0, 1, -1, -1],
+    ]
+    assert owned["matched"].tolist() == [
+        [True, True, True, False],
+        [True, True, False, False],
+    ]
+
+
 def test_zero_step_is_exact_v7_but_student_receives_gradients() -> None:
     torch.manual_seed(7)
     model = _model().train()
@@ -135,6 +174,12 @@ def test_soft_viterbi_prefers_coherent_path() -> None:
         unary, transition_radius_bins=2, transition_penalty=1.0
     )
     assert marginal[0, 0, 3].argmax().item() == 5
+    torch.testing.assert_close(
+        torch.logsumexp(marginal, dim=-1),
+        torch.zeros_like(marginal[..., 0]),
+        rtol=0.0,
+        atol=1.0e-6,
+    )
 
 
 def test_vectorized_transition_matches_offset_reference() -> None:
@@ -182,3 +227,13 @@ def test_official_v23_protocol_requires_train_txt(tmp_path: Path) -> None:
             )
     finally:
         protocol.OFFICIAL_V23_CULANE_LISTS = original
+
+
+def test_v23_uses_measured_worker_count() -> None:
+    config = (
+        Path(__file__).resolve().parents[1]
+        / "configs/culane_v23_ordered_slot_cost_volume_gate.yaml"
+    )
+    cfg = load_config(config)
+    assert cfg["dataloader"]["num_workers"] == 2
+    assert cfg["training"]["cpu_threads"] == 8

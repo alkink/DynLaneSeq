@@ -13,6 +13,13 @@ model:
   name: DynLaneSeqV23
   pretrained_backbone: false
   require_pretrained_backbone: false
+  # The frozen V7 row-reference block normally projects keys and values with
+  # two separate linear calls.  Its existing fused backend concatenates the
+  # same weights and has been verified tensor-exact on 256 official val
+  # images, while removing one large launch per reference layer.
+  structured_query:
+    row_reference:
+      projection_backend: fused
 
 v23:
   hidden_dim: 96
@@ -71,7 +78,10 @@ augmentation:
   random_shadow_roi_start_y: 0.25
 
 dataloader:
-  num_workers: 12
+  # The path recurrence is host-launch-bound.  A same-process A/B measured
+  # 8.77 img/s with two workers versus 7.40 with four; two still decode about
+  # 15 img/s by themselves and therefore fully feed this model.
+  num_workers: 2
   persistent_workers: true
   pin_memory: true
   prefetch_factor: 4
@@ -80,6 +90,9 @@ dataloader:
 
 training:
   seed: 3407
+  # Same-process profiling on the deployment host: 1/4/8/32 threads yielded
+  # 8.02/8.57/8.77/8.61 img/s with two loader workers.
+  cpu_threads: 8
   # RTX 5080 smoke measured 6.55/16.3 GiB at physical batch four. Physical
   # batch eight removes accumulation while preserving effective batch 8.
   batch_size: 8

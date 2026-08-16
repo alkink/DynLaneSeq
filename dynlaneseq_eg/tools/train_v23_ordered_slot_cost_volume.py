@@ -43,7 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-workers", type=int, default=12)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override dataloader.num_workers; omitted means use the config.",
+    )
     parser.add_argument(
         "--mode",
         choices=("gate", "smoke"),
@@ -68,11 +73,56 @@ def _configured(
     cfg.setdefault("dataset", {})["root"] = dataset_root
     cfg["dataset"].setdefault("lists", {})["train"] = official_train_list
     cfg["dataset"]["lists"]["val"] = official_val_list
-    cfg.setdefault("dataloader", {})["num_workers"] = int(args.num_workers)
-    cfg["dataloader"]["persistent_workers"] = bool(args.num_workers > 0)
+    dataloader_cfg = cfg.setdefault("dataloader", {})
+    configured_workers = int(dataloader_cfg.get("num_workers", 0))
+    workers = (
+        configured_workers
+        if args.num_workers is None
+        else int(args.num_workers)
+    )
+    dataloader_cfg["num_workers"] = workers
+    dataloader_cfg["persistent_workers"] = bool(workers > 0)
     cfg.setdefault("model", {})["pretrained_backbone"] = False
     cfg["model"]["require_pretrained_backbone"] = False
     return cfg
+
+
+def _configure_cuda_runtime(cfg: dict[str, Any], device: torch.device) -> None:
+    """Apply the same CUDA backend contract as the repository's main trainer."""
+
+    train_cfg = cfg.get("training", {})
+    cpu_threads = train_cfg.get("cpu_threads")
+    if cpu_threads is not None:
+        torch.set_num_threads(max(int(cpu_threads), 1))
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = bool(
+        train_cfg.get("cudnn_benchmark", False)
+    )
+    if bool(train_cfg.get("tf32", False)):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+def _move_images(
+    images: torch.Tensor,
+    *,
+    device: torch.device,
+    channels_last: bool,
+) -> torch.Tensor:
+    if channels_last and device.type == "cuda":
+        # An isolated 30-repeat A/B on the deployment host found the explicit
+        # device conversion more stable than requesting a destination memory
+        # format during H2D (3.96 ms mean versus 9.67 ms with outliers).  Both
+        # paths are value-exact, so retain the measured stable route.
+        return images.to(device, non_blocking=True).contiguous(
+            memory_format=torch.channels_last
+        )
+    return images.to(device, non_blocking=True)
 
 
 def _make_v22(cfg: dict[str, Any]) -> V22LaneFieldStageA:
@@ -177,6 +227,15 @@ def _state_digest(module: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
+def _state_versions(module: torch.nn.Module) -> dict[str, int]:
+    """Cheaply detect any in-place parameter or buffer mutation."""
+
+    return {
+        name: int(value._version)
+        for name, value in module.state_dict(keep_vars=True).items()
+    }
+
+
 def _gradient_norm(parameters) -> float:
     values = [
         parameter.grad.detach().float().pow(2).sum()
@@ -186,6 +245,34 @@ def _gradient_norm(parameters) -> float:
     return float(torch.sqrt(sum(values))) if values else 0.0
 
 
+def _assert_finite_without_host_sync(value: torch.Tensor, message: str) -> None:
+    condition = torch.isfinite(value).all()
+    if value.is_cuda and hasattr(torch, "_assert_async"):
+        torch._assert_async(condition, message)
+        return
+    if not bool(condition):
+        raise FloatingPointError(message)
+
+
+def _scalars_to_host(
+    values: dict[str, torch.Tensor],
+    *,
+    extra: dict[str, torch.Tensor] | None = None,
+) -> dict[str, float]:
+    combined = dict(values)
+    if extra:
+        combined.update(extra)
+    names = tuple(combined)
+    if not names:
+        return {}
+    # One packed device-to-host copy replaces one synchronizing float(tensor)
+    # call for every diagnostic scalar.
+    packed = torch.stack(
+        [combined[name].detach().float().reshape(()) for name in names]
+    ).cpu()
+    return dict(zip(names, (float(value) for value in packed.tolist())))
+
+
 def _gate_zero(
     model: DynLaneSeqV23,
     batch,
@@ -193,15 +280,17 @@ def _gate_zero(
     device: torch.device,
     cfg: dict[str, Any],
     weights: V23LossWeights,
+    expected_teacher_digest: str,
 ) -> dict[str, Any]:
     images, targets, _metas = batch
-    images = images[:1].to(device)
+    channels_last = bool(cfg["training"].get("channels_last", False))
+    images = _move_images(
+        images[:1], device=device, channels_last=channels_last
+    )
     targets = targets[:1]
-    if bool(cfg["training"].get("channels_last", False)):
-        images = images.contiguous(memory_format=torch.channels_last)
     model.train()
     model.zero_grad(set_to_none=True)
-    teacher_before = _state_digest(model.teacher)
+    teacher_versions_before = _state_versions(model.teacher)
     with torch.no_grad():
         teacher_output = model.teacher(images.float(), inference_only=True)
     amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
@@ -219,7 +308,10 @@ def _gate_zero(
             weights=weights,
         )
     total.backward()
-    teacher_after = _state_digest(model.teacher)
+    teacher_versions_after = _state_versions(model.teacher)
+    teacher_versions_unchanged = (
+        teacher_versions_before == teacher_versions_after
+    )
     parity = {
         "pred_x_rows": float(
             (
@@ -255,7 +347,7 @@ def _gate_zero(
         finite
         and parity["pred_x_rows"] == 0.0
         and parity["range_norm"] == 0.0
-        and teacher_before == teacher_after
+        and teacher_versions_unchanged
         and teacher_gradient_tensors == 0
         and all(value > 0.0 and math.isfinite(value) for value in gradient_norms.values())
     )
@@ -265,8 +357,8 @@ def _gate_zero(
     return {
         "passed": passed,
         "zero_step_public_geometry_parity": parity,
-        "teacher_state_sha256_before": teacher_before,
-        "teacher_state_sha256_after": teacher_after,
+        "teacher_state_sha256_before": expected_teacher_digest,
+        "teacher_state_version_unchanged": teacher_versions_unchanged,
         "teacher_gradient_tensors": teacher_gradient_tensors,
         "student_gradient_norms": gradient_norms,
         "losses_finite": finite,
@@ -308,6 +400,7 @@ def main() -> None:
         raise ValueError("V23 smoke mode is limited to 1..10 mechanical steps")
 
     device = torch.device(args.device)
+    _configure_cuda_runtime(cfg, device)
     model = build_model(cfg)
     if not isinstance(model, DynLaneSeqV23):
         raise TypeError("factory did not construct DynLaneSeqV23")
@@ -332,10 +425,14 @@ def main() -> None:
         resume_path = Path(args.resume).expanduser().resolve()
         if not resume_path.is_file():
             raise FileNotFoundError(resume_path)
+        # Resume files intentionally contain only the trainable student.  The
+        # frozen V7 teacher is always reloaded from the separately checksummed
+        # source checkpoint, so it is neither duplicated in every 500-step
+        # checkpoint nor overwritten by resume state.
         start_step = int(
             load_checkpoint(
                 resume_path,
-                model,
+                model.student,
                 optimizer=optimizer,
                 strict=True,
                 restore_rng_state=True,
@@ -346,8 +443,6 @@ def main() -> None:
                 f"resume iteration must be in (0,{steps}), got {start_step}"
             )
         resumed_from = str(resume_path)
-        if _state_digest(model.teacher) != v7_teacher_digest:
-            raise RuntimeError("resume checkpoint changed the exact V7 teacher state")
     loader = build_dataloader(
         cfg, split="train", training=True, start_iteration=start_step
     )
@@ -366,6 +461,7 @@ def main() -> None:
             device=device,
             cfg=cfg,
             weights=weights,
+            expected_teacher_digest=v7_teacher_digest,
         )
         if not gate_zero["passed"]:
             raise RuntimeError(
@@ -407,14 +503,14 @@ def main() -> None:
             minimum_ratio=float(opt_cfg["minimum_lr_ratio"]),
         )
         optimizer.zero_grad(set_to_none=True)
-        accumulated: dict[str, float] = {}
+        accumulated: dict[str, torch.Tensor] = {}
         for _micro in range(accumulation_steps):
             (images, targets, _metas), iterator = _next_batch(loader, iterator)
             images_seen += int(images.shape[0])
             run_images_seen += int(images.shape[0])
-            images = images.to(device, non_blocking=True)
-            if channels_last:
-                images = images.contiguous(memory_format=torch.channels_last)
+            images = _move_images(
+                images, device=device, channels_last=channels_last
+            )
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -429,24 +525,27 @@ def main() -> None:
                     weights=weights,
                 )
                 scaled_loss = loss / float(accumulation_steps)
-            if not bool(torch.isfinite(scaled_loss)):
-                raise FloatingPointError(f"non-finite V23 loss at step {step}")
+            _assert_finite_without_host_sync(
+                scaled_loss, f"non-finite V23 loss at step {step}"
+            )
             scaled_loss.backward()
             for name, value in diagnostics.items():
-                accumulated[name] = accumulated.get(name, 0.0) + float(value) / float(
-                    accumulation_steps
-                )
-        gradient_norm = float(
-            torch.nn.utils.clip_grad_norm_(
-                model.student.parameters(),
-                max_norm=float(cfg["training"]["clip_grad_norm"]),
-            )
+                detached = value.detach() / float(accumulation_steps)
+                accumulated[name] = accumulated.get(name, 0.0) + detached
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            model.student.parameters(),
+            max_norm=float(cfg["training"]["clip_grad_norm"]),
         )
-        if not math.isfinite(gradient_norm):
-            raise FloatingPointError(f"non-finite V23 gradient at step {step}")
+        _assert_finite_without_host_sync(
+            gradient_norm, f"non-finite V23 gradient at step {step}"
+        )
         optimizer.step()
-        final_diagnostics = accumulated
         if step == 1 or step % int(args.log_interval) == 0 or step == steps:
+            host_scalars = _scalars_to_host(
+                accumulated, extra={"gradient_norm": gradient_norm}
+            )
+            gradient_norm_value = host_scalars.pop("gradient_norm")
+            final_diagnostics = dict(host_scalars)
             elapsed = max(time.perf_counter() - start_time, 1.0e-6)
             row = {
                 "step": step,
@@ -457,11 +556,11 @@ def main() -> None:
                 # estimate severely misleading.
                 "run_images_seen": run_images_seen,
                 "images_per_second": float(run_images_seen) / elapsed,
-                "gradient_norm": gradient_norm,
+                "gradient_norm": gradient_norm_value,
                 "learning_rate_ratio": lr_ratio,
                 "backbone_lr": float(optimizer.param_groups[0]["lr"]),
                 "student_lr": float(optimizer.param_groups[1]["lr"]),
-                **accumulated,
+                **host_scalars,
             }
             text = json.dumps(row, sort_keys=True)
             print(text, flush=True)
@@ -475,7 +574,7 @@ def main() -> None:
         ):
             save_checkpoint(
                 resume_checkpoint,
-                model,
+                model.student,
                 optimizer=optimizer,
                 iteration=step,
                 cfg=cfg,
@@ -492,6 +591,7 @@ def main() -> None:
         iteration=steps,
         cfg=cfg,
     )
+    endpoint_teacher_digest = _state_digest(model.teacher)
     report = {
         "experiment": "V23 ordered slot-conditioned lane cost volume",
         "scientific_gate": args.mode == "gate",
@@ -522,8 +622,9 @@ def main() -> None:
         "model_contract": v23_model_contract(model.student),
         "warm_start": warm_start,
         "gate_zero": gate_zero,
-        "teacher_state_sha256_at_endpoint": _state_digest(model.teacher),
-        "teacher_state_still_exact": _state_digest(model.teacher)
+        "resume_checkpoint_format": "student_optimizer_rng_only",
+        "teacher_state_sha256_at_endpoint": endpoint_teacher_digest,
+        "teacher_state_still_exact": endpoint_teacher_digest
         == v7_teacher_digest,
         "official_train_population_contract": train_population,
         "official_val_population_contract": val_population,

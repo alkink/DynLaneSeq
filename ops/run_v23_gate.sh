@@ -20,9 +20,9 @@ args=(
   --dataset-root /workspace/CULane
   --output-dir "${output}"
   --device cuda
-  # A measured 12-worker control was slower because full-resolution workers
-  # increased IPC/cache pressure. Four gave the best sustained throughput.
-  --num-workers 4
+  # Two workers fully feed the model without starving its host-launched path
+  # recurrence; the measured four-worker control was about 16% slower.
+  --num-workers 2
   --mode gate
   --log-interval 25
   --resume-interval 500
