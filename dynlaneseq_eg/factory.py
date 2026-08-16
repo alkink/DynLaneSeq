@@ -15,7 +15,14 @@ from .losses.loss_s1 import S1LossConfig
 from .losses.loss_s2 import S2LossConfig
 from .losses.loss_s4 import S4LossConfig
 from .losses.matcher_s0 import MatcherConfig
-from .modeling import DynLaneSeqS0, DynLaneSeqS1, DynLaneSeqS2, DynLaneSeqS3, DynLaneSeqS4
+from .modeling import (
+    DynLaneSeqS0,
+    DynLaneSeqS1,
+    DynLaneSeqS2,
+    DynLaneSeqS3,
+    DynLaneSeqS4,
+    DynLaneSeqV23,
+)
 
 
 def build_model(cfg: dict[str, Any]) -> torch.nn.Module:
@@ -26,6 +33,7 @@ def build_model(cfg: dict[str, Any]) -> torch.nn.Module:
         "DynLaneSeqS2": DynLaneSeqS2,
         "DynLaneSeqS3": DynLaneSeqS3,
         "DynLaneSeqS4": DynLaneSeqS4,
+        "DynLaneSeqV23": DynLaneSeqV23,
     }
     if name not in table:
         raise ValueError(f"Unsupported model.name: {name}")

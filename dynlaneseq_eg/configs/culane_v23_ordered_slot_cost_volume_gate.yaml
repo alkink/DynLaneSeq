@@ -1,0 +1,97 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v23_ordered_slot_cost_volume_gate
+
+dataset:
+  # V23 is locked by code to these untouched populations. No subset, clip
+  # filter, repeated-row removal, or alternative list may be substituted.
+  lists:
+    train: list/train.txt
+    val: list/val.txt
+
+model:
+  name: DynLaneSeqV23
+  pretrained_backbone: false
+  require_pretrained_backbone: false
+
+v23:
+  hidden_dim: 96
+  query_dim: 96
+  vertical_layers: 2
+  num_heads: 4
+  ff_dim: 256
+  teacher_prior_sigma_px: 18.0
+  teacher_prior_weight: 1.0
+  transition_radius_bins: 8
+  transition_penalty: 0.15
+  freeze_batch_norm_stats: true
+  loss:
+    row_distribution: 5.0
+    point: 1.0
+    strip_iou: 2.0
+    quality50: 0.5
+    quality75: 0.25
+    smoothness: 0.25
+    order: 0.25
+    proposal_path: 1.0
+    nondegradation: 2.0
+    gate_regularization: 0.01
+    tail_scale: 1.0
+    proposal_temperature: 0.08
+    line_width: 30.0
+    minimum_valid_rows: 5
+  optimizer:
+    backbone_lr: 0.00002
+    student_lr: 0.00010
+    weight_decay: 0.0001
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+
+augmentation:
+  cut_height: 270
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  channel_shuffle_prob: 0.0
+  hue_saturation_prob: 0.2
+  blur_prob: 0.1
+  affine_prob: 0.2
+  affine_translate_x: 0.03
+  affine_translate_y: 0.02
+  affine_rotate_deg: 2.0
+  affine_scale_min: 0.95
+  affine_scale_max: 1.05
+  random_shadow_prob: 0.2
+  random_shadow_min_opacity: 0.20
+  random_shadow_max_opacity: 0.55
+  random_shadow_min_vertices: 3
+  random_shadow_max_vertices: 6
+  random_shadow_roi_start_y: 0.25
+
+dataloader:
+  num_workers: 12
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  resume_safe: true
+  eval_batch_size: 1
+
+training:
+  seed: 3407
+  # RTX 5080 16 GiB: the full [4,160,800] differentiable path graph is first
+  # qualified at physical batch one. Accumulation preserves effective batch 8.
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_iters: 8000
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  clip_grad_norm: 1.0
+  log_interval: 25
+
+postprocess:
+  # Activity/count and visible ranges are exactly V7 in the first V23 arm.
+  score_mode: exist
+  score_thresh: 0.5
+  quality_score_power: 0.0
+  lane_nms_distance_thresh_px: 0.0
+  top_k: 4
