@@ -471,10 +471,18 @@ class V25ImageMediatedLaneObjects(nn.Module):
         expected = (posterior * centres.view(1, 1, 1, -1)).sum(dim=-1)
         row_index = unary_logits.float().argmax(dim=-1)
         row_argmax = (row_index.float() + 0.5) * bin_width
-        hard_index = hard_viterbi_paths(
-            unary_logits,
-            transition_radius_bins=self.transition_radius_bins,
-            transition_penalty=self.transition_penalty,
+        # The discrete path is a writer/inference operation. Running another
+        # 159-step recurrence during training adds no gradient and previously
+        # consumed roughly one third of decoder time. Row argmax is retained
+        # as a cheap training diagnostic; eval always computes the exact path.
+        hard_index = (
+            row_index
+            if self.training
+            else hard_viterbi_paths(
+                unary_logits,
+                transition_radius_bins=self.transition_radius_bins,
+                transition_penalty=self.transition_penalty,
+            )
         )
         hard = (hard_index.float() + 0.5) * bin_width
         selected = {
@@ -498,15 +506,15 @@ class V25ImageMediatedLaneObjects(nn.Module):
         values = self.value_projection(features)
         query = self._initial_query(batch, device=images.device).to(dtype=features.dtype)
         prior = self._anchor_prior(batch, device=images.device).to(dtype=features.dtype)
-        layer_logits: list[torch.Tensor] = []
-        layer_coverage: list[torch.Tensor] = []
+        final_layer_logits: torch.Tensor | None = None
+        final_other_coverage: torch.Tensor | None = None
         cumulative = prior
         for layer in self.decoder:
             query, logits, _probability, other_coverage = layer(
                 query, keys, values, prior_logits=cumulative
             )
-            layer_logits.append(logits)
-            layer_coverage.append(other_coverage)
+            final_layer_logits = logits
+            final_other_coverage = other_coverage
             # ``logits`` already contains the prior/cumulative evidence passed
             # into this block. Adding it again would double all earlier
             # evidence at every layer.
@@ -540,8 +548,8 @@ class V25ImageMediatedLaneObjects(nn.Module):
             "path_posterior": decoded["path_posterior"],
             "lane_object_state": query,
             "image_features": features,
-            "layer_image_logits": torch.stack(layer_logits, dim=0),
-            "layer_other_coverage": torch.stack(layer_coverage, dim=0),
+            "final_layer_image_logits": final_layer_logits,
+            "final_other_coverage": final_other_coverage,
         }
 
 
@@ -628,7 +636,10 @@ def v25_lane_object_loss(
         existence_target.reshape(-1),
     )
     row = _row_distribution_loss(
-        outputs["path_logits"],
+        # Direct x-distribution supervision belongs on the image-owned unary
+        # cost volume. Path marginals provide a structured geometry posterior
+        # for point/IoU losses but can be extremely sharp at random init.
+        outputs["unary_logits"],
         ordered["x_rows"],
         valid,
         input_w=input_w,
