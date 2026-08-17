@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument("--resume", default="")
     parser.add_argument("--resume-interval", type=int, default=500)
+    parser.add_argument("--oof-fold-manifest", default="")
+    parser.add_argument("--oof-fold-index", type=int, default=-1)
+    parser.add_argument("--train-list", default="")
     return parser.parse_args()
 
 
@@ -291,7 +294,25 @@ def main() -> None:
     args = parse_args()
     seed_everything(3407)
     root = Path(args.dataset_root).expanduser().resolve()
-    train_population = official_v23_culane_list_contract(root, split="train")
+    official_train_population = official_v23_culane_list_contract(root, split="train")
+    if args.oof_fold_manifest:
+        if not args.train_list or args.oof_fold_index not in (0, 1):
+            raise ValueError(
+                "OOF training requires --train-list and --oof-fold-index 0/1"
+            )
+        from dynlaneseq_eg.tools.build_v25_s1_oof_folds import (
+            validate_fold_training_population,
+        )
+
+        train_population = validate_fold_training_population(
+            args.oof_fold_manifest,
+            fold=args.oof_fold_index,
+            supplied_train_list=args.train_list,
+        )
+    else:
+        if args.train_list or args.oof_fold_index >= 0:
+            raise ValueError("custom train lists are allowed only by the OOF contract")
+        train_population = official_train_population
     val_population = official_v23_culane_list_contract(root, split="val")
     cfg = _configured(
         args,
@@ -313,7 +334,11 @@ def main() -> None:
         int(train_population["expected_nonempty_rows"]) / effective_batch
     )
     steps = expected_steps if args.mode == "gate" else int(args.smoke_steps)
-    if args.mode == "gate" and int(cfg["training"]["max_iters"]) != expected_steps:
+    if (
+        args.mode == "gate"
+        and not args.oof_fold_manifest
+        and int(cfg["training"]["max_iters"]) != expected_steps
+    ):
         raise ValueError(
             "V25 G0 must consume exactly one official train-list epoch: "
             f"expected max_iters={expected_steps}"
@@ -488,6 +513,8 @@ def main() -> None:
         "gradient_accumulation_steps": accumulation_steps,
         "effective_batch_size": effective_batch,
         "complete_official_train_epochs_seen": float(images_seen)
+        / float(official_train_population["expected_nonempty_rows"]),
+        "complete_loader_population_epochs_seen": float(images_seen)
         / float(train_population["expected_nonempty_rows"]),
         "elapsed_seconds": elapsed,
         "images_per_second": float(run_images_seen) / max(elapsed, 1.0e-6),
@@ -501,6 +528,9 @@ def main() -> None:
         "model_contract": v25_model_contract(model.detector),
         "gate_zero": gate_zero,
         "official_train_population_contract": train_population,
+        "untouched_official_train_population_contract": official_train_population,
+        "oof_fold_index": int(args.oof_fold_index),
+        "oof_fold_training": bool(args.oof_fold_manifest),
         "official_val_population_contract": val_population,
         "final_training_diagnostics": final_diagnostics,
         "logged_gradient_clip_fraction": float(clipped_log_steps)
