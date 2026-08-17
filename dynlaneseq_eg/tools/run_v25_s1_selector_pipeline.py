@@ -69,7 +69,7 @@ def main() -> None:
     root = Path(args.output_dir).expanduser().resolve()
     dataset = Path(args.dataset_root).expanduser().resolve()
     folds = json.loads(Path(args.fold_manifest).read_text(encoding="utf-8"))
-    if int(folds["folds"]) != 2:
+    if int(folds["fold_count"]) != 2 or len(folds.get("folds", [])) != 2:
         raise ValueError("V25-S1 primary gate is fixed to two OOF folds")
     wrong_report = json.loads(Path(args.wrong_image_report).read_text(encoding="utf-8"))
     if not bool(wrong_report.get("checks", {}).get("all_pass", False)):
@@ -166,7 +166,17 @@ def main() -> None:
     mechanism_path = mechanism / "mechanism_gate_report.json"
     mechanism_path.write_text(json.dumps(mechanism_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not mechanism_report["pass"]:
-        print(json.dumps({"status": "mechanism_stop", "report": str(mechanism_path)}, indent=2), flush=True)
+        state = {
+            "status": "mechanism_stop",
+            "mechanism_gate": mechanism_report,
+            "official_gate": "not_run_by_predeclared_stop_rule",
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+        state_path = root / "v25_s1_pipeline_report.json"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps({"report": str(state_path), **state}, indent=2), flush=True)
         return
 
     final_treatment = root / "final_selector" / "treatment"

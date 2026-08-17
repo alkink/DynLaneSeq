@@ -89,10 +89,12 @@ class ImmutableCacheDataset(Dataset):
             value = arrays[name][local]
             # DataLoader collates these views into writable pinned tensors; no
             # mutation is performed on the mmap itself.
-            result[name] = torch.from_numpy(np.asarray(value))
-        result["action_outcome"] = torch.from_numpy(np.asarray(arrays["action_outcome"][local]))
+            result[name] = torch.from_numpy(np.array(value, copy=True))
+        result["action_outcome"] = torch.from_numpy(
+            np.array(arrays["action_outcome"][local], copy=True)
+        )
         for name in DIAGNOSTIC_NAMES:
-            result[name] = torch.from_numpy(np.asarray(arrays[name][local]))
+            result[name] = torch.from_numpy(np.array(arrays[name][local], copy=True))
         result["target_action"] = torch.as_tensor(int(arrays["target_action"][local]), dtype=torch.long)
         return result
 
