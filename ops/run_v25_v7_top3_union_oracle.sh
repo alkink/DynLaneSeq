@@ -28,4 +28,5 @@ exec "${python}" -m dynlaneseq_eg.tools.evaluate_v25_v7_top3_union_oracle \
   --num-workers 2 \
   --metric-workers 20 \
   --metric-chunksize 32 \
+  --oracle-workers 8 \
   --log-interval 100

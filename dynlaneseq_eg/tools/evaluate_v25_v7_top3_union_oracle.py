@@ -5,6 +5,7 @@ import copy
 import hashlib
 from itertools import product
 import json
+import multiprocessing as mp
 from pathlib import Path
 import time
 from typing import Any, Iterable, Sequence
@@ -64,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--metric-workers", type=int, default=20)
     parser.add_argument("--metric-chunksize", type=int, default=32)
+    parser.add_argument("--oracle-workers", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=100)
     return parser.parse_args()
 
@@ -313,6 +315,32 @@ def _delta_histogram(source: tuple[int, int], result: dict[str, Any]) -> dict[st
     }
 
 
+def _score_union_task(
+    task: tuple[
+        list[list[tuple[str, Lane | None]]],
+        list[Lane],
+        list[Lane],
+    ],
+) -> tuple[tuple[int, int, float], dict[str, Any], dict[str, Any]]:
+    """CPU-only exact set scoring, safe to execute in spawned workers."""
+
+    banks, target_lanes, v7_lanes = task
+    source_summary = _official_assignment_summary(
+        official_iou_matrix(v7_lanes, target_lanes)
+    )
+    fixed = select_slot_union_oracle(
+        banks,
+        target_lanes,
+        fixed_v7_count=True,
+    )
+    flexible = select_slot_union_oracle(
+        banks,
+        target_lanes,
+        fixed_v7_count=False,
+    )
+    return source_summary, fixed, flexible
+
+
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
@@ -364,117 +392,138 @@ def main() -> None:
     combinations_fixed = 0
     combinations_flexible = 0
     started = time.perf_counter()
-    for batch_index, (images, _targets, metas) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True)
-        if channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
-        with torch.autocast(device_type=device.type, enabled=False):
-            source = model(images.float())
-        diverse = diverse_viterbi_paths(
-            source["unary_logits"],
-            num_hypotheses=3,
-            transition_radius_bins=model.detector.transition_radius_bins,
-            transition_penalty=model.detector.transition_penalty,
-            suppression_radius_bins=5,
-            suppression_penalty=8.0,
-        )
-        bin_width = float(model.detector.input_w) / float(model.detector.x_bins)
-        hypotheses = (diverse.indices.float() + 0.5) * bin_width
+    worker_count = max(1, int(args.oracle_workers))
+    oracle_pool = (
+        mp.get_context("spawn").Pool(processes=worker_count)
+        if worker_count > 1
+        else None
+    )
+    try:
+        for batch_index, (images, _targets, metas) in enumerate(loader, start=1):
+            images = images.to(device, non_blocking=True)
+            if channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
+            with torch.autocast(device_type=device.type, enabled=False):
+                source = model(images.float())
+            diverse = diverse_viterbi_paths(
+                source["unary_logits"],
+                num_hypotheses=3,
+                transition_radius_bins=model.detector.transition_radius_bins,
+                transition_penalty=model.detector.transition_penalty,
+                suppression_radius_bins=5,
+                suppression_penalty=8.0,
+            )
+            bin_width = float(model.detector.input_w) / float(model.detector.x_bins)
+            hypotheses = (diverse.indices.float() + 0.5) * bin_width
 
-        for image_index, meta in enumerate(metas):
-            v7_path = _prediction_path(v7_root, meta)
-            if not v7_path.is_file():
-                raise FileNotFoundError(v7_path)
-            relative = v7_path.relative_to(v7_root)
-            rel_paths.append(relative)
-            v7_lanes = sorted(load_culane_img_data(v7_path), key=_bottom_x)[:4]
-            target_lanes = load_culane_img_data(meta["anno_path"])
-            banks: list[list[tuple[str, Lane | None]]] = []
-            for slot in range(4):
-                v7_lane = v7_lanes[slot] if slot < len(v7_lanes) else None
-                bank: list[tuple[str, Lane | None]] = [("v7", v7_lane)]
-                for hypothesis in range(3):
-                    lane = _model_lane_to_original(
-                        hypotheses[image_index, slot, hypothesis],
-                        source["range_norm"][image_index, slot],
-                        meta,
-                    )
-                    bank.append(
-                        (
-                            f"g0_path{hypothesis}",
-                            _quantize_writer_lane(lane) if len(lane) >= 2 else None,
+            prepared: list[dict[str, Any]] = []
+            tasks = []
+            for image_index, meta in enumerate(metas):
+                v7_path = _prediction_path(v7_root, meta)
+                if not v7_path.is_file():
+                    raise FileNotFoundError(v7_path)
+                relative = v7_path.relative_to(v7_root)
+                rel_paths.append(relative)
+                v7_lanes = sorted(load_culane_img_data(v7_path), key=_bottom_x)[:4]
+                target_lanes = load_culane_img_data(meta["anno_path"])
+                banks: list[list[tuple[str, Lane | None]]] = []
+                for slot in range(4):
+                    v7_lane = v7_lanes[slot] if slot < len(v7_lanes) else None
+                    bank: list[tuple[str, Lane | None]] = [("v7", v7_lane)]
+                    for hypothesis in range(3):
+                        lane = _model_lane_to_original(
+                            hypotheses[image_index, slot, hypothesis],
+                            source["range_norm"][image_index, slot],
+                            meta,
                         )
-                    )
-                bank.append(("dustbin", None))
-                banks.append(bank)
-
-            source_iou = official_iou_matrix(v7_lanes, target_lanes)
-            source_summary = _official_assignment_summary(source_iou)
-            fixed = select_slot_union_oracle(
-                banks,
-                target_lanes,
-                fixed_v7_count=True,
-            )
-            flexible = select_slot_union_oracle(
-                banks,
-                target_lanes,
-                fixed_v7_count=False,
-            )
-            combinations_fixed += int(fixed["combinations"])
-            combinations_flexible += int(flexible["combinations"])
-            _write_lane_file(fixed_dir / relative, fixed["lanes"])
-            _write_lane_file(flexible_dir / relative, flexible["lanes"])
-
-            for slot in range(4):
-                source_selection["v7" if slot < len(v7_lanes) else "dustbin"] += 1
-            for result, histogram, outcome_name in (
-                (fixed, fixed_selection, "fixed"),
-                (flexible, flexible_selection, "flexible"),
-            ):
-                for label in result["labels"]:
-                    histogram[label] += 1
-                image_outcomes[outcome_name]["images_edited"] += int(
-                    result["edit_count"] > 0
-                )
-                for key, source_value, result_value in (
-                    ("tp50", source_summary[0], result["tp50"]),
-                    ("tp75", source_summary[1], result["tp75"]),
-                ):
-                    suffix = (
-                        "improved" if result_value > source_value
-                        else "worsened" if result_value < source_value
-                        else "tied"
-                    )
-                    image_outcomes[outcome_name][f"{key}_{suffix}"] += 1
-            if fixed["edit_count"] > 0 or flexible["edit_count"] > 0:
-                changed_records.append(
+                        bank.append(
+                            (
+                                f"g0_path{hypothesis}",
+                                _quantize_writer_lane(lane) if len(lane) >= 2 else None,
+                            )
+                        )
+                    bank.append(("dustbin", None))
+                    banks.append(bank)
+                prepared.append(
                     {
-                        "image": str(relative).replace(".lines.txt", ".jpg"),
-                        "source_tp50": source_summary[0],
-                        "source_tp75": source_summary[1],
-                        "fixed_labels": fixed["labels"],
-                        "fixed_delta": _delta_histogram(source_summary[:2], fixed),
-                        "flexible_labels": flexible["labels"],
-                        "flexible_delta": _delta_histogram(source_summary[:2], flexible),
+                        "relative": relative,
+                        "v7_lanes": v7_lanes,
                     }
                 )
-        images_seen += int(images.shape[0])
-        if batch_index == 1 or (
-            args.log_interval > 0 and batch_index % args.log_interval == 0
-        ):
-            elapsed = max(time.perf_counter() - started, 1.0e-9)
-            print(
-                json.dumps(
-                    {
-                        "phase": "v25_v7_top3_union_oracle",
-                        "images": images_seen,
-                        "images_per_second": images_seen / elapsed,
-                        "changed_records": len(changed_records),
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
+                tasks.append((banks, target_lanes, v7_lanes))
+            scored = (
+                oracle_pool.map(_score_union_task, tasks, chunksize=1)
+                if oracle_pool is not None
+                else [_score_union_task(task) for task in tasks]
             )
+
+            for record, (source_summary, fixed, flexible) in zip(prepared, scored):
+                relative = record["relative"]
+                v7_lanes = record["v7_lanes"]
+                combinations_fixed += int(fixed["combinations"])
+                combinations_flexible += int(flexible["combinations"])
+                _write_lane_file(fixed_dir / relative, fixed["lanes"])
+                _write_lane_file(flexible_dir / relative, flexible["lanes"])
+
+                for slot in range(4):
+                    source_selection[
+                        "v7" if slot < len(v7_lanes) else "dustbin"
+                    ] += 1
+                for result, histogram, outcome_name in (
+                    (fixed, fixed_selection, "fixed"),
+                    (flexible, flexible_selection, "flexible"),
+                ):
+                    for label in result["labels"]:
+                        histogram[label] += 1
+                    image_outcomes[outcome_name]["images_edited"] += int(
+                        result["edit_count"] > 0
+                    )
+                    for key, source_value, result_value in (
+                        ("tp50", source_summary[0], result["tp50"]),
+                        ("tp75", source_summary[1], result["tp75"]),
+                    ):
+                        suffix = (
+                            "improved" if result_value > source_value
+                            else "worsened" if result_value < source_value
+                            else "tied"
+                        )
+                        image_outcomes[outcome_name][f"{key}_{suffix}"] += 1
+                if fixed["edit_count"] > 0 or flexible["edit_count"] > 0:
+                    changed_records.append(
+                        {
+                            "image": str(relative).replace(".lines.txt", ".jpg"),
+                            "source_tp50": source_summary[0],
+                            "source_tp75": source_summary[1],
+                            "fixed_labels": fixed["labels"],
+                            "fixed_delta": _delta_histogram(source_summary[:2], fixed),
+                            "flexible_labels": flexible["labels"],
+                            "flexible_delta": _delta_histogram(
+                                source_summary[:2], flexible
+                            ),
+                        }
+                    )
+            images_seen += int(images.shape[0])
+            if batch_index == 1 or (
+                args.log_interval > 0 and batch_index % args.log_interval == 0
+            ):
+                elapsed = max(time.perf_counter() - started, 1.0e-9)
+                print(
+                    json.dumps(
+                        {
+                            "phase": "v25_v7_top3_union_oracle",
+                            "images": images_seen,
+                            "images_per_second": images_seen / elapsed,
+                            "changed_records": len(changed_records),
+                            "oracle_workers": worker_count,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+    finally:
+        if oracle_pool is not None:
+            oracle_pool.close()
+            oracle_pool.join()
     if images_seen != expected or len(rel_paths) != expected:
         raise RuntimeError("union oracle did not consume full official validation")
 
