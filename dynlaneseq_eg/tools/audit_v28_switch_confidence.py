@@ -98,59 +98,66 @@ def _risk_curve(
 ) -> dict[str, Any]:
     matched = [row for row in rows if bool(row["matched"])]
     source_positive = sum(float(row["source_quality"]) >= threshold for row in matched)
-    all_gain = sum(
-        float(row["source_quality"]) < threshold
-        and float(row["selected_quality"]) >= threshold
-        for row in matched
+    changed = [row for row in matched if bool(row["changed"])]
+    margins = np.asarray(
+        [float(row["selected_source_margin"]) for row in changed],
+        dtype=np.float64,
     )
-    margins = sorted(
-        {
-            float(row["selected_source_margin"])
-            for row in matched
-            if bool(row["changed"])
-        },
-        reverse=True,
+    gain = np.asarray(
+        [
+            float(row["source_quality"]) < threshold
+            and float(row["selected_quality"]) >= threshold
+            for row in changed
+        ],
+        dtype=np.int64,
     )
-    # Include the no-switch and all-switch endpoints.  This is a diagnostic
-    # upper envelope on validation, not a deployable calibrated threshold.
-    candidates = [float("inf"), *margins, float("-inf")]
-    best: dict[str, Any] | None = None
-    for margin_threshold in candidates:
-        gained = 0
-        lost = 0
-        switched = 0
-        for row in matched:
-            apply = bool(row["changed"]) and (
-                float(row["selected_source_margin"]) >= margin_threshold
-            )
-            quality = (
-                float(row["selected_quality"])
-                if apply
-                else float(row["source_quality"])
-            )
-            switched += int(apply)
-            gained += int(
-                float(row["source_quality"]) < threshold and quality >= threshold
-            )
-            lost += int(
-                float(row["source_quality"]) >= threshold and quality < threshold
-            )
-        harmful_rate = lost / max(source_positive, 1)
-        candidate = {
-            "margin_threshold": margin_threshold,
-            "switched": switched,
-            "gained": gained,
-            "lost": lost,
-            "net": gained - lost,
-            "harmful_rate": harmful_rate,
-            "beneficial_recall_of_arm_c_gains": gained / max(all_gain, 1),
-        }
-        if harmful_rate <= 0.01 and (
-            best is None
-            or (candidate["net"], candidate["gained"])
-            > (best["net"], best["gained"])
-        ):
-            best = candidate
+    loss = np.asarray(
+        [
+            float(row["source_quality"]) >= threshold
+            and float(row["selected_quality"]) < threshold
+            for row in changed
+        ],
+        dtype=np.int64,
+    )
+    all_gain = int(gain.sum())
+    best: dict[str, Any] = {
+        "margin_threshold": None,
+        "switched": 0,
+        "gained": 0,
+        "lost": 0,
+        "net": 0,
+        "harmful_rate": 0.0,
+        "beneficial_recall_of_arm_c_gains": 0.0,
+    }
+    if margins.size:
+        order = np.argsort(-margins, kind="stable")
+        margins = margins[order]
+        cumulative_gain = np.cumsum(gain[order])
+        cumulative_loss = np.cumsum(loss[order])
+        group_end = np.flatnonzero(
+            np.r_[margins[1:] != margins[:-1], True]
+        )
+        # Each point applies all changes whose margin is at least the score at
+        # that tie-group boundary.  This computes the same diagnostic envelope
+        # as the former nested loop in O(N log N), dominated by sorting.
+        for index in group_end.tolist():
+            gained = int(cumulative_gain[index])
+            lost = int(cumulative_loss[index])
+            harmful_rate = lost / max(source_positive, 1)
+            candidate = {
+                "margin_threshold": float(margins[index]),
+                "switched": int(index + 1),
+                "gained": gained,
+                "lost": lost,
+                "net": gained - lost,
+                "harmful_rate": harmful_rate,
+                "beneficial_recall_of_arm_c_gains": gained / max(all_gain, 1),
+            }
+            if harmful_rate <= 0.01 and (
+                (candidate["net"], candidate["gained"])
+                > (best["net"], best["gained"])
+            ):
+                best = candidate
     return {
         "threshold": threshold,
         "source_positive": source_positive,
