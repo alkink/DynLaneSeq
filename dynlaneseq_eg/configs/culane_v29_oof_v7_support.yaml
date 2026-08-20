@@ -1,0 +1,37 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v29_oof_rbf_gate/support_placeholder
+
+# Each support model sees one deterministic clip-disjoint half.  Halving both
+# the original 278k schedule and the audited 225k endpoint preserves the V7
+# epoch count and cosine phase rather than accidentally training twice as many
+# epochs on half the data.
+scheduler:
+  name: cosine
+  total_iters: 139000
+  warmup_iters: 500
+  min_lr_ratio: 0.01
+
+training:
+  seed: 3407
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_iters: 112500
+  checkpoint_interval: 10000
+  checkpoint_include_optimizer: true
+  save_last_alias: false
+  log_interval: 50
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  compile_model: false
+  clip_grad_norm: 1.0
+  clip_grad_norm_mode: global
+  check_finite_grad: true
+
+dataloader:
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  resume_safe: true

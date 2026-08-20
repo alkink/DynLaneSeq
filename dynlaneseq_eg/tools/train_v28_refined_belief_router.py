@@ -21,6 +21,7 @@ from dynlaneseq_eg.modeling.v28_refined_belief_router import (
     v28_model_contract,
     v28_refined_belief_loss,
 )
+from dynlaneseq_eg.tools.build_v29_oof_folds import validate_fold_contract
 from dynlaneseq_eg.tools.train import seed_everything
 from dynlaneseq_eg.tools.v23_official_protocol import (
     official_v23_culane_list_contract,
@@ -49,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument("--resume", default="")
     parser.add_argument("--resume-interval", type=int, default=500)
+    parser.add_argument(
+        "--train-list",
+        default="",
+        help=(
+            "Optional V29 OOF image-only training list. It is accepted only "
+            "with an exact fold contract and --oof-fold."
+        ),
+    )
+    parser.add_argument("--train-list-contract", default="")
+    parser.add_argument("--oof-fold", choices=("a", "b"), default="")
     return parser.parse_args()
 
 
@@ -382,8 +393,26 @@ def _host_scalars(values: dict[str, torch.Tensor]) -> dict[str, float]:
 def main() -> None:
     args = parse_args()
     seed_everything(FIXED_SEED)
-    train_population = official_v23_culane_list_contract(
-        args.dataset_root, split="train"
+    oof_args = (
+        bool(args.train_list),
+        bool(args.train_list_contract),
+        bool(args.oof_fold),
+    )
+    if any(oof_args) and not all(oof_args):
+        raise ValueError(
+            "V29 OOF training requires --train-list, --train-list-contract, "
+            "and --oof-fold together"
+        )
+    train_population = (
+        validate_fold_contract(
+            args.train_list_contract,
+            fold=args.oof_fold,
+            list_path=args.train_list,
+        )
+        if all(oof_args)
+        else official_v23_culane_list_contract(
+            args.dataset_root, split="train"
+        )
     )
     val_population = official_v23_culane_list_contract(
         args.dataset_root, split="val"
@@ -439,7 +468,7 @@ def main() -> None:
         cfg, split="train", training=True, start_iteration=start_step
     )
     if len(loader.dataset) != int(train_population["expected_nonempty_rows"]):
-        raise ValueError("V28 altered the official train.txt population")
+        raise ValueError("V28/V29 altered the contracted training population")
     iterator = iter(loader)
     if start_step == 0:
         gate_batch, iterator = _next_batch(loader, iterator)
@@ -607,6 +636,8 @@ def main() -> None:
         "teacher_state_sha256_at_endpoint": endpoint_teacher_digest,
         "teacher_state_still_exact": endpoint_teacher_digest == teacher_digest,
         "official_train_population_contract": train_population,
+        "training_population_is_oof": all(oof_args),
+        "oof_fold": str(args.oof_fold) if all(oof_args) else None,
         "official_val_population_contract": val_population,
         "final_training_diagnostics": final_diagnostics,
         "checkpoint_selection_performed": False,
