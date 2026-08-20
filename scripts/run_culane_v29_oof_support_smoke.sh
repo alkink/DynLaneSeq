@@ -10,6 +10,7 @@ FOLD_ROOT="${FOLD_ROOT:-${OUTPUT_ROOT}/folds}"
 SMOKE_ROOT="${SMOKE_ROOT:-${OUTPUT_ROOT}/support_smoke_fold_a}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SMOKE_STEPS="${SMOKE_STEPS:-5}"
+COMPILE_MODEL="${COMPILE_MODEL:-false}"
 
 cd "${REPO_ROOT}"
 mkdir -p "${FOLD_ROOT}" "${SMOKE_ROOT}"
@@ -31,6 +32,7 @@ fi
   --max-iters "${SMOKE_STEPS}" \
   --checkpoint-interval 0 \
   --num-workers "${NUM_WORKERS}" \
+  --compile-model "${COMPILE_MODEL}" \
   --resume-safe-data true
 
 echo "V29 fold-support smoke completed at ${SMOKE_STEPS} optimizer steps."
