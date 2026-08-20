@@ -250,6 +250,47 @@ def _gate_zero(
         total, diagnostics = _loss(
             output, targets, cfg=cfg, arm=arm, weights=weights
         )
+        route_probe, _ = _loss(
+            output, targets, cfg=cfg, arm="B", weights=weights
+        )
+        combined_probe, _ = _loss(
+            output, targets, cfg=cfg, arm="C", weights=weights
+        )
+        field_probe = (combined_probe - route_probe) / max(
+            float(weights.field), 1.0e-12
+        )
+    trainable = tuple(model.router.parameters())
+    route_gradients = torch.autograd.grad(
+        route_probe,
+        trainable,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    field_gradients = torch.autograd.grad(
+        field_probe,
+        trainable,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    route_squared = route_probe.new_zeros(())
+    field_squared = route_probe.new_zeros(())
+    gradient_dot = route_probe.new_zeros(())
+    for route_gradient, field_gradient in zip(
+        route_gradients, field_gradients
+    ):
+        if route_gradient is not None:
+            route_squared = route_squared + route_gradient.float().pow(2).sum()
+        if field_gradient is not None:
+            field_squared = field_squared + field_gradient.float().pow(2).sum()
+        if route_gradient is not None and field_gradient is not None:
+            gradient_dot = gradient_dot + (
+                route_gradient.float() * field_gradient.float()
+            ).sum()
+    route_norm = route_squared.sqrt()
+    field_norm = field_squared.sqrt()
+    gradient_cosine = gradient_dot / (
+        route_norm * field_norm
+    ).clamp_min(1.0e-12)
     total.backward()
     teacher_versions_after = _state_versions(model.teacher)
     source_routes = output["source_route"].clamp_min(0)
@@ -319,6 +360,13 @@ def _gate_zero(
         == teacher_versions_after,
         "teacher_gradient_tensors": teacher_gradient_tensors,
         "belief_gradient_norms": gradient_norms,
+        "objective_gradient_geometry": {
+            "route_norm": float(route_norm),
+            "unweighted_field_norm": float(field_norm),
+            "configured_weighted_field_norm": float(field_norm)
+            * float(weights.field),
+            "route_field_cosine": float(gradient_cosine),
+        },
         "losses_finite": finite,
     }
 
