@@ -153,19 +153,16 @@ class DynLaneSeqV28(nn.Module):
         source_x = source["x_rows"].detach().float().clone()
         source_range = source["range_norm"].detach().float().clone()
         source_active = source["active"].detach().bool().clone()
-        source_is_real = source_routes >= 0
-        if bool(source_is_real.any()):
-            batch_ids, slot_ids = torch.nonzero(
-                source_is_real, as_tuple=True
-            )
-            route_ids = source_routes[batch_ids, slot_ids]
-            candidate_x[batch_ids, slot_ids, route_ids] = source_x[
-                batch_ids, slot_ids
-            ]
-            candidate_range[batch_ids, slot_ids, route_ids] = source_range[
-                batch_ids, slot_ids
-            ]
-            candidate_valid[batch_ids, slot_ids, route_ids] = True
+        batch_ids = torch.arange(
+            source_routes.shape[0], device=source_routes.device
+        ).view(-1, 1).expand_as(source_routes)
+        slot_ids = torch.arange(
+            source_routes.shape[1], device=source_routes.device
+        ).view(1, -1).expand_as(source_routes)
+        route_ids = source_routes.clamp_min(0)
+        candidate_x[batch_ids, slot_ids, route_ids] = source_x
+        candidate_range[batch_ids, slot_ids, route_ids] = source_range
+        candidate_valid[batch_ids, slot_ids, route_ids] = True
         bank = {
             # Clone inference tensors before the trainable router saves them
             # for backward. Geometry remains detached and immutable.

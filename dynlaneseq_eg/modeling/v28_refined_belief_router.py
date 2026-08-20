@@ -88,7 +88,13 @@ def decode_v28_unique_routes(
     selected_valid = candidate_valid.gather(
         -1, indices.clamp_min(0).unsqueeze(-1)
     ).squeeze(-1)
-    if not bool(selected_valid.all()):
+    condition = selected_valid.all()
+    if condition.is_cuda and hasattr(torch, "_assert_async"):
+        torch._assert_async(
+            condition,
+            "V28 could not find a valid injective route assignment",
+        )
+    elif not bool(condition):
         raise RuntimeError("V28 could not find a valid injective route assignment")
     return indices
 
