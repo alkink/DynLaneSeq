@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-workers", type=int, default=0)
     parser.add_argument("--metric-chunksize", type=int, default=32)
     parser.add_argument("--log-interval", type=int, default=100)
+    parser.add_argument("--oof-fold", choices=("a", "b"), default="")
+    parser.add_argument("--train-list-contract", default="")
+    parser.add_argument("--expected-v7-checkpoint", default="")
+    parser.add_argument("--support-training-report", default="")
     return parser.parse_args()
 
 
@@ -102,6 +106,9 @@ def _validate_endpoint(
     *,
     arm: str,
     router_only: bool,
+    oof_fold: str = "",
+    fold_contract_sha256: str = "",
+    expected_v7_sha256: str = "",
 ) -> dict[str, Any]:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     key = "router_only_checkpoint_sha256" if router_only else "checkpoint_sha256"
@@ -117,6 +124,27 @@ def _validate_endpoint(
         is False,
         "test_unused": report.get("test_set_used") is False,
     }
+    if oof_fold:
+        population = report.get("official_train_population_contract", {})
+        checks.update(
+            {
+                "oof_population_exact": report.get("training_population_is_oof")
+                is True,
+                "oof_fold_exact": str(report.get("oof_fold")) == oof_fold,
+                "oof_population_fold_exact": str(population.get("fold"))
+                == oof_fold,
+                "oof_fold_contract_exact": str(
+                    population.get("fold_contract_sha256")
+                )
+                == fold_contract_sha256,
+                "oof_v7_checkpoint_exact": str(
+                    report.get("v7_checkpoint_sha256")
+                )
+                == expected_v7_sha256,
+                "oof_v7_iteration_exact": int(report.get("v7_iteration", -1))
+                == 112_500,
+            }
+        )
     if not all(checks.values()):
         raise ValueError(
             f"V28 arm {arm} endpoint contract failed: "
@@ -126,6 +154,58 @@ def _validate_endpoint(
         "checks": checks,
         "checkpoint_sha256": sha256_file(checkpoint),
         "training_report_sha256": sha256_file(report_path),
+    }
+
+
+def _validate_v29_support(
+    *,
+    checkpoint: Path,
+    report_path: Path,
+    fold_contract_path: Path,
+    belief_fold: str,
+) -> dict[str, Any]:
+    fold_contract = json.loads(fold_contract_path.read_text(encoding="utf-8"))
+    support_report = json.loads(report_path.read_text(encoding="utf-8"))
+    support_fold = "b" if belief_fold == "a" else "a"
+    support_entry = fold_contract.get("folds", {}).get(support_fold, {})
+    checks = {
+        "fold_contract_passed": fold_contract.get("passed") is True,
+        "support_checkpoint_sha256_exact": sha256_file(checkpoint)
+        == str(support_report.get("checkpoint_sha256")),
+        "support_iteration_exact": int(support_report.get("iteration", -1))
+        == 112_500,
+        "support_train_fold_exact": str(
+            support_report.get("support_train_fold")
+        )
+        == support_fold,
+        "belief_train_fold_exact": str(support_report.get("belief_train_fold"))
+        == belief_fold,
+        "fold_contract_sha256_exact": str(
+            support_report.get("fold_contract_sha256")
+        )
+        == sha256_file(fold_contract_path),
+        "support_training_list_sha256_exact": str(
+            support_report.get("training_list_sha256")
+        )
+        == str(support_entry.get("gt_list_sha256")),
+        "validation_checkpoint_selection_absent": support_report.get(
+            "validation_used_for_checkpoint_selection"
+        )
+        is False,
+        "test_unused": support_report.get("test_set_used") is False,
+    }
+    if not all(checks.values()):
+        raise ValueError(
+            "V29 OOF support contract failed: "
+            + json.dumps(checks, sort_keys=True)
+        )
+    return {
+        "checks": checks,
+        "support_fold": support_fold,
+        "belief_fold": belief_fold,
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "support_training_report_sha256": sha256_file(report_path),
+        "fold_contract_sha256": sha256_file(fold_contract_path),
     }
 
 
@@ -647,18 +727,47 @@ def main() -> None:
     )
     arm_b_checkpoint = Path(args.arm_b_checkpoint).expanduser().resolve()
     arm_c_checkpoint = Path(args.arm_c_router_checkpoint).expanduser().resolve()
+    oof_values = (
+        bool(args.oof_fold),
+        bool(args.train_list_contract),
+        bool(args.expected_v7_checkpoint),
+        bool(args.support_training_report),
+    )
+    if any(oof_values) and not all(oof_values):
+        raise ValueError(
+            "V29 OOF evaluation requires --oof-fold, --train-list-contract, "
+            "--expected-v7-checkpoint, and --support-training-report together"
+        )
+    oof_contract = None
+    endpoint_kwargs: dict[str, str] = {}
+    if all(oof_values):
+        fold_contract_path = Path(args.train_list_contract).expanduser().resolve()
+        expected_v7 = Path(args.expected_v7_checkpoint).expanduser().resolve()
+        oof_contract = _validate_v29_support(
+            checkpoint=expected_v7,
+            report_path=Path(args.support_training_report).expanduser().resolve(),
+            fold_contract_path=fold_contract_path,
+            belief_fold=str(args.oof_fold),
+        )
+        endpoint_kwargs = {
+            "oof_fold": str(args.oof_fold),
+            "fold_contract_sha256": sha256_file(fold_contract_path),
+            "expected_v7_sha256": sha256_file(expected_v7),
+        }
     endpoint_contracts = {
         "arm_b": _validate_endpoint(
             arm_b_checkpoint,
             Path(args.arm_b_training_report).expanduser().resolve(),
             arm="B",
             router_only=False,
+            **endpoint_kwargs,
         ),
         "arm_c": _validate_endpoint(
             arm_c_checkpoint,
             Path(args.arm_c_training_report).expanduser().resolve(),
             arm="C",
             router_only=True,
+            **endpoint_kwargs,
         ),
     }
 
@@ -735,6 +844,7 @@ def main() -> None:
     report = {
         "experiment": "V28 immutable refined-bank belief B/C official gate",
         "endpoint_contracts": endpoint_contracts,
+        "oof_support_contract": oof_contract,
         "wrong_image_contract": wrong_contract,
         "official_validation_population_contract": population,
         "writer": writer,
@@ -754,6 +864,7 @@ def main() -> None:
             "inference_dtype": "float32",
             "optimized_single_teacher_paired_writer": True,
             "exact_parallel_raster_metric": True,
+            "oof_support_distribution": bool(oof_contract),
         },
         "recommendation": (
             "mechanism_passed_review_before_test"

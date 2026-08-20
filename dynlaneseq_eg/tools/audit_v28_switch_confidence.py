@@ -13,6 +13,7 @@ from scipy.stats import rankdata
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import load_checkpoint
+from dynlaneseq_eg.evaluation.candidate_diagnostics import sha256_file
 from dynlaneseq_eg.factory import build_dataloader, build_model
 from dynlaneseq_eg.modeling.dynlaneseq_v28 import DynLaneSeqV28
 from dynlaneseq_eg.modeling.v23_ordered_slot_cost_volume import (
@@ -27,6 +28,7 @@ from dynlaneseq_eg.tools.evaluate_v28_refined_belief_gate import (
     _configured,
     _move_images,
     _validate_endpoint,
+    _validate_v29_support,
 )
 from dynlaneseq_eg.tools.train import seed_everything
 from dynlaneseq_eg.tools.v23_official_protocol import (
@@ -52,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=100)
+    parser.add_argument("--oof-fold", choices=("a", "b"), default="")
+    parser.add_argument("--train-list-contract", default="")
+    parser.add_argument("--expected-v7-checkpoint", default="")
+    parser.add_argument("--support-training-report", default="")
     return parser.parse_args()
 
 
@@ -325,18 +331,47 @@ def main() -> None:
     expected = int(population["expected_nonempty_rows"])
     arm_b_checkpoint = Path(args.arm_b_checkpoint).expanduser().resolve()
     arm_c_checkpoint = Path(args.arm_c_router_checkpoint).expanduser().resolve()
+    oof_values = (
+        bool(args.oof_fold),
+        bool(args.train_list_contract),
+        bool(args.expected_v7_checkpoint),
+        bool(args.support_training_report),
+    )
+    if any(oof_values) and not all(oof_values):
+        raise ValueError(
+            "V29 OOF audit requires --oof-fold, --train-list-contract, "
+            "--expected-v7-checkpoint, and --support-training-report together"
+        )
+    oof_contract = None
+    endpoint_kwargs: dict[str, str] = {}
+    if all(oof_values):
+        fold_contract_path = Path(args.train_list_contract).expanduser().resolve()
+        expected_v7 = Path(args.expected_v7_checkpoint).expanduser().resolve()
+        oof_contract = _validate_v29_support(
+            checkpoint=expected_v7,
+            report_path=Path(args.support_training_report).expanduser().resolve(),
+            fold_contract_path=fold_contract_path,
+            belief_fold=str(args.oof_fold),
+        )
+        endpoint_kwargs = {
+            "oof_fold": str(args.oof_fold),
+            "fold_contract_sha256": sha256_file(fold_contract_path),
+            "expected_v7_sha256": sha256_file(expected_v7),
+        }
     endpoint_contracts = {
         "arm_b": _validate_endpoint(
             arm_b_checkpoint,
             Path(args.arm_b_training_report).expanduser().resolve(),
             arm="B",
             router_only=False,
+            **endpoint_kwargs,
         ),
         "arm_c": _validate_endpoint(
             arm_c_checkpoint,
             Path(args.arm_c_training_report).expanduser().resolve(),
             arm="C",
             router_only=True,
+            **endpoint_kwargs,
         ),
     }
 
@@ -400,6 +435,7 @@ def main() -> None:
             "posthoc_risk_curve_is_diagnostic_only": True,
         },
         "endpoint_contracts": endpoint_contracts,
+        "oof_support_contract": oof_contract,
         "official_validation_population_contract": population,
         "runtime": runtime,
         "population": {
