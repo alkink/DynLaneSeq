@@ -12,6 +12,10 @@ from dynlaneseq_eg.modeling.v28_refined_belief_router import (
     score_slot_candidate_paths,
     v28_refined_belief_loss,
 )
+from dynlaneseq_eg.tools.evaluate_v28_refined_belief_gate import (
+    _clip_domain,
+    _summarize_domain,
+)
 
 
 def _ranges(*shape: int) -> torch.Tensor:
@@ -191,3 +195,42 @@ def test_arm_b_route_gradient_reaches_image_encoder_and_arm_c_adds_field() -> No
             and parameter.grad.abs().sum() > 0
             for parameter in group.parameters()
         )
+
+
+def test_validation_half_assignment_is_clip_disjoint() -> None:
+    assert _clip_domain("/driver/clip_a/00000.jpg") == _clip_domain(
+        "/driver/clip_a/00300.jpg"
+    )
+
+
+def test_paired_summary_tracks_source_correct_loss_and_exact_count() -> None:
+    def policy(tp: int, matched: tuple[int, ...]):
+        return {
+            "0.50": (tp, 2 - tp, 2 - tp, matched),
+            "0.75": (tp, 2 - tp, 2 - tp, matched),
+        }
+
+    rows = [
+        {
+            "prediction_count": {
+                "source_v7": 2,
+                "arm_b": 2,
+                "arm_c": 2,
+                "arm_c_wrong_image": 2,
+            },
+            "policies": {
+                "source_v7": policy(2, (0, 1)),
+                "arm_b": policy(1, (0,)),
+                "arm_c": policy(2, (0, 1)),
+                "arm_c_wrong_image": policy(0, ()),
+            },
+        }
+    ]
+    summary = _summarize_domain(rows)
+    assert summary["metrics"]["arm_c"]["0.50"]["F1"] == 1.0
+    assert (
+        summary["source_correct_degradation"]["arm_b"]["0.50"]["fraction"]
+        == 0.5
+    )
+    assert summary["source_correct_degradation"]["arm_c"]["0.50"]["fraction"] == 0.0
+    assert summary["cardinality_exact_source_fraction"]["arm_c"] == 1.0
