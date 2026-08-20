@@ -4,6 +4,7 @@ from .dynlaneseq_s2 import DynLaneSeqS2
 from .dynlaneseq_s3 import DynLaneSeqS3
 from .dynlaneseq_s4 import DynLaneSeqS4
 from .dynlaneseq_v23 import DynLaneSeqV23
+from .dynlaneseq_v28 import DynLaneSeqV28
 from .dynlaneseq_v25 import DynLaneSeqV25
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "DynLaneSeqS3",
     "DynLaneSeqS4",
     "DynLaneSeqV23",
+    "DynLaneSeqV28",
     "DynLaneSeqV25",
 ]

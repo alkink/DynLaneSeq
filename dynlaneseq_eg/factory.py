@@ -22,6 +22,7 @@ from .modeling import (
     DynLaneSeqS3,
     DynLaneSeqS4,
     DynLaneSeqV23,
+    DynLaneSeqV28,
     DynLaneSeqV25,
 )
 
@@ -35,6 +36,7 @@ def build_model(cfg: dict[str, Any]) -> torch.nn.Module:
         "DynLaneSeqS3": DynLaneSeqS3,
         "DynLaneSeqS4": DynLaneSeqS4,
         "DynLaneSeqV23": DynLaneSeqV23,
+        "DynLaneSeqV28": DynLaneSeqV28,
         "DynLaneSeqV25": DynLaneSeqV25,
     }
     if name not in table:
