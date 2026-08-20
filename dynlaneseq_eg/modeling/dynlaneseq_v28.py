@@ -136,21 +136,45 @@ class DynLaneSeqV28(nn.Module):
             ).long(),
             order,
         )
+        candidate_x = gather_canonical_slots(
+            counterfactual["x_rows"], order
+        ).detach().float().clone()
+        candidate_range = gather_canonical_slots(
+            counterfactual["range_norm"], order
+        ).detach().float().clone()
+        candidate_valid = gather_canonical_slots(
+            counterfactual["valid"], order
+        ).detach().bool().clone()
+        # A second frozen-refiner call can differ from the already-deployed
+        # source by a few thousandths of a pixel due to kernel execution
+        # order. Replace precisely the source proposal entry with V7's first
+        # forward tensors. Thus "belief chose the V7 ID" is byte-identical to
+        # V7, while all 31 alternatives remain counterfactual-refined.
+        source_x = source["x_rows"].detach().float().clone()
+        source_range = source["range_norm"].detach().float().clone()
+        source_active = source["active"].detach().bool().clone()
+        source_is_real = source_routes >= 0
+        if bool(source_is_real.any()):
+            batch_ids, slot_ids = torch.nonzero(
+                source_is_real, as_tuple=True
+            )
+            route_ids = source_routes[batch_ids, slot_ids]
+            candidate_x[batch_ids, slot_ids, route_ids] = source_x[
+                batch_ids, slot_ids
+            ]
+            candidate_range[batch_ids, slot_ids, route_ids] = source_range[
+                batch_ids, slot_ids
+            ]
+            candidate_valid[batch_ids, slot_ids, route_ids] = True
         bank = {
             # Clone inference tensors before the trainable router saves them
             # for backward. Geometry remains detached and immutable.
-            "candidate_x": gather_canonical_slots(
-                counterfactual["x_rows"], order
-            ).detach().float().clone(),
-            "candidate_range": gather_canonical_slots(
-                counterfactual["range_norm"], order
-            ).detach().float().clone(),
-            "candidate_valid": gather_canonical_slots(
-                counterfactual["valid"], order
-            ).detach().bool().clone(),
-            "source_x": source["x_rows"].detach().float().clone(),
-            "source_range": source["range_norm"].detach().float().clone(),
-            "source_active": source["active"].detach().bool().clone(),
+            "candidate_x": candidate_x,
+            "candidate_range": candidate_range,
+            "candidate_valid": candidate_valid,
+            "source_x": source_x,
+            "source_range": source_range,
+            "source_active": source_active,
             "source_route": source_routes.detach().long().clone(),
             "source_slot_indices": order.detach().long().clone(),
         }
