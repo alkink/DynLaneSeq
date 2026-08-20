@@ -24,7 +24,11 @@ training:
   amp: true
   amp_dtype: bfloat16
   channels_last: true
-  compile_model: false
+  # The V29 V7 graph passed a real 200-step RTX 5080 smoke.  This execution
+  # backend keeps the model, losses, optimizer, data stream and checkpoints
+  # unchanged while reducing the measured steady-state step time.
+  compile_model: true
+  compile_mode: default
   clip_grad_norm: 1.0
   clip_grad_norm_mode: global
   check_finite_grad: true

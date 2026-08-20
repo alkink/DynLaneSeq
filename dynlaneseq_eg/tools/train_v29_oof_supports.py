@@ -120,6 +120,8 @@ def _verify_endpoint(
         raise ValueError("V29 support endpoint used the wrong dataset root")
     if int(cfg["scheduler"]["total_iters"]) != FOLD_V7_SCHEDULE:
         raise ValueError("V29 support endpoint used the wrong cosine horizon")
+    if cfg["training"].get("compile_model") is not True:
+        raise ValueError("V29 support endpoint did not use the verified backend")
     return {
         "checkpoint": str(endpoint),
         "checkpoint_sha256": _sha256(endpoint),
@@ -134,6 +136,7 @@ def _verify_endpoint(
         "fold_v7_endpoint_iteration": ENDPOINT_ITERATION,
         "fold_v7_schedule_iterations": FOLD_V7_SCHEDULE,
         "cosine_phase_ratio": ENDPOINT_ITERATION / FOLD_V7_SCHEDULE,
+        "compile_model": True,
         "test_set_used": False,
         "validation_used_for_checkpoint_selection": False,
     }
