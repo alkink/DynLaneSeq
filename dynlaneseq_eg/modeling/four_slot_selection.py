@@ -21,6 +21,7 @@ from .v19_counterfactual_fidelity import (
     frozen_v7_counterfactual_anchors,
 )
 from .v20_slot_owned_replacement import SlotOwnedSafeReplacementHead
+from .v30_joint_slot_field import FourSlotJointBeliefField
 
 
 def _count_repeated_real_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -5039,6 +5040,10 @@ class FourSlotLaneSelectionHead(nn.Module):
         visual_precision_geometry_proposal_distance_scale: float = 8.0,
         visual_precision_geometry_invisible_row_logit_bias: float = -2.0,
         visual_precision_geometry_gradient_only_candidate_scale: float = 0.10,
+        joint_slot_field_enabled: bool = False,
+        joint_slot_field_num_rows: int = 160,
+        joint_slot_field_hidden_dim: int = 64,
+        joint_slot_field_route_residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if int(hidden_dim) % int(num_heads):
@@ -5099,6 +5104,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         self.visual_precision_geometry_enabled = bool(
             visual_precision_geometry_enabled
         )
+        self.joint_slot_field_enabled = bool(joint_slot_field_enabled)
         if sum(
             (
                 self.refinement_enabled,
@@ -5324,6 +5330,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.iterative_slot_geometry_enabled
             or self.joint_exact_set_energy_enabled
             or self.counterfactual_fidelity_enabled
+            or self.joint_slot_field_enabled
         )
         self.requires_multi_scale_features = (
             self.iterative_slot_geometry_enabled
@@ -5335,6 +5342,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         # deliberately reachable from the exact final-set objective.
         self.requires_live_row_value_features = (
             self.joint_exact_set_energy_enabled
+            or self.joint_slot_field_enabled
         )
 
         # Exact successful probe descriptor:
@@ -6002,6 +6010,24 @@ class FourSlotLaneSelectionHead(nn.Module):
             if self.visual_precision_geometry_enabled
             else None
         )
+        # V30 is deliberately attached to the mature V7 selector rather than
+        # implemented as another frozen sidecar.  Its slot-conditioned field
+        # loss therefore reaches the shared image representation, while
+        # detached proposal coordinates preserve the existing support bank.
+        self.joint_slot_field = (
+            FourSlotJointBeliefField(
+                feature_dim=self.dim,
+                slot_dim=self.hidden_dim,
+                num_rows=int(joint_slot_field_num_rows),
+                input_w=self.input_w,
+                hidden_dim=int(joint_slot_field_hidden_dim),
+                route_residual_scale=float(
+                    joint_slot_field_route_residual_scale
+                ),
+            )
+            if self.joint_slot_field_enabled
+            else None
+        )
         nn.init.normal_(self.slot_tokens.weight, std=0.02)
         if self.active is not None:
             nn.init.zeros_(self.active.weight)
@@ -6202,6 +6228,27 @@ class FourSlotLaneSelectionHead(nn.Module):
             self.slot_query(slots),
             self.candidate_key(candidates),
         ) / math.sqrt(float(self.hidden_dim))
+        joint_field_result: dict[str, torch.Tensor] | None = None
+        joint_field_route_residual: torch.Tensor | None = None
+        if self.joint_slot_field is not None:
+            if not isinstance(row_value_features, torch.Tensor):
+                raise ValueError("V30 joint field requires live P2 row features")
+            joint_field_result = self.joint_slot_field(
+                slot_states=slots,
+                row_value_features=row_value_features,
+                proposal_x_rows=outputs["pred_x_rows"],
+                proposal_range_norm=outputs["range_norm"],
+                candidate_valid=candidate_valid,
+            )
+            joint_field_route_residual = joint_field_result[
+                "route_residual"
+            ].to(dtype=real_route_logits.dtype)
+            real_route_logits = real_route_logits + joint_field_route_residual
+            # Preserve V7's historical backward graph everywhere else.  The
+            # live tensor has already entered the new field; the mature
+            # bounded refiner and all legacy optional consumers still receive
+            # the same detached P2 view they received before V30.
+            row_value_features = row_value_features.detach()
         real_route_logits = real_route_logits.masked_fill(
             ~candidate_valid[:, None, :],
             -1.0e4,
@@ -6282,6 +6329,10 @@ class FourSlotLaneSelectionHead(nn.Module):
                 self.slot_query(geometry_slots),
                 self.candidate_key(geometry_candidates),
             ) / math.sqrt(float(self.hidden_dim))
+            if joint_field_route_residual is not None:
+                geometry_route_logits = (
+                    geometry_route_logits + joint_field_route_residual
+                )
             geometry_route_logits = geometry_route_logits.masked_fill(
                 ~candidate_valid[:, None, :],
                 -1.0e4,
@@ -6335,6 +6386,23 @@ class FourSlotLaneSelectionHead(nn.Module):
                 "selection_slot_scores": decoded["scores"],
                 "selection_slot_global_repair_count": decoded["repair_count"],
             }
+        if joint_field_result is not None:
+            result.update(
+                {
+                    "selection_slot_joint_field_logits": joint_field_result[
+                        "field_logits"
+                    ],
+                    "selection_slot_joint_field_candidate_score": (
+                        joint_field_result["candidate_score"]
+                    ),
+                    "selection_slot_joint_field_route_residual": (
+                        joint_field_result["route_residual"]
+                    ),
+                    "selection_slot_joint_field_route_gate": (
+                        joint_field_result["route_gate"]
+                    ),
+                }
+            )
         v18_route_result: dict[str, torch.Tensor] | None = None
         v18_image_features: dict[str, torch.Tensor] | None = None
         # Preserve the already-computed V7 deployment tensors from this exact

@@ -1187,6 +1187,9 @@ class LossConfig:
     four_slot_geometry_range_weight: float = 0.0
     four_slot_geometry_match_min_quality: float = 0.20
     four_slot_geometry_match_all_slots: bool = False
+    # V30 sends the final slot-to-GT target back into the live P2 image
+    # representation as a slot-conditioned row-wise spatial field.
+    w_four_slot_joint_field: float = 0.0
     # V11 uses one final-slot Hungarian assignment for activity, global
     # proposal-memory attention and final slot-owned geometry.  This removes
     # the independent selection/geometry assignment contracts used by V7.
@@ -1599,6 +1602,7 @@ class S0Criterion(nn.Module):
             or self.cfg.w_four_slot_v17 != 0
             or self.cfg.w_four_slot_v18 != 0
             or self.cfg.w_four_slot_v19 != 0
+            or self.cfg.w_four_slot_joint_field != 0
         ):
             proposal_rows = outputs.get("pred_x_rows")
             if not isinstance(proposal_rows, torch.Tensor):
@@ -1709,6 +1713,21 @@ class S0Criterion(nn.Module):
                 "mean_reference_quality": zero,
                 "mean_refined_quality": zero,
                 "mean_quality_gain": zero,
+            }
+        if self.cfg.w_four_slot_joint_field != 0:
+            four_slot_joint_field = self.compute_four_slot_joint_field_loss(
+                outputs,
+                targets,
+                four_slot_targets,
+            )
+        else:
+            four_slot_joint_field = {
+                "total": zero,
+                "dfl": zero,
+                "mean_matched": zero,
+                "mean_mae_px": zero,
+                "route_gate": zero,
+                "route_residual_abs": zero,
             }
         if self.cfg.w_four_slot_unified != 0:
             four_slot_unified = self.compute_four_slot_unified_loss(
@@ -1956,6 +1975,8 @@ class S0Criterion(nn.Module):
             + self.cfg.w_pointer_selection * pointer_selection["total"]
             + self.cfg.w_four_slot_selection * four_slot_selection["total"]
             + self.cfg.w_four_slot_geometry * four_slot_geometry["total"]
+            + self.cfg.w_four_slot_joint_field
+            * four_slot_joint_field["total"]
             + self.cfg.w_four_slot_unified * four_slot_unified["total"]
             + self.cfg.w_four_slot_visual_first
             * four_slot_visual_first["total"]
@@ -2093,6 +2114,20 @@ class S0Criterion(nn.Module):
             "four_slot_geometry_mean_quality_gain": four_slot_geometry[
                 "mean_quality_gain"
             ],
+            "loss_four_slot_joint_field": four_slot_joint_field["total"],
+            "loss_four_slot_joint_field_dfl": four_slot_joint_field["dfl"],
+            "four_slot_joint_field_mean_matched": four_slot_joint_field[
+                "mean_matched"
+            ],
+            "four_slot_joint_field_mean_mae_px": four_slot_joint_field[
+                "mean_mae_px"
+            ],
+            "four_slot_joint_field_route_gate": four_slot_joint_field[
+                "route_gate"
+            ],
+            "four_slot_joint_field_route_residual_abs": (
+                four_slot_joint_field["route_residual_abs"]
+            ),
             "loss_four_slot_unified": four_slot_unified["total"],
             "loss_four_slot_unified_active": four_slot_unified["active"],
             "loss_four_slot_unified_attention": four_slot_unified[
@@ -5913,6 +5948,103 @@ class S0Criterion(nn.Module):
         )
         match_count = reference.new_tensor(pair_counts, dtype=torch.float32)
         return matches, reference_quality, match_count
+
+    def compute_four_slot_joint_field_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        padded_targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Supervise each final slot with its owned GT lane in image space.
+
+        This is not the existing class-agnostic centerline auxiliary loss.
+        The V7 routed reference first fixes a one-to-one slot/GT identity;
+        each slot then receives a full row-wise x distribution for only that
+        physical lane.  The logits originate from live P2 features, so this
+        loss creates the route-to-image gradient edge missing from the frozen
+        selector family.
+        """
+
+        field_logits = outputs.get("selection_slot_joint_field_logits")
+        reference = outputs.get("selection_slot_input_reference_x_rows")
+        ranges = outputs.get("selection_slot_input_range_norm")
+        if not isinstance(ranges, torch.Tensor):
+            ranges = outputs.get("selection_slot_range_norm")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (field_logits, reference, ranges)
+        ):
+            raise ValueError(
+                "w_four_slot_joint_field > 0 requires V30 field and V7 "
+                "reference tensors"
+            )
+        if field_logits.ndim != 4:
+            raise ValueError(
+                "selection_slot_joint_field_logits must have shape [B,S,R,X]"
+            )
+
+        matches, _reference_quality, match_count = (
+            self._match_four_slot_reference_geometry(
+                outputs,
+                targets,
+                padded_targets,
+            )
+        )
+        field_outputs = {
+            "pred_x_rows": reference,
+            "range_norm": ranges,
+            "row_x_logits": field_logits,
+        }
+        packed = self._pack_matched_lanes(field_outputs, targets, matches)
+        dfl = self.compute_row_dfl_loss(
+            field_outputs,
+            targets,
+            matches,
+            packed,
+        )
+
+        if packed.row_logits is None or int(packed.row_logits.shape[0]) == 0:
+            mean_mae = field_logits.detach().sum(dtype=torch.float32) * 0.0
+        else:
+            logits = packed.row_logits.float()
+            x_bins = int(logits.shape[-1])
+            centers = torch.arange(
+                x_bins,
+                device=logits.device,
+                dtype=logits.dtype,
+            ) * (float(self.cfg.input_w) / float(x_bins))
+            expected_x = (
+                torch.softmax(logits, dim=-1) * centers.view(1, 1, -1)
+            ).sum(dim=-1)
+            gt_x = packed.gt_x[:, : int(expected_x.shape[-1])].float()
+            valid = (
+                packed.valid[:, : int(expected_x.shape[-1])].bool()
+                & torch.isfinite(gt_x)
+            )
+            valid_float = valid.to(dtype=expected_x.dtype)
+            mean_mae = (
+                (expected_x.detach() - gt_x).abs() * valid_float
+            ).sum() / valid_float.sum().clamp_min(1.0)
+
+        gate = outputs.get("selection_slot_joint_field_route_gate")
+        residual = outputs.get("selection_slot_joint_field_route_residual")
+        zero = field_logits.detach().sum(dtype=torch.float32) * 0.0
+        return {
+            "total": dfl,
+            "dfl": dfl,
+            "mean_matched": match_count.mean().detach(),
+            "mean_mae_px": mean_mae.detach(),
+            "route_gate": (
+                gate.detach().float()
+                if isinstance(gate, torch.Tensor)
+                else zero
+            ),
+            "route_residual_abs": (
+                residual.detach().float().abs().mean()
+                if isinstance(residual, torch.Tensor)
+                else zero
+            ),
+        }
 
     def compute_four_slot_geometry_loss(
         self,

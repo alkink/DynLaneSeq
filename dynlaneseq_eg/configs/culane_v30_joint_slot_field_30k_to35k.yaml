@@ -1,0 +1,31 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v30_joint_slot_field_30k_to35k
+
+# V30 tests one intervention only: the final four V7 slots receive a
+# slot-conditioned spatial belief field whose loss is allowed to reshape the
+# shared image representation.  All mature proposal, activity, refinement and
+# writer objectives remain enabled and unchanged.
+model:
+  structured_query:
+    set_selection:
+      four_slot_joint_field_enabled: true
+      four_slot_joint_field_hidden_dim: 64
+      # The bounded residual is multiplied by a learned gate initialized to
+      # exactly zero, so iteration 30K is exact V7 parity.
+      four_slot_joint_field_route_residual_scale: 1.0
+
+loss:
+  # Conservative relative weight: strong enough to shape P2 but smaller than
+  # the mature proposal and final-slot geometry objectives.
+  w_four_slot_joint_field: 0.25
+
+training:
+  # --resume starts at global iteration 30K.  Five thousand optimizer steps
+  # therefore produce the requested global 35K endpoint.
+  max_iters: 5000
+  checkpoint_interval: 5000
+  save_last_alias: false
+
+dataloader:
+  resume_safe: true
