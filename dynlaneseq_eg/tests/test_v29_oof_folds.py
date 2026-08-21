@@ -203,6 +203,89 @@ def test_v29_eval_contract_binds_support_and_belief_fold(tmp_path: Path) -> None
     assert all(endpoint["checks"].values())
 
 
+def test_v29_eval_contract_accepts_predeclared_early_support_iteration(
+    tmp_path: Path,
+) -> None:
+    images, gt = _rows()
+    train = tmp_path / "train.txt"
+    train_gt = tmp_path / "train_gt.txt"
+    train.write_text("\n".join(images) + "\n", encoding="utf-8")
+    train_gt.write_text("\n".join(gt) + "\n", encoding="utf-8")
+    report = build(
+        train_list=train,
+        train_gt_list=train_gt,
+        output_dir=tmp_path / "folds",
+        seed=3407,
+    )
+    fold_contract = tmp_path / "folds" / "fold_contract.json"
+    support_checkpoint = tmp_path / "support_30k.pt"
+    support_checkpoint.write_bytes(b"support-v7-30k")
+    support_report = tmp_path / "support_report.json"
+    support_report.write_text(
+        json.dumps(
+            {
+                "checkpoint_sha256": sha256_file(support_checkpoint),
+                "iteration": 30_000,
+                "support_train_fold": "a",
+                "belief_train_fold": "b",
+                "fold_contract_sha256": sha256_file(fold_contract),
+                "training_list_sha256": report["folds"]["a"][
+                    "gt_list_sha256"
+                ],
+                "validation_used_for_checkpoint_selection": False,
+                "test_set_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    contract = _validate_v29_support(
+        checkpoint=support_checkpoint,
+        report_path=support_report,
+        fold_contract_path=fold_contract,
+        belief_fold="b",
+        expected_iteration=30_000,
+    )
+    assert all(contract["checks"].values())
+
+    arm_checkpoint = tmp_path / "arm.pt"
+    arm_checkpoint.write_bytes(b"arm-c")
+    arm_report = tmp_path / "arm_report.json"
+    arm_report.write_text(
+        json.dumps(
+            {
+                "arm": "C",
+                "iteration": 6_000,
+                "router_only_checkpoint_sha256": sha256_file(arm_checkpoint),
+                "gate_zero": {"passed": True},
+                "teacher_state_still_exact": True,
+                "checkpoint_selection_performed": False,
+                "threshold_selection_performed": False,
+                "test_set_used": False,
+                "training_population_is_oof": True,
+                "oof_fold": "b",
+                "v7_checkpoint_sha256": sha256_file(support_checkpoint),
+                "v7_iteration": 30_000,
+                "official_train_population_contract": {
+                    "fold": "b",
+                    "fold_contract_sha256": sha256_file(fold_contract),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    endpoint = _validate_endpoint(
+        arm_checkpoint,
+        arm_report,
+        arm="C",
+        router_only=True,
+        oof_fold="b",
+        fold_contract_sha256=sha256_file(fold_contract),
+        expected_v7_sha256=sha256_file(support_checkpoint),
+        expected_v7_iteration=30_000,
+    )
+    assert all(endpoint["checks"].values())
+
+
 def test_v29_summary_requires_a_passing_oof_direction(tmp_path: Path) -> None:
     root = tmp_path / "support_a_to_fold_b"
     paired_dir = root / "paired"

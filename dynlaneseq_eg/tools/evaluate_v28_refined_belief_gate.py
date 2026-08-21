@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oof-fold", choices=("a", "b"), default="")
     parser.add_argument("--train-list-contract", default="")
     parser.add_argument("--expected-v7-checkpoint", default="")
+    parser.add_argument("--expected-v7-iteration", type=int, default=112_500)
     parser.add_argument("--support-training-report", default="")
     return parser.parse_args()
 
@@ -109,6 +110,7 @@ def _validate_endpoint(
     oof_fold: str = "",
     fold_contract_sha256: str = "",
     expected_v7_sha256: str = "",
+    expected_v7_iteration: int = 112_500,
 ) -> dict[str, Any]:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     key = "router_only_checkpoint_sha256" if router_only else "checkpoint_sha256"
@@ -142,7 +144,7 @@ def _validate_endpoint(
                 )
                 == expected_v7_sha256,
                 "oof_v7_iteration_exact": int(report.get("v7_iteration", -1))
-                == 112_500,
+                == int(expected_v7_iteration),
             }
         )
     if not all(checks.values()):
@@ -163,6 +165,7 @@ def _validate_v29_support(
     report_path: Path,
     fold_contract_path: Path,
     belief_fold: str,
+    expected_iteration: int = 112_500,
 ) -> dict[str, Any]:
     fold_contract = json.loads(fold_contract_path.read_text(encoding="utf-8"))
     support_report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -173,7 +176,7 @@ def _validate_v29_support(
         "support_checkpoint_sha256_exact": sha256_file(checkpoint)
         == str(support_report.get("checkpoint_sha256")),
         "support_iteration_exact": int(support_report.get("iteration", -1))
-        == 112_500,
+        == int(expected_iteration),
         "support_train_fold_exact": str(
             support_report.get("support_train_fold")
         )
@@ -739,7 +742,7 @@ def main() -> None:
             "--expected-v7-checkpoint, and --support-training-report together"
         )
     oof_contract = None
-    endpoint_kwargs: dict[str, str] = {}
+    endpoint_kwargs: dict[str, Any] = {}
     if all(oof_values):
         fold_contract_path = Path(args.train_list_contract).expanduser().resolve()
         expected_v7 = Path(args.expected_v7_checkpoint).expanduser().resolve()
@@ -748,11 +751,13 @@ def main() -> None:
             report_path=Path(args.support_training_report).expanduser().resolve(),
             fold_contract_path=fold_contract_path,
             belief_fold=str(args.oof_fold),
+            expected_iteration=int(args.expected_v7_iteration),
         )
         endpoint_kwargs = {
             "oof_fold": str(args.oof_fold),
             "fold_contract_sha256": sha256_file(fold_contract_path),
             "expected_v7_sha256": sha256_file(expected_v7),
+            "expected_v7_iteration": int(args.expected_v7_iteration),
         }
     endpoint_contracts = {
         "arm_b": _validate_endpoint(

@@ -37,6 +37,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--folds",
+        nargs="+",
+        choices=FOLD_NAMES,
+        default=list(FOLD_NAMES),
+        help="Support folds to train/materialize, in execution order.",
+    )
+    parser.add_argument(
+        "--endpoint-iteration",
+        type=int,
+        default=ENDPOINT_ITERATION,
+        help="Fixed support endpoint. The production two-fold contract uses 112500.",
+    )
+    parser.add_argument(
+        "--summary-name",
+        default="support_training_summary.json",
+        help="Summary filename under --output-root.",
+    )
     return parser.parse_args()
 
 
@@ -55,7 +73,11 @@ def _checkpoint_iteration(path: Path) -> int:
     return int(match.group(1))
 
 
-def _latest_checkpoint(output_dir: Path) -> Path | None:
+def _latest_checkpoint(
+    output_dir: Path,
+    *,
+    endpoint_iteration: int,
+) -> Path | None:
     checkpoints = sorted(
         output_dir.glob("iter_*.pt"),
         key=_checkpoint_iteration,
@@ -63,7 +85,7 @@ def _latest_checkpoint(output_dir: Path) -> Path | None:
     valid = [
         path
         for path in checkpoints
-        if 0 < _checkpoint_iteration(path) <= ENDPOINT_ITERATION
+        if 0 < _checkpoint_iteration(path) <= int(endpoint_iteration)
     ]
     return valid[-1] if valid else None
 
@@ -101,13 +123,15 @@ def _verify_endpoint(
     *,
     fold_contract: dict[str, Any],
     dataset_root: Path,
+    endpoint_iteration: int,
 ) -> dict[str, Any]:
     payload = _torch_load(endpoint)
     iteration = int(payload.get("iteration", -1))
     cfg = payload.get("cfg")
-    if iteration != ENDPOINT_ITERATION:
+    if iteration != int(endpoint_iteration):
         raise ValueError(
-            f"V29 support endpoint iteration {iteration} != {ENDPOINT_ITERATION}"
+            "V29 support endpoint iteration "
+            f"{iteration} != {int(endpoint_iteration)}"
         )
     if not isinstance(cfg, dict):
         raise ValueError("V29 support endpoint is missing its expanded config")
@@ -133,9 +157,9 @@ def _verify_endpoint(
         "training_clips": int(fold_contract["clip_count"]),
         "original_v7_endpoint_iteration": ORIGINAL_V7_ENDPOINT,
         "original_v7_schedule_iterations": ORIGINAL_V7_SCHEDULE,
-        "fold_v7_endpoint_iteration": ENDPOINT_ITERATION,
+        "fold_v7_endpoint_iteration": int(endpoint_iteration),
         "fold_v7_schedule_iterations": FOLD_V7_SCHEDULE,
-        "cosine_phase_ratio": ENDPOINT_ITERATION / FOLD_V7_SCHEDULE,
+        "cosine_phase_ratio": int(endpoint_iteration) / FOLD_V7_SCHEDULE,
         "compile_model": True,
         "test_set_used": False,
         "validation_used_for_checkpoint_selection": False,
@@ -152,10 +176,19 @@ def main() -> None:
         raise ValueError("V29 support training requires a passing fold contract")
     output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    endpoint_iteration = int(args.endpoint_iteration)
+    if endpoint_iteration <= 0 or endpoint_iteration > ENDPOINT_ITERATION:
+        raise ValueError(
+            "--endpoint-iteration must be in "
+            f"[1, {ENDPOINT_ITERATION}]"
+        )
+    summary_name = Path(args.summary_name)
+    if summary_name.name != str(args.summary_name):
+        raise ValueError("--summary-name must be a plain filename")
     reports: dict[str, Any] = {}
     started = time.perf_counter()
 
-    for fold in FOLD_NAMES:
+    for fold in args.folds:
         fold_output = output_root / f"support_fold_{fold}"
         fold_output.mkdir(parents=True, exist_ok=True)
         gt_list = Path(fold_report["folds"][fold]["gt_list"])
@@ -164,9 +197,12 @@ def main() -> None:
             fold=fold,
             gt_list_path=gt_list,
         )
-        endpoint = fold_output / f"iter_{ENDPOINT_ITERATION:07d}.pt"
+        endpoint = fold_output / f"iter_{endpoint_iteration:07d}.pt"
         if not endpoint.is_file():
-            latest = _latest_checkpoint(fold_output)
+            latest = _latest_checkpoint(
+                fold_output,
+                endpoint_iteration=endpoint_iteration,
+            )
             command = [
                 sys.executable,
                 "-u",
@@ -183,7 +219,7 @@ def main() -> None:
                 "--output-dir",
                 str(fold_output),
                 "--max-iters",
-                str(ENDPOINT_ITERATION),
+                str(endpoint_iteration),
                 "--checkpoint-interval",
                 "10000",
                 "--num-workers",
@@ -198,6 +234,7 @@ def main() -> None:
             endpoint,
             fold_contract=fold_contract,
             dataset_root=dataset_root,
+            endpoint_iteration=endpoint_iteration,
         )
         report.update(
             {
@@ -218,7 +255,9 @@ def main() -> None:
 
     summary = {
         "experiment": "V29 two-fold OOF support training",
-        "passed": len(reports) == len(FOLD_NAMES),
+        "passed": len(reports) == len(args.folds),
+        "support_folds": list(args.folds),
+        "endpoint_iteration": endpoint_iteration,
         "elapsed_seconds": time.perf_counter() - started,
         "fold_contract": str(fold_report_path),
         "fold_contract_sha256": _sha256(fold_report_path),
@@ -226,7 +265,7 @@ def main() -> None:
         "checkpoint_selection_performed": False,
         "test_set_used": False,
     }
-    (output_root / "support_training_summary.json").write_text(
+    (output_root / summary_name).write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )

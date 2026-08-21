@@ -12,14 +12,11 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT}/belief_gate_6k}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 LOG_INTERVAL="${LOG_INTERVAL:-25}"
 RESUME_INTERVAL="${RESUME_INTERVAL:-500}"
+SUPPORT_ITERATION="${SUPPORT_ITERATION:-112500}"
+DIRECTION_PAIRS="${DIRECTION_PAIRS:-a:b b:a}"
 
 cd "${REPO_ROOT}"
 mkdir -p "${OUTPUT_ROOT}"
-
-if [[ ! -f "${SUPPORT_ROOT}/support_training_summary.json" ]]; then
-  echo "V29 OOF support endpoints are incomplete; refusing belief training." >&2
-  exit 2
-fi
 
 run_arm() {
   local support_fold="$1"
@@ -29,12 +26,19 @@ run_arm() {
   arm_lower="$(printf '%s' "${arm}" | tr '[:upper:]' '[:lower:]')"
   local direction="support_${support_fold}_to_fold_${belief_fold}"
   local output_dir="${OUTPUT_ROOT}/${direction}/arm_${arm_lower}"
-  local support_checkpoint="${SUPPORT_ROOT}/support_fold_${support_fold}/iter_0112500.pt"
+  local support_tag
+  support_tag="$(printf '%07d' "${SUPPORT_ITERATION}")"
+  local support_checkpoint="${SUPPORT_ROOT}/support_fold_${support_fold}/iter_${support_tag}.pt"
+  local support_report="${SUPPORT_ROOT}/support_fold_${support_fold}/support_training_report.json"
   local train_list="${ROOT}/folds/fold_${belief_fold}_train.txt"
   local resume_args=()
 
   if [[ ! -f "${support_checkpoint}" ]]; then
     echo "Missing support endpoint: ${support_checkpoint}" >&2
+    exit 2
+  fi
+  if [[ ! -f "${support_report}" ]]; then
+    echo "Missing support training report: ${support_report}" >&2
     exit 2
   fi
   if [[ -f "${output_dir}/v28_gate_endpoint.pt" ]]; then
@@ -64,9 +68,15 @@ run_arm() {
 
 # Each direction uses a support V7 that never saw the belief-training fold.
 # One 16-GiB GPU runs all arms sequentially to preserve the paired contract.
-run_arm a b B
-run_arm a b C
-run_arm b a B
-run_arm b a C
+read -r -a direction_pairs <<< "${DIRECTION_PAIRS}"
+for pair in "${direction_pairs[@]}"; do
+  IFS=: read -r support_fold belief_fold <<< "${pair}"
+  if [[ -z "${support_fold}" || -z "${belief_fold}" ]]; then
+    echo "Invalid DIRECTION_PAIRS entry: ${pair}" >&2
+    exit 2
+  fi
+  run_arm "${support_fold}" "${belief_fold}" B
+  run_arm "${support_fold}" "${belief_fold}" C
+done
 
-echo "V29 two-direction OOF B/C belief endpoints completed."
+echo "V29 requested OOF B/C belief endpoints completed: ${DIRECTION_PAIRS}."

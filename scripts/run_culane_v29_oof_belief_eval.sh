@@ -14,6 +14,8 @@ CONTRACT_ROOT="${CONTRACT_ROOT:-${ROOT}/eval_contract}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 METRIC_WORKERS="${METRIC_WORKERS:-12}"
+SUPPORT_ITERATION="${SUPPORT_ITERATION:-112500}"
+DIRECTION_PAIRS="${DIRECTION_PAIRS:-a:b b:a}"
 
 cd "${REPO_ROOT}"
 mkdir -p "${OUTPUT_ROOT}" "${CONTRACT_ROOT}"
@@ -34,7 +36,9 @@ run_direction() {
   local direction="support_${support_fold}_to_fold_${belief_fold}"
   local direction_gate="${GATE_ROOT}/${direction}"
   local direction_output="${OUTPUT_ROOT}/${direction}"
-  local support_checkpoint="${SUPPORT_ROOT}/support_fold_${support_fold}/iter_0112500.pt"
+  local support_tag
+  support_tag="$(printf '%07d' "${SUPPORT_ITERATION}")"
+  local support_checkpoint="${SUPPORT_ROOT}/support_fold_${support_fold}/iter_${support_tag}.pt"
   local support_report="${SUPPORT_ROOT}/support_fold_${support_fold}/support_training_report.json"
 
   "${PYTHON_BIN}" -u -m dynlaneseq_eg.tools.evaluate_v28_refined_belief_gate \
@@ -49,6 +53,7 @@ run_direction() {
     --oof-fold "${belief_fold}" \
     --train-list-contract "${FOLD_CONTRACT}" \
     --expected-v7-checkpoint "${support_checkpoint}" \
+    --expected-v7-iteration "${SUPPORT_ITERATION}" \
     --support-training-report "${support_report}" \
     --output-dir "${direction_output}/paired" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
@@ -67,6 +72,7 @@ run_direction() {
     --oof-fold "${belief_fold}" \
     --train-list-contract "${FOLD_CONTRACT}" \
     --expected-v7-checkpoint "${support_checkpoint}" \
+    --expected-v7-iteration "${SUPPORT_ITERATION}" \
     --support-training-report "${support_report}" \
     --output-dir "${direction_output}/switch_confidence" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
@@ -74,10 +80,29 @@ run_direction() {
     --log-interval 100
 }
 
-run_direction a b
-run_direction b a
+read -r -a direction_pairs <<< "${DIRECTION_PAIRS}"
+for pair in "${direction_pairs[@]}"; do
+  IFS=: read -r support_fold belief_fold <<< "${pair}"
+  if [[ -z "${support_fold}" || -z "${belief_fold}" ]]; then
+    echo "Invalid DIRECTION_PAIRS entry: ${pair}" >&2
+    exit 2
+  fi
+  run_direction "${support_fold}" "${belief_fold}"
+done
 
-"${PYTHON_BIN}" -u -m dynlaneseq_eg.tools.summarize_v29_oof_belief_gate \
-  --direction-a-to-b "${OUTPUT_ROOT}/support_a_to_fold_b" \
-  --direction-b-to-a "${OUTPUT_ROOT}/support_b_to_fold_a" \
-  --output "${OUTPUT_ROOT}/v29_oof_gate_summary.json"
+if [[ "${DIRECTION_PAIRS}" == "a:b b:a" ]]; then
+  "${PYTHON_BIN}" -u -m dynlaneseq_eg.tools.summarize_v29_oof_belief_gate \
+    --direction-a-to-b "${OUTPUT_ROOT}/support_a_to_fold_b" \
+    --direction-b-to-a "${OUTPUT_ROOT}/support_b_to_fold_a" \
+    --output "${OUTPUT_ROOT}/v29_oof_gate_summary.json"
+elif [[ "${#direction_pairs[@]}" -eq 1 ]]; then
+  pair="${direction_pairs[0]}"
+  IFS=: read -r support_fold belief_fold <<< "${pair}"
+  "${PYTHON_BIN}" -u -m dynlaneseq_eg.tools.summarize_v29_oof_direction \
+    --direction "${OUTPUT_ROOT}/support_${support_fold}_to_fold_${belief_fold}" \
+    --support-fold "${support_fold}" \
+    --belief-fold "${belief_fold}" \
+    --output "${OUTPUT_ROOT}/support_${support_fold}_to_fold_${belief_fold}/direction_summary.json"
+else
+  echo "Multiple custom directions completed; no aggregate summary was inferred."
+fi

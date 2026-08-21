@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oof-fold", choices=("a", "b"), default="")
     parser.add_argument("--train-list-contract", default="")
     parser.add_argument("--expected-v7-checkpoint", default="")
+    parser.add_argument("--expected-v7-iteration", type=int, default=112_500)
     parser.add_argument("--support-training-report", default="")
     return parser.parse_args()
 
@@ -343,7 +344,7 @@ def main() -> None:
             "--expected-v7-checkpoint, and --support-training-report together"
         )
     oof_contract = None
-    endpoint_kwargs: dict[str, str] = {}
+    endpoint_kwargs: dict[str, Any] = {}
     if all(oof_values):
         fold_contract_path = Path(args.train_list_contract).expanduser().resolve()
         expected_v7 = Path(args.expected_v7_checkpoint).expanduser().resolve()
@@ -352,11 +353,13 @@ def main() -> None:
             report_path=Path(args.support_training_report).expanduser().resolve(),
             fold_contract_path=fold_contract_path,
             belief_fold=str(args.oof_fold),
+            expected_iteration=int(args.expected_v7_iteration),
         )
         endpoint_kwargs = {
             "oof_fold": str(args.oof_fold),
             "fold_contract_sha256": sha256_file(fold_contract_path),
             "expected_v7_sha256": sha256_file(expected_v7),
+            "expected_v7_iteration": int(args.expected_v7_iteration),
         }
     endpoint_contracts = {
         "arm_b": _validate_endpoint(
