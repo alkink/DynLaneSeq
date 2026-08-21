@@ -11,6 +11,7 @@ import torch
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import (
+    _torch_load,
     load_checkpoint,
     load_compatible_model_weights,
     remap_optimizer_state_by_parameter,
@@ -410,7 +411,11 @@ def main() -> None:
         print(f"initialized compatible weights from {args.init_from}: {stats}")
     if args.resume:
         if args.resume_remap_optimizer_groups:
-            payload = torch.load(args.resume, map_location="cpu")
+            # PyTorch 2.6 changed ``torch.load`` to ``weights_only=True`` by
+            # default.  Full training checkpoints intentionally contain RNG
+            # and optimizer metadata, so use the project's compatibility
+            # loader just like every other checkpoint path.
+            payload = _torch_load(args.resume, map_location="cpu")
             source_cfg = payload.get("cfg")
             if not isinstance(source_cfg, dict) or not source_cfg:
                 raise ValueError(
