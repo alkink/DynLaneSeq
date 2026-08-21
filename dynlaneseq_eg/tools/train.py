@@ -415,7 +415,7 @@ def main() -> None:
             # default.  Full training checkpoints intentionally contain RNG
             # and optimizer metadata, so use the project's compatibility
             # loader just like every other checkpoint path.
-            payload = _torch_load(args.resume, map_location="cpu")
+            payload = _torch_load(args.resume)
             source_cfg = payload.get("cfg")
             if not isinstance(source_cfg, dict) or not source_cfg:
                 raise ValueError(
