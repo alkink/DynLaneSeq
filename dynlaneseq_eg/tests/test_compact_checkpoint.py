@@ -8,7 +8,11 @@ import pytest
 import torch
 from torch import nn
 
-from dynlaneseq_eg.engine.checkpoint import load_checkpoint, save_checkpoint
+from dynlaneseq_eg.engine.checkpoint import (
+    load_checkpoint,
+    load_checkpoint_model_prefixes,
+    save_checkpoint,
+)
 
 
 class _TinyModel(nn.Module):
@@ -106,3 +110,53 @@ def test_checkpoint_can_restore_python_numpy_and_torch_rng(tmp_path: Path) -> No
     assert random.random() == expected_python
     assert float(np.random.rand()) == expected_numpy
     torch.testing.assert_close(torch.rand(4), expected_torch, rtol=0.0, atol=0.0)
+
+
+def test_checkpoint_prefix_overlay_swaps_only_requested_subtree(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(811)
+    base = _TinyModel()
+    base_path = tmp_path / "base.pt"
+    save_checkpoint(base_path, base, iteration=100)
+
+    donor = _TinyModel()
+    with torch.no_grad():
+        donor.backbone.weight.fill_(91.0)
+        donor.structured_query_head.set_selection_head.weight.fill_(17.0)
+        donor.structured_query_head.set_selection_head.bias.fill_(19.0)
+    donor_path = tmp_path / "donor.pt"
+    save_checkpoint(donor_path, donor, iteration=200)
+
+    restored = _TinyModel()
+    load_checkpoint(base_path, restored, strict=True)
+    backbone_before = restored.backbone.weight.detach().clone()
+    stats = load_checkpoint_model_prefixes(
+        donor_path,
+        restored,
+        prefixes=("structured_query_head.set_selection_head",),
+    )
+
+    assert stats == {"iteration": 200, "tensors": 2, "prefixes": 1}
+    torch.testing.assert_close(restored.backbone.weight, backbone_before)
+    torch.testing.assert_close(
+        restored.structured_query_head.set_selection_head.weight,
+        donor.structured_query_head.set_selection_head.weight,
+    )
+    torch.testing.assert_close(
+        restored.structured_query_head.set_selection_head.bias,
+        donor.structured_query_head.set_selection_head.bias,
+    )
+
+
+def test_checkpoint_prefix_overlay_rejects_unknown_target_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.pt"
+    save_checkpoint(path, _TinyModel(), iteration=1)
+    with pytest.raises(ValueError, match="matched no target tensors"):
+        load_checkpoint_model_prefixes(
+            path,
+            _TinyModel(),
+            prefixes=("does_not_exist",),
+        )

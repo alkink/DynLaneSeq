@@ -309,6 +309,60 @@ def load_checkpoint(
     return int(payload.get("iteration", 0))
 
 
+def load_checkpoint_model_prefixes(
+    path: str | Path,
+    model,
+    *,
+    prefixes,
+) -> dict[str, int]:
+    """Overlay an exact model subtree from a materialized checkpoint.
+
+    Every tensor below the requested target prefixes must exist in the source
+    checkpoint with the same shape.  This keeps causal module-swap audits from
+    silently loading only part of a component.
+    """
+
+    normalized = _normalize_prefixes(prefixes)
+    if not normalized:
+        raise ValueError("checkpoint model-prefix overlay requires prefixes")
+    source, payload = _materialize_model_state(path)
+    target = model.state_dict()
+    source_subset = {
+        name: value
+        for name, value in source.items()
+        if _matches_prefix(name, normalized)
+    }
+    target_subset = {
+        name: value
+        for name, value in target.items()
+        if _matches_prefix(name, normalized)
+    }
+    if not target_subset:
+        raise ValueError(
+            "checkpoint model-prefix overlay matched no target tensors: "
+            + ", ".join(normalized)
+        )
+    missing = sorted(set(target_subset) - set(source_subset))
+    unexpected = sorted(set(source_subset) - set(target_subset))
+    mismatched = sorted(
+        name
+        for name in set(target_subset) & set(source_subset)
+        if tuple(target_subset[name].shape) != tuple(source_subset[name].shape)
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            "checkpoint model-prefix overlay is not exact; "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
+            f"shape_mismatch={mismatched[:5]}"
+        )
+    model.load_state_dict(source_subset, strict=False)
+    return {
+        "iteration": int(payload.get("iteration", 0)),
+        "tensors": len(source_subset),
+        "prefixes": len(normalized),
+    }
+
+
 def load_compatible_model_weights(path: str | Path, model) -> dict[str, int]:
     source, _payload = _materialize_model_state(path)
     for key, value in list(source.items()):

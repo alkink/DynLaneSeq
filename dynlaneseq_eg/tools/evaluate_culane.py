@@ -9,7 +9,10 @@ import torch
 from tqdm import tqdm
 
 from dynlaneseq_eg.config import load_config
-from dynlaneseq_eg.engine.checkpoint import load_checkpoint
+from dynlaneseq_eg.engine.checkpoint import (
+    load_checkpoint,
+    load_checkpoint_model_prefixes,
+)
 from dynlaneseq_eg.evaluation.culane_metric import (
     eval_predictions,
     eval_predictions_with_categories,
@@ -103,6 +106,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Write DynLaneSeq predictions and evaluate CULane F1.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", default="")
+    parser.add_argument(
+        "--module-override-checkpoint",
+        default="",
+        help=(
+            "Optional checkpoint whose exact subtree is overlaid after the "
+            "main checkpoint for a causal module-swap replay."
+        ),
+    )
+    parser.add_argument(
+        "--module-override-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Model-state prefix to import from --module-override-checkpoint; "
+            "repeat for multiple exact subtrees."
+        ),
+    )
     parser.add_argument("--split", default="val")
     parser.add_argument("--dataset-root", default="", help="Override cfg.dataset.root.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -169,6 +189,11 @@ def main() -> None:
         raise ValueError("--checkpoint is required unless --skip-write is set.")
     if args.skip_write and not args.pred_dir:
         raise ValueError("--pred-dir is required when --skip-write is set.")
+    if bool(args.module_override_checkpoint) != bool(args.module_override_prefix):
+        raise ValueError(
+            "--module-override-checkpoint and --module-override-prefix must be "
+            "provided together"
+        )
 
     cfg = load_config(args.config)
     if args.dataset_root:
@@ -226,6 +251,7 @@ def main() -> None:
 
     inference_only = False
     pass_targets = False
+    module_override_stats = None
     if not args.skip_write:
         # Checkpoint evaluation must not download or overwrite a backbone with
         # ImageNet initialization before loading the trained model state.
@@ -233,6 +259,12 @@ def main() -> None:
         cfg.setdefault("model", {})["require_pretrained_backbone"] = False
         model = build_model(cfg)
         load_checkpoint(args.checkpoint, model, strict=False)
+        if args.module_override_checkpoint:
+            module_override_stats = load_checkpoint_model_prefixes(
+                args.module_override_checkpoint,
+                model,
+                prefixes=args.module_override_prefix,
+            )
         pass_targets = bool(getattr(model, "oracle_coarse_enabled", False))
         inference_only = bool(getattr(model, "supports_inference_only", False) and not args.legacy_inference)
         if inference_only and not pass_targets:
@@ -296,6 +328,9 @@ def main() -> None:
     report_lines = [
         f"config: {args.config}",
         f"checkpoint: {args.checkpoint}" if args.checkpoint else "checkpoint: <skip-write>",
+        f"module_override_checkpoint: {args.module_override_checkpoint or '<none>'}",
+        "module_override_prefix: "
+        + (", ".join(args.module_override_prefix) or "<none>"),
         f"split: {args.split}",
         f"pred_dir: {pred_dir}",
         f"anno_dir: {anno_dir}",
@@ -340,6 +375,9 @@ def main() -> None:
         payload = {
             "config": args.config,
             "checkpoint": args.checkpoint,
+            "module_override_checkpoint": args.module_override_checkpoint,
+            "module_override_prefix": args.module_override_prefix,
+            "module_override_stats": module_override_stats,
             "split": args.split,
             "pred_dir": str(pred_dir),
             "anno_dir": str(anno_dir),
