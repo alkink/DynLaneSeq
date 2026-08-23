@@ -189,7 +189,11 @@ def _to_host(
     return dict(zip(names, tensor.cpu().tolist()))
 
 
-def _gradient_contract(model: DynLaneSeqV25) -> dict[str, Any]:
+def _gradient_contract(
+    model: DynLaneSeqV25,
+    *,
+    weights: V25LossWeights,
+) -> dict[str, Any]:
     prefixes = [
         "detector.backbone",
         "detector.fpn",
@@ -200,14 +204,14 @@ def _gradient_contract(model: DynLaneSeqV25) -> dict[str, Any]:
     ]
     detector = model.detector
     if hasattr(detector, "reliability_head"):
-        prefixes.extend(
-            (
-                "detector.reliability_head",
-                "detector.row_visibility_head",
-                "detector.proposal_memory",
-            )
-        )
-        if bool(getattr(detector, "enable_proposal_fusion", False)):
+        fusion_enabled = bool(getattr(detector, "enable_proposal_fusion", False))
+        if float(weights.quality50) > 0.0 or float(weights.quality75) > 0.0:
+            prefixes.append("detector.reliability_head")
+        if float(weights.visibility) > 0.0:
+            prefixes.append("detector.row_visibility_head")
+        if float(weights.proposal_coverage) > 0.0 or fusion_enabled:
+            prefixes.append("detector.proposal_memory")
+        if fusion_enabled:
             prefixes.extend(
                 (
                     "detector.energy_mixture",
@@ -215,7 +219,7 @@ def _gradient_contract(model: DynLaneSeqV25) -> dict[str, Any]:
                     "detector.proposal_key",
                 )
             )
-    else:
+    elif float(weights.quality50) > 0.0 or float(weights.quality75) > 0.0:
         prefixes.append("detector.quality_head")
     result: dict[str, Any] = {}
     named = list(model.named_parameters())
@@ -271,7 +275,7 @@ def _gate_zero(
         )
     _assert_finite(loss, "V25 Gate 0 produced a non-finite loss")
     loss.backward()
-    gradients = _gradient_contract(model)
+    gradients = _gradient_contract(model, weights=weights)
     model.zero_grad(set_to_none=True)
     contract = v25_model_contract(model.detector)
     forbidden_names = [

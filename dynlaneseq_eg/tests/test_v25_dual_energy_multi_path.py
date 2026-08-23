@@ -13,6 +13,9 @@ from dynlaneseq_eg.modeling.v25_image_mediated_lane_objects import (
     V25LossWeights,
     v25_lane_object_loss,
 )
+from dynlaneseq_eg.tools.train_v25_image_mediated_lane_objects import (
+    _gradient_contract,
+)
 
 
 def _target(rows: int) -> list[dict[str, torch.Tensor]]:
@@ -241,18 +244,19 @@ def test_aux_only_arm_preserves_primary_writer_at_initialization() -> None:
     auxiliary.train()
     auxiliary.zero_grad(set_to_none=True)
     output = auxiliary(images[:1])
+    weights = V25LossWeights(
+        minimum_valid_rows=2,
+        quality50=0.0,
+        quality75=0.0,
+        visibility=0.0,
+        proposal_coverage=1.0,
+        proposal_groups=4,
+    )
     loss, diagnostics = v25_lane_object_loss(
         output,
         _target(6),
         input_w=64,
-        weights=V25LossWeights(
-            minimum_valid_rows=2,
-            quality50=0.0,
-            quality75=0.0,
-            visibility=0.0,
-            proposal_coverage=1.0,
-            proposal_groups=4,
-        ),
+        weights=weights,
     )
     assert diagnostics["loss_proposal_coverage"] > 0
     loss.backward()
@@ -268,3 +272,11 @@ def test_aux_only_arm_preserves_primary_writer_at_initialization() -> None:
         and parameter.grad.abs().sum() > 0
         for parameter in auxiliary.backbone.parameters()
     )
+
+    wrapper = torch.nn.Module()
+    wrapper.add_module("detector", auxiliary)
+    contract = _gradient_contract(wrapper, weights=weights)
+    assert contract["passed"]
+    assert "detector.proposal_memory" in contract
+    assert "detector.reliability_head" not in contract
+    assert "detector.row_visibility_head" not in contract
