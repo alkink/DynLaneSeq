@@ -20,9 +20,13 @@ from dynlaneseq_eg.evaluation.culane_metric import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Paired per-image official-raster audit for a V8 full-validation "
-            "candidate and its frozen V7 source."
+            "Paired image- and clip-level official-raster audit for a "
+            "full-validation candidate and its source."
         )
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default="paired full-validation official-raster effect audit",
     )
     parser.add_argument("--source-pred-dir", required=True)
     parser.add_argument("--candidate-pred-dir", required=True)
@@ -161,6 +165,61 @@ def _paired_bootstrap(
     }
 
 
+def _paired_cluster_bootstrap(
+    source: np.ndarray,
+    candidate: np.ndarray,
+    indices: np.ndarray,
+    cluster_labels: np.ndarray,
+    *,
+    samples: int,
+    seed: int,
+) -> dict[str, float | int]:
+    """Resample complete clips so correlated frames move together."""
+
+    labels = cluster_labels[indices]
+    unique_labels, inverse = np.unique(labels, return_inverse=True)
+    cluster_count = int(unique_labels.size)
+    source_by_cluster = np.zeros((cluster_count, 3), dtype=np.int64)
+    candidate_by_cluster = np.zeros((cluster_count, 3), dtype=np.int64)
+    np.add.at(source_by_cluster, inverse, source[indices])
+    np.add.at(candidate_by_cluster, inverse, candidate[indices])
+
+    rng = np.random.default_rng(int(seed))
+    deltas: list[np.ndarray] = []
+    chunk_size = 256
+    cluster_indices = np.arange(cluster_count, dtype=np.int64)
+    for start in range(0, int(samples), chunk_size):
+        current = min(chunk_size, int(samples) - start)
+        draws = rng.choice(
+            cluster_indices,
+            size=(current, cluster_count),
+            replace=True,
+        )
+        source_sum = source_by_cluster[draws].sum(axis=1)
+        candidate_sum = candidate_by_cluster[draws].sum(axis=1)
+        deltas.append(
+            _f1(candidate_sum[:, 0], candidate_sum[:, 1], candidate_sum[:, 2])
+            - _f1(source_sum[:, 0], source_sum[:, 1], source_sum[:, 2])
+        )
+    values = (
+        np.concatenate(deltas)
+        if deltas
+        else np.zeros((0,), dtype=np.float64)
+    )
+    return {
+        "samples": int(samples),
+        "seed": int(seed),
+        "cluster_definition": "parent directory of validation image path",
+        "clusters": cluster_count,
+        "images": int(indices.size),
+        "mean_delta_f1": float(values.mean()),
+        "median_delta_f1": float(np.median(values)),
+        "ci_2p5": float(np.percentile(values, 2.5)),
+        "ci_97p5": float(np.percentile(values, 97.5)),
+        "probability_delta_positive": float((values > 0.0).mean()),
+    }
+
+
 def _reported_counts(path: str | None, threshold: float) -> list[int] | None:
     if not path:
         return None
@@ -173,6 +232,7 @@ def _group_summary(
     source: np.ndarray,
     candidate: np.ndarray,
     indices: np.ndarray,
+    cluster_labels: np.ndarray,
     *,
     bootstrap_samples: int,
     bootstrap_seed: int,
@@ -194,12 +254,23 @@ def _group_summary(
             samples=bootstrap_samples,
             seed=bootstrap_seed,
         ),
+        "paired_clip_bootstrap_f1_delta": _paired_cluster_bootstrap(
+            source,
+            candidate,
+            indices,
+            cluster_labels,
+            samples=bootstrap_samples,
+            seed=bootstrap_seed + 5000,
+        ),
     }
 
 
 def main() -> None:
     args = parse_args()
     rels = list_image_rel_paths(args.list_path)
+    cluster_labels = np.asarray(
+        [Path(rel).parent.as_posix() for rel in rels], dtype=object
+    )
     thresholds = tuple(float(value) for value in args.iou_thresholds)
     tasks: Iterable[tuple[Any, ...]] = zip(
         rels,
@@ -254,6 +325,7 @@ def main() -> None:
                 source,
                 candidate,
                 all_indices,
+                cluster_labels,
                 bootstrap_samples=args.bootstrap_samples,
                 bootstrap_seed=args.bootstrap_seed + int(round(threshold * 100)),
             ),
@@ -261,6 +333,7 @@ def main() -> None:
                 source,
                 candidate,
                 uniform_indices,
+                cluster_labels,
                 bootstrap_samples=args.bootstrap_samples,
                 bootstrap_seed=args.bootstrap_seed + 1000 + int(round(threshold * 100)),
             ),
@@ -268,6 +341,7 @@ def main() -> None:
                 source,
                 candidate,
                 complement_indices,
+                cluster_labels,
                 bootstrap_samples=args.bootstrap_samples,
                 bootstrap_seed=args.bootstrap_seed + 2000 + int(round(threshold * 100)),
             ),
@@ -286,11 +360,12 @@ def main() -> None:
         }
 
     payload = {
-        "experiment": "V8 full-validation paired per-image effect audit",
+        "experiment": args.experiment_name,
         "diagnostic_only": True,
         "test_set_used": False,
         "official_raster": True,
         "images": len(rels),
+        "clips": int(np.unique(cluster_labels).size),
         "uniform_images": int(uniform_indices.size),
         "complement_images": int(complement_indices.size),
         "source_pred_dir": args.source_pred_dir,

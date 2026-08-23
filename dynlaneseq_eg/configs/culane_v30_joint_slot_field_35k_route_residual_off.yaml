@@ -1,0 +1,9 @@
+_base_: culane_v30_joint_slot_field_30k_to35k.yaml
+
+# Training-free mechanism ablation.  The checkpoint still contains the
+# representation learned with the joint field loss, but the field's direct
+# residual contribution to four-slot routing is disabled at inference.
+model:
+  structured_query:
+    set_selection:
+      four_slot_joint_field_route_residual_scale: 0.0

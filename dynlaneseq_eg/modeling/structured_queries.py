@@ -3653,6 +3653,27 @@ class StructuredLaneQueryHead(nn.Module):
                         0.10,
                     )
                 ),
+                joint_slot_field_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_field_enabled", False
+                    )
+                ),
+                joint_slot_field_num_rows=self.num_rows,
+                joint_slot_field_hidden_dim=int(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_field_hidden_dim", 64
+                    )
+                ),
+                joint_slot_field_route_residual_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_field_route_residual_scale", 1.0
+                    )
+                ),
+                selection_row_token_gradient_scale=float(
+                    self.set_selection_cfg.get(
+                        "four_slot_selection_row_token_gradient_scale", 0.0
+                    )
+                ),
             )
         elif self.set_selection_enabled:
             self.set_selection_head = SetAwareLaneSelectionHead(

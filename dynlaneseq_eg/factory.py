@@ -231,6 +231,9 @@ def build_criterion(cfg: dict[str, Any]) -> torch.nn.Module:
         four_slot_geometry_match_all_slots=bool(
             loss.get("four_slot_geometry_match_all_slots", False)
         ),
+        w_four_slot_joint_field=float(
+            loss.get("w_four_slot_joint_field", 0.0)
+        ),
         w_four_slot_unified=float(
             loss.get("w_four_slot_unified", 0.0)
         ),

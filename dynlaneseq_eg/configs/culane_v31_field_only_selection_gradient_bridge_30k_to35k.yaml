@@ -1,0 +1,17 @@
+_base_: culane_v30_joint_slot_field_35k_route_residual_off.yaml
+
+# V31 changes no forward value.  It opens only the backward edge from the
+# mature four-slot selection objective into proposal row representations.
+# Coordinate/range/confidence/ownership inputs remain detached, and the V30
+# field-to-route residual remains disabled during both training and inference.
+model:
+  structured_query:
+    set_selection:
+      # At scale 1.0 the zero-step route gradient reaching the backbone was
+      # larger than the weighted field signal by more than 12x and risked
+      # dominating the mature objective under global clipping.  Scale 0.10
+      # norm-matches the new bridge to the proven field supervision without a
+      # validation sweep.
+      four_slot_selection_row_token_gradient_scale: 0.10
+
+output_dir: outputs/diagnostics/v31_selection_gradient_bridge_30k_to35k

@@ -11,9 +11,11 @@ import torch
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import (
+    _torch_load,
     load_checkpoint,
     load_compatible_model_weights,
     remap_optimizer_state_by_parameter,
+    restore_checkpoint_rng_state,
     save_checkpoint,
 )
 from dynlaneseq_eg.engine.frozen_training import freeze_except_parameter_prefixes
@@ -410,7 +412,11 @@ def main() -> None:
         print(f"initialized compatible weights from {args.init_from}: {stats}")
     if args.resume:
         if args.resume_remap_optimizer_groups:
-            payload = torch.load(args.resume, map_location="cpu")
+            # PyTorch 2.6 changed ``torch.load`` to ``weights_only=True`` by
+            # default.  Full training checkpoints intentionally contain RNG
+            # and optimizer metadata, so use the project's compatibility
+            # loader just like every other checkpoint path.
+            payload = _torch_load(args.resume)
             source_cfg = payload.get("cfg")
             if not isinstance(source_cfg, dict) or not source_cfg:
                 raise ValueError(
@@ -457,6 +463,14 @@ def main() -> None:
                 optimizer,
                 start_iter,
             )
+            # Optimizer-group remapping is still a true resume.  Restore the
+            # checkpoint RNG *after* constructing the larger treatment model
+            # and its new optimizer groups so added-module initialization
+            # cannot shift dropout or any other model-side stochastic stream.
+            # Resume-safe data augmentation is independently addressed by
+            # global iteration, but exact paired experiments require both
+            # sources of randomness to be aligned.
+            rng_state_restored = restore_checkpoint_rng_state(payload)
             del source_optimizer
             del payload
             print(
@@ -467,6 +481,9 @@ def main() -> None:
                     ],
                     "scheduler_state_restored": False,
                     "scheduler_phase_alignment": scheduler_alignment,
+                    "rng_state_restored_after_optimizer_remap": (
+                        rng_state_restored
+                    ),
                 }
             )
         else:

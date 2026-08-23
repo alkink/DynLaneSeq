@@ -170,6 +170,16 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(cuda_state)
 
 
+def restore_checkpoint_rng_state(payload: dict[str, Any]) -> bool:
+    """Restore a full checkpoint RNG payload and report whether it existed."""
+
+    rng_state = payload.get("rng_state")
+    if not isinstance(rng_state, dict) or not rng_state:
+        return False
+    _restore_rng_state(rng_state)
+    return True
+
+
 def remap_optimizer_state_by_parameter(
     source_optimizer: torch.optim.Optimizer,
     target_optimizer: torch.optim.Optimizer,
