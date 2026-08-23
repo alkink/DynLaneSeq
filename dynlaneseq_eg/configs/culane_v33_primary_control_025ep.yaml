@@ -1,0 +1,20 @@
+_base_: culane_v25_g0_direct_four_lane_objects_1ep.yaml
+
+output_dir: outputs/diagnostics/v33_primary_control_025ep
+
+# V33 asks one narrow question: can one-to-many proposal supervision improve
+# the otherwise identical direct four-lane primary detector?  Stochastic model
+# dropout is disabled in all three arms so different private module counts
+# cannot desynchronise the shared primary path's random masks.
+v25:
+  dropout: 0.0
+  enable_competition: false
+  enable_slot_interaction: false
+  loss:
+    quality50: 0.0
+    quality75: 0.0
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+

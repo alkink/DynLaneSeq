@@ -9,6 +9,7 @@ from dynlaneseq_eg.modeling.v25_dual_energy_multi_path import (
     exact_small_path_set_decode,
 )
 from dynlaneseq_eg.modeling.v25_image_mediated_lane_objects import (
+    V25ImageMediatedLaneObjects,
     V25LossWeights,
     v25_lane_object_loss,
 )
@@ -176,3 +177,94 @@ def test_advanced_eval_writes_one_of_the_hard_hypotheses() -> None:
                 output["path_hypotheses"][0, slot, choice],
             )
 
+
+def test_aux_only_arm_preserves_primary_writer_at_initialization() -> None:
+    """An unfused auxiliary bank must be training-only at gate zero.
+
+    V33 Arm B is allowed to send proposal-coverage gradients into the shared
+    image encoder, but the newly initialised private proposal modules must not
+    change the primary prediction before any update.  This makes Arm A/B a
+    causal auxiliary-supervision comparison rather than an inference rewrite.
+    """
+
+    common = dict(
+        input_h=32,
+        input_w=64,
+        num_rows=6,
+        x_bins=16,
+        fpn_channels=32,
+        hidden_dim=32,
+        decoder_layers=1,
+        num_heads=4,
+        ff_dim=64,
+        dropout=0.0,
+        transition_radius_bins=2,
+        transition_penalty=0.1,
+        enable_competition=False,
+        enable_slot_interaction=False,
+        pretrained_backbone=False,
+        require_pretrained_backbone=False,
+    )
+    torch.manual_seed(101)
+    primary = V25ImageMediatedLaneObjects(**common).eval()
+    torch.manual_seed(202)
+    auxiliary = V25DualEnergyMultiPath(
+        **common,
+        proposal_count=8,
+        proposal_groups=4,
+        proposal_dropout=0.0,
+        enable_proposal_fusion=False,
+        num_path_hypotheses=1,
+        exact_set_selection=False,
+    ).eval()
+    advanced_state = auxiliary.state_dict()
+    for name, value in primary.state_dict().items():
+        assert name in advanced_state
+        advanced_state[name] = value.detach().clone()
+    auxiliary.load_state_dict(advanced_state, strict=True)
+
+    images = torch.randn(2, 3, 32, 64)
+    with torch.no_grad():
+        source = primary(images)
+        treatment = auxiliary(images)
+    for name in (
+        "unary_logits",
+        "path_logits",
+        "soft_x_rows",
+        "hard_path_x_rows",
+        "pred_x_rows",
+        "exist_logits",
+        "range_norm",
+    ):
+        assert torch.allclose(source[name], treatment[name], atol=1.0e-6), name
+
+    auxiliary.train()
+    auxiliary.zero_grad(set_to_none=True)
+    output = auxiliary(images[:1])
+    loss, diagnostics = v25_lane_object_loss(
+        output,
+        _target(6),
+        input_w=64,
+        weights=V25LossWeights(
+            minimum_valid_rows=2,
+            quality50=0.0,
+            quality75=0.0,
+            visibility=0.0,
+            proposal_coverage=1.0,
+            proposal_groups=4,
+        ),
+    )
+    assert diagnostics["loss_proposal_coverage"] > 0
+    loss.backward()
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum() > 0
+        for parameter in auxiliary.proposal_memory.parameters()
+    )
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum() > 0
+        for parameter in auxiliary.backbone.parameters()
+    )

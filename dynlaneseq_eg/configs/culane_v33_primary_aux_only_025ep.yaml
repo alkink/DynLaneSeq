@@ -1,0 +1,28 @@
+_base_: culane_v25_g0_direct_four_lane_objects_1ep.yaml
+
+output_dir: outputs/diagnostics/v33_primary_aux_only_025ep
+
+v25:
+  dropout: 0.0
+  enable_competition: false
+  enable_slot_interaction: false
+  enable_dual_energy_multi_path: true
+  # The auxiliary proposal branch is trained, but cannot affect the primary
+  # writer in this arm.  This isolates its training-time encoder supervision.
+  enable_proposal_fusion: false
+  proposal_count: 32
+  proposal_groups: 4
+  proposal_dropout: 0.0
+  num_path_hypotheses: 1
+  exact_set_selection: false
+  loss:
+    quality50: 0.0
+    quality75: 0.0
+    visibility: 0.0
+    proposal_coverage: 1.0
+    proposal_groups: 4
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+

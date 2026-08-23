@@ -1,0 +1,9 @@
+_base_: culane_v33_primary_aux_only_025ep.yaml
+
+output_dir: outputs/diagnostics/v33_primary_aux_memory_025ep
+
+v25:
+  # This is the only change from Arm B: the primary row energy can read the
+  # separately preserved 32-proposal spatial distribution.
+  enable_proposal_fusion: true
+

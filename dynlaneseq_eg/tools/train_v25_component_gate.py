@@ -69,6 +69,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument("--resume", default="")
     parser.add_argument("--resume-interval", type=int, default=250)
+    parser.add_argument(
+        "--reset-runtime-rng-after-init",
+        action="store_true",
+        help=(
+            "Reset Python/NumPy/PyTorch RNG after model/checkpoint/optimizer "
+            "construction. This makes paired arms with different private "
+            "module sets start the dataloader and stochastic runtime from the "
+            "same state."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -156,6 +166,15 @@ def main() -> None:
     if denoising_enabled and denoising_weight <= 0.0:
         raise ValueError("enabled denoising requires a positive loss_weight")
     optimizer = _optimizer(model, cfg)
+    runtime_seed = FIXED_SEED
+    if args.reset_runtime_rng_after_init:
+        # Model construction legitimately consumes a different number of RNG
+        # draws when a treatment owns private auxiliary modules.  Those draws
+        # must not change the paired augmentation/loader stream.  Dropout is
+        # disabled in the V33 causal configs, so resetting here gives all arms
+        # the same remaining stochastic contract without coupling parameters.
+        runtime_seed = FIXED_SEED * 1_000_003 + int(init_iteration)
+        seed_everything(runtime_seed)
     local_start = 0
     global_start = init_iteration
     resumed_from = ""
@@ -377,6 +396,10 @@ def main() -> None:
         "initial_checkpoint": str(init_checkpoint),
         "initial_checkpoint_sha256": sha256_file(init_checkpoint),
         "advanced_partial_init": bool(args.allow_advanced_init),
+        "runtime_rng_reset_after_init": bool(
+            args.reset_runtime_rng_after_init
+        ),
+        "runtime_seed": int(runtime_seed),
         "initial_iteration": init_iteration,
         "component_steps": component_steps,
         "final_iteration": final_iteration,
