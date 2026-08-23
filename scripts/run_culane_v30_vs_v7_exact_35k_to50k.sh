@@ -111,22 +111,40 @@ if not report["passed"]:
 PY
 
 if [[ ! -f "${V7_ENDPOINT}" ]]; then
-  "${PYTHON}" -u -m dynlaneseq_eg.tools.train \
-    --config "${V7_CONFIG}" \
-    --dataset-root "${DATA_ROOT}" \
-    --device "${DEVICE}" \
-    --output-dir "${V7_DIR}" \
-    --resume "${V7_SOURCE}" \
-    --resume-rng-from "${V30_SOURCE}" \
-    --max-iters "${TRAINING_STEPS}" \
-    --checkpoint-interval 5000 \
-    --seed "${SEED}" \
-    --batch-size "${BATCH_SIZE}" \
-    --grad-accum "${GRAD_ACCUM}" \
-    --num-workers "${NUM_WORKERS}" \
-    --seg-aux-amp-dtype bfloat16 \
-    --compile-model true \
-    --resume-safe-data true \
+  latest_checkpoint=""
+  latest_iteration="${SOURCE_ITERATION}"
+  for candidate in "${V7_DIR}"/iter_*.pt; do
+    [[ -f "${candidate}" ]] || continue
+    candidate_iteration="$(checkpoint_iteration "${candidate}")"
+    if (( candidate_iteration > latest_iteration && candidate_iteration < ENDPOINT_ITERATION )); then
+      latest_checkpoint="${candidate}"
+      latest_iteration="${candidate_iteration}"
+    fi
+  done
+
+  train_args=(
+    --config "${V7_CONFIG}"
+    --dataset-root "${DATA_ROOT}"
+    --device "${DEVICE}"
+    --output-dir "${V7_DIR}"
+    --max-iters "$((ENDPOINT_ITERATION - latest_iteration))"
+    --checkpoint-interval 5000
+    --seed "${SEED}"
+    --batch-size "${BATCH_SIZE}"
+    --grad-accum "${GRAD_ACCUM}"
+    --num-workers "${NUM_WORKERS}"
+    --seg-aux-amp-dtype bfloat16
+    --compile-model true
+    --resume-safe-data true
+  )
+  if [[ -n "${latest_checkpoint}" ]]; then
+    echo "Resuming exact V7 control: ${latest_iteration} -> ${ENDPOINT_ITERATION}"
+    train_args+=(--resume "${latest_checkpoint}")
+  else
+    echo "Starting exact V7 control: ${SOURCE_ITERATION} -> ${ENDPOINT_ITERATION}"
+    train_args+=(--resume "${V7_SOURCE}" --resume-rng-from "${V30_SOURCE}")
+  fi
+  "${PYTHON}" -u -m dynlaneseq_eg.tools.train "${train_args[@]}" \
     2>&1 | tee -a "${V7_DIR}/train.log"
 fi
 if (( $(checkpoint_iteration "${V7_ENDPOINT}") != ENDPOINT_ITERATION )); then
