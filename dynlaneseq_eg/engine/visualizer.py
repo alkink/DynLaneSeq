@@ -24,8 +24,13 @@ def save_prediction_visuals(
     flat = outputs.get("stage2") or outputs.get("final") or outputs
     for b in range(images.shape[0]):
         image = tensor_to_pil(images[b].cpu())
-        pred = {k: v[b : b + 1] for k, v in flat.items() if isinstance(v, torch.Tensor) and v.shape[0] == images.shape[0]}
+        pred = {
+            k: v[b : b + 1]
+            for k, v in flat.items()
+            if isinstance(v, torch.Tensor)
+            and v.ndim > 0
+            and v.shape[0] == images.shape[0]
+        }
         lanes = predictions_to_lanes(pred, score_thresh=score_thresh)[0]
         out = draw_lanes(image, lanes, width=3)
         out.save(out_dir / f"step_{step:07d}_sample_{b}_range_filtered.jpg")
-

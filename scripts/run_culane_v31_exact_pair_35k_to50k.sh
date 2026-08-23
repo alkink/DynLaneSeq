@@ -100,14 +100,31 @@ train_arm() {
   local endpoint="$5"
   local log="${output_dir}/train.log"
   if [[ ! -f "${endpoint}" ]]; then
+    local resume_checkpoint="${source}"
+    local resume_iteration="${SOURCE_ITERATION}"
+    local candidate_checkpoint
+    while IFS= read -r candidate_checkpoint; do
+      local candidate_iteration
+      candidate_iteration="$(checkpoint_iteration "${candidate_checkpoint}")"
+      if (( candidate_iteration > resume_iteration && candidate_iteration < ENDPOINT_ITERATION )); then
+        resume_checkpoint="${candidate_checkpoint}"
+        resume_iteration="${candidate_iteration}"
+      fi
+    done < <(find "${output_dir}" -maxdepth 1 -type f -name 'iter_*.pt' | sort)
+    local remaining_steps=$(( ENDPOINT_ITERATION - resume_iteration ))
+    local rng_args=()
+    if (( resume_iteration == SOURCE_ITERATION )); then
+      rng_args=(--resume-rng-from "${CONTROL_SOURCE}")
+    fi
+    echo "${label}: resuming global ${resume_iteration} -> ${ENDPOINT_ITERATION} from ${resume_checkpoint}" | tee -a "${log}"
     "${PYTHON}" -u -m dynlaneseq_eg.tools.train \
       --config "${config}" \
       --dataset-root "${DATA_ROOT}" \
       --device "${DEVICE}" \
       --output-dir "${output_dir}" \
-      --resume "${source}" \
-      --resume-rng-from "${CONTROL_SOURCE}" \
-      --max-iters "${TRAINING_STEPS}" \
+      --resume "${resume_checkpoint}" \
+      "${rng_args[@]}" \
+      --max-iters "${remaining_steps}" \
       --checkpoint-interval 5000 \
       --seed "${SEED}" \
       --batch-size "${BATCH_SIZE}" \
