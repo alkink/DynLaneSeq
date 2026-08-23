@@ -46,6 +46,19 @@ def _oracle(report: dict[str, Any], threshold: str) -> dict[str, Any]:
     }
 
 
+def _paired_clip_bootstrap(report: dict[str, Any], threshold: str) -> dict[str, Any]:
+    threshold_report = report["thresholds"][threshold]
+    # The paired official-raster audit groups the population summaries under
+    # ``full_validation`` and names the statistic explicitly as an F1 delta.
+    # Keep compatibility with the early flat draft so old partial artifacts do
+    # not make the autopsy summarizer brittle.
+    if "paired_clip_bootstrap" in threshold_report:
+        return threshold_report["paired_clip_bootstrap"]
+    return threshold_report["full_validation"][
+        "paired_clip_bootstrap_f1_delta"
+    ]
+
+
 def _gradient_focus(report: dict[str, Any]) -> dict[str, Any]:
     pairs = report["summary"]["pairs"]
     output: dict[str, Any] = {}
@@ -87,7 +100,7 @@ def main() -> None:
         for threshold in ("0.5", "0.75"):
             source = _metric(v7_metrics, threshold)
             candidate = _metric(v30_metrics, threshold)
-            bootstrap = paired["thresholds"][threshold]["paired_clip_bootstrap"]
+            bootstrap = _paired_clip_bootstrap(paired, threshold)
             source_oracle = _oracle(v7_coverage, f"{float(threshold):.2f}")
             candidate_oracle = _oracle(v30_coverage, f"{float(threshold):.2f}")
             thresholds[threshold] = {
