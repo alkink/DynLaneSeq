@@ -13,6 +13,8 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     cardinality_oracle_assignment,
     evaluator_hungarian_assignment,
 )
+from dynlaneseq_eg.evaluation.culane_metric import load_culane_img_data
+from dynlaneseq_eg.modeling.common import fixed_y_rows
 
 
 ROW_BANDS = (
@@ -71,12 +73,62 @@ def _stage(record: dict[str, Any]) -> dict[str, torch.Tensor]:
     return stage
 
 
-def _valid_target_rows(record: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    target = record["target"]
-    x_rows = target["x_rows"].float()
-    mask = target["valid_mask"].bool() & torch.isfinite(x_rows)
-    valid_gt = mask.sum(dim=-1) >= 5
-    return x_rows[valid_gt], mask[valid_gt]
+def _official_target_rows(record: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample every official GT polyline on the model's fixed row grid.
+
+    The training target builder intentionally drops lanes with fewer than five
+    sampled rows.  The official CULane evaluator does not: it rasterizes every
+    polyline in the ``.lines.txt`` annotation.  Consequently, using cached
+    training targets here can both change the GT count and shift GT indices.
+    Rebuilding the rows from the official annotation preserves the exact GT
+    ordering used by ``official_iou`` while still giving us row-band errors in
+    input-image coordinates.
+    """
+
+    meta = record["meta"]
+    anno_path = meta.get("anno_path")
+    lanes = load_culane_img_data(anno_path) if anno_path else []
+    rows = int(record["target"]["x_rows"].shape[-1])
+    input_h = int(meta["input_h"])
+    input_w = int(meta["input_w"])
+    y_rows = fixed_y_rows(rows, input_h, dtype=torch.float32)
+    x_rows = torch.full((len(lanes), rows), -1.0, dtype=torch.float32)
+    valid = torch.zeros((len(lanes), rows), dtype=torch.bool)
+
+    scale_x = float(meta.get("scale_x", 1.0))
+    scale_y = float(meta.get("scale_y", 1.0))
+    crop_x = float(meta.get("crop_x", 0.0))
+    crop_y = float(meta.get("crop_y", 0.0))
+    eps = 1e-6
+    for lane_index, lane in enumerate(lanes):
+        grouped: dict[float, list[float]] = {}
+        for x_original, y_original in lane:
+            x = (float(x_original) - crop_x) * scale_x
+            y = (float(y_original) - crop_y) * scale_y
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            if x < 0.0 or x >= input_w or y < 0.0 or y >= input_h:
+                continue
+            grouped.setdefault(round(y, 4), []).append(x)
+        points = [
+            (float(np.mean(xs)), float(y)) for y, xs in grouped.items()
+        ]
+        points.sort(key=lambda point: point[1])
+        for row_index, y_row_tensor in enumerate(y_rows):
+            y_row = float(y_row_tensor)
+            intersections: list[float] = []
+            for (x_a, y_a), (x_b, y_b) in zip(points[:-1], points[1:]):
+                if abs(y_b - y_a) < eps:
+                    continue
+                if min(y_a, y_b) - eps <= y_row <= max(y_a, y_b) + eps:
+                    fraction = (y_row - y_a) / (y_b - y_a)
+                    x = x_a + fraction * (x_b - x_a)
+                    if 0.0 <= x < input_w:
+                        intersections.append(float(x))
+            if intersections:
+                x_rows[lane_index, row_index] = float(np.mean(intersections))
+                valid[lane_index, row_index] = True
+    return x_rows, valid
 
 
 def _row_masks(
@@ -291,15 +343,21 @@ def main() -> None:
             cohorts[f"{population}_cross_down_{tag}"] = _new_cohort()
             cohorts[f"{population}_cross_up_{tag}"] = _new_cohort()
 
+    official_gt_with_fewer_than_five_rows = 0
     for image_id in sorted(source_by_image):
         source_record = source_by_image[image_id]
         candidate_record = candidate_by_image[image_id]
-        source_target_x, source_target_mask = _valid_target_rows(source_record)
-        candidate_target_x, candidate_target_mask = _valid_target_rows(candidate_record)
+        source_target_x, source_target_mask = _official_target_rows(source_record)
+        candidate_target_x, candidate_target_mask = _official_target_rows(
+            candidate_record
+        )
         if not torch.equal(source_target_mask, candidate_target_mask) or not torch.allclose(
             source_target_x, candidate_target_x
         ):
             raise ValueError(f"paired target mismatch for {image_id}")
+        official_gt_with_fewer_than_five_rows += int(
+            (source_target_mask.sum(dim=-1) < 5).sum()
+        )
         source_stage = _stage(source_record)
         candidate_stage = _stage(candidate_record)
         if int(source_stage["official_iou"].shape[0]) != int(source_target_x.shape[0]):
@@ -385,6 +443,9 @@ def main() -> None:
         "source_cache": args.source_cache,
         "candidate_cache": args.candidate_cache,
         "images": len(source_by_image),
+        "official_gt_with_fewer_than_five_sampled_rows": (
+            official_gt_with_fewer_than_five_rows
+        ),
         "row_bands": [
             {"name": name, "start_inclusive": start, "end_exclusive": end}
             for name, start, end in ROW_BANDS
