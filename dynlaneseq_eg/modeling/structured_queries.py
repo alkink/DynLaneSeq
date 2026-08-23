@@ -3658,6 +3658,11 @@ class StructuredLaneQueryHead(nn.Module):
                         "four_slot_joint_field_enabled", False
                     )
                 ),
+                joint_slot_field_forward_enabled=bool(
+                    self.set_selection_cfg.get(
+                        "four_slot_joint_field_forward_enabled", True
+                    )
+                ),
                 joint_slot_field_num_rows=self.num_rows,
                 joint_slot_field_hidden_dim=int(
                     self.set_selection_cfg.get(

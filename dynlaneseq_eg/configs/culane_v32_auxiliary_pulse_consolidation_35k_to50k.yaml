@@ -1,0 +1,27 @@
+_base_: culane_v31_field_only_selection_gradient_bridge_30k_to35k.yaml
+
+# V32 tests whether the representation changes learned during the first 5K
+# auxiliary pulse can be consolidated by the mature V7 objective.  The field
+# module remains instantiated so V30/V31 optimizer states resume exactly, but
+# neither auxiliary objective has a forward or backward effect after 35K.
+model:
+  structured_query:
+    set_selection:
+      four_slot_joint_field_enabled: true
+      four_slot_joint_field_forward_enabled: false
+      four_slot_joint_field_route_residual_scale: 0.0
+      four_slot_selection_row_token_gradient_scale: 0.0
+
+loss:
+  w_four_slot_joint_field: 0.0
+
+output_dir: outputs/diagnostics/v32_auxiliary_pulse_exact_35k_to50k/train
+
+training:
+  # Resume begins at global iteration 35K.  The sole decision endpoint is 50K.
+  max_iters: 15000
+  checkpoint_interval: 5000
+  save_last_alias: false
+
+dataloader:
+  resume_safe: true

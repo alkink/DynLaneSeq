@@ -5041,6 +5041,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         visual_precision_geometry_invisible_row_logit_bias: float = -2.0,
         visual_precision_geometry_gradient_only_candidate_scale: float = 0.10,
         joint_slot_field_enabled: bool = False,
+        joint_slot_field_forward_enabled: bool = True,
         joint_slot_field_num_rows: int = 160,
         joint_slot_field_hidden_dim: int = 64,
         joint_slot_field_route_residual_scale: float = 1.0,
@@ -5106,6 +5107,13 @@ class FourSlotLaneSelectionHead(nn.Module):
             visual_precision_geometry_enabled
         )
         self.joint_slot_field_enabled = bool(joint_slot_field_enabled)
+        # Pulse/consolidation runs must retain the V30 module and optimizer
+        # topology so a 35K checkpoint is a true resume.  They can still skip
+        # the expensive field projection after its supervision and route
+        # residual have both been disabled.
+        self.joint_slot_field_forward_enabled = bool(
+            self.joint_slot_field_enabled and joint_slot_field_forward_enabled
+        )
         if sum(
             (
                 self.refinement_enabled,
@@ -5356,7 +5364,7 @@ class FourSlotLaneSelectionHead(nn.Module):
             or self.iterative_slot_geometry_enabled
             or self.joint_exact_set_energy_enabled
             or self.counterfactual_fidelity_enabled
-            or self.joint_slot_field_enabled
+            or self.joint_slot_field_forward_enabled
         )
         self.requires_multi_scale_features = (
             self.iterative_slot_geometry_enabled
@@ -5368,7 +5376,7 @@ class FourSlotLaneSelectionHead(nn.Module):
         # deliberately reachable from the exact final-set objective.
         self.requires_live_row_value_features = (
             self.joint_exact_set_energy_enabled
-            or self.joint_slot_field_enabled
+            or self.joint_slot_field_forward_enabled
         )
 
         # Exact successful probe descriptor:
@@ -6326,7 +6334,10 @@ class FourSlotLaneSelectionHead(nn.Module):
         ) / math.sqrt(float(self.hidden_dim))
         joint_field_result: dict[str, torch.Tensor] | None = None
         joint_field_route_residual: torch.Tensor | None = None
-        if self.joint_slot_field is not None:
+        if (
+            self.joint_slot_field is not None
+            and self.joint_slot_field_forward_enabled
+        ):
             if not isinstance(row_value_features, torch.Tensor):
                 raise ValueError("V30 joint field requires live P2 row features")
             joint_field_result = self.joint_slot_field(
