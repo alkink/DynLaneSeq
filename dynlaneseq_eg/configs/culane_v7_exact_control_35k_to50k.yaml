@@ -1,0 +1,12 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v30_field_only_vs_v7_exact_35k_to50k/train/v7_control
+
+training:
+  # Resume begins at global iteration 35K. The locked decision endpoint is 50K.
+  max_iters: 15000
+  checkpoint_interval: 5000
+  save_last_alias: false
+
+dataloader:
+  resume_safe: true
