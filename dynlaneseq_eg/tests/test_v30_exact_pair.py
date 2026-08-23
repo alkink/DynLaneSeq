@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from dynlaneseq_eg.config import load_config
 from dynlaneseq_eg.engine.checkpoint import restore_checkpoint_rng_state
@@ -11,6 +12,7 @@ from dynlaneseq_eg.tools.audit_v30_exact_pair_contract import (
     ALLOWED_CONFIG_DIFFERENCES,
     _config_differences,
 )
+from dynlaneseq_eg.tools.train import restore_rng_from_reference_checkpoint
 
 
 CONTROL_CONFIG = (
@@ -75,3 +77,40 @@ def test_field_forward_does_not_advance_model_rng() -> None:
     rng_after = torch.random.get_rng_state()
     torch.testing.assert_close(rng_after, rng_before, rtol=0.0, atol=0.0)
     assert torch.count_nonzero(output["route_residual"]).item() == 0
+
+
+def test_reference_checkpoint_restores_rng_at_matching_iteration(tmp_path) -> None:
+    torch.manual_seed(3407)
+    checkpoint_state = torch.random.get_rng_state().clone()
+    expected = torch.rand(8)
+    checkpoint = tmp_path / "rng_reference.pt"
+    torch.save(
+        {
+            "iteration": 35000,
+            "rng_state": {"torch_cpu": checkpoint_state},
+        },
+        checkpoint,
+    )
+    torch.manual_seed(9999)
+    report = restore_rng_from_reference_checkpoint(
+        checkpoint,
+        expected_iteration=35000,
+    )
+    assert report["restored"] is True
+    torch.testing.assert_close(torch.rand(8), expected, rtol=0.0, atol=0.0)
+
+
+def test_reference_checkpoint_rejects_wrong_iteration(tmp_path) -> None:
+    checkpoint = tmp_path / "rng_reference.pt"
+    torch.save(
+        {
+            "iteration": 35000,
+            "rng_state": {"torch_cpu": torch.random.get_rng_state()},
+        },
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="iteration mismatch"):
+        restore_rng_from_reference_checkpoint(
+            checkpoint,
+            expected_iteration=40000,
+        )

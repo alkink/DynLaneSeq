@@ -1,0 +1,12 @@
+_base_: culane_v31_field_only_selection_gradient_bridge_30k_to35k.yaml
+
+output_dir: outputs/diagnostics/v31_selection_bridge_exact_pair_35k_to50k/train/selection_bridge
+
+training:
+  # Resume begins at global iteration 35K. The locked decision endpoint is 50K.
+  max_iters: 15000
+  checkpoint_interval: 5000
+  save_last_alias: false
+
+dataloader:
+  resume_safe: true

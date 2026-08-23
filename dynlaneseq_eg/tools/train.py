@@ -112,6 +112,40 @@ def apply_optimizer_group_lr_overrides(
     return changes
 
 
+def restore_rng_from_reference_checkpoint(
+    path: str | Path,
+    *,
+    expected_iteration: int,
+) -> dict[str, object]:
+    """Restore only RNG state from a paired-run reference checkpoint.
+
+    Exact-paired continuations may start from different model/optimizer states
+    whose saved Torch RNG streams have drifted.  The data sampler is already
+    addressed by global iteration; this helper aligns Python, NumPy, CPU Torch,
+    and CUDA Torch randomness without replacing either arm's learned state.
+    """
+
+    payload = _torch_load(path)
+    reference_iteration = int(payload.get("iteration", -1))
+    if reference_iteration != int(expected_iteration):
+        raise ValueError(
+            "paired RNG reference iteration mismatch: "
+            f"checkpoint={reference_iteration}, expected={expected_iteration}"
+        )
+    rng_state = payload.get("rng_state")
+    rng_keys = sorted(rng_state) if isinstance(rng_state, dict) else []
+    restored = restore_checkpoint_rng_state(payload)
+    del payload
+    if not restored:
+        raise ValueError("paired RNG reference checkpoint has no RNG state")
+    return {
+        "path": str(path),
+        "iteration": reference_iteration,
+        "rng_keys": rng_keys,
+        "restored": True,
+    }
+
+
 def align_scheduler_to_iteration(
     scheduler,
     optimizer: torch.optim.Optimizer,
@@ -269,6 +303,15 @@ def main() -> None:
             "config. The checkpoint must contain its original expanded config."
         ),
     )
+    parser.add_argument(
+        "--resume-rng-from",
+        default="",
+        help=(
+            "After restoring --resume model/optimizer/scheduler state, restore "
+            "only the RNG state from this same-iteration checkpoint. This is "
+            "used to align stochastic streams in exact-paired continuations."
+        ),
+    )
     args = parser.parse_args()
     resume_group_lr_overrides = parse_optimizer_group_lr_overrides(
         args.resume_group_lr
@@ -277,6 +320,8 @@ def main() -> None:
         raise ValueError("--resume-group-lr requires --resume")
     if args.resume_remap_optimizer_groups and not args.resume:
         raise ValueError("--resume-remap-optimizer-groups requires --resume")
+    if args.resume_rng_from and not args.resume:
+        raise ValueError("--resume-rng-from requires --resume")
     if args.resume_remap_optimizer_groups and resume_group_lr_overrides:
         raise ValueError(
             "--resume-remap-optimizer-groups cannot be combined with "
@@ -507,6 +552,12 @@ def main() -> None:
                 resume_group_lr_overrides,
             )
             print({"resume_optimizer_lr_overrides": changes})
+        if args.resume_rng_from:
+            rng_override = restore_rng_from_reference_checkpoint(
+                args.resume_rng_from,
+                expected_iteration=start_iter,
+            )
+            print({"resume_rng_override": rng_override})
     if loader is None:
         loader = build_dataloader(
             cfg,
