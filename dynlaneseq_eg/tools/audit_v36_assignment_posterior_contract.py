@@ -184,7 +184,17 @@ def _slot_geometry_assignment(
     line_width: float,
     min_valid_rows: int,
 ) -> dict[int, int]:
-    routes = stage["selection_slot_indices"].long()
+    # Factorized V7 keeps a real proposal route for every slot even when the
+    # deployed active decision emits dustbin.  The geometry loss consumes
+    # that real route; ``selection_slot_indices`` may contain the synthetic
+    # dustbin id for inactive slots, whereas raw indices are always real.
+    routes_value = stage.get("selection_slot_raw_indices")
+    if not isinstance(routes_value, torch.Tensor):
+        routes_value = stage["selection_slot_indices"]
+    routes = routes_value.long()
+    candidate_count = int(stage["pred_x_rows"].shape[0])
+    if bool(((routes < 0) | (routes >= candidate_count)).any()):
+        raise ValueError("slot geometry replay requires real proposal indices")
     pred_x = stage["pred_x_rows"].float().index_select(0, routes)
     pred_range = stage["range_norm"].float().index_select(0, routes)
     quality, slot_valid, gt_valid = _candidate_quality(
