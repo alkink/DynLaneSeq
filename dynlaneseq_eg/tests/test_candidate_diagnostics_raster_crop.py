@@ -7,6 +7,7 @@ from dynlaneseq_eg.evaluation.candidate_diagnostics import (
     _raster_lane_crop,
     _raster_lane_mask,
 )
+from dynlaneseq_eg.evaluation.culane_metric import draw_lane, interp
 
 
 def _restore_crop(
@@ -61,3 +62,19 @@ def test_tight_lane_raster_intersection_matches_full_canvas() -> None:
                 cropped[first_index], cropped[second_index]
             )
             assert actual == expected
+
+
+def test_diagnostic_raster_uses_official_integer_truncation() -> None:
+    image_h, image_w, width = 590, 1640, 30
+    lane = [
+        (108.9, 589.0),
+        (244.7, 387.4),
+        (391.8, 101.3),
+    ]
+    official = draw_lane(
+        interp(lane, n=5),
+        img_shape=(image_h, image_w),
+        width=width,
+    ).astype(np.uint8)
+    diagnostic = _raster_lane_mask(lane, image_h, image_w, width)
+    np.testing.assert_array_equal(diagnostic, official)

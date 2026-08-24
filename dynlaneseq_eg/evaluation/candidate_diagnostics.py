@@ -756,7 +756,10 @@ def _raster_lane_mask(
     mask = np.zeros((int(image_h), int(image_w)), dtype=np.uint8)
     points = interp(lane, n=5)
     if len(points) >= 2:
-        points = np.rint(points).astype(np.int32)
+        # Match ``culane_metric.draw_lane`` exactly: NumPy's integer cast
+        # truncates toward zero. Rounding here moves sub-pixel coordinates by
+        # one pixel and creates measurable TP drift at the strict 0.75 gate.
+        points = points.astype(np.int32)
         for p1, p2 in zip(points[:-1], points[1:]):
             cv2.line(mask, tuple(p1), tuple(p2), color=1, thickness=int(width))
     return mask
@@ -774,8 +777,8 @@ def _raster_lane_crop(
     intersections.  Allocating a full ``image_h x image_w`` canvas for every
     one of the 4x32 counterfactual lanes is needlessly expensive.  OpenCV's
     integer LINE_8 rasterizer is translation invariant, so drawing the same
-    rounded polyline inside a crop that contains the complete stroke produces
-    exactly the non-zero pixels of the full canvas.
+    integer-cast polyline inside a crop that contains the complete stroke
+    produces exactly the non-zero pixels of the full canvas.
 
     ``width + 2`` is deliberately more conservative than the half-thickness
     actually required by ``cv2.line``.  It also keeps clipping identical for
@@ -785,7 +788,7 @@ def _raster_lane_crop(
     points = interp(lane, n=5)
     if len(points) < 2:
         return np.zeros((0, 0), dtype=np.uint8), 0, 0
-    points = np.rint(points).astype(np.int32)
+    points = points.astype(np.int32)
     margin = int(width) + 2
     left = max(int(points[:, 0].min()) - margin, 0)
     right = min(int(points[:, 0].max()) + margin + 1, int(image_w))
@@ -885,6 +888,7 @@ def ensure_official_iou_cache(
         "line_width": float(line_width),
         "min_valid_rows": int(min_valid_rows),
         "row_visibility_thresh": float(row_visibility_thresh),
+        "integer_conversion": "truncate_like_culane_metric_v2",
     }
     if cache.get("metadata", {}).get("official_iou_cache") == signature and all(
         "official_iou" in stage

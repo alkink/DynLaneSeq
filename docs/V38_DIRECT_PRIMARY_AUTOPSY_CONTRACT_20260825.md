@@ -18,6 +18,8 @@ training a new model:
 - 30-pixel official raster width;
 - FP32 inference with the same `channels_last` memory format as the official
   V38 evaluator;
+- the same truncate-to-`int32` coordinate conversion as the official CULane
+  rasterizer;
 - no checkpoint or threshold selection;
 - no test split.
 
