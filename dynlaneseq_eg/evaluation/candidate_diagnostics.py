@@ -97,6 +97,7 @@ def _cache_path(
     eval_batch_size: int | None,
     sample_strategy: str,
     amp_dtype: str,
+    channels_last: bool,
 ) -> Path:
     checkpoint = Path(checkpoint_path)
     stat = checkpoint.stat()
@@ -117,6 +118,8 @@ def _cache_path(
     # from silently reusing numerically different cached predictions.
     if str(amp_dtype) != "none":
         fields.append(f"amp_dtype={amp_dtype}")
+    if bool(channels_last):
+        fields.append("channels_last=true")
     payload = "|".join(fields)
     key = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return Path(cache_dir) / f"{checkpoint.stem}_{key}.pt"
@@ -226,6 +229,7 @@ def load_or_collect_cache(
     num_workers: int | None = None,
     sample_strategy: str = "sequential",
     amp_dtype: str = "none",
+    channels_last: bool = False,
     desc: str = "candidate cache",
 ) -> dict[str, Any]:
     cfg = override_eval_list(load_config(config_path), split, list_path)
@@ -270,6 +274,7 @@ def load_or_collect_cache(
         effective_eval_batch_size,
         sample_strategy,
         canonical_amp,
+        bool(channels_last),
     )
     if (reuse_cache or require_cache) and cache_path.exists():
         try:
@@ -288,6 +293,8 @@ def load_or_collect_cache(
 
     torch_device = torch.device(device)
     model = build_model(cfg).to(torch_device)
+    if bool(channels_last) and torch_device.type == "cuda":
+        model.to(memory_format=torch.channels_last)
     load_checkpoint(checkpoint_path, model, strict=False)
     supports_inference_only = bool(getattr(model, "supports_inference_only", False))
     if supports_inference_only and hasattr(model, "prepare_for_inference"):
@@ -309,6 +316,8 @@ def load_or_collect_cache(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         images = images.to(torch_device, non_blocking=True)
+        if bool(channels_last) and torch_device.type == "cuda":
+            images = images.contiguous(memory_format=torch.channels_last)
         active_amp_dtype = amp_types[normalized_amp]
         amp_enabled = active_amp_dtype is not None and torch_device.type == "cuda"
         with torch.autocast(
@@ -356,6 +365,7 @@ def load_or_collect_cache(
             "num_workers": int(dataloader_cfg.get("num_workers", 0)),
             "sample_strategy": str(sample_strategy),
             "amp_dtype": canonical_amp,
+            "channels_last": bool(channels_last),
             "sampled_dataset_indices": sampled_indices,
             "input_w": int(model_cfg.get("input_w", 800)),
             "input_h": int(model_cfg.get("input_h", 288)),

@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line-width", type=float, default=30.0)
     parser.add_argument("--min-valid-rows", type=int, default=5)
     parser.add_argument("--reuse-cache", action="store_true")
+    parser.add_argument("--channels-last", action="store_true")
     return parser.parse_args()
 
 
@@ -315,6 +316,7 @@ def main() -> None:
         num_workers=int(args.num_workers),
         sample_strategy="sequential",
         amp_dtype="none",
+        channels_last=bool(args.channels_last),
         desc="V38 full-val autopsy cache",
     )
     cache = ensure_official_iou_cache(
@@ -505,7 +507,17 @@ def main() -> None:
         for threshold in THRESHOLDS
     )
     if not deployed_exact:
-        raise RuntimeError("V38 cached deployed counts do not match official report")
+        mismatch = {
+            str(threshold): {
+                "cache": policies["deployed"][str(threshold)],
+                "official_report": report_metrics[str(threshold)],
+            }
+            for threshold in THRESHOLDS
+        }
+        raise RuntimeError(
+            "V38 cached deployed counts do not match official report: "
+            + json.dumps(mismatch, sort_keys=True)
+        )
 
     v7 = v38_report["v7_reference"]["results"]
     bottleneck = {
@@ -566,6 +578,7 @@ def main() -> None:
             "score_threshold_fixed": float(args.score_threshold),
             "line_width": float(args.line_width),
             "full_validation": len(records) == expected_images,
+            "channels_last": bool(args.channels_last),
         },
         "policies": policies,
         "v7_reference": v7,

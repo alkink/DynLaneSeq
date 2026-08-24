@@ -16,6 +16,8 @@ training a new model:
 - score threshold `0.50`;
 - top four, no NMS;
 - 30-pixel official raster width;
+- FP32 inference with the same `channels_last` memory format as the official
+  V38 evaluator;
 - no checkpoint or threshold selection;
 - no test split.
 

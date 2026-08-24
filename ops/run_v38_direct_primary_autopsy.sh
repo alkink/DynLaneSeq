@@ -19,4 +19,5 @@ cd "${ROOT}"
   --eval-batch-size 16 \
   --num-workers 6 \
   --official-workers 12 \
+  --channels-last \
   "$@"
