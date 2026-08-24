@@ -549,11 +549,22 @@ def _process_sample(
     context_scores: dict[str, list[dict[str, Any]]] = {}
     for name, image_id in contexts.items():
         context_record = records[image_id]
+        context_banks = _stage_banks(
+            context_record["stages"]["main"], input_h, input_w
+        )
+        # Diagnostic-only sanity check: adjacent-frame GT never enters the
+        # primary score or gate, but tells us whether flow maps the oracle-good
+        # target proposal to the annotated physical lane.  This separates a
+        # broken flow proxy from temporally persistent wrong V7 belief.
+        context_banks["gt"] = (
+            context_record["target"]["x_rows"].float().numpy(),
+            context_record["target"]["valid_mask"].bool().numpy(),
+        )
         context_scores[name] = _score_context(
             cases,
             target_image,
             _read_flow_image(context_record, flow_scale),
-            _stage_banks(context_record["stages"]["main"], input_h, input_w),
+            context_banks,
             y_rows,
             input_w=input_w,
             input_h=input_h,
@@ -567,7 +578,7 @@ def _process_sample(
         for context_name, scored in context_scores.items():
             for key, value in scored[index].items():
                 row[f"{context_name}_{key}"] = value
-        for bank in ("selected", "bank"):
+        for bank in ("selected", "bank", "gt"):
             for role in ("good", "wrong"):
                 row[f"bidirectional_{bank}_{role}"] = _mean_finite(
                     (
@@ -673,7 +684,9 @@ def summarize_pairs(
         "following_selected": "following_selected",
         "bidirectional_selected_primary": "bidirectional_selected",
         "bidirectional_bank": "bidirectional_bank",
+        "bidirectional_gt_diagnostic": "bidirectional_gt",
         "identity_bidirectional_selected_control": "identity_bidirectional_selected",
+        "identity_bidirectional_gt_diagnostic": "identity_bidirectional_gt",
         "wrong_clip_selected_control": "wrong_context_selected",
         "wrong_clip_bank_control": "wrong_context_bank",
     }
@@ -757,14 +770,15 @@ def _markdown(payload: dict[str, Any]) -> str:
         f"- Evaluated route-recoverable pairs: `{len(payload['pairs'])}`",
         "- Primary score: bidirectional optical-flow alignment to adjacent-frame deployed V7 lanes.",
         "",
-        "| Fold | IoU | Pairs | Pair accuracy | AUC | Wrong-clip AUC | AUC advantage | Bank AUC |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Fold | IoU | Pairs | Pair accuracy | AUC | Wrong-clip AUC | AUC advantage | Bank AUC | Adjacent-GT AUC |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in payload["summary"]["by_fold_threshold"].values():
         metrics = item["metrics"]
         primary = metrics["bidirectional_selected_primary"]
         wrong = metrics["wrong_clip_selected_control"]
         bank = metrics["bidirectional_bank"]
+        gt = metrics["bidirectional_gt_diagnostic"]
 
         def show(value: Any) -> str:
             return "n/a" if value is None else f"{float(value):.4f}"
@@ -774,7 +788,8 @@ def _markdown(payload: dict[str, Any]) -> str:
             f"{item['fold']} | {item['threshold']:.2f} | {primary['pairs']} | "
             f"{show(primary['pair_accuracy'])} | {show(primary['auc'])} | "
             f"{show(wrong['auc'])} | "
-            f"{show(metrics['primary_minus_wrong_clip_auc'])} | {show(bank['auc'])} |"
+            f"{show(metrics['primary_minus_wrong_clip_auc'])} | {show(bank['auc'])} | "
+            f"{show(gt['auc'])} |"
         )
     lines.extend(
         [
@@ -848,21 +863,47 @@ def main() -> None:
         for record in cache["records"]
         if _record_key(record, dataset_root) in target_ids
     ]
-    target_iou_cache = {
-        **cache,
-        "metadata": {
-            **cache["metadata"],
-            "cache_path": str(output_dir / "target_main_official_iou.pt"),
-            "num_records": len(target_records),
-        },
-        "records": target_records,
-    }
-    target_iou_cache["metadata"].pop("official_iou_cache", None)
-    ensure_official_iou_cache(
-        target_iou_cache,
-        line_width=args.line_width,
-        workers=args.metric_workers,
-    )
+    target_iou_path = output_dir / "target_main_official_iou.pt"
+    if bool(args.reuse_cache) and target_iou_path.exists():
+        try:
+            saved_target_iou = torch.load(
+                target_iou_path, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            saved_target_iou = torch.load(target_iou_path, map_location="cpu")
+        saved_by_image = {
+            _record_key(record, dataset_root): record
+            for record in saved_target_iou.get("records", [])
+        }
+        if set(saved_by_image) != target_ids:
+            raise ValueError("target official-IoU cache does not match the manifest")
+        for record in target_records:
+            image_id = _record_key(record, dataset_root)
+            source_stage = saved_by_image[image_id]["stages"]["main"]
+            destination_stage = record["stages"]["main"]
+            for field in (
+                "official_iou",
+                "official_candidate_valid",
+                "selection_slot_official_iou",
+                "selection_slot_official_candidate_valid",
+            ):
+                destination_stage[field] = source_stage[field]
+    else:
+        target_iou_cache = {
+            **cache,
+            "metadata": {
+                **cache["metadata"],
+                "cache_path": str(target_iou_path),
+                "num_records": len(target_records),
+            },
+            "records": target_records,
+        }
+        target_iou_cache["metadata"].pop("official_iou_cache", None)
+        ensure_official_iou_cache(
+            target_iou_cache,
+            line_width=args.line_width,
+            workers=args.metric_workers,
+        )
     records = {
         _record_key(record, dataset_root): record for record in cache["records"]
     }
@@ -937,6 +978,7 @@ def main() -> None:
             "line_width": float(args.line_width),
             "optical_flow": "OpenCV DIS FAST, forward/backward consistency",
             "gt_enters_temporal_score": False,
+            "adjacent_gt_score_is_diagnostic_only": True,
             "test_set_used": False,
             "training_performed": False,
             "checkpoint_selection_performed": False,

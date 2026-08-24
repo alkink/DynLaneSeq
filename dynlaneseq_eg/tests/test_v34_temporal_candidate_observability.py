@@ -110,7 +110,9 @@ def test_summary_requires_both_folds_and_both_thresholds() -> None:
                 "following_selected",
                 "bidirectional_selected",
                 "bidirectional_bank",
+                "bidirectional_gt",
                 "identity_bidirectional_selected",
+                "identity_bidirectional_gt",
             ):
                 row[f"{prefix}_good"] = 0.9
                 row[f"{prefix}_wrong"] = 0.1
@@ -121,4 +123,3 @@ def test_summary_requires_both_folds_and_both_thresholds() -> None:
     summary = summarize_pairs(rows, bootstrap_reps=20, seed=3)
     assert summary["passed"] is True
     assert len(summary["checks"]) == 16
-
