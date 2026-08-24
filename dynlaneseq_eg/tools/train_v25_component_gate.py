@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import time
+from typing import Any
 
 import torch
 
@@ -52,6 +53,24 @@ def parse_args() -> argparse.Namespace:
         "--allow-advanced-init",
         action="store_true",
         help="Load every shared G0/G2 tensor exactly and initialize only new dual-energy modules.",
+    )
+    parser.add_argument(
+        "--advanced-private-checkpoint",
+        default="",
+        help=(
+            "Optional strict checkpoint supplying only private tensors after "
+            "the advanced parent initialization. The causal parent remains "
+            "--init-checkpoint, so shared/primary provenance stays paired."
+        ),
+    )
+    parser.add_argument(
+        "--advanced-private-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Private state prefix copied from --advanced-private-checkpoint; "
+            "repeat for multiple prefixes."
+        ),
     )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -116,6 +135,11 @@ def main() -> None:
     if not isinstance(model, DynLaneSeqV25):
         raise TypeError("factory did not construct DynLaneSeqV25")
     init_checkpoint = Path(args.init_checkpoint).expanduser().resolve()
+    private_initialization: dict[str, Any] | None = None
+    if args.advanced_private_checkpoint and not args.allow_advanced_init:
+        raise ValueError("advanced private initialization requires --allow-advanced-init")
+    if args.advanced_private_checkpoint and not args.advanced_private_prefix:
+        raise ValueError("advanced private initialization requires at least one prefix")
     if args.allow_advanced_init:
         base_cfg = copy.deepcopy(cfg)
         base_cfg.setdefault("v25", {})["enable_dual_energy_multi_path"] = False
@@ -142,6 +166,57 @@ def main() -> None:
                     }
                 )
             )
+        if args.advanced_private_checkpoint:
+            private_checkpoint = (
+                Path(args.advanced_private_checkpoint).expanduser().resolve()
+            )
+            private_model = build_model(cfg)
+            private_iteration = int(
+                load_checkpoint(private_checkpoint, private_model, strict=True)
+            )
+            if private_iteration != init_iteration:
+                raise ValueError(
+                    "private checkpoint must retain the causal parent iteration: "
+                    f"private={private_iteration}, parent={init_iteration}"
+                )
+            prefixes = tuple(str(value) for value in args.advanced_private_prefix)
+            source_state = private_model.state_dict()
+            destination_state = model.state_dict()
+            copied: list[str] = []
+            with torch.no_grad():
+                for name, value in source_state.items():
+                    if not name.startswith(prefixes):
+                        continue
+                    if name not in destination_state:
+                        raise KeyError(f"private destination lacks tensor {name}")
+                    if destination_state[name].shape != value.shape:
+                        raise ValueError(f"private tensor shape mismatch: {name}")
+                    destination_state[name].copy_(value)
+                    copied.append(name)
+            if not copied:
+                raise ValueError(
+                    "advanced private prefixes matched no tensors: "
+                    + json.dumps(prefixes)
+                )
+            post_private_shared_mismatch = [
+                name
+                for name, value in base_model.state_dict().items()
+                if not torch.equal(model.state_dict()[name].cpu(), value.cpu())
+            ]
+            if post_private_shared_mismatch:
+                raise ValueError(
+                    "private initialization changed causal parent tensors: "
+                    + json.dumps(post_private_shared_mismatch[:10])
+                )
+            private_initialization = {
+                "checkpoint": str(private_checkpoint),
+                "checkpoint_sha256": sha256_file(private_checkpoint),
+                "iteration": private_iteration,
+                "prefixes": list(prefixes),
+                "tensor_count": len(copied),
+                "causal_parent_tensor_parity": True,
+            }
+            del private_model
         del base_model
     else:
         init_iteration = int(load_checkpoint(init_checkpoint, model, strict=True))
@@ -396,6 +471,7 @@ def main() -> None:
         "initial_checkpoint": str(init_checkpoint),
         "initial_checkpoint_sha256": sha256_file(init_checkpoint),
         "advanced_partial_init": bool(args.allow_advanced_init),
+        "advanced_private_initialization": private_initialization,
         "runtime_rng_reset_after_init": bool(
             args.reset_runtime_rng_after_init
         ),
