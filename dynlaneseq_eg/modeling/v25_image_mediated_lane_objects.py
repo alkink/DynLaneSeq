@@ -280,6 +280,127 @@ class ImageMediatedLaneBlock(nn.Module):
         return query, logits, probability, other_coverage
 
 
+class ImageConditionedPatternQueryInitializer(nn.Module):
+    """Predict a safe full-curve query anchor from global image evidence.
+
+    The module mixes a fixed train-split curve bank independently for every
+    final lane slot.  A zero-initialized scalar gate interpolates from V38's
+    canonical straight anchor to that image-conditioned mixture.  Therefore
+    enabling the module is exactly output preserving before the first update,
+    while subsequent geometry losses can train the complete initializer and
+    the shared image representation.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        num_slots: int,
+        num_rows: int,
+        pattern_count: int = 16,
+        pooled_rows: int = 10,
+        pooled_columns: int = 25,
+        projection_channels: int = 16,
+        hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        if pattern_count < 2:
+            raise ValueError("pattern query initialization needs at least two patterns")
+        if min(pooled_rows, pooled_columns, projection_channels, hidden_dim) < 1:
+            raise ValueError("pattern query initializer dimensions must be positive")
+        self.num_slots = int(num_slots)
+        self.num_rows = int(num_rows)
+        self.pattern_count = int(pattern_count)
+        self.pooled_rows = int(pooled_rows)
+        self.pooled_columns = int(pooled_columns)
+        self.spatial_projection = nn.Sequential(
+            nn.Conv2d(int(channels), int(projection_channels), 1, bias=False),
+            nn.GroupNorm(
+                _group_count(int(projection_channels)), int(projection_channels)
+            ),
+            nn.GELU(),
+        )
+        flattened = int(projection_channels) * self.pooled_rows * self.pooled_columns
+        self.context = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(flattened),
+            nn.Linear(flattened, int(hidden_dim)),
+            nn.GELU(),
+        )
+        self.pattern_and_gate = nn.Linear(
+            int(hidden_dim), self.num_slots * (self.pattern_count + 1)
+        )
+        nn.init.zeros_(self.pattern_and_gate.weight)
+        nn.init.zeros_(self.pattern_and_gate.bias)
+        self.register_buffer(
+            "pattern_bank",
+            self._fallback_patterns(
+                slots=self.num_slots,
+                patterns=self.pattern_count,
+                rows=self.num_rows,
+            ),
+            persistent=True,
+        )
+
+    @staticmethod
+    def _fallback_patterns(*, slots: int, patterns: int, rows: int) -> torch.Tensor:
+        """Deterministic smooth bank used until a train-only bank is loaded."""
+
+        row = torch.linspace(-1.0, 1.0, rows, dtype=torch.float32)
+        canonical = torch.linspace(0.16, 0.84, slots, dtype=torch.float32)
+        bank = torch.empty((slots, patterns, rows), dtype=torch.float32)
+        for slot in range(slots):
+            for pattern in range(patterns):
+                phase = float(pattern) / float(max(patterns - 1, 1))
+                shift = (phase - 0.5) * 0.24
+                slope = (((pattern * 5) % patterns) / float(patterns - 1) - 0.5) * 0.16
+                bend = (((pattern * 9) % patterns) / float(patterns - 1) - 0.5) * 0.10
+                bank[slot, pattern] = (
+                    canonical[slot] + shift + slope * row + bend * row.square()
+                ).clamp(0.0, 1.0)
+        return bank
+
+    @torch.no_grad()
+    def set_pattern_bank(self, patterns: torch.Tensor) -> None:
+        expected = (self.num_slots, self.pattern_count, self.num_rows)
+        if tuple(patterns.shape) != expected:
+            raise ValueError(
+                f"pattern bank must have shape {expected}, got {tuple(patterns.shape)}"
+            )
+        value = patterns.detach().to(device=self.pattern_bank.device, dtype=torch.float32)
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError("pattern bank contains non-finite values")
+        if bool(((value < 0.0) | (value > 1.0)).any()):
+            raise ValueError("pattern bank must contain normalized x values in [0,1]")
+        self.pattern_bank.copy_(value)
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        canonical_slot_centres: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        pooled = F.adaptive_avg_pool2d(
+            self.spatial_projection(image_features),
+            output_size=(self.pooled_rows, self.pooled_columns),
+        )
+        context = self.context(pooled)
+        raw = self.pattern_and_gate(context).view(
+            image_features.shape[0], self.num_slots, self.pattern_count + 1
+        )
+        pattern_logits = raw[..., : self.pattern_count]
+        gate = torch.tanh(raw[..., self.pattern_count])
+        weights = pattern_logits.float().softmax(dim=-1)
+        mixture = torch.einsum("bsk,skr->bsr", weights, self.pattern_bank)
+        canonical = canonical_slot_centres.float().view(1, self.num_slots, 1)
+        anchors = canonical + gate.float().unsqueeze(-1) * (mixture - canonical)
+        return {
+            "query_anchor_x_rows": anchors.clamp(0.0, 1.0),
+            "pattern_weights": weights,
+            "pattern_gate": gate.float(),
+            "pattern_mixture_x_rows": mixture,
+        }
+
+
 class V25ImageMediatedLaneObjects(nn.Module):
     """Four image-owned lane objects with coherent continuous path output."""
 
@@ -308,6 +429,12 @@ class V25ImageMediatedLaneObjects(nn.Module):
         require_pretrained_backbone: bool = True,
         pretrained_weights_path: str = "",
         freeze_batch_norm_stats: bool = True,
+        enable_pattern_query_initializer: bool = False,
+        pattern_query_count: int = 16,
+        pattern_query_pooled_rows: int = 10,
+        pattern_query_pooled_columns: int = 25,
+        pattern_query_projection_channels: int = 16,
+        pattern_query_hidden_dim: int = 128,
     ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -327,6 +454,9 @@ class V25ImageMediatedLaneObjects(nn.Module):
         self.anchor_prior_sigma = float(anchor_prior_sigma)
         self.decode_mode = str(decode_mode)
         self.freeze_batch_norm_stats = bool(freeze_batch_norm_stats)
+        self.enable_pattern_query_initializer = bool(
+            enable_pattern_query_initializer
+        )
 
         self.backbone = DLA34Backbone(
             pretrained=bool(pretrained_backbone),
@@ -360,6 +490,20 @@ class V25ImageMediatedLaneObjects(nn.Module):
             nn.GroupNorm(_group_count(int(hidden_dim)), int(hidden_dim)),
             nn.GELU(),
             nn.Conv2d(int(hidden_dim), int(hidden_dim), 1, bias=False),
+        )
+        self.pattern_query_initializer = (
+            ImageConditionedPatternQueryInitializer(
+                channels=int(hidden_dim),
+                num_slots=self.num_slots,
+                num_rows=self.num_rows,
+                pattern_count=int(pattern_query_count),
+                pooled_rows=int(pattern_query_pooled_rows),
+                pooled_columns=int(pattern_query_pooled_columns),
+                projection_channels=int(pattern_query_projection_channels),
+                hidden_dim=int(pattern_query_hidden_dim),
+            )
+            if self.enable_pattern_query_initializer
+            else None
         )
         self.key_projection = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
         self.value_projection = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
@@ -473,12 +617,24 @@ class V25ImageMediatedLaneObjects(nn.Module):
             + self.anchor_projection(geometry)
         )
 
-    def _anchor_prior(self, batch: int, *, device: torch.device) -> torch.Tensor:
+    def _anchor_prior(
+        self,
+        batch: int,
+        *,
+        device: torch.device,
+        query_anchor_x_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = (
             fixed_indices(self.x_bins, device=device, dtype=torch.float32) + 0.5
         ) / float(self.x_bins)
-        centres = self.canonical_slot_centres.to(device=device).view(
-            1, self.num_slots, 1, 1
+        centres = (
+            self.canonical_slot_centres.to(device=device).view(
+                1, self.num_slots, 1, 1
+            )
+            if query_anchor_x_rows is None
+            else query_anchor_x_rows.to(device=device, dtype=torch.float32)
+            .clamp(0.0, 1.0)
+            .unsqueeze(-1)
         )
         prior = -0.5 * ((x.view(1, 1, 1, -1) - centres) / self.anchor_prior_sigma).pow(2)
         return self.anchor_prior_weight * prior.expand(
@@ -535,6 +691,12 @@ class V25ImageMediatedLaneObjects(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch = int(images.shape[0])
         features = self._image_features(images)
+        initializer_output: dict[str, torch.Tensor] = {}
+        if query_anchor_x_rows is None and self.pattern_query_initializer is not None:
+            initializer_output = self.pattern_query_initializer(
+                features, self.canonical_slot_centres
+            )
+            query_anchor_x_rows = initializer_output["query_anchor_x_rows"]
         keys = self.key_projection(features)
         values = self.value_projection(features)
         query = self._initial_query(
@@ -542,7 +704,11 @@ class V25ImageMediatedLaneObjects(nn.Module):
             device=images.device,
             query_anchor_x_rows=query_anchor_x_rows,
         ).to(dtype=features.dtype)
-        prior = self._anchor_prior(batch, device=images.device).to(dtype=features.dtype)
+        prior = self._anchor_prior(
+            batch,
+            device=images.device,
+            query_anchor_x_rows=query_anchor_x_rows,
+        ).to(dtype=features.dtype)
         final_layer_logits: torch.Tensor | None = None
         final_other_coverage: torch.Tensor | None = None
         cumulative = prior
@@ -587,6 +753,7 @@ class V25ImageMediatedLaneObjects(nn.Module):
             "image_features": features,
             "final_layer_image_logits": final_layer_logits,
             "final_other_coverage": final_other_coverage,
+            **initializer_output,
         }
 
 
@@ -967,4 +1134,14 @@ def v25_model_contract(model: V25ImageMediatedLaneObjects) -> dict[str, Any]:
             getattr(model, "exact_set_selection", False)
         ),
         "row_visibility_present": hasattr(model, "row_visibility_head"),
+        "pattern_query_initializer_enabled": bool(
+            getattr(model, "pattern_query_initializer", None) is not None
+        ),
+        "pattern_query_count": int(
+            getattr(
+                getattr(model, "pattern_query_initializer", None),
+                "pattern_count",
+                0,
+            )
+        ),
     }

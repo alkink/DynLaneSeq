@@ -1,0 +1,21 @@
+_base_: culane_v38_direct_primary_maturity_50k.yaml
+
+output_dir: outputs/diagnostics/v39_pattern_query_initialization/control_65k
+
+# Exact-paired continuation from the common V38 50K endpoint.  The control
+# keeps the V38 canonical straight query anchors unchanged.
+v25:
+  pattern_query_initializer:
+    enabled: false
+
+v39:
+  arm: control
+  source_iteration: 50000
+  endpoint_iteration: 65000
+  scheduler_total_iters: 278000
+  pattern_count: 16
+  train_pattern_images: 20000
+
+training:
+  max_iters: 65000
+

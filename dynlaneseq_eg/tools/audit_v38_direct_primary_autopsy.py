@@ -59,6 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-valid-rows", type=int, default=5)
     parser.add_argument("--reuse-cache", action="store_true")
     parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument("--expected-iteration", type=int, default=50_000)
+    parser.add_argument(
+        "--experiment-label", default="V38 direct-primary 50K"
+    )
+    parser.add_argument(
+        "--output-stem", default="v38_direct_primary_50k_autopsy"
+    )
     return parser.parse_args()
 
 
@@ -235,7 +242,7 @@ def classify_threshold_bottleneck(
 def _write_markdown(payload: dict[str, Any], path: Path) -> None:
     policies = payload["policies"]
     lines = [
-        "# V38 Direct-Primary 50K Training-Free Autopsy",
+        f"# {payload['experiment']}",
         "",
         f"- Decision: **{payload['verdict']['decision']}**",
         f"- Images: `{payload['population']['images']}`",
@@ -293,8 +300,10 @@ def main() -> None:
     checkpoint = Path(args.checkpoint).expanduser().resolve()
     v38_report_path = Path(args.v38_report).expanduser().resolve()
     v38_report = json.loads(v38_report_path.read_text(encoding="utf-8"))
-    if int(v38_report.get("checkpoint_iteration", -1)) != 50_000:
-        raise ValueError("V38 autopsy requires the fixed 50K endpoint")
+    if int(v38_report.get("checkpoint_iteration", -1)) != int(
+        args.expected_iteration
+    ):
+        raise ValueError("direct-primary autopsy endpoint mismatch")
     if Path(str(v38_report.get("checkpoint", ""))).name != checkpoint.name:
         raise ValueError("V38 report/checkpoint mismatch")
     contract = v38_report.get("contract", {})
@@ -556,7 +565,9 @@ def main() -> None:
     quality_labels_050 = [value > 0.50 for value in quality_values]
     quality_labels_075 = [value > 0.75 for value in quality_values]
     payload = {
-        "experiment": "V38 direct-primary 50K training-free full-validation autopsy",
+        "experiment": (
+            f"{args.experiment_label} training-free full-validation autopsy"
+        ),
         "diagnostic_only": True,
         "training_performed": False,
         "test_set_used": False,
@@ -606,8 +617,8 @@ def main() -> None:
             "interpretation": interpretation,
         },
     }
-    json_path = output_dir / "v38_direct_primary_50k_autopsy.json"
-    markdown_path = output_dir / "V38_DIRECT_PRIMARY_50K_AUTOPSY.md"
+    json_path = output_dir / f"{args.output_stem}.json"
+    markdown_path = output_dir / f"{args.output_stem.upper()}.md"
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     _write_markdown(payload, markdown_path)
     print(json.dumps(payload, indent=2))

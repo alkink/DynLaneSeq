@@ -54,6 +54,26 @@ class DynLaneSeqV25(nn.Module):
             freeze_batch_norm_stats=bool(
                 v25.get("freeze_batch_norm_stats", True)
             ),
+            enable_pattern_query_initializer=bool(
+                v25.get("pattern_query_initializer", {}).get("enabled", False)
+            ),
+            pattern_query_count=int(
+                v25.get("pattern_query_initializer", {}).get("pattern_count", 16)
+            ),
+            pattern_query_pooled_rows=int(
+                v25.get("pattern_query_initializer", {}).get("pooled_rows", 10)
+            ),
+            pattern_query_pooled_columns=int(
+                v25.get("pattern_query_initializer", {}).get("pooled_columns", 25)
+            ),
+            pattern_query_projection_channels=int(
+                v25.get("pattern_query_initializer", {}).get(
+                    "projection_channels", 16
+                )
+            ),
+            pattern_query_hidden_dim=int(
+                v25.get("pattern_query_initializer", {}).get("hidden_dim", 128)
+            ),
         )
         if detector_type is V25DualEnergyMultiPath:
             common_kwargs.update(

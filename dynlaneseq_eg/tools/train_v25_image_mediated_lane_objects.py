@@ -117,12 +117,16 @@ def _optimizer(
     model: DynLaneSeqV25, cfg: dict[str, Any]
 ) -> torch.optim.Optimizer:
     raw = cfg["v25"]["optimizer"]
-    backbone = list(model.detector.backbone.parameters())
+    backbone = [
+        parameter
+        for parameter in model.detector.backbone.parameters()
+        if parameter.requires_grad
+    ]
     backbone_ids = {id(parameter) for parameter in backbone}
     rest = [
         parameter
         for parameter in model.detector.parameters()
-        if id(parameter) not in backbone_ids
+        if parameter.requires_grad and id(parameter) not in backbone_ids
     ]
     return torch.optim.AdamW(
         (

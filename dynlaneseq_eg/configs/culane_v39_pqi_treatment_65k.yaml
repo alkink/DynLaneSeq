@@ -1,0 +1,19 @@
+_base_: culane_v39_pqi_control_65k.yaml
+
+output_dir: outputs/diagnostics/v39_pattern_query_initialization/treatment_65k
+
+# The only treatment change is the zero-init image-conditioned full-curve
+# query anchor.  No quality loss, field loss, denoising, selector, NMS, or
+# decoder change is enabled.
+v25:
+  pattern_query_initializer:
+    enabled: true
+    pattern_count: 16
+    pooled_rows: 10
+    pooled_columns: 25
+    projection_channels: 16
+    hidden_dim: 128
+
+v39:
+  arm: treatment
+
