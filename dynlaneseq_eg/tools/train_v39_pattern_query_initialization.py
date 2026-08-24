@@ -252,13 +252,24 @@ def _zero_parity_and_gradient_gate(
     )
     model.eval()
     with torch.no_grad():
-        treatment = model(images)
         source = model(images, query_anchor_x_rows=canonical)
-    exact = {
-        name: bool(torch.equal(treatment[name], source[name]))
-        for name in PRIMARY_OUTPUTS
-    }
-    anchor_exact = bool(torch.equal(treatment["query_anchor_x_rows"], canonical))
+        source_cpu = {name: source[name].detach().cpu() for name in PRIMARY_OUTPUTS}
+        del source
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        treatment = model(images)
+        exact = {
+            name: bool(torch.equal(treatment[name].detach().cpu(), source_cpu[name]))
+            for name in PRIMARY_OUTPUTS
+        }
+        anchor_exact = bool(
+            torch.equal(
+                treatment["query_anchor_x_rows"].detach().cpu(), canonical.cpu()
+            )
+        )
+        del treatment, source_cpu
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     model.train()
     model.zero_grad(set_to_none=True)
     output = model(images)
