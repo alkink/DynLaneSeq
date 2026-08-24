@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-trained-iteration", type=int, default=13_888)
     parser.add_argument("--runtime-seed", type=int, default=DEFAULT_RUNTIME_SEED)
     parser.add_argument(
+        "--hybrid-private-prefixes",
+        nargs="+",
+        default=("detector.proposal_memory",),
+        help=(
+            "Private trained auxiliary modules transplanted onto the exact "
+            "parent shared/primary state for the cold-start counterfactual."
+        ),
+    )
+    parser.add_argument(
         "--relative-step-scales",
         type=float,
         nargs="+",
@@ -373,6 +382,8 @@ def _load_model(
     expected_iteration: int,
     device: torch.device,
     channels_last: bool,
+    private_source_checkpoint: Path | None = None,
+    private_prefixes: tuple[str, ...] = (),
 ) -> tuple[DynLaneSeqV25, int, dict[str, Any]]:
     model = build_model(cfg)
     if not isinstance(model, DynLaneSeqV25):
@@ -407,6 +418,52 @@ def _load_model(
                 )
             )
         initialization["shared_tensor_parity"] = True
+        if private_source_checkpoint is not None:
+            if not private_prefixes:
+                raise ValueError("private transplant requires at least one prefix")
+            private_source = build_model(cfg)
+            private_iteration = int(
+                load_checkpoint(private_source_checkpoint, private_source, strict=True)
+            )
+            source_state = private_source.state_dict()
+            destination_state = model.state_dict()
+            copied = []
+            with torch.no_grad():
+                for name, value in source_state.items():
+                    if name.startswith(private_prefixes):
+                        if name not in destination_state:
+                            raise KeyError(f"private transplant destination lacks {name}")
+                        if destination_state[name].shape != value.shape:
+                            raise ValueError(f"private transplant shape mismatch: {name}")
+                        destination_state[name].copy_(value)
+                        copied.append(name)
+            if not copied:
+                raise ValueError(
+                    f"private transplant prefixes matched nothing: {private_prefixes}"
+                )
+            post_transplant_mismatches = [
+                name
+                for name, value in base.state_dict().items()
+                if not torch.equal(model.state_dict()[name].cpu(), value.cpu())
+            ]
+            if post_transplant_mismatches:
+                raise ValueError(
+                    "private transplant changed parent shared/primary tensors: "
+                    + json.dumps(post_transplant_mismatches[:10])
+                )
+            initialization.update(
+                {
+                    "private_transplant_checkpoint": str(private_source_checkpoint),
+                    "private_transplant_checkpoint_sha256": sha256_file(
+                        private_source_checkpoint
+                    ),
+                    "private_transplant_iteration": private_iteration,
+                    "private_transplant_prefixes": list(private_prefixes),
+                    "private_transplant_tensor_count": len(copied),
+                    "post_transplant_parent_tensor_parity": True,
+                }
+            )
+            del private_source
         del base
     else:
         iteration = int(load_checkpoint(checkpoint, model, strict=True))
@@ -464,6 +521,8 @@ def audit_checkpoint(
     num_pairs: int,
     data_start_iteration: int,
     relative_step_scales: list[float],
+    private_source_checkpoint: Path | None = None,
+    private_prefixes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     channels_last = bool(cfg["training"].get("channels_last", False))
     amp_enabled = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
@@ -476,6 +535,8 @@ def audit_checkpoint(
         expected_iteration=expected_iteration,
         device=device,
         channels_last=channels_last,
+        private_source_checkpoint=private_source_checkpoint,
+        private_prefixes=private_prefixes,
     )
     weights = _loss_weights(cfg)
     primary_weights, auxiliary_weights = split_primary_auxiliary_weights(weights)
@@ -704,6 +765,20 @@ def main() -> None:
         data_start_iteration=int(args.data_start_iteration),
         relative_step_scales=list(args.relative_step_scales),
     )
+    hybrid = audit_checkpoint(
+        label="parent_with_trained_private_auxiliary_head",
+        cfg=cfg,
+        checkpoint=Path(args.parent_checkpoint).expanduser().resolve(),
+        advanced_partial_init=True,
+        expected_iteration=int(args.expected_parent_iteration),
+        device=device,
+        runtime_seed=int(args.runtime_seed),
+        num_pairs=int(args.num_pairs),
+        data_start_iteration=int(args.data_start_iteration),
+        relative_step_scales=list(args.relative_step_scales),
+        private_source_checkpoint=Path(args.trained_checkpoint).expanduser().resolve(),
+        private_prefixes=tuple(args.hybrid_private_prefixes),
+    )
     trained = audit_checkpoint(
         label="trained_auxiliary_endpoint",
         cfg=cfg,
@@ -716,15 +791,29 @@ def main() -> None:
         data_start_iteration=int(args.data_start_iteration),
         relative_step_scales=list(args.relative_step_scales),
     )
-    manifests_match = (
-        parent["batch_manifest_sha256"] == trained["batch_manifest_sha256"]
-    )
+    manifests_match = len(
+        {
+            parent["batch_manifest_sha256"],
+            hybrid["batch_manifest_sha256"],
+            trained["batch_manifest_sha256"],
+        }
+    ) == 1
     if not manifests_match:
         raise RuntimeError("parent/trained audits did not see exact paired batches")
-    labels = {parent["verdict"]["label"], trained["verdict"]["label"]}
-    if "gradient_conflict" in labels:
-        combined = "gradient_conflict_detected"
-    elif labels == {"aligned_or_redundant"}:
+    parent_label = parent["verdict"]["label"]
+    hybrid_label = hybrid["verdict"]["label"]
+    trained_label = trained["verdict"]["label"]
+    if parent_label == "gradient_conflict" and hybrid_label == "aligned_or_redundant":
+        combined = "private_auxiliary_cold_start_conflict_supported"
+    elif (
+        parent_label == "gradient_conflict"
+        and hybrid_label == "gradient_conflict"
+        and trained_label == "aligned_or_redundant"
+    ):
+        combined = "shared_representation_adaptation_required_before_alignment"
+    elif trained_label == "gradient_conflict":
+        combined = "persistent_gradient_conflict_detected"
+    elif {parent_label, hybrid_label, trained_label} == {"aligned_or_redundant"}:
         combined = "aligned_but_no_f1_gain_supports_redundancy"
     else:
         combined = "mixed_interaction_requires_layer_localization"
@@ -742,12 +831,21 @@ def main() -> None:
         "images_per_checkpoint": int(args.num_pairs) * int(args.batch_size) * 2,
         "exact_batch_manifest_match": manifests_match,
         "parent": parent,
+        "hybrid_parent_with_trained_private_auxiliary": hybrid,
         "trained": trained,
         "combined_verdict": combined,
         "decision_contract": {
-            "gradient_conflict_detected": (
-                "Close shared-encoder auxiliary training; inspect layer-local "
-                "conflict before authorizing at most one surgical detach gate."
+            "private_auxiliary_cold_start_conflict_supported": (
+                "A private-head pretraining/freeze-then-unfreeze causal gate is "
+                "the only justified auxiliary follow-up."
+            ),
+            "shared_representation_adaptation_required_before_alignment": (
+                "A private head alone cannot remove conflict; close the current "
+                "shared auxiliary route instead of opening a long run."
+            ),
+            "persistent_gradient_conflict_detected": (
+                "Close shared-encoder auxiliary training; do not authorize a "
+                "loss sweep or long schedule."
             ),
             "aligned_but_no_f1_gain_supports_redundancy": (
                 "Close the direct-primary auxiliary family; more gradient or "
@@ -770,6 +868,7 @@ def main() -> None:
         "combined_verdict": combined,
         "parent_verdict": parent["verdict"],
         "trained_verdict": trained["verdict"],
+        "hybrid_verdict": hybrid["verdict"],
         "exact_batch_manifest_match": manifests_match,
     }, indent=2))
 

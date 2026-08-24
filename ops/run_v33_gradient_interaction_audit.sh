@@ -6,7 +6,7 @@ dataset=${CULANE_ROOT:-/workspace/CULane}
 python=${DYNLANESEQ_PYTHON:-/venv/clrernet/bin/python}
 
 root=${project}/outputs/diagnostics/v33_primary_aux_sufficiency_gate
-output=${root}/gradient_interaction/v33_gradient_interaction_32pairs.json
+output=${root}/gradient_interaction/v33_gradient_interaction_32pairs_3way.json
 
 cd "${project}"
 export PYTHONPATH="${project}${PYTHONPATH:+:${PYTHONPATH}}"
