@@ -1,0 +1,45 @@
+_base_: culane_v33_primary_control_025ep.yaml
+
+output_dir: outputs/diagnostics/v38_direct_primary_maturity/train
+
+# V38 is not an auxiliary-component gate.  It gives the four-query direct
+# primary detector the same optimizer-step and effective-batch exposure as the
+# exact V7 50K reference.  The LR trajectory is the first 50K steps of the
+# same predeclared 278K horizon rather than a short cosine that reaches its
+# minimum at the diagnostic endpoint.
+v25:
+  # G0's pre-V38 full-validation replay rejected hard-path deployment:
+  # expectation was +0.220 F1@.50 and +2.819 F1@.75 on the exact same logits.
+  # The path policy is therefore fixed before V38 training, not selected at 50K.
+  decode_mode: expectation
+  optimizer:
+    warmup_steps: 1000
+    minimum_lr_ratio: 0.01
+
+v38:
+  endpoint_iteration: 50000
+  scheduler_total_iters: 278000
+  reference_effective_batch: 16
+  reference_v7_iteration: 50000
+
+dataloader:
+  num_workers: 6
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  resume_safe: true
+  eval_batch_size: 16
+
+training:
+  seed: 3407
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  max_iters: 50000
+  checkpoint_interval: 2500
+  amp: true
+  amp_dtype: bfloat16
+  channels_last: true
+  clip_grad_norm: 50.0
+  cudnn_benchmark: true
+  tf32: true
+  log_interval: 25
