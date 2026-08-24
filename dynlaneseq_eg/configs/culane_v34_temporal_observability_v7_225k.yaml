@@ -1,0 +1,15 @@
+_base_: culane_s0_structured_query_dla34_v7_joint_four_slot_resume_safe.yaml
+
+output_dir: outputs/diagnostics/v34_temporal_candidate_observability
+
+# The audit restores a complete V7 checkpoint.  It must not try to download or
+# require a separate ImageNet backbone while constructing the model.
+model:
+  pretrained_backbone: false
+  require_pretrained_backbone: false
+
+dataloader:
+  eval_batch_size: 8
+  num_workers: 6
+  persistent_workers: true
+
