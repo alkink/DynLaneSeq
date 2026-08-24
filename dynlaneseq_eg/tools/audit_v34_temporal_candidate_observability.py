@@ -833,8 +833,33 @@ def main() -> None:
         amp_dtype=args.amp_dtype,
         desc="V34 temporal union cache",
     )
-    cache = ensure_official_iou_cache(
-        cache,
+    # Official raster IoU is used only to label target-frame good/wrong pairs.
+    # Neighbor frames contribute prediction geometry and optical flow only.  A
+    # full union cache contains roughly three times as many records, and V7 may
+    # also expose intermediate decoder stages that this audit never reads.
+    # Restricting rasterization to target/main records preserves exact labels
+    # while avoiding several times the CPU work.
+    target_ids = {str(row["target"]) for row in manifest["samples"]}
+    target_records = [
+        {
+            **record,
+            "stages": {"main": record["stages"]["main"]},
+        }
+        for record in cache["records"]
+        if _record_key(record, dataset_root) in target_ids
+    ]
+    target_iou_cache = {
+        **cache,
+        "metadata": {
+            **cache["metadata"],
+            "cache_path": str(output_dir / "target_main_official_iou.pt"),
+            "num_records": len(target_records),
+        },
+        "records": target_records,
+    }
+    target_iou_cache["metadata"].pop("official_iou_cache", None)
+    ensure_official_iou_cache(
+        target_iou_cache,
         line_width=args.line_width,
         workers=args.metric_workers,
     )
