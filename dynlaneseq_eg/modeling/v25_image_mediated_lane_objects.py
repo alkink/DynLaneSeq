@@ -379,9 +379,15 @@ class ImageConditionedPatternQueryInitializer(nn.Module):
         image_features: torch.Tensor,
         canonical_slot_centres: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        pooled = F.adaptive_avg_pool2d(
-            self.spatial_projection(image_features),
-            output_size=(self.pooled_rows, self.pooled_columns),
+        # Pool before the learned projection.  Projecting the full
+        # [160,800] map would retain a second high-resolution activation for
+        # backward and pushes the 32 GB 5090 over its memory limit, while the
+        # initializer only needs a coarse global road layout.
+        pooled = self.spatial_projection(
+            F.adaptive_avg_pool2d(
+                image_features,
+                output_size=(self.pooled_rows, self.pooled_columns),
+            )
         )
         context = self.context(pooled)
         raw = self.pattern_and_gate(context).view(
