@@ -246,7 +246,12 @@ def _zero_parity_and_gradient_gate(
     if initializer is None:
         return {"passed": True, "applicable": False}
     images, targets, _metas = batch
-    images = _move_images(images, device=device, channels_last=channels_last)
+    # The parity gate performs three forwards (source, zero-init treatment,
+    # gradient population).  A single deterministic example is sufficient for
+    # this mathematical contract and avoids tripling V38's already large
+    # full-batch activation footprint on a 32 GB GPU.
+    images = _move_images(images[:1], device=device, channels_last=channels_last)
+    targets = targets[:1]
     canonical = model.detector.canonical_slot_centres.view(1, 4, 1).expand(
         images.shape[0], 4, model.detector.num_rows
     )
@@ -286,6 +291,7 @@ def _zero_parity_and_gradient_gate(
     model.zero_grad(set_to_none=True)
     result = {
         "applicable": True,
+        "examples_checked": int(images.shape[0]),
         "primary_outputs_bit_exact": exact,
         "query_anchor_bit_exact": anchor_exact,
         "initializer_output_gradient_finite": gradient_finite,
