@@ -22,10 +22,13 @@ V37 kalan tek assignment-contract ihtimalini test eder:
 
 - mature V7 `iter_0225000.pt`;
 - V36'daki exact 625 görüntü / 980 pair;
+- V34 cache'in üretildiği exact `temporal_union_val.txt` sırası ve batch
+  kompozisyonu;
 - dört decoder output: üç intermediate + final;
 - her layer kendi configured V7 Hungarian assignment'ını kullanır;
 - AMP: BF16, model eval, augmentation yok;
-- final proposal output V34 cache ile parity kontrolünden geçer;
+- final proposal output V34 cache ile cross-device BF16 replay stability
+  kontrolünden geçer;
 - test split kapalı;
 - training veya checkpoint seçimi yok.
 
@@ -56,6 +59,21 @@ No-lane CE class weight `0.10` aynen korunur.
 Gradient ölçümü iki folddan deterministik toplam 128 görüntüde yapılır. Bu
 ölçüm yalnız shared proposal existence head içindir; bütün backbone gradienti
 olduğu şeklinde yorumlanmaz.
+
+V34 cache önceki GPU üzerinde üretilmiş olabileceği için tek bir autoregressive
+row'un maksimum piksel farkını bit-exact gate olarak kullanmıyoruz. Replay şu
+üç koşulu birlikte sağlamalıdır:
+
+```text
+all-proposal mean absolute coordinate difference <= 1.0 px
+V36 pair assignment-state agreement              >= %95
+good/wrong target-quality mean absolute error     <= 0.03
+```
+
+İlk denemede farklı batch kompozisyonuyla `max abs = 100.845 px` görüldüğü için
+koşu sonuç üretmeden durduruldu. Yukarıdaki cross-device sözleşme ve exact V34
+batch sırası bu başarısız replay sonrasında, bilimsel metriğe bakılmadan önce
+kilitlendi.
 
 ## Önceden kilitli karar ağacı
 

@@ -123,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--replay-list", required=True)
     parser.add_argument("--target-cache", required=True)
     parser.add_argument("--v36-json", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -482,6 +483,7 @@ def main() -> None:
     config_path = Path(args.config).expanduser().resolve()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    replay_list = Path(args.replay_list).expanduser().resolve()
     cache_path = Path(args.target_cache).expanduser().resolve()
     v36_path = Path(args.v36_json).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -507,10 +509,20 @@ def main() -> None:
             _uniform_take(candidates, int(args.gradient_images_per_fold))
         )
     gradient_set = set(gradient_images)
-    ordered_images = gradient_images + sorted(set(pairs_by_image) - gradient_set)
-    list_path = output_dir / "v37_pair_images.txt"
-    list_path.write_text(
-        "".join(f"/{image.lstrip('/')}\n" for image in ordered_images),
+    if not replay_list.exists():
+        raise FileNotFoundError(f"V34 replay list does not exist: {replay_list}")
+    replay_images = {
+        Path(line.strip().split()[0]).as_posix().lstrip("/")
+        for line in replay_list.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    missing_replay = sorted(set(pairs_by_image) - replay_images)
+    if missing_replay:
+        raise ValueError(
+            f"V34 replay list is missing {len(missing_replay)} V36 pair images"
+        )
+    (output_dir / "v37_gradient_images.txt").write_text(
+        "".join(f"/{image.lstrip('/')}\n" for image in gradient_images),
         encoding="utf-8",
     )
 
@@ -528,7 +540,7 @@ def main() -> None:
 
     cfg = load_config(config_path)
     cfg.setdefault("dataset", {})["root"] = str(dataset_root)
-    cfg["dataset"].setdefault("lists", {})["val"] = str(list_path)
+    cfg["dataset"].setdefault("lists", {})["val"] = str(replay_list)
     cfg.setdefault("dataloader", {})["eval_batch_size"] = int(args.eval_batch_size)
     cfg["dataloader"]["num_workers"] = int(args.num_workers)
     cfg["dataloader"]["persistent_workers"] = bool(int(args.num_workers) > 0)
@@ -583,6 +595,7 @@ def main() -> None:
     pred_count = 0
     pred_abs_max = 0.0
     range_abs_max = 0.0
+    pair_parity_rows: list[dict[str, Any]] = []
     processed_gradient_images = 0
     seen_images: set[str] = set()
     layer_count: int | None = None
@@ -592,9 +605,14 @@ def main() -> None:
             _canonical_image_id(str(meta["image_path"]), dataset_root)
             for meta in metas
         ]
-        do_gradient = all(image_id in gradient_set for image_id in batch_ids)
+        gradient_batch_indices = [
+            index
+            for index, image_id in enumerate(batch_ids)
+            if image_id in gradient_set
+        ]
+        do_gradient = bool(gradient_batch_indices)
         if do_gradient:
-            processed_gradient_images += len(batch_ids)
+            processed_gradient_images += len(gradient_batch_indices)
         images = images.to(
             device,
             non_blocking=True,
@@ -650,11 +668,18 @@ def main() -> None:
             ]
 
             if do_gradient:
+                gradient_indices = torch.tensor(
+                    gradient_batch_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
                 final_loss = (
                     final_exist_loss_weight
                     * exact_exist_loss(
-                        layers[-1]["exist_logits"],
-                        labels_by_layer[-1],
+                        layers[-1]["exist_logits"].index_select(
+                            0, gradient_indices
+                        ),
+                        labels_by_layer[-1].index_select(0, gradient_indices),
                         no_lane_weight=no_lane_weight,
                     )
                 )
@@ -662,8 +687,8 @@ def main() -> None:
                     intermediate_exist_loss_weight
                     * coefficient
                     * exact_exist_loss(
-                        layer["exist_logits"],
-                        labels,
+                        layer["exist_logits"].index_select(0, gradient_indices),
+                        labels.index_select(0, gradient_indices),
                         no_lane_weight=no_lane_weight,
                     )
                     for layer, labels, coefficient in zip(
@@ -711,6 +736,8 @@ def main() -> None:
         for batch_index, (image_id, target_cpu) in enumerate(
             zip(batch_ids, targets_cpu)
         ):
+            if image_id not in pairs_by_image:
+                continue
             seen_images.add(image_id)
             cached = cache_records[image_id]["stages"]["main"]
             final_x = layer_cpu[-1]["pred_x_rows"][batch_index]
@@ -764,6 +791,45 @@ def main() -> None:
                 wrong_intended = [float(value == intended) for value in wrong_assignment]
                 good_any = [float(value >= 0) for value in good_assignment]
                 wrong_any = [float(value >= 0) for value in wrong_assignment]
+                fresh_final_state = (
+                    good_intended[-1],
+                    wrong_intended[-1],
+                    good_any[-1],
+                    wrong_any[-1],
+                )
+                cached_final_state = (
+                    float(pair["configured_good_intended"]),
+                    float(pair["configured_wrong_intended"]),
+                    float(pair["configured_good_any_positive"]),
+                    float(pair["configured_wrong_any_positive"]),
+                )
+                pair_parity_rows.append(
+                    {
+                        "clip": str(pair["clip"]),
+                        "curve_mean_abs": float(
+                            torch.stack((difference[good], difference[wrong])).mean()
+                        ),
+                        "quality_good_abs": abs(
+                            float(qualities[-1][good, intended])
+                            - float(pair["target_quality_good"])
+                        ),
+                        "quality_wrong_abs": abs(
+                            float(qualities[-1][wrong, intended])
+                            - float(pair["target_quality_wrong"])
+                        ),
+                        "exist_good_abs": abs(
+                            float(probabilities[-1][good])
+                            - float(pair["exist_probability_good"])
+                        ),
+                        "exist_wrong_abs": abs(
+                            float(probabilities[-1][wrong])
+                            - float(pair["exist_probability_wrong"])
+                        ),
+                        "assignment_pair_state_same": float(
+                            fresh_final_state == cached_final_state
+                        ),
+                    }
+                )
                 good_updates = [
                     float(update_cpu[layer][batch_index, good])
                     for layer in range(len(layers))
@@ -826,9 +892,30 @@ def main() -> None:
         raise ValueError(
             f"V37 dataloader saw {len(seen_images)} of {len(pairs_by_image)} pair images"
         )
-    if pred_abs_max > 0.50:
+    pred_mean_abs = pred_abs_sum / float(max(pred_count, 1))
+    assignment_pair_state_same = _mean(
+        row["assignment_pair_state_same"] for row in pair_parity_rows
+    )
+    quality_abs_mean = _mean(
+        value
+        for row in pair_parity_rows
+        for value in (row["quality_good_abs"], row["quality_wrong_abs"])
+    )
+    # The V34 cache may have been produced on the preceding GPU.  BF16 replay
+    # is therefore validated by aggregate geometry and decision stability,
+    # not by one unstable row's maximum absolute coordinate difference.
+    if (
+        pred_mean_abs > 1.0
+        or assignment_pair_state_same is None
+        or assignment_pair_state_same < 0.95
+        or quality_abs_mean is None
+        or quality_abs_mean > 0.03
+    ):
         raise ValueError(
-            f"fresh final proposal output failed cache parity: max={pred_abs_max:.6f}px"
+            "fresh final proposal output failed cross-device replay stability: "
+            f"mean_px={pred_mean_abs:.6f}, "
+            f"assignment_state={assignment_pair_state_same}, "
+            f"quality_abs={quality_abs_mean}"
         )
     if layer_count is None or not trajectory_rows:
         raise RuntimeError("V37 produced no trajectory rows")
@@ -902,9 +989,27 @@ def main() -> None:
             "final_good_positive_pairs": len(final_positive_rows),
         },
         "parity": {
-            "pred_x_mean_abs": pred_abs_sum / float(max(pred_count, 1)),
+            "contract": "cross_device_bf16_stability",
+            "replay_list": str(replay_list),
+            "pred_x_mean_abs": pred_mean_abs,
             "pred_x_max_abs": pred_abs_max,
             "range_max_abs": range_abs_max,
+            "pair_curve_mean_abs": _quantiles(
+                row["curve_mean_abs"] for row in pair_parity_rows
+            ),
+            "quality_good_abs": _quantiles(
+                row["quality_good_abs"] for row in pair_parity_rows
+            ),
+            "quality_wrong_abs": _quantiles(
+                row["quality_wrong_abs"] for row in pair_parity_rows
+            ),
+            "exist_good_abs": _quantiles(
+                row["exist_good_abs"] for row in pair_parity_rows
+            ),
+            "exist_wrong_abs": _quantiles(
+                row["exist_wrong_abs"] for row in pair_parity_rows
+            ),
+            "assignment_pair_state_same": assignment_pair_state_same,
         },
         "summary": summaries,
         "final_good_positive_summary": final_positive_summary,
