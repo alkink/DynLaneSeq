@@ -193,10 +193,15 @@ def _slot_geometry_assignment(
         routes_value = stage["selection_slot_indices"]
     routes = routes_value.long()
     candidate_count = int(stage["pred_x_rows"].shape[0])
-    if bool(((routes < 0) | (routes >= candidate_count)).any()):
-        raise ValueError("slot geometry replay requires real proposal indices")
-    pred_x = stage["pred_x_rows"].float().index_select(0, routes)
-    pred_range = stage["range_norm"].float().index_select(0, routes)
+    valid_slot_ids = torch.nonzero(
+        (routes >= 0) & (routes < candidate_count),
+        as_tuple=False,
+    ).flatten()
+    if valid_slot_ids.numel() == 0:
+        return {}
+    valid_routes = routes.index_select(0, valid_slot_ids)
+    pred_x = stage["pred_x_rows"].float().index_select(0, valid_routes)
+    pred_range = stage["range_norm"].float().index_select(0, valid_routes)
     quality, slot_valid, gt_valid = _candidate_quality(
         pred_x,
         pred_range,
@@ -214,7 +219,7 @@ def _slot_geometry_assignment(
     local = cost.index_select(0, finite_slots).index_select(1, finite_gt)
     local_slot, local_gt = HungarianMatcherS0._linear_sum_assignment(local)
     return {
-        int(finite_slots[int(slot)]): int(finite_gt[int(gt)])
+        int(valid_slot_ids[int(finite_slots[int(slot)])]): int(finite_gt[int(gt)])
         for slot, gt in zip(local_slot.tolist(), local_gt.tolist())
     }
 
